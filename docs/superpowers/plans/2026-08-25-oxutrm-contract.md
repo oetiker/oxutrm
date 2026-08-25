@@ -181,18 +181,44 @@ pub const FLAG_ZSTD: u8 = 0x01;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// FIELD ORDER IS WIRE-SIGNIFICANT. postcard serialises in declaration order,
 /// so reordering these silently breaks interoperability with no useful error.
-/// Do not tidy this struct.
+/// Do not tidy this struct, and do not re-add fragmentation fields — see the
+/// channel-selection note below for why they are gone.
 pub struct Frame {
     pub my_state: u64,
     pub from_state: u64,
     pub ack_state: u64,
     pub flags: u8,
-    /// 0-based fragment index within this target state.
-    pub frag_index: u16,
-    /// Total fragments for this target state. 1 means unfragmented.
-    pub frag_count: u16,
     pub payload: Vec<u8>,
 }
+
+// ---- CHANNEL SELECTION: which transport carries this Frame ----
+//
+// There is NO datagram fragmentation. It was specified, reviewed, and removed:
+// a state of F fragments needs all F to arrive with no retransmission, so
+// delivery probability is (1-p)^F. A 200x60 truecolor full state is ~125
+// fragments — 28% delivery at 1% loss, 0.16% at 5%. Worse, the ring-miss
+// recovery path is OBLIGED to send a full state, so the mechanism most needed
+// after a burst of loss was the one least able to survive it.
+//
+// Instead, size picks the channel:
+//
+//   fits in one datagram  -> QUIC unreliable datagram. The common case:
+//                            incremental diffs and keystrokes. Latency wins,
+//                            and a loss costs nothing because the next diff
+//                            re-diffs from the same ack and contains it.
+//
+//   larger                -> a FRESH unidirectional QUIC stream, reliable and
+//                            ordered. A full state is a recovery mechanism, not
+//                            a latency-critical one, so reliability is right.
+//
+// The rule that keeps "never stale, never behind" true on the stream path:
+// if a newer state becomes current while such a stream is still in flight,
+// RESET_STREAM it and open a new stream for the CURRENT state. Never queue.
+// The receiver then gets nothing rather than something out of date.
+//
+// Streams may complete out of order; the receiver applies one only if its
+// `my_state` is newer than what it holds. `Frame`'s sequence numbers already
+// answer that, so no extra machinery is needed.
 
 impl Frame {
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError>;
