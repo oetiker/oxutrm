@@ -69,6 +69,7 @@
 | `base64` | `0.22` | proto |
 | `unicode-width` | `0.2` | term, client |
 | `compact_str` | `0.10` | term — `CellText`, inline for <=24 bytes |
+| `libc` | `0.2` | host; client — **only** `sigaction`, to restore the terminal when the client is killed. rustix has no stable binding for installing a handler (`rustix::runtime` is explicitly unstable), and that one gap is why `oxutrm-client` is `deny(unsafe_code)` rather than `forbid`. |
 | `proptest` | `1` | sync (dev) |
 | `insta` | `1` | term (dev, snapshots) |
 
@@ -732,7 +733,8 @@ impl Renderer {
     pub fn render<W: std::io::Write>(&mut self, w: &mut W, s: &ScreenState) -> std::io::Result<()>;
 }
 
-/// Raw mode on entry, restored on Drop and on panic.
+/// Raw mode on entry, restored on Drop, on panic, and on a catchable
+/// termination signal.
 pub struct RawGuard { /* private */ }
 impl RawGuard { pub fn enter() -> anyhow::Result<RawGuard>; }
 impl Drop for RawGuard;
@@ -742,6 +744,45 @@ pub fn terminal_size() -> anyhow::Result<TermSize>;
 /// One connect-time line, then silence.
 pub fn status_line(path: &PathDescription) -> String;
 ```
+
+**A full repaint states every mode, in whichever direction.** When the painted
+model is unknown — a first render, a resize, an `invalidate` after a path
+migration — `render` emits `\x1b[?1049h` *or* `\x1b[?1049l`, the bracketed-paste
+mode either way when the terminal has it, and the full mouse sequence even for
+`MouseMode::Off`. "Nothing is known about the terminal" is not "the terminal is
+in the default state". Emitting only the modes that wanted turning *on* is what
+left a resized-then-quit vim behind on the alternate buffer, still reporting the
+mouse, with the user's shell unusable and no way back but a blind `reset`.
+
+**A mode that swaps the physical screen buffer forces a repaint, and is emitted
+before it.** Crossing `alt_screen` invalidates the painted model in the same
+pass: every cell it holds belongs to the buffer being left, so a diff against it
+would paint nothing onto the buffer the user is now looking at. The bell is read
+before that drop, so a ring is not lost to the swap.
+
+**The painted model is committed only after a successful, complete write.** On
+any error from `write_all` — including the short write `write_all` reports as
+`WriteZero` — the model is invalidated and the next render repaints. A model
+that claims a screen state the terminal never received poisons every later diff
+permanently. This is the render-path form of the standing rule that a rejected
+frame costs a repaint, never a session.
+
+**`RawGuard::enter` claims SIGTERM, SIGINT, SIGHUP and SIGQUIT.** The handler
+restores the terminal, resets the signal to its default disposition and
+re-raises, so the process still dies of the signal it was sent and a waiting
+parent sees the truth. `SIGKILL` and `SIGSTOP` cannot be caught, so `kill -9`
+still leaves the terminal raw; nothing can change that. This is why the client
+depends on `libc`: `sigaction` has no safe binding in this tree, and the crate
+is `deny(unsafe_code)` with that single documented exception rather than
+`forbid`.
+
+**On an 8-colour terminal, only `Idx(8..16)` reaches the bright half.** An
+application that said "bright red" gets the traditional bold-plus-base-colour
+rendering. A cube or grey index (`>= 16`) carries no brightness signal — it says
+no more than the RGB it is defined as — so it folds with the high bit masked
+off, exactly as `Rgb` always did. Without that mask a dark teal landed on 8 and
+the renderer promoted it to bold, putting text in a heavier font than the
+application ever asked for.
 
 ---
 

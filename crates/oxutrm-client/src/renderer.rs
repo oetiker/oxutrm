@@ -75,32 +75,75 @@ impl Renderer {
             self.painted = None;
         }
 
-        let full = self.painted.is_none();
+        let mut full = self.painted.is_none();
+
+        // `\x1b[?1049h`/`l` swaps the physical screen buffer. Everything the
+        // model claims is painted belongs to the buffer being left, so from
+        // here on there is nothing to diff against: the bell is read before
+        // the model is dropped, and every later pass runs as a full repaint.
+        let buffer_swapped = self
+            .painted
+            .as_ref()
+            .is_some_and(|p| p.modes.alt_screen != s.modes.alt_screen);
+
+        // Read before the model can be dropped below, emitted after everything
+        // else: a bell is not worth a cursor move, and `write_cursor` restates
+        // the position whenever anything at all was emitted before it.
+        let ring = self.should_ring(s);
+
+        // Modes go first, because the swap has to happen before the repaint
+        // that fills the buffer it swapped to.
         self.write_modes(&mut out, s, full);
+        if buffer_swapped {
+            self.painted = None;
+            full = true;
+        }
+
         self.write_title(&mut out, s, full);
         self.write_cells(&mut out, s, full);
         self.write_cursor(&mut out, s, full);
-        self.write_bell(&mut out, s);
+        if ring {
+            out.push(0x07);
+        }
 
-        self.painted = Some(Painted {
-            cells: s.cells.clone(),
-            cursor: s.cursor,
-            modes: s.modes,
-            title: s.title.clone(),
-            bell: s.bell,
-        });
-
-        w.write_all(&out)
+        // Only a write that completed makes the model true. Committing it
+        // before the bytes are out would leave every later diff computed
+        // against a screen that was never painted, with no way back — and a
+        // rejected frame must cost a repaint, never a session.
+        match w.write_all(&out) {
+            Ok(()) => {
+                self.painted = Some(Painted {
+                    cells: s.cells.clone(),
+                    cursor: s.cursor,
+                    modes: s.modes,
+                    title: s.title.clone(),
+                    bell: s.bell,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                self.painted = None;
+                Err(e)
+            }
+        }
     }
 
     // ---- modes -------------------------------------------------------------
 
+    /// On a full repaint every mode is *stated*, in whichever direction.
+    ///
+    /// "Nothing is known about the terminal" is not "the terminal is in the
+    /// default state": emitting only the modes that want turning on is what
+    /// left a resized-then-quit vim behind on the alternate buffer, still
+    /// reporting the mouse, with the user's shell unusable. A mode we cannot
+    /// vouch for has to be said out loud, and `l` is as much a statement as
+    /// `h`.
     fn write_modes(&self, out: &mut Vec<u8>, s: &ScreenState, full: bool) {
         let before = self.painted.as_ref().map(|p| p.modes);
 
         let changed = |f: fn(&Modes) -> bool| match before {
             Some(b) if !full => f(&s.modes) != f(&b),
-            _ => f(&s.modes),
+            _ => true,
         };
 
         if changed(|m| m.alt_screen) {
@@ -123,7 +166,10 @@ impl Renderer {
 
         let mouse_changed = match before {
             Some(b) if !full => s.modes.mouse != b.mouse,
-            _ => s.modes.mouse != MouseMode::Off,
+            // `write_mouse` clears all three tracking modes before enabling
+            // the wanted one, so stating `Off` is exactly the sequence that
+            // stops a terminal nobody can vouch for from reporting.
+            _ => true,
         };
         if mouse_changed {
             self.write_mouse(out, s.modes.mouse);
@@ -305,12 +351,8 @@ impl Renderer {
     /// undone — ringing on it would be the reset bug the counter exists to
     /// prevent. One ring per increase rather than one per unit, because a
     /// burst that scrolled past deserves one bell, not fifty.
-    fn write_bell(&self, out: &mut Vec<u8>, s: &ScreenState) {
-        if let Some(p) = self.painted.as_ref()
-            && s.bell > p.bell
-        {
-            out.push(0x07);
-        }
+    fn should_ring(&self, s: &ScreenState) -> bool {
+        self.painted.as_ref().is_some_and(|p| s.bell > p.bell)
     }
 }
 
@@ -394,6 +436,12 @@ mod tests {
             term_name: "test".to_string(),
         }
     }
+
+    /// What a full repaint says about the modes when every one of them is off.
+    /// Nothing is known about the terminal, so every mode is stated rather than
+    /// assumed — see [`Renderer::write_modes`].
+    const MODES_ALL_OFF: &str = "\u{1b}[?1049l\u{1b}[?2004l\
+                                 \u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1006l";
 
     fn size() -> TermSize {
         TermSize { cols: 5, rows: 2 }
@@ -654,11 +702,14 @@ mod tests {
         r.invalidate();
         let mut third = base.clone();
         third.seq = 3;
-        // A full repaint also restates cursor shape and visibility: with no
-        // model of the terminal, neither can be assumed.
+        // A full repaint also restates every mode, the cursor shape and the
+        // cursor visibility: with no model of the terminal, none of them can
+        // be assumed.
         assert_eq!(
             render(&mut r, &third),
-            "\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            format!(
+                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            )
         );
     }
 
@@ -670,7 +721,9 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &s),
-            "\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            format!(
+                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            )
         );
     }
 
@@ -682,7 +735,9 @@ mod tests {
 
         let mut next = base.clone();
         next.seq = 2;
-        assert!(render(&mut r, &next).starts_with("\u{1b}[H\u{1b}[2J"));
+        let out = render(&mut r, &next);
+        assert!(out.starts_with(MODES_ALL_OFF), "{out:?}");
+        assert!(out.contains("\u{1b}[H\u{1b}[2J"), "{out:?}");
     }
 
     /// A state of a different shape cannot be painted incrementally: every
@@ -698,7 +753,9 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &wider),
-            "\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            format!(
+                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+            )
         );
         assert_eq!(r.size(), TermSize { cols: 8, rows: 3 });
     }
@@ -787,6 +844,158 @@ mod tests {
         reset.seq = 2;
         reset.bell = 0;
         assert_eq!(render(&mut r, &reset), "");
+    }
+
+    /// The bug this exists to prevent, in the user's words: resize the window
+    /// while in vim, quit vim, and the shell is unusable — still on the
+    /// alternate buffer, still sending mouse reports on every twitch.
+    ///
+    /// The resize invalidates the model, so the next render is a full repaint
+    /// with nothing known about the terminal. "Nothing known" is not "off": a
+    /// mode whose desired value is false has to be *said*, or whatever the
+    /// terminal happens to be in stays.
+    #[test]
+    fn a_full_repaint_turns_off_the_modes_it_cannot_vouch_for() {
+        let mut vim = blank_state();
+        vim.modes.alt_screen = true;
+        vim.modes.bracketed_paste = true;
+        vim.modes.mouse = MouseMode::AnyMotion;
+        let mut r = primed(caps(16_777_216), &vim);
+
+        // The window was resized: everything painted is gone, and so is every
+        // claim about what mode the terminal is in.
+        r.invalidate();
+
+        let mut shell = vim.clone();
+        shell.seq = 2;
+        shell.modes.alt_screen = false;
+        shell.modes.bracketed_paste = false;
+        shell.modes.mouse = MouseMode::Off;
+
+        let out = render(&mut r, &shell);
+        assert!(
+            out.contains("\u{1b}[?1049l"),
+            "the terminal was left on the alternate buffer: {out:?}"
+        );
+        assert!(
+            out.contains("\u{1b}[?2004l"),
+            "bracketed paste was never turned off: {out:?}"
+        );
+        assert!(
+            out.contains("\u{1b}[?1003l"),
+            "mouse reporting was never turned off: {out:?}"
+        );
+    }
+
+    /// `\x1b[?1049h`/`l` swaps the physical screen buffer under us. Cells that
+    /// match the model are not on the buffer we just switched to, so a diff
+    /// against that model paints nothing and the user sees the *other*
+    /// application's screen.
+    #[test]
+    fn crossing_the_alternate_buffer_repaints_rather_than_diffing() {
+        let mut alt = blank_state();
+        alt.modes.alt_screen = true;
+        alt.cells[0] = cell("V");
+        let mut r = primed(caps(16_777_216), &alt);
+
+        // Leaving the alternate buffer. `V` is unchanged in the model, so an
+        // incremental diff would emit nothing for it at all.
+        let mut normal = alt.clone();
+        normal.seq = 2;
+        normal.modes.alt_screen = false;
+
+        let out = render(&mut r, &normal);
+        let leave = out
+            .find("\u{1b}[?1049l")
+            .expect("the buffer swap was never emitted");
+        let clear = out.find("\u{1b}[H\u{1b}[2J").unwrap_or_else(|| {
+            panic!("the buffer swapped but the screen was not repainted: {out:?}")
+        });
+        assert!(
+            leave < clear,
+            "the repaint went to the buffer we were leaving: {out:?}"
+        );
+        assert!(
+            out.contains('V'),
+            "a cell equal to the model was never painted onto the new buffer: {out:?}"
+        );
+    }
+
+    /// A writer that refuses everything.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that takes the first byte and then stops accepting anything,
+    /// which is how `write_all` reports a truncated write.
+    struct ShortWriter {
+        taken: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.taken == 0 && !buf.is_empty() {
+                self.taken = 1;
+                return Ok(1);
+            }
+            Ok(0)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The model says "this is on the screen". It may only say so once the
+    /// bytes that would put it there have actually gone out.
+    #[test]
+    fn a_failed_write_does_not_leave_the_model_claiming_a_painted_screen() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+
+        let mut next = base.clone();
+        next.seq = 2;
+        next.cells[0] = cell("X");
+        assert!(r.render(&mut FailingWriter, &next).is_err(), "write failed");
+
+        // Whatever comes next cannot be a diff against a screen that was never
+        // painted; the only safe move is to repaint.
+        let mut after = next.clone();
+        after.seq = 3;
+        let out = render(&mut r, &after);
+        assert!(
+            out.contains("\u{1b}[H\u{1b}[2J"),
+            "the model survived a failed write: {out:?}"
+        );
+        assert!(out.contains('X'), "the cell was never repainted: {out:?}");
+    }
+
+    #[test]
+    fn a_short_write_does_not_leave_the_model_claiming_a_painted_screen() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+
+        let mut next = base.clone();
+        next.seq = 2;
+        next.cells[0] = cell("X");
+        let err = r
+            .render(&mut ShortWriter { taken: 0 }, &next)
+            .expect_err("a truncated write is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+
+        let mut after = next.clone();
+        after.seq = 3;
+        let out = render(&mut r, &after);
+        assert!(
+            out.contains("\u{1b}[H\u{1b}[2J"),
+            "the model survived a truncated write: {out:?}"
+        );
     }
 
     #[test]

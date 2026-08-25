@@ -1,4 +1,9 @@
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`, for exactly one exception: installing the signal
+// handlers that restore the user's terminal when the client is killed. That
+// needs `sigaction`, which has no safe binding anywhere in this dependency
+// tree. Every `#[allow(unsafe_code)]` in this crate is in `guard.rs` and is
+// about that one thing; anything else is a bug.
+#![deny(unsafe_code)]
 
 //! The local half: it paints the authoritative screen into the terminal the
 //! user is actually sitting in front of, and sends their keystrokes back.

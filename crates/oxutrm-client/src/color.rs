@@ -151,8 +151,14 @@ pub fn down_convert(c: Color, caps: &TerminalCaps) -> Color {
                     // 8-colour terminal has always shown bright.
                     Color::Idx(i)
                 } else {
+                    // A cube or grey index is a colour, not a brightness: it
+                    // says no more than the RGB it is defined as. So the high
+                    // bit comes off here exactly as it does for `Rgb` above —
+                    // without the mask, a dark teal lands on 8 and the SGR
+                    // writer promotes it to bold, putting text in a heavier
+                    // font than the application ever asked for.
                     let (r, g, b) = idx_to_rgb(i);
-                    Color::Idx(rgb_to_16(r, g, b))
+                    Color::Idx(rgb_to_16(r, g, b) & 0x07)
                 }
             }
         },
@@ -250,6 +256,43 @@ mod tests {
         // writer to turn into bold.
         assert_eq!(down_convert(Color::Idx(9), &c), Color::Idx(9));
         // A high cube index has no brightness signal, so it folds plainly.
-        assert!(matches!(down_convert(Color::Idx(196), &c), Color::Idx(n) if n < 16));
+        assert_eq!(down_convert(Color::Idx(196), &c), Color::Idx(1));
+    }
+
+    /// The bright half is reserved for colours that asked for it.
+    ///
+    /// An 8-colour terminal has no bright half, so the SGR writer renders one
+    /// as **bold plus the base colour**. That is the right answer for
+    /// `Idx(8..16)`, where the application said "bright red" — and the wrong
+    /// one for everything else, which would come out in a heavier font than
+    /// the application ever asked for. A cube or grey index is just a colour:
+    /// it carries no more brightness signal than the RGB it is defined as, and
+    /// the RGB arm has always masked the high bit off for exactly that reason.
+    ///
+    /// This replaces an `n < 16` assertion that held for every possible
+    /// implementation, including one returning a constant.
+    #[test]
+    fn no_index_above_the_ansi_sixteen_reaches_the_bright_half_on_8_colours() {
+        let c = caps(8);
+        for i in 16u8..=255 {
+            match down_convert(Color::Idx(i), &c) {
+                Color::Idx(n) => assert!(
+                    n < 8,
+                    "index {i} folded to {n}, in the bright half this terminal does not have"
+                ),
+                other => panic!("expected an index, got {other:?}"),
+            }
+        }
+    }
+
+    /// The other half of the same rule, and the reason it is not simply "mask
+    /// everything": an explicitly bright ANSI index keeps its brightness, for
+    /// the renderer to spend on a bold promotion.
+    #[test]
+    fn the_ansi_bright_half_survives_on_8_colours() {
+        let c = caps(8);
+        for i in 8u8..16 {
+            assert_eq!(down_convert(Color::Idx(i), &c), Color::Idx(i));
+        }
     }
 }
