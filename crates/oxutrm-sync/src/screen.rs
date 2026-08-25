@@ -148,6 +148,14 @@ impl SyncState for ScreenState {
         ScreenState::validate(self)
     }
 
+    /// I5 and I6 — the bell never goes backwards, scrollback never shrinks.
+    ///
+    /// `ScreenState::validate_transition` validates `self` on its own first,
+    /// so I1 to I3 are still checked here exactly as before.
+    fn validate_transition(&self, previous: &Self) -> Result<(), ApplyError> {
+        ScreenState::validate_transition(self, previous)
+    }
+
     fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.rows != base.rows || self.cols != base.cols;
 

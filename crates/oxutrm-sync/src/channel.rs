@@ -233,7 +233,20 @@ impl<S: SyncState> Receiver<S> {
         next.apply(f.from_state, f.my_state, &diff)?;
         // AFTER apply, never before: the question is whether the RESULT is a
         // legal state, and the state we already hold is legal by induction.
-        next.validate()?;
+        //
+        // `validate_transition`, not `validate`: the state we are replacing is
+        // the only thing that can show the invariants a single value cannot —
+        // I5, the bell is a monotonic counter, and I6, scrollback never
+        // shrinks. Both were enforced NOWHERE until this call existed, while
+        // `oxutrm-proto`'s tests called the checker directly and reported
+        // green. The default implementation of `validate_transition` is
+        // `validate`, so nothing is lost for a state with no transition rules.
+        //
+        // This is where the "a rejected frame never disconnects the session"
+        // rule is paid for: the check runs against a CLONE, so a failure
+        // leaves `self.state` and `ack()` exactly as they were, and the
+        // session loop logs and carries on.
+        next.validate_transition(&self.state)?;
 
         self.state = next;
         self.applied_any = true;

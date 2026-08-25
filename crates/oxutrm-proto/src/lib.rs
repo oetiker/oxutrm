@@ -42,10 +42,33 @@
 //! I1 to I3 are properties of one state, so [`ScreenState::validate`] can see
 //! them and every constructor calls it. I5 and I6 are properties of a
 //! *transition* — one state in isolation carries no history — so they live in
-//! [`ScreenState::validate_transition`], which the sync layer runs after
-//! applying a diff. I4 is enforced by the strongest mechanism available: the
-//! field does not exist, and an exhaustive struct literal in the test suite
-//! stops anyone adding it back without noticing.
+//! [`ScreenState::validate_transition`]. I4 is enforced by the strongest
+//! mechanism available: the field does not exist, and an exhaustive struct
+//! literal in the test suite stops anyone adding it back without noticing.
+//!
+//! ## Where the transition check actually runs
+//!
+//! `oxutrm-sync`'s `Receiver::on_frame` calls it after applying a diff, with
+//! the pre-application state as `previous`, through the `SyncState`
+//! trait — which is also why the trait carries a `validate_transition` whose
+//! default implementation is plain `validate`. This sentence is load-bearing
+//! and it used to be false: the crate documented the call and nothing made
+//! it, so I5 and I6 were enforced nowhere while `tests/invariants.rs` called
+//! the checker directly and reported green. A test that calls a checker is
+//! not evidence that the production path does.
+//!
+//! A transition that fails is a **rejected frame, not a fatal error**. The
+//! receiver applies to a clone, so a rejection leaves the state and the ack
+//! untouched and the session continues; the host and client loops log the
+//! reason and take the next frame.
+//!
+//! The counters this rests on are monotonic at the source, so enforcement
+//! cannot strand a healthy session: `HostTerm` accumulates `bell` and
+//! `scrollback_len` with `saturating_add` and never resets either. In
+//! particular `scrollback_len` is **not** `Term::history_size()`, which
+//! saturates at the ring's capacity and falls when the emulator is reset —
+//! it is a synthesized counter that only ever climbs, and the fetch path
+//! clamps a request against the history actually still held.
 //!
 //! Nothing here clamps. A cursor outside the screen is rejected, because a
 //! clamped cursor is a state that validates while the two ends quietly

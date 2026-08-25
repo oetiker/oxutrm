@@ -219,6 +219,14 @@ fn i4_the_title_is_the_only_osc_derived_string() {
 }
 
 // ---------------------------------------------------------------- I5
+//
+// The I5 and I6 cases below call `validate_transition` DIRECTLY, and that
+// proves only that the function computes the right answer. It says nothing
+// about whether the path a state actually travels ever asks — and for the
+// whole life of this crate it did not, while these tests reported green.
+// `oxutrm-sync/tests/faults.rs` is where enforcement is proved, by pushing a
+// backwards bell and a shrinking scrollback through `Receiver::on_frame`.
+// Keep both: these pin the rule, that one pins the caller.
 
 #[test]
 fn i5_a_bell_that_goes_backwards_is_rejected() {

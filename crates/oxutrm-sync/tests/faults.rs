@@ -403,3 +403,106 @@ fn a_state_the_sender_has_forgotten_falls_back_to_a_full_state() {
     assert_eq!(rx.on_frame(&f), Ok(true));
     assert_eq!(rx.state(), tx.current());
 }
+
+// ---- I5 and I6: the invariants that only exist BETWEEN two states ----
+//
+// These belong here rather than in `oxutrm-proto`'s `tests/invariants.rs`,
+// which calls `ScreenState::validate_transition` directly. Calling it directly
+// proves the function computes the right answer; it proves nothing about
+// whether the path a state actually travels ever asks. It did not, for the
+// whole life of the crate, while a green test suite asserted that it did.
+
+#[test]
+fn a_bell_that_goes_backwards_is_rejected_by_the_real_apply_path() {
+    let mut start = screen(3, 4);
+    start.bell = 7;
+    let mut rx = Receiver::new(start);
+
+    let mut d = empty_diff();
+    d.bell = Some(3);
+    let f = frame_of(2, 1, &d);
+
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::BellWentBackwards { was: 7, now: 3 }),
+        "a bell counter that went backwards",
+    );
+}
+
+#[test]
+fn a_scrollback_that_shrinks_is_rejected_by_the_real_apply_path() {
+    let mut start = screen(3, 4);
+    start.scrollback_len = 900;
+    let mut rx = Receiver::new(start);
+
+    let mut d = empty_diff();
+    d.scrollback_len = Some(12);
+    let f = frame_of(2, 1, &d);
+
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::ScrollbackShrank { was: 900, now: 12 }),
+        "scrollback that shrank",
+    );
+}
+
+#[test]
+fn a_full_state_is_held_to_the_transition_invariants_too() {
+    // `from_state == 0` builds on nothing as far as CONTENT goes. `bell` and
+    // `scrollback_len` are not content: they are the host's own monotonic
+    // counters, and a full state that walks them backwards is as wrong as a
+    // diff that does.
+    let mut start = screen(3, 4);
+    start.bell = 5;
+    start.scrollback_len = 40;
+    let mut rx = Receiver::new(start);
+
+    let mut newer = screen(3, 4);
+    newer.bell = 5;
+    newer.scrollback_len = 41;
+    newer.seq = 2;
+    let d = oxutrm_sync::SyncState::full_diff(&newer);
+    let mut f = frame_of(2, 0, &d);
+    assert_eq!(
+        rx.on_frame(&f),
+        Ok(true),
+        "a lawful full state still applies"
+    );
+
+    let mut regressed = screen(3, 4);
+    regressed.bell = 1;
+    regressed.scrollback_len = 41;
+    regressed.seq = 3;
+    let d = oxutrm_sync::SyncState::full_diff(&regressed);
+    f = frame_of(3, 0, &d);
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::BellWentBackwards { was: 5, now: 1 }),
+        "a full state that rings the bell backwards",
+    );
+}
+
+#[test]
+fn counters_that_move_forwards_still_apply() {
+    // The other half: enforcement must not turn a legal state into a rejected
+    // one, or the receiver stalls forever on a frame the sender keeps resending.
+    let mut start = screen(3, 4);
+    start.bell = 2;
+    start.scrollback_len = 10;
+    let mut rx = Receiver::new(start);
+
+    let mut d = empty_diff();
+    d.bell = Some(3);
+    d.scrollback_len = Some(11);
+    assert_eq!(rx.on_frame(&frame_of(2, 1, &d)), Ok(true));
+    assert_eq!(rx.state().bell, 3);
+    assert_eq!(rx.state().scrollback_len, 11);
+
+    // Unchanged counters ride on a diff that mentions neither.
+    assert_eq!(rx.on_frame(&frame_of(3, 2, &empty_diff())), Ok(true));
+    assert_eq!(rx.state().bell, 3);
+    assert_eq!(rx.state().scrollback_len, 11);
+}

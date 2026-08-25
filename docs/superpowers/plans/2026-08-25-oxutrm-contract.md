@@ -333,10 +333,23 @@ impl ScreenState {
     pub fn cell(&self, row: u16, col: u16) -> &Cell;
     pub fn row(&self, row: u16) -> &[Cell];
 
-    /// Checks every invariant below. Called by `Receiver::on_frame` after
-    /// `apply`, and by every constructor. A comment is not a constraint
-    /// anyone checks — this is.
+    /// Checks I1-I3 — every invariant that a single state can show. Called by
+    /// every constructor. A comment is not a constraint anyone checks — this
+    /// is.
     pub fn validate(&self) -> Result<(), ApplyError>;
+
+    /// Checks I5 and I6, which only exist BETWEEN two states. Calls
+    /// `validate` on `self` first, so it is a superset.
+    ///
+    /// Its production caller is `Receiver::on_frame`, which runs it after
+    /// `apply` with the pre-application state as `previous`. That call is
+    /// normative: without it I5 and I6 are enforced NOWHERE, which is exactly
+    /// what was true until it was added — the doc claimed the sync layer ran
+    /// it and only `oxutrm-proto`'s own tests ever did.
+    ///
+    /// A failure is a REJECTED FRAME, never a fatal error: `on_frame` applies
+    /// to a clone, so the state and the ack are untouched.
+    pub fn validate_transition(&self, previous: &ScreenState) -> Result<(), ApplyError>;
 }
 
 // ---- ScreenState INVARIANTS — enforced, not merely documented ----
@@ -352,10 +365,17 @@ impl ScreenState {
 //     `vte` silently drops OSC 1.
 // I5. `bell` is a MONOTONIC counter, never a flag and never reset. The client
 //     rings once per increment, so a reset would ring the terminal once for
-//     every bell in the session's history.
+//     every bell in the session's history. Enforced on the receiving side by
+//     `validate_transition`, via `Receiver::on_frame`.
 // I6. `scrollback_len` counts lines that NEVER travel in a datagram. The lines
 //     themselves are fetched on a stream. It is synthesized by accumulating
 //     `saturating_sub` of `Term::history_size()`, which saturates at capacity.
+//     It never shrinks; enforced the same way as I5.
+//     NOTE: it is deliberately NOT `history_size()` itself, which both
+//     saturates and FALLS when the emulator is reset. `HostTerm` only ever
+//     `saturating_add`s it, which is what makes enforcing I6 safe: a healthy
+//     session cannot produce a frame this rejects. The scrollback FETCH path
+//     is what reconciles the counter with the lines actually still held.
 
 /// PTY + `alacritty_terminal::term::Term`, fed by a re-exported
 /// `alacritty_terminal::vte::ansi::Processor`. Owns the child process.
@@ -457,6 +477,14 @@ pub trait SyncState: Clone {
     /// Diff that turns `base` into `self`.
     fn diff_from(&self, base: &Self) -> Self::Diff;
     fn apply(&mut self, base: u64, target: u64, d: &Self::Diff) -> Result<(), ApplyError>;
+    /// This value's own invariants.
+    fn validate(&self) -> Result<(), ApplyError>;
+    /// The invariants that exist only BETWEEN two states. `Receiver::on_frame`
+    /// calls THIS after `apply`, not `validate`, with the state being replaced
+    /// as `previous`. The default implementation is `self.validate()`, so a
+    /// state with no transition rules needs nothing; `ScreenState` overrides
+    /// it to enforce I5 and I6.
+    fn validate_transition(&self, previous: &Self) -> Result<(), ApplyError> { self.validate() }
     /// A diff from nothing: used when the peer's ack has left the ring.
     fn full_diff(&self) -> Self::Diff;
 }
@@ -518,6 +546,12 @@ impl<S: SyncState> Receiver<S> {
     pub fn new(initial: S) -> Receiver<S>;
     /// Returns true when the state advanced. Stale or duplicate frames
     /// return Ok(false) — they are never an error.
+    ///
+    /// Applies to a CLONE, then runs `validate_transition` on the result with
+    /// the state being replaced as `previous`. Nothing is committed unless
+    /// both succeed, so an `Err` is a rejection that leaves the state and the
+    /// ack exactly as they were. A rejected frame NEVER disconnects the
+    /// session; the host and client loops log it and go on.
     pub fn on_frame(&mut self, f: &Frame) -> Result<bool, ApplyError>;
     pub fn state(&self) -> &S;
     /// The sequence number to put in our outgoing `ack_state`.

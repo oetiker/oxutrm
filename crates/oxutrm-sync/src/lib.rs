@@ -52,10 +52,28 @@ pub trait SyncState: Clone {
 
     /// Check this value's own invariants.
     ///
-    /// [`Receiver::on_frame`] calls this **after** [`SyncState::apply`], never
-    /// before: the question is whether the *result* is a legal state, and the
-    /// state already held is legal by induction.
+    /// Called **after** [`SyncState::apply`], never before: the question is
+    /// whether the *result* is a legal state, and the state already held is
+    /// legal by induction.
     fn validate(&self) -> Result<(), ApplyError>;
+
+    /// Check the invariants that exist only **between** two states — the ones
+    /// a single value cannot show, because one state in isolation carries no
+    /// history.
+    ///
+    /// This is what [`Receiver::on_frame`] calls after [`SyncState::apply`],
+    /// with the pre-application state as `previous`. It replaces the bare
+    /// [`SyncState::validate`] call rather than joining it: the default
+    /// implementation here *is* `validate`, so a state whose invariants are
+    /// all properties of one value gets exactly the old behaviour and an
+    /// implementor cannot forget to chain.
+    ///
+    /// A failure here is a **rejection with a reason**, never a fatal error:
+    /// `on_frame` applies to a clone, so the live state and the ack are both
+    /// untouched, and the session carries on.
+    fn validate_transition(&self, _previous: &Self) -> Result<(), ApplyError> {
+        self.validate()
+    }
 
     /// The diff that turns `base` into `self`.
     fn diff_from(&self, base: &Self) -> Self::Diff;

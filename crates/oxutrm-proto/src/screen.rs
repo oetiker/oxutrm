@@ -179,8 +179,12 @@ impl ScreenState {
     /// (the bell never goes backwards) and **I6** (scrollback never shrinks).
     ///
     /// `validate` cannot see either of these, because one state in isolation
-    /// carries no history. This is the check the sync layer runs after
-    /// applying a diff, with the pre-application state as `previous`.
+    /// carries no history.
+    ///
+    /// The production caller is `oxutrm_sync::Receiver::on_frame`, which runs
+    /// it after applying a diff to a clone, with the pre-application state as
+    /// `previous`. A failure therefore **rejects the frame** and leaves the
+    /// receiver's state and ack untouched; it never ends the session.
     ///
     /// Validates `self` on its own first, so a transition check can never let
     /// a malformed state through.
