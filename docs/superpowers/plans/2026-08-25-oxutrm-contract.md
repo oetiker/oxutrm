@@ -211,10 +211,36 @@ pub struct Frame {
 //                            ordered. A full state is a recovery mechanism, not
 //                            a latency-critical one, so reliability is right.
 //
+//   no datagrams at all   -> NOTHING is sent, and the sender says so once, out
+//                            loud. `max_datagram_size()` returning `None` means
+//                            the peer never advertised
+//                            `max_datagram_frame_size`; it is not a missing
+//                            number to guess at, and it is not a cue to put
+//                            every frame on a stream.
+//
+// That last line is a behavioural rule, not a definition, and it was added
+// because the code did the opposite: with datagrams off it fell through to the
+// stream path silently, so keystrokes and diffs alike each took a fresh
+// unidirectional stream, one at a time, at one frame per pacing interval, with
+// everything offered in between dropped. That is a terminal that feels
+// mysteriously broken instead of a configuration bug anyone can find, and it
+// converts the recovery channel into the whole transport. Both ends of oxutrm
+// set both datagram buffer sizes, so `None` means the config grew a hole or the
+// peer is not oxutrm — and neither is something to paper over. A refusal is
+// still not fatal: the session survives, as every send failure must.
+//
 // The rule that keeps "never stale, never behind" true on the stream path:
 // if a newer state becomes current while such a stream is still in flight,
 // RESET_STREAM it and open a new stream for the CURRENT state. Never queue.
 // The receiver then gets nothing rather than something out of date.
+//
+// "In flight" means STILL BEING WRITTEN, never "was started once". A writer
+// that finished, failed, or was reset stops counting immediately, so a state
+// that does not advance can be offered again after a lost attempt. Held the
+// other way — as it was — a stream that could not even be opened pinned its
+// state for ever, every state got exactly one attempt in its whole life, and
+// retry did not exist; a long-finished stream was also reported as superseded
+// by the next one, which made the outcome unable to distinguish a real reset.
 //
 // Streams may complete out of order; the receiver applies one only if its
 // `my_state` is newer than what it holds. `Frame`'s sequence numbers already
@@ -716,6 +742,28 @@ impl Drop for RegistryGuard;           // removes the directory
 /// Double fork, setsid, chdir /, close every inherited descriptor,
 /// reopen 0/1/2 on /dev/null. Must be called only after HostHello is flushed.
 pub fn daemonize() -> anyhow::Result<()>;
+
+// There is deliberately no `transport::Path` here. One was written — an enum
+// over "datagram path" and "rung-4 tunnel", exposing a `max_payload() -> usize`
+// so that nobody could write `max_datagram_size().unwrap_or(1200)` — and it
+// acquired no production caller, while the real send site in `src/link.rs` did
+// the very thing it forbade. It was removed rather than wired in, for two
+// reasons beyond its being unused.
+//
+// Its `max_payload` was decided once, when the path was built. On a live QUIC
+// connection that is wrong: the datagram limit shrinks with the path MTU, so a
+// cached one survives a migration that invalidated it. `FrameSink::send` asks
+// the connection per frame instead.
+//
+// And its tunnel half described a wire nothing speaks. `oxutrm_net::ice` never
+// nominates `Rung::SshTunnel`, so rung 4 has no implementation to be abstracted
+// from; its framing and its size limit will be written next to the code that
+// carries them, where the size question gets asked again with a real answer.
+//
+// The rule the type existed to hold now lives in `FrameSink::send`, on the path
+// a frame actually takes, with a test on that path. This is the lesson from the
+// fragmentation removal restated: a rule that lives only in prose or in an
+// abstraction nobody calls is a rule nobody implements.
 ```
 
 ### `oxutrm-client`

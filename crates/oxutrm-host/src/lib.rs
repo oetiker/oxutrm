@@ -34,7 +34,6 @@ pub mod ladder;
 pub mod registry;
 pub mod signalling;
 pub mod ssh;
-pub mod transport;
 
 pub use daemon::{daemonize, daemonize_session};
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
@@ -45,4 +44,13 @@ pub use registry::{
     choose_registry_root, detachable_for_rung, entry_is_stale, linger_enabled, now_unix, pid_alive,
     process_start_unix, read_root_env, resolve_registry_root,
 };
-pub use transport::{Path, PathError, TUNNEL_MAX_PAYLOAD};
+
+// There is deliberately no `transport::Path` here any more. It existed to hold
+// one rule — that `max_datagram_size()` returning `None` means "the peer turned
+// datagrams off", never "guess a size" — and it held it in a type with no
+// production caller, while the real send site in `src/link.rs` did the very
+// thing it forbade. The rule now lives in `FrameSink::send`, on the path a
+// frame actually takes, with a test on that path. Its other half, a tunnel
+// framing for rung 4, described a wire nothing speaks: `oxutrm_net::ice` never
+// nominates `Rung::SshTunnel`, so it will be written next to the code that
+// carries it, and asks its size question again there.
