@@ -4519,6 +4519,12 @@ pub async fn serve_attach(session: &mut Session, stream: UnixStream) -> anyhow::
         .await
         .context("reading ClientHello")?
     {
+        // `caps` is deliberately not kept here. Spec §9.4 and M4's Task 5:
+        // `TERM` derives solely from what the emulator supports, never from
+        // the current client, because a narrowed `TERM` bakes degraded output
+        // into the authoritative state forever. Capabilities steer the
+        // client's own down-conversion and reach the host later, for
+        // diagnosis only, as `ControlMsg::CapsUpdate`.
         Signal::ClientHello { size, .. } => session.set_size(size),
         other => anyhow::bail!("expected a ClientHello, got {other:?}"),
     }
@@ -4695,7 +4701,24 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   /// its end of the pipe closes and reading returns end of file.
   pub async fn link_closed<R>(r: R)
   where R: tokio::io::AsyncRead + Unpin;
+
+  impl Session {
+      pub fn set_detachable(&mut self, detachable: bool);
+      /// Called once the ladder has nominated a rung: records detachability,
+      /// and daemonizes when — and only when — the session may detach.
+      /// Must run after the handshake and before `publish`.
+      pub fn finish_bootstrap(&mut self, rung: Rung) -> anyhow::Result<()>;
+  }
   ```
+
+**Who decides, and when.** The rung is not known when `HostHello` is written:
+candidates travel in that message, so it precedes the ladder by construction.
+`HostHello.detachable` is therefore the host's **intent** — false only when it
+already knows it cannot detach, as `--no-detach` says. The **authoritative**
+answer is the rung the ladder nominates, and `finish_bootstrap` is the single
+place that turns it into `SessionMeta.detachable`, `meta.json`, and the decision
+whether to fork. M4 calls it with the nominated rung; M3 calls it with a
+stand-in, because M3 has no ladder.
   plus the rule, enforced by `SessionConfig::detachable` and
   `SessionMeta::detachable`, that a non-detachable session never calls
   `daemonize()`.
@@ -4784,6 +4807,33 @@ async fn the_registry_entry_goes_when_the_ssh_connection_does() {
     assert!(Registry::list_in(&root).expect("list").is_empty());
 }
 
+/// A session starts optimistic and is settled by the rung. This runs in the
+/// test process on purpose: if `finish_bootstrap` ever forked on the rung-4
+/// path, the test harness itself would fork and the failure would be loud.
+#[test]
+fn finishing_on_rung_four_records_it_and_never_forks() {
+    let before = std::process::id();
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    assert!(
+        session.meta().detachable,
+        "a session intends to detach until the ladder says otherwise"
+    );
+
+    session
+        .finish_bootstrap(oxutrm_proto::Rung::SshTunnel)
+        .expect("finish_bootstrap");
+
+    assert!(!session.meta().detachable, "rung 4 cannot detach");
+    assert_eq!(
+        std::process::id(),
+        before,
+        "rung 4 must not daemonize: forking here would close the transport"
+    );
+}
+
+/// The detachable path cannot be exercised in-process — it would daemonize the
+/// test harness. Task 16's CLI test covers it end to end, and Task 8's probe
+/// covers `daemonize` itself.
 #[tokio::test]
 async fn traffic_on_the_link_is_not_mistaken_for_it_closing() {
     let (mut ssh_side, session_side) = tokio::io::duplex(1024);
@@ -4839,6 +4889,31 @@ where
 }
 ```
 
+Add to the `impl Session` block in `crates/oxutrm-host/src/session.rs`:
+
+```rust
+    pub fn set_detachable(&mut self, detachable: bool) {
+        self.meta.detachable = detachable;
+        self.sync_meta();
+    }
+
+    /// Settle detachability once the ladder has nominated a rung, and detach
+    /// if the rung allows it.
+    ///
+    /// Rung 4 runs the transport inside the SSH connection, so closing those
+    /// descriptors would destroy it: that path never forks (spec §4.3, §5.5).
+    /// Every other rung daemonizes here, which also changes the pid, so the
+    /// registry entry must be published *after* this call and not before.
+    pub fn finish_bootstrap(&mut self, rung: Rung) -> anyhow::Result<()> {
+        self.set_detachable(rung != Rung::SshTunnel);
+        if self.meta.detachable {
+            crate::daemonize()?;
+            self.refresh_pid();
+        }
+        Ok(())
+    }
+```
+
 Extend the re-export in `crates/oxutrm-host/src/lib.rs`:
 
 ```rust
@@ -4851,7 +4926,7 @@ pub use session::{
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-host --test tied_session -- --test-threads 4`
-Expected: PASS, 3 tests.
+Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Run the whole suite, lint and commit**
 
@@ -5383,10 +5458,11 @@ use oxutrm_host::session::{
     link_closed, relay_attach, run_session, run_session_until, SessionConfig, StubShell,
 };
 use oxutrm_host::{
-    bootstrap, check_socket_path_length, daemonize, resolve_registry_root, Registry, Session,
-    SshCommand,
+    bootstrap, check_socket_path_length, resolve_registry_root, Registry, Session, SshCommand,
 };
-use oxutrm_proto::{read_signal, write_signal, PathDescription, Signal, TermSize, TerminalCaps};
+use oxutrm_proto::{
+    read_signal, write_signal, PathDescription, Rung, Signal, TermSize, TerminalCaps,
+};
 
 const USAGE: &str = "\
 oxutrm — a remote terminal that survives bad networks
@@ -5543,14 +5619,18 @@ fn serve(args: &[String]) -> Result<()> {
         // `keys` is dropped here, zeroing the psk.
     }
 
-    // 2. Detach, unless the transport is inside this ssh connection.
-    //    Everything above this line spoke on descriptors that are about to be
-    //    closed.
-    if detachable {
-        daemonize().context("detaching from ssh")?;
-        // 3. The pid changed twice; the registry must hold the new one.
-        session.refresh_pid();
-    }
+    // 2. The nominated rung settles detachability, and detaching happens
+    //    inside `finish_bootstrap` — including the pid refresh, since forking
+    //    twice changes it. Everything above this line spoke on descriptors
+    //    that are about to be closed.
+    //
+    //    M3 has no ladder, so `--no-detach` stands in for "the ladder landed
+    //    on rung 4". M4 passes the rung ICE actually nominated, at exactly
+    //    this point, and deletes the stand-in.
+    let rung = if detachable { Rung::StunPunch } else { Rung::SshTunnel };
+    session.finish_bootstrap(rung).context("detaching from ssh")?;
+
+    // 3. Published after detaching, so `meta.json` records the final pid.
     session.publish(&dir).context("publishing the session")?;
 
     // 4. Bind after detaching: daemonize closes every descriptor above 2.
