@@ -21,8 +21,9 @@ scrollback.
 - **Both endpoints may sit behind NAT.**
 - **SSH for session initiation and reattachment** — no new trust root, no new
   daemon to expose.
-- **Real `alacritty_terminal` emulation on both ends**, so screen state is authoritative on
-  the host and predictions on the client are correct rather than approximated.
+- **Real `alacritty_terminal` emulation on both ends**, so screen state is
+  authoritative on the host and predictions on the client are correct rather
+  than approximated.
 - **Detach and reattach**: the remote session outlives the client indefinitely.
 - **Working scrollback**, which Mosh cannot provide.
 - **Full fidelity**: 24-bit colour, SGR mouse reporting, resize **with reflow**,
@@ -30,9 +31,10 @@ scrollback.
   inverse, bold, italic, dim, hidden and strikeout natively, plus **five**
   underline styles (single, double, undercurl, dotted, dashed), **per-cell
   underline colour** (SGR 58/59) and OSC 8 hyperlinks. Blink is the one attribute
-  the emulator parses but drops, and §9.1.1 recovers it. v1 collapses the five
-  underline styles to a single underline bit and does not carry underline colour
-  — the capability is there whenever the wire format wants it.
+  the emulator parses but drops, and §9.1.1 recovers it. v1 deliberately spends
+  less than it could: the five underline styles collapse to a single underline
+  bit, and underline colour and hyperlinks are not carried at all (§8.2). The
+  capability is there whenever the wire format wants it.
 - **Bandwidth adaptation** so a poor link degrades gracefully instead of
   falling behind.
 - **`tmux -CC` control mode integration** (phase D), so window switching and the
@@ -41,8 +43,8 @@ scrollback.
 
 ### 1.2 Non-goals
 
-- Graphics protocols (Sixel, Kitty, iTerm2 inline images). `alacritty_terminal` does not
-  model them; claiming support would be a lie.
+- Graphics protocols (Sixel, Kitty, iTerm2 inline images). `alacritty_terminal`
+  does not model them; claiming support would be a lie.
 - A GUI client. oxutrm renders into an existing terminal.
 - Replacing tmux. oxutrm integrates with it (phase D) rather than competing.
 - Being a general-purpose VPN or port forwarder.
@@ -66,7 +68,7 @@ scrollback.
 | Client prediction | heuristic overlay | a second real `alacritty_terminal`, reconciled |
 | Scrollback | broken | synced, and local scrolling is instant |
 | Reattach | none | same code path as first connect |
-| `TERM` | hardcoded `xterm-256color` | negotiated from the client's real capabilities |
+| `TERM` | hardcoded `xterm-256color` | derived from what the emulator really emulates; the client down-converts (§9.4) |
 | Bulk transfers | none | separate QUIC streams, cannot block the screen |
 
 ---
@@ -285,8 +287,9 @@ follows if it fails. A `Symmetric` verdict skips directly to rung 3 rather than
 burning several seconds failing.
 
 **Punching uses real ICE.** Probes are **STUN Binding Requests carrying a
-`MESSAGE-INTEGRITY` attribute keyed by the `psk`**, exactly as ICE
-connectivity checks do. This is chosen over a bespoke probe format because:
+`MESSAGE-INTEGRITY` attribute**, keyed by credentials derived from the `psk`
+rather than by the `psk` itself — see "Credentials are derived" below — exactly
+as ICE connectivity checks do. This is chosen over a bespoke probe format because:
 
 - it demultiplexes cleanly against QUIC on the same socket — a STUN packet's
   first two bits are `00`, while every QUIC packet has the fixed bit set;
@@ -600,22 +603,22 @@ A `Cell` is its text, a foreground and background colour, and its attributes.
 `CellText` is the contract's alias for `compact_str::CompactString`, which stores
 up to 24 bytes inline. Nearly every cell — one ASCII character, or one character
 plus a combining mark — therefore allocates nothing at all. This matters more
-than a per-cell figure suggests, because §8.2's ring of 32 states multiplies it:
-a plain `String` would mean roughly 61,000 live heap allocations for an 80×24
-session. The wire encoding is identical either way, and the indirection through
-the alias is what keeps the choice reversible in one line.
+than a per-cell figure suggests, because the ring of 32 states described below
+multiplies it: a plain `String` would mean roughly 61,000 live heap allocations
+for an 80×24 session. The wire encoding is identical either way, and the
+indirection through the alias is what keeps the choice reversible in one line.
 
 `text` is a small string rather than a `char` so grapheme clusters and combining
 marks survive intact. Wide-character continuation cells are represented
 explicitly, not as spaces.
 
 `Attrs` carries **nine** bits: inverse, bold, italic, dim, hidden, strikeout,
-underline, blink, and `WIDE_CONT`. The first six are native cell flags.
-**Blink** is the one attribute the emulator parses and then discards, so §9.1.1
-recovers it explicitly. **`WIDE_CONT`** marks the right-hand half of a
-double-width character (the emulator's `WIDE_CHAR_SPACER`) — this is how the
-explicit continuation cell described above is represented, and it is a bit of
-`Attrs` rather than a separate field.
+underline, blink, and `WIDE_CONT`. All but one map straight onto native cell
+flags. **Blink** is the single exception — the emulator parses it and then
+discards it, so §9.1.1 recovers it explicitly. **`WIDE_CONT`** marks the
+right-hand half of a double-width character (the emulator's `WIDE_CHAR_SPACER`)
+— this is how the explicit continuation cell described above is represented, and
+it is a bit of `Attrs` rather than a separate field.
 
 Three capabilities the emulator offers are deliberately **not** on the wire in
 v1, because each would widen `Cell` for something no caller needs yet: the five
@@ -888,8 +891,8 @@ bright variants is a renderer decision, and the crate does none of it.
 line. A scrollback line is therefore just
 `&term.grid()[Point::new(Line(-n), Column(c))]` — O(1), and it does **not** move
 the viewport, so reading history never disturbs what the live screen shows. The
-valid span is `topmost_line()..=bottommost_line()`, and `ScrollbackReq { from_line, to_line }`
-(§7.2) maps onto it directly.
+valid span is `topmost_line()..=bottommost_line()`, and
+`ScrollbackReq { from_line, to_line }` (§7.2) maps onto it directly.
 
 `HostTerm` must **not** maintain a parallel scrollback ring: a second copy would
 be a second source of truth, and keeping it consistent with the grid across every
@@ -900,8 +903,9 @@ exists to prevent.
 rather than truncating them — verified in both directions: shrinking pushes rows
 into history, and growing pulls them back and re-joins the text. This applies to
 the **primary grid only**; the alternate screen has a history of 0 and never
-reflows, which is correct and matches every other emulator. The host resizes the `Term` and the PTY together
-and lets the next diff carry the result; the client does not predict a reflow.
+reflows, which is correct and matches every other emulator. The host resizes the
+`Term` and the PTY together and lets the next diff carry the result; the client
+does not predict a reflow.
 
 ### 9.2 Registry
 
@@ -966,7 +970,7 @@ Mosh hardcodes `xterm-256color` and hopes. oxutrm does better, because the
 client re-renders into the user's *actual* terminal and therefore knows what can
 be displayed.
 
-`ClientHello.caps` carries:
+`ClientHello.caps` carries a `TerminalCaps`.
 
 > **The interface contract defines `TerminalCaps`.** Field list and types are
 > normative there.
@@ -980,8 +984,8 @@ The colour count is a `u32`, not a `u16`, for the unglamorous reason that
 contract audit caught it (§18, finding 3).
 
 **`caps` never reaches the child environment.** The host derives `TERM` and
-`COLORTERM` **solely from what `alacritty_terminal` emulates** — `negotiate_term` takes no
-`TerminalCaps` argument and has nothing client-specific to take. All capability
+`COLORTERM` **solely from what `alacritty_terminal` emulates** — `negotiate_term`
+takes no `TerminalCaps` argument and has nothing client-specific to take. All capability
 adaptation lives in the client: colours the client cannot show are down-converted
 there, at render time.
 
@@ -1226,7 +1230,7 @@ addressable scrollback, per-line damage tracking, and the `EventListener` events
 that carry title, bell and OSC 52. The four things oxutrm must still do for
 itself are enumerated in §9.1.1.
 
-Three facts about the dependency, recorded because they constrain the workspace:
+Four facts about the dependency, recorded because they constrain the workspace:
 
 - **`serde` is a default feature and is switched off.** oxutrm's wire encoding is
   `postcard` over its own types (§7), so the emulator's `serde` impls are weight
@@ -1239,8 +1243,8 @@ Three facts about the dependency, recorded because they constrain the workspace:
 - **It re-exports `vte`**, which is where the `Handler` trait of §9.1.1 comes
   from; oxutrm does not depend on `vte` separately.
 - **Edition 2024, `rust-version = 1.85.0`, Apache-2.0.** The workspace moves to
-  edition 2024 to match. That MSRV is the
-  workspace's floor, and the licence differs from the rest of the tree.
+  edition 2024 to match; that MSRV is the workspace's floor, and the licence
+  differs from the rest of the tree.
 
 ---
 
@@ -1248,8 +1252,8 @@ Three facts about the dependency, recorded because they constrain the workspace:
 
 Specified in its own document when phase A+B lands. The shape:
 
-**Speculative echo.** The client holds a **second `alacritty_terminal`**, seeded from the
-authoritative screen. Predicted echo bytes are fed into it and drawn
+**Speculative echo.** The client holds a **second `alacritty_terminal`**, seeded
+from the authoritative screen. Predicted echo bytes are fed into it and drawn
 immediately. Because prediction runs through a *real emulator*, wide characters,
 right-margin wrapping and attribute inheritance are correct — precisely the
 cases Mosh's overlay gets wrong.
@@ -1296,12 +1300,20 @@ forward-compatibility constraint phase D places on phase A+B.
 | # | Deliverable | Proves |
 |---|---|---|
 | **M1** | Loopback terminal: shell → `alacritty_terminal` → sync engine → renderer, one process, no network | terminal core and sync engine, with the convergence property green |
-| **M2** | QUIC over a punched socket, dummy payload, rungs 0-2, netns tests | NAT traversal actually works |
+| **M2** | QUIC over a punched socket, dummy payload, **rungs 0-3**, certificate pinning, netns tests | NAT traversal actually works |
 | **M3** | SSH bootstrap, signalling, daemonize, registry, detach and reattach | the session model |
-| **M4** | Joined up: a real remote terminal. Rungs 3-4, status display, capability negotiation | **usable daily** |
+| **M4** | Joined up: a real remote terminal. **Rung 4**, fragmentation, roaming, status display, colour down-conversion | **usable daily** |
 
 M1 is deliberately first: it needs no network, and it de-risks the component
 whose correctness is hardest to recover from later.
+
+Two placements are worth stating because the obvious guess is wrong. **Rung 3
+belongs to M2, not M4** — the birthday blast is a NAT-traversal technique and it
+is tested by the same namespace harness as rungs 0-2, so splitting it off would
+mean building that harness twice. **Fragmentation (§7.1.1) belongs to M4**, even
+though `frag_index` and `frag_count` exist in `Frame` from M1: M1 is a single
+process with no datagram size limit to exceed, so there is nothing to fragment
+until a real link exists.
 
 ---
 
@@ -1356,11 +1368,11 @@ decided twice, and the second decision reversed the first.
 **First: patch `vt100`.** Finding 7 was originally resolved by having `HostTerm`
 hand-roll a sidecar scanner over the PTY byte stream plus its own scrollback ring,
 wrapped around a pinned fork (`Junyi-99/vt100-rust` `deck`, commit
-`4bca1b1ec4efbb73b55f6c229e38268dca836825`). An audit of that commit found two
+`4bca1b1ec4efbb73b55f6c229e38268dca836825`). An audit of that commit found three
 gaps that no wrapper could close, because they are missing *values* rather than
-missing accessors: the parser discards SGR 5, 8 and 9 before they reach the grid,
-and scrolled-off rows sit in a private `VecDeque` with no indexed accessor and no
-fill counter. The plan became a small patch adding both.
+missing accessors: the parser discards SGR 5, 8 and 9 before they reach the grid;
+scrolled-off rows sit in a private `VecDeque` with no indexed accessor; and there
+is no counter of lines scrolled off. The plan became a small patch adding them.
 
 **Then: adopt `alacritty_terminal` 0.26.0 instead.** A probe program was compiled
 and run against the crate to establish what it does empirically rather than from
