@@ -136,50 +136,36 @@ Newline-delimited JSON on the SSH child's stdin/stdout. JSON, not a binary
 format, because this channel is low-volume, human-debuggable, and version
 skew here must fail loudly.
 
-```rust
-/// host -> client, first line
-struct HostHello {
-    proto: u32,                  // protocol version, hard failure on mismatch
-    session_id: String,          // 128-bit, hex
-    attach_id: u64,              // increments per attach; scopes all sync sequence numbers (§8.5)
-    cert_spki_sha256: String,    // base64; pins the host's self-signed QUIC
-                                 // certificate. Base64 rather than [u8; 32]
-                                 // because this travels as JSON, where a byte
-                                 // array becomes 32 numbers.
-    psk: String,                 // base64, 32 random bytes: root secret for the ICE
-                                 // credentials derived in §5.3; never used directly
-    candidates: Vec<Candidate>,
-    nat_type: NatType,
-    bound_port: u16,
-    detachable: bool,            // false once the session has fallen back to rung 4 (§5.5)
-}
+> **The interface contract defines these types.** `Signal`, `Candidate`,
+> `CandidateKind` and `NatType` are specified field-by-field in
+> `docs/superpowers/plans/2026-08-25-oxutrm-contract.md`, which is normative.
+> What follows explains what each message is *for*; it is not a second
+> definition, and where the two ever appear to disagree the contract is right.
 
-/// client -> host, first line
-struct ClientHello {
-    proto: u32,
-    candidates: Vec<Candidate>,
-    nat_type: NatType,
-    caps: TerminalCaps,
-    size: TermSize,              // cols, rows
-}
+Five messages, carried as one `Signal` enum:
 
-/// either direction, repeatable until the link is up
-struct CandidateUpdate { candidates: Vec<Candidate> }
+- **`HostHello`**, the host's first line. It carries the protocol version
+  (mismatch is a hard failure), the session id, and the three things the client
+  cannot proceed without: the **SPKI fingerprint** that pins the host's
+  certificate (§6.1), the **`psk`**, and the host's initial candidates and NAT
+  type. Two fields exist for reasons a reader would not guess: **`attach_id`**
+  scopes every sync sequence number, because both counters reset to 1 at each
+  attach and the two ends must agree on which generation they are in (§8.5); and
+  **`detachable`** tells the client at handshake time that a rung-4 session
+  cannot be reattached (§5.5), which is what the §10.3 warning is built from.
+- **`ClientHello`**, the client's first line: version, its own candidates and NAT
+  type, its terminal capabilities (§9.4) and its size.
+- **`CandidateUpdate`**, either direction, repeatable until the link is up. This
+  is the message that justifies keeping SSH open at all (§4.1): candidates are
+  discovered asynchronously and must be exchanged as they appear.
+- **`Established`**, carrying the `PathDescription` that §10.3's status line
+  renders, and **`Failed`**, carrying a reason. Either terminates signalling.
 
-/// either direction, terminates signalling
-struct Established { path: PathDescription }
-struct Failed { reason: String }
-```
-
-```rust
-struct Candidate {
-    addr: SocketAddr,
-    kind: CandidateKind,   // Host | PortMapped | ServerReflexive | PeerReflexive
-    priority: u32,         // ICE-style; IPv6 Host highest, PeerReflexive lowest
-}
-
-enum NatType { None, EndpointIndependent, AddressDependent, Symmetric, Unknown }
-```
+Two field types carry design meaning worth stating outside the contract. The
+SPKI fingerprint travels **base64-encoded rather than as a byte array**, because
+this channel is JSON and a `[u8; 32]` would serialise as thirty-two numbers.
+And a candidate's **priority is ICE-style** — IPv6 host candidates highest,
+peer-reflexive lowest — which is what makes §5.3's nomination deterministic.
 
 `psk` is 32 bytes from the OS CSPRNG. It never touches disk on either side. It is
 a root secret, not a credential: the ICE short-term credentials are derived from
@@ -489,27 +475,34 @@ that somehow obtained the certificate but not the PSK cannot complete ICE.
 
 ### 7.1 Datagram framing
 
+> **The interface contract defines `Frame`.** Its exact fields, types and
+> **order** are normative there. This section explains why it carries what it
+> carries.
+
 Every datagram carries three sequence numbers, its position in a fragment set,
-and a payload:
+a flags byte, and a payload.
 
-```rust
-struct Frame {
-    my_state: u64,       // the state this datagram describes
-    from_state: u64,     // the peer-acknowledged state it is a diff against
-    ack_state: u64,      // highest peer state I have applied
-    flags: u8,           // bit 0: payload is zstd-compressed
-    frag_index: u16,     // 0-based position in this state's fragment set
-    frag_count: u16,     // total fragments for this state; 1 means unfragmented
-    payload: Vec<u8>,    // a slice of the postcard-encoded ScreenDiff or InputDiff
-}
-```
+The **three sequence numbers** are the whole of the sync protocol's bookkeeping,
+and each answers a different question. `my_state` names the state this datagram
+describes. `from_state` names the peer-acknowledged state it is a diff against —
+and `from_state == 0` is the sentinel meaning "this is a full state, not a diff"
+(§8.5). `ack_state` is the highest peer state this side has applied, which is
+what lets the peer trim its own ring and its own unacknowledged input. Because
+every datagram carries all three, a lost one costs nothing: the next datagram
+re-states the same relationship (§8.1).
 
-**This field order is wire-significant and must not be changed.** `postcard`
+**`frag_index` and `frag_count`** place the datagram in its state's fragment set;
+`frag_count == 1` means unfragmented (§7.1.1). Bit 0 of **`flags`** marks a
+zstd-compressed payload, and the payload itself is a slice of the postcard-encoded
+`ScreenDiff` or `InputDiff`.
+
+**`Frame`'s field order is wire-significant and must not be changed.** `postcard`
 serialises struct fields in declaration order, so reordering them — tidying them
 by size, or alphabetically — silently changes the wire format. Two builds that
 disagree produce a host and client that cannot talk to each other, and the
 failure surfaces as garbage decoding rather than as anything that names the
-cause.
+cause. This is precisely why the contract, and not this document, is the place
+the order is recorded.
 
 **`Frame` is the sole carrier of the sequence numbers.** The diff structures in
 §8 do not repeat `base` and `target`; there is exactly one place a receiver looks
@@ -585,22 +578,24 @@ supplies the parts Mosh had to build.
 
 ### 8.2 Host → client: `ScreenState`
 
-```rust
-struct ScreenState {
-    seq: u64,
-    rows: u16,
-    cols: u16,
-    cells: Vec<Cell>,          // rows * cols, row-major
-    cursor: Cursor,            // row, col, visible, shape
-    modes: Modes,              // alt-screen, bracketed paste, mouse mode, keypad/cursor app
-    title: String,             // OSC 0 and OSC 2; there is no icon field, see §1.2
-    bell: u32,                 // monotonic counter; client rings on increase
-    scrollback_len: u64,       // total lines ever scrolled off; lines travel on a stream
-}
+> **The interface contract defines `ScreenState`, `Cell`, `ScreenDiff`,
+> `RowPatch` and `Run`.** Field lists and types are normative there. This section
+> explains what the state holds and why.
 
-struct Cell { text: CellText, fg: Color, bg: Color, attrs: Attrs }
-```
+A `ScreenState` is a complete picture of the terminal at one instant: its
+sequence number, its dimensions, a row-major grid of cells exactly `rows * cols`
+long, the cursor, the mode flags (alt-screen, bracketed paste, mouse mode,
+keypad and cursor application modes), the window title, a bell counter and the
+scrollback length.
 
+Three of those are not simply data fields. **`title`** comes from `OSC 0` and
+`OSC 2` only — there is no icon field, and §1.2 records why. **`bell`** is a
+monotonic counter rather than a flag, so the client rings on an *increase* and a
+lost datagram cannot lose a bell. **`scrollback_len`** is the total number of
+lines ever scrolled off; the lines themselves never travel in a datagram, only
+on a stream (§7.2).
+
+A `Cell` is its text, a foreground and background colour, and its attributes.
 `CellText` is the contract's alias for `compact_str::CompactString`, which stores
 up to 24 bytes inline. Nearly every cell — one ASCII character, or one character
 plus a combining mark — therefore allocates nothing at all. This matters more
@@ -628,23 +623,18 @@ collapse to the one `UNDERLINE` bit; per-cell underline colour from SGR 58/59 is
 dropped; and OSC 8 hyperlinks are ignored. All three remain available to a later
 protocol version — the emulator holds them, `ScreenState` simply does not ask.
 
-```rust
-struct ScreenDiff {
-    resize: Option<TermSize>,
-    rows: Vec<RowPatch>,                 // changed rows only
-    cursor: Option<Cursor>,
-    modes: Option<Modes>,
-    title: Option<String>,
-    bell: Option<u32>,
-    scrollback_len: Option<u64>,
-}
+A `ScreenDiff` mirrors that state with every field optional except the rows,
+which carry **only the rows that changed**. Everything else — resize, cursor,
+modes, title, bell, scrollback length — is present only when it differs from the
+base state.
 
-struct RowPatch { row: u16, runs: Vec<Run> }
-struct Run { start_col: u16, repeat: u16, cells: Vec<Cell> }
-```
+`base` and `target` are **not** carried in the diff; they live in `Frame` (§7.1)
+and nowhere else. This is the single most important thing about the shape, and
+it is why finding 12 in §18 exists: duplicating them invites the two copies to
+disagree.
 
-`base` and `target` are **not** carried here; they live in `Frame` (§7.1) and
-nowhere else.
+A changed row is a `RowPatch` — a row number and a list of runs — and a `Run` is
+a starting column, a repeat count and a short sequence of cells.
 
 **`Run` semantics, precisely.** The `cells` sequence is emitted **`repeat + 1`
 times consecutively**, starting at `start_col`. So `repeat == 0` means the
@@ -668,19 +658,12 @@ in the `Frame` (§8.5).
 
 The same machinery, inverted.
 
-```rust
-struct InputState {
-    seq: u64,
-    pending: Vec<u8>,        // user input not yet acknowledged, in order
-    size: TermSize,          // latest requested terminal size
-}
+> **The interface contract defines `InputState` and `InputDiff`.** Field lists
+> and types are normative there.
 
-struct InputDiff {
-    consumed: u64,           // bytes to drop from the front of base.pending
-    appended: Vec<u8>,       // bytes to append afterwards
-    size: Option<TermSize>,
-}
-```
+An `InputState` is a sequence number, the user input **not yet acknowledged** in
+order, and the latest requested terminal size. Its diff carries a `consumed`
+count, the bytes `appended` since the base state, and the size when it changed.
 
 When the host acknowledges state *N*, the client forms state *N+1* with the
 consumed prefix removed. Unacknowledged input is therefore retransmitted
@@ -709,6 +692,10 @@ Its two central operations are:
 fn diff_from(&self, base: &Self) -> Self::Diff;
 fn apply(&mut self, base: u64, target: u64, d: &Self::Diff) -> Result<(), ApplyError>;
 ```
+
+*This is the one signature kept in full here, deliberately: it is an API shape
+rather than a wire type, and the argument the section makes — that `base` and
+`target` are parameters and not fields — cannot be made without showing them.*
 
 `base` and `target` are parameters rather than fields of `Diff` because `Frame`
 owns them (§7.1). `apply` is responsible for checking that `base` matches the
@@ -919,17 +906,16 @@ be displayed.
 
 `ClientHello.caps` carries:
 
-```rust
-struct TerminalCaps {
-    truecolor: bool,       // COLORTERM=truecolor present
-    colors: u32,           // 8 / 16 / 256 / 16777216 — u32, since 16777216 does
-                           // not fit in a u16
-    bracketed_paste: bool,
-    mouse_sgr: bool,
-    osc52: bool,
-    term_name: String,     // the client's own $TERM, for diagnosis only
-}
-```
+> **The interface contract defines `TerminalCaps`.** Field list and types are
+> normative there.
+
+It reports whether the client's terminal has truecolor, how many colours it can
+show, and whether it supports bracketed paste, SGR mouse reporting and OSC 52,
+plus the client's own `$TERM` **for diagnosis only**.
+
+The colour count is a `u32`, not a `u16`, for the unglamorous reason that
+16777216 does not fit in sixteen bits — an error this document carried until the
+contract audit caught it (§18, finding 3).
 
 **`caps` never reaches the child environment.** The host derives `TERM` and
 `COLORTERM` **solely from what `alacritty_terminal` emulates** — `negotiate_term` takes no
