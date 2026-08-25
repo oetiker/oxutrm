@@ -788,7 +788,9 @@ indexed and named colours resolve to nothing until something supplies them. This
 is the obligation most likely to be missed, because the type looks like a palette.
 
 oxutrm owns a full **269-entry** table and consults `colors()` only as an override
-layer on top of it:
+layer on top of it. **All ranges below are half-open**, `a..b` meaning `a` up to
+but excluding `b` — the distinction matters, because reading them as inclusive
+both leaves a gap and makes the total come out wrong:
 
 | Index | Contents |
 |---|---|
