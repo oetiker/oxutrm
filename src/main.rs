@@ -58,8 +58,53 @@ fn dispatch(args: &[String]) -> Result<()> {
 }
 
 /// The remote half, spawned over SSH. Not normally typed by hand.
-fn run_host(_args: &[String]) -> Result<()> {
-    unimplemented!("oxutrm host: implemented in M3")
+fn run_host(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            print!("{HOST_USAGE}");
+            Ok(())
+        }
+        // Works today: it needs the registry and nothing else.
+        Some("--list") => run_host_list(),
+        Some("--serve") => Err(anyhow::anyhow!(
+            "`oxutrm host --serve` is not wired up yet. The pieces exist and are \
+             tested -- the ssh handshake, the registry, daemonize, the ladder -- \
+             but the session loop they feed is still being fixed, so serving \
+             would start a session that never paints. Use `oxutrm loopback` to \
+             exercise the terminal core in the meantime."
+        )),
+        Some("--attach") => Err(anyhow::anyhow!(
+            "`oxutrm host --attach` is not wired up yet, for the same reason as \
+             --serve: there is no live session to attach to until serving works."
+        )),
+        Some(other) => {
+            eprintln!("oxutrm host: unknown option {other:?}\nTry `oxutrm host --help`.");
+            std::process::exit(2);
+        }
+        None => {
+            eprintln!(
+                "oxutrm host: needs one of --serve, --list or --attach <id>.\nTry `oxutrm host --help`."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `oxutrm host --list`: what is running on this machine.
+///
+/// Prints the registry's own warning first when it had to fall back out of
+/// `$XDG_RUNTIME_DIR`, because a user wondering why a session vanished at
+/// logout needs that sentence more than they need the list.
+fn run_host_list() -> Result<()> {
+    let root = oxutrm_host::resolve_registry_root()
+        .context("deciding where oxutrm records its sessions")?;
+    if let Some(warning) = &root.warning {
+        eprintln!("{warning}");
+    }
+
+    let sessions = oxutrm_host::Registry::list().context("reading the session registry")?;
+    print!("{}", oxutrm_host::attach::format_session_list(&sessions));
+    Ok(())
 }
 
 /// Both halves in one process over a channel, with no network in between.
@@ -142,9 +187,35 @@ fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> Result<()> {
 /// The default path: drive `ssh` to start or find a session on the far end,
 /// exchange candidates over that channel, bring up QUIC, then become the
 /// client. Connect and reattach are deliberately one code path.
-fn run_connect(_args: &[String]) -> Result<()> {
-    unimplemented!("oxutrm <ssh-target>: implemented in M3 and M4")
+fn run_connect(args: &[String]) -> Result<()> {
+    let target = args.first().map_or("<ssh-target>", String::as_str);
+    Err(anyhow::anyhow!(
+        "connecting to {target} is not wired up yet. Every piece it needs \
+         exists and is tested on its own -- driving ssh, the signalling \
+         handshake and its failure messages, the connection ladder, \
+         detachability settled from the nominated rung, the registry and \
+         daemonize -- but the session loop that would carry the screen is \
+         still being fixed, so connecting would attach you to a terminal that \
+         never paints.\n\nRun `oxutrm loopback` to use the terminal core \
+         today, or `oxutrm host --list` to see what this machine is tracking."
+    ))
 }
+
+const HOST_USAGE: &str = "\
+oxutrm host — the remote half of a session. Normally spawned over ssh rather
+than typed by hand.
+
+USAGE
+  oxutrm host --list          Sessions on this machine, oldest first.
+  oxutrm host --serve         Create a session and hand it to a client.
+  oxutrm host --attach <id>   Relay a new attach into a running session.
+
+Only --list works today; the others say why when you run them.
+
+A session that reached the far end over an ssh tunnel (rung 4) is listed as
+NOT detachable: it carries its data inside that ssh connection, so it dies
+with it and cannot be reattached.
+";
 
 const LOOPBACK_USAGE: &str = "\
 oxutrm loopback — run both halves in one process, with no network in between.
