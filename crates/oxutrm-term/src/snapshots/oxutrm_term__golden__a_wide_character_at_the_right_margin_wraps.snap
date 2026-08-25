@@ -1,0 +1,25 @@
+---
+source: crates/oxutrm-term/src/golden.rs
+expression: text
+---
+size    3x5 (rows x cols)
+cursor  (1,4) visible=true Block
+modes   alt=false paste=false mouse=Off app_cursor=false app_keypad=false
+title   ""
+bell    0   scrollback 0
+
+screen
+  0 |abcd░|
+  1 |你░好░ |
+  2 |     |
+
+non-blank cells
+(0,0) "a" fg=default bg=default attrs=-
+(0,1) "b" fg=default bg=default attrs=-
+(0,2) "c" fg=default bg=default attrs=-
+(0,3) "d" fg=default bg=default attrs=-
+(0,4) "" fg=default bg=default attrs=WIDE_CONT
+(1,0) "你" fg=default bg=default attrs=-
+(1,1) "" fg=default bg=default attrs=WIDE_CONT
+(1,2) "好" fg=default bg=default attrs=-
+(1,3) "" fg=default bg=default attrs=WIDE_CONT

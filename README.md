@@ -129,6 +129,11 @@ Real ones, found by testing rather than guessed at:
   straight one is a smaller lie than drawing none.
 - **No icon name.** OSC 1 is silently dropped by the parser, so there is no
   field for it — an icon field could only ever hold a value oxutrm invented.
+- **Reflow is lossless across the grid, not across the visible screen.**
+  Narrowing the window wraps a long line and pushes the rows that no longer fit
+  into scrollback; widening again does not pull them back down. That matches
+  what a local terminal does, but "lossless in both directions" is too strong a
+  claim for what a client actually sees.
 - **A better path found after connect is lost until the next attach.** QUIC
   migration lets a client change its own *local* address; there is no mechanism
   to repoint an established connection at a different *remote* address.

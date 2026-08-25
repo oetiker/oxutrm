@@ -1,0 +1,33 @@
+---
+source: crates/oxutrm-term/src/golden.rs
+expression: text
+---
+size    3x24 (rows x cols)
+cursor  (0,19) visible=true Block
+modes   alt=false paste=false mouse=Off app_cursor=false app_keypad=false
+title   ""
+bell    0   scrollback 0
+
+screen
+  0 |blink strike hidden     |
+  1 |                        |
+  2 |                        |
+
+non-blank cells
+(0,0) "b" fg=default bg=default attrs=BLINK
+(0,1) "l" fg=default bg=default attrs=BLINK
+(0,2) "i" fg=default bg=default attrs=BLINK
+(0,3) "n" fg=default bg=default attrs=BLINK
+(0,4) "k" fg=default bg=default attrs=BLINK
+(0,6) "s" fg=default bg=default attrs=STRIKE
+(0,7) "t" fg=default bg=default attrs=STRIKE
+(0,8) "r" fg=default bg=default attrs=STRIKE
+(0,9) "i" fg=default bg=default attrs=STRIKE
+(0,10) "k" fg=default bg=default attrs=STRIKE
+(0,11) "e" fg=default bg=default attrs=STRIKE
+(0,13) "h" fg=default bg=default attrs=HIDDEN
+(0,14) "i" fg=default bg=default attrs=HIDDEN
+(0,15) "d" fg=default bg=default attrs=HIDDEN
+(0,16) "d" fg=default bg=default attrs=HIDDEN
+(0,17) "e" fg=default bg=default attrs=HIDDEN
+(0,18) "n" fg=default bg=default attrs=HIDDEN

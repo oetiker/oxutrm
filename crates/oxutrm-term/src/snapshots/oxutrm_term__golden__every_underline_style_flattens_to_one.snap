@@ -1,0 +1,21 @@
+---
+source: crates/oxutrm-term/src/golden.rs
+expression: text
+---
+size    3x30 (rows x cols)
+cursor  (0,5) visible=true Block
+modes   alt=false paste=false mouse=Off app_cursor=false app_keypad=false
+title   ""
+bell    0   scrollback 0
+
+screen
+  0 |abcde                         |
+  1 |                              |
+  2 |                              |
+
+non-blank cells
+(0,0) "a" fg=default bg=default attrs=UNDERLINE
+(0,1) "b" fg=default bg=default attrs=UNDERLINE
+(0,2) "c" fg=default bg=default attrs=UNDERLINE
+(0,3) "d" fg=default bg=default attrs=UNDERLINE
+(0,4) "e" fg=default bg=default attrs=UNDERLINE

@@ -182,50 +182,18 @@ impl HostTerm {
 
     /// Build a state carrying the given sequence number.
     pub fn snapshot(&self, seq: u64) -> ScreenState {
-        let rows = self.size.rows;
-        let cols = self.size.cols;
-        let mut cells = Vec::with_capacity(rows as usize * cols as usize);
-
-        for row in 0..rows {
-            for col in 0..cols {
-                let point = Point::new(Line(row as i32), Column(col as usize));
-                let cell = match cell_at(&self.term, point) {
-                    Some(c) => self.convert(c, point),
-                    // Outside the emulator's grid: the sizes disagree, which
-                    // can happen for one poll after a resize. A blank keeps
-                    // the length invariant, which matters more than the cell.
-                    None => Cell::blank(),
-                };
-                cells.push(cell);
-            }
-        }
-
-        let cursor_point = self.term.grid().cursor.point;
-        let cursor = Cursor {
-            row: cursor_point.line.0.clamp(0, rows.saturating_sub(1) as i32) as u16,
-            col: (cursor_point.column.0 as u16).min(cols.saturating_sub(1)),
-            visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
-            shape: match self.term.cursor_style().shape {
-                VteCursorShape::Block | VteCursorShape::HollowBlock => CursorShape::Block,
-                VteCursorShape::Underline => CursorShape::Underline,
-                VteCursorShape::Beam => CursorShape::Bar,
-                // The enum is non-exhaustive from our side; a block is the
-                // least surprising thing to draw for anything new.
-                _ => CursorShape::Block,
+        screen_state_of(
+            &self.term,
+            &self.blink,
+            &self.palette,
+            self.size,
+            StateMeta {
+                seq,
+                title: self.title.clone(),
+                bell: self.bell,
+                scrollback_len: self.scrollback_len,
             },
-        };
-
-        ScreenState {
-            seq,
-            rows,
-            cols,
-            cells,
-            cursor,
-            modes: self.modes(),
-            title: self.title.clone(),
-            bell: self.bell,
-            scrollback_len: self.scrollback_len,
-        }
+        )
     }
 
     /// Scrollback lines `[from, to)` as rendered cell rows.
@@ -254,7 +222,9 @@ impl HostTerm {
             for col in 0..self.size.cols {
                 let point = Point::new(line, Column(col as usize));
                 row.push(match cell_at(&self.term, point) {
-                    Some(c) => self.convert(c, point),
+                    Some(c) => {
+                        convert_cell(c, point, &self.blink, self.term.colors(), &self.palette)
+                    }
                     None => Cell::blank(),
                 });
             }
@@ -281,25 +251,84 @@ impl HostTerm {
     pub fn child_pid(&self) -> u32 {
         self.pty.child_pid()
     }
+}
 
-    fn modes(&self) -> Modes {
-        let m = self.term.mode();
-        Modes {
-            alt_screen: m.contains(TermMode::ALT_SCREEN),
-            bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
-            mouse: mouse_mode(m),
-            app_cursor: m.contains(TermMode::APP_CURSOR),
-            app_keypad: m.contains(TermMode::APP_KEYPAD),
+/// Convert what the emulator holds into a [`ScreenState`].
+///
+/// A free function rather than a method so that emulation fidelity can be
+/// tested against a bare `Term` - no PTY, no child process, no timing. That
+/// matters: the golden tests are the only thing standing between us and a
+/// silent change in how the emulator renders, and they should not depend on
+/// a shell starting fast enough.
+pub(crate) struct StateMeta {
+    pub seq: u64,
+    pub title: String,
+    pub bell: u32,
+    pub scrollback_len: u64,
+}
+
+pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    blink: &BlinkPlane,
+    palette: &[Rgb; PALETTE_LEN],
+    size: TermSize,
+    meta: StateMeta,
+) -> ScreenState {
+    let rows = size.rows;
+    let cols = size.cols;
+    let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let point = Point::new(Line(row as i32), Column(col as usize));
+            cells.push(match cell_at(term, point) {
+                Some(c) => convert_cell(c, point, blink, term.colors(), palette),
+                // Outside the emulator's grid: the sizes disagree, which can
+                // happen for one poll after a resize. A blank keeps the length
+                // invariant, which matters more than the cell.
+                None => Cell::blank(),
+            });
         }
     }
 
-    fn convert(&self, cell: &VteCell, point: Point) -> Cell {
-        Cell {
-            text: cell_text(cell),
-            fg: to_proto_color(cell.fg, self.term.colors(), &self.palette),
-            bg: to_proto_color(cell.bg, self.term.colors(), &self.palette),
-            attrs: attrs_of(cell.flags) | blink_of(&self.blink, point),
-        }
+    let cursor_point = term.grid().cursor.point;
+    let cursor = Cursor {
+        row: cursor_point.line.0.clamp(0, rows.saturating_sub(1) as i32) as u16,
+        col: (cursor_point.column.0 as u16).min(cols.saturating_sub(1)),
+        visible: term.mode().contains(TermMode::SHOW_CURSOR),
+        shape: match term.cursor_style().shape {
+            VteCursorShape::Block | VteCursorShape::HollowBlock => CursorShape::Block,
+            VteCursorShape::Underline => CursorShape::Underline,
+            VteCursorShape::Beam => CursorShape::Bar,
+            _ => CursorShape::Block,
+        },
+    };
+
+    ScreenState {
+        seq: meta.seq,
+        rows,
+        cols,
+        cells,
+        cursor,
+        modes: modes_of(term.mode()),
+        title: meta.title,
+        bell: meta.bell,
+        scrollback_len: meta.scrollback_len,
+    }
+}
+
+pub(crate) fn convert_cell(
+    cell: &VteCell,
+    point: Point,
+    blink: &BlinkPlane,
+    overrides: &alacritty_terminal::term::color::Colors,
+    palette: &[Rgb; PALETTE_LEN],
+) -> Cell {
+    Cell {
+        text: cell_text(cell),
+        fg: to_proto_color(cell.fg, overrides, palette),
+        bg: to_proto_color(cell.bg, overrides, palette),
+        attrs: attrs_of(cell.flags) | blink_of(blink, point),
     }
 }
 
@@ -374,6 +403,16 @@ fn attrs_of(flags: Flags) -> Attrs {
         a |= Attrs::WIDE_CONT;
     }
     a
+}
+
+fn modes_of(m: &TermMode) -> Modes {
+    Modes {
+        alt_screen: m.contains(TermMode::ALT_SCREEN),
+        bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
+        mouse: mouse_mode(m),
+        app_cursor: m.contains(TermMode::APP_CURSOR),
+        app_keypad: m.contains(TermMode::APP_KEYPAD),
+    }
 }
 
 fn mouse_mode(m: &TermMode) -> MouseMode {

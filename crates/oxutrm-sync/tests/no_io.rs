@@ -182,3 +182,144 @@ fn the_crate_source_reaches_for_no_io_module() {
         }
     }
 }
+
+// ---------------------------------------------------------------- transitive
+
+/// Every crate in `oxutrm-sync`'s **resolved** normal-dependency closure.
+///
+/// The manifest checks above are necessary and not sufficient. They read this
+/// crate's own `[dependencies]` and allowlist `oxutrm-proto` with a comment
+/// saying it is I/O-free "by the same rule" — and that rule was enforced
+/// nowhere. Add `reqwest` to `oxutrm-proto` tomorrow and every test above
+/// still passes while this crate transitively links an HTTP stack, a socket
+/// and a thread pool. That is exactly the silent erosion the boundary exists
+/// to prevent.
+///
+/// So this is the whole closure, and it is an allowlist rather than a
+/// denylist: a denylist only catches the I/O crates someone thought to name,
+/// and it can be defeated by adding a fourth crate to the chain. Anything
+/// unrecognised fails here, wherever in the tree it appears.
+const TRANSITIVE_ALLOWED: &[&str] = &[
+    // Ours.
+    "oxutrm-sync",
+    "oxutrm-proto",
+    // Serialisation, and what serde pulls in.
+    "serde",
+    "serde_core",
+    "serde_derive",
+    "serde_json",
+    "itoa",
+    "memchr",
+    "zmij",
+    // postcard and its no_std building blocks.
+    "postcard",
+    "cobs",
+    "heapless",
+    "hash32",
+    "byteorder",
+    "stable_deref_trait",
+    "spin",
+    "lock_api",
+    "scopeguard",
+    // Compression: byte slices in, byte slices out.
+    "zstd",
+    "zstd-safe",
+    "zstd-sys",
+    // The screen model's cell text.
+    "compact_str",
+    "castaway",
+    "rustversion",
+    "static_assertions",
+    // Error derive; no runtime behaviour.
+    "thiserror",
+    "thiserror-impl",
+    // Proc-macro machinery, compile time only.
+    "proc-macro2",
+    "quote",
+    "syn",
+    "unicode-ident",
+    // Small leaves.
+    "base64",
+    "bitflags",
+    "cfg-if",
+];
+
+/// The resolved normal-dependency closure, from cargo itself.
+///
+/// `cargo tree` rather than hand-parsing lock files: it is cargo's own answer
+/// to the question, it already excludes dev- and build-dependencies with
+/// `-e normal`, and it accounts for feature resolution. Running a subprocess
+/// is I/O — in the **test**, which is allowed; the crate under test still
+/// performs none.
+fn transitive_closure() -> Vec<String> {
+    let out = std::process::Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "-p",
+            "oxutrm-sync",
+            "-e",
+            "normal",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo tree must run");
+    assert!(
+        out.status.success(),
+        "cargo tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|n| !n.is_empty() && *n != "(*)")
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[test]
+fn the_closure_walk_actually_finds_the_tree() {
+    // A guard on the guard: a walk that silently returned nothing would make
+    // the test below pass for the wrong reason.
+    let closure = transitive_closure();
+    assert!(closure.len() > 5, "suspiciously small closure: {closure:?}");
+    assert!(
+        closure.contains(&"oxutrm-proto".to_owned()),
+        "got {closure:?}"
+    );
+    assert!(closure.contains(&"postcard".to_owned()), "got {closure:?}");
+}
+
+#[test]
+fn nothing_in_the_whole_dependency_tree_performs_io() {
+    for dep in transitive_closure() {
+        assert!(
+            TRANSITIVE_ALLOWED.contains(&dep.as_str()),
+            "`{dep}` is in oxutrm-sync's TRANSITIVE dependency tree and is not allowlisted.\n\
+             This crate performs no I/O - no sockets, no files, no clocks - and that has to \
+             hold for everything it links, not just for what its own manifest names.\n\
+             If `{dep}` is genuinely pure, add it to TRANSITIVE_ALLOWED with a note saying \
+             why. If it reaches the outside world, something upstream of us grew a \
+             dependency it should not have."
+        );
+    }
+}
+
+#[test]
+fn the_named_io_crates_are_absent_from_the_whole_tree() {
+    // Redundant with the allowlist above, and kept anyway: it names the
+    // specific regressions, so the failure message says "tokio appeared"
+    // rather than "something unrecognised appeared".
+    let closure = transitive_closure();
+    for bad in NEVER {
+        assert!(
+            !closure.iter().any(|d| d == bad),
+            "`{bad}` is in oxutrm-sync's transitive dependency tree"
+        );
+    }
+}

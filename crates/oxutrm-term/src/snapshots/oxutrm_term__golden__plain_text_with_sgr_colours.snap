@@ -1,0 +1,30 @@
+---
+source: crates/oxutrm-term/src/golden.rs
+expression: text
+---
+size    4x24 (rows x cols)
+cursor  (0,15) visible=true Block
+modes   alt=false paste=false mouse=Off app_cursor=false app_keypad=false
+title   ""
+bell    0   scrollback 0
+
+screen
+  0 |red bright true         |
+  1 |                        |
+  2 |                        |
+  3 |                        |
+
+non-blank cells
+(0,0) "r" fg=idx1 bg=default attrs=-
+(0,1) "e" fg=idx1 bg=default attrs=-
+(0,2) "d" fg=idx1 bg=default attrs=-
+(0,4) "b" fg=idx10 bg=default attrs=-
+(0,5) "r" fg=idx10 bg=default attrs=-
+(0,6) "i" fg=idx10 bg=default attrs=-
+(0,7) "g" fg=idx10 bg=default attrs=-
+(0,8) "h" fg=idx10 bg=default attrs=-
+(0,9) "t" fg=idx10 bg=default attrs=-
+(0,11) "t" fg=rgb(10,20,30) bg=default attrs=-
+(0,12) "r" fg=rgb(10,20,30) bg=default attrs=-
+(0,13) "u" fg=rgb(10,20,30) bg=default attrs=-
+(0,14) "e" fg=rgb(10,20,30) bg=default attrs=-

@@ -1,0 +1,17 @@
+---
+source: crates/oxutrm-term/src/golden.rs
+expression: text
+---
+size    2x12 (rows x cols)
+cursor  (0,2) visible=true Block
+modes   alt=false paste=false mouse=Off app_cursor=false app_keypad=false
+title   "a title"
+bell    0   scrollback 0
+
+screen
+  0 |hi          |
+  1 |            |
+
+non-blank cells
+(0,0) "h" fg=default bg=default attrs=-
+(0,1) "i" fg=default bg=default attrs=-

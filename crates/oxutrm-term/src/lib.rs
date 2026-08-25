@@ -49,6 +49,8 @@ mod palette;
 mod pty;
 
 #[cfg(test)]
+mod golden;
+#[cfg(test)]
 mod testing;
 
 pub use caps::{detect_caps, negotiate_term};
