@@ -6,13 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "oxutrm local half: rendering, input and the terminal guard"
 
+# NO alacritty_terminal. This crate renders a ScreenState; it does not emulate.
+# Adding the emulator here would also drag a PTY, `polling` and `signal-hook`
+# into the client for no reason. Phase C's speculative echo will revisit that.
 [dependencies]
-rustix.workspace = true
-tokio.workspace = true
-quinn.workspace = true
-unicode-width.workspace = true
+# `pty` is used only by the RawGuard tests, which need a real terminal: a test
+# binary has no controlling terminal, so the restore path could not otherwise
+# be exercised at all.
+rustix = { workspace = true, features = ["pty"] }
 anyhow.workspace = true
 oxutrm-proto.workspace = true
-oxutrm-sync.workspace = true
-oxutrm-term.workspace = true
-oxutrm-net.workspace = true

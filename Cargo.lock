@@ -1126,14 +1126,8 @@ name = "oxutrm-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "oxutrm-net",
  "oxutrm-proto",
- "oxutrm-sync",
- "oxutrm-term",
- "quinn",
  "rustix",
- "tokio",
- "unicode-width",
 ]
 
 [[package]]
