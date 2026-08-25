@@ -146,6 +146,20 @@ impl<S: SyncState> Receiver<S> {
     /// the sender "I have state N" while holding N-1, and the sender would
     /// then diff against N forever while the receiver rejected every one.
     pub fn on_frame(&mut self, f: &Frame) -> Result<bool, ApplyError> {
+        // The peer's acknowledgement is recorded FIRST, and from every frame
+        // including stale and duplicate ones. `ack_state` is a statement about
+        // what the PEER holds; whether this frame's payload happens to be
+        // applicable to US is a separate question. Throwing it away would
+        // leave our sender diffing from an older base than it needs to, and
+        // never retiring states from its ring — a permanent bandwidth cost
+        // that only reordering and loss ever trigger, so no happy-path test
+        // would show it.
+        //
+        // Monotonic, because reordering can deliver an older acknowledgement
+        // after a newer one and taking that at face value would un-retire
+        // states the sender had already dropped.
+        self.peer_ack = self.peer_ack.max(f.ack_state);
+
         if f.my_state <= self.state.seq() {
             return Ok(false);
         }
@@ -166,7 +180,6 @@ impl<S: SyncState> Receiver<S> {
         next.validate()?;
 
         self.state = next;
-        self.peer_ack = f.ack_state;
         Ok(true)
     }
 
@@ -340,6 +353,63 @@ mod tests {
         assert_eq!(rx.peer_ack(), 0);
         rx.on_frame(&f).expect("apply");
         assert_eq!(rx.peer_ack(), 77);
+    }
+
+    /// A stale or duplicate frame is not applicable to us, but its
+    /// `ack_state` is still a true statement about what the PEER holds — and
+    /// that statement is what lets our sender retire states from its ring and
+    /// diff from a newer base.
+    ///
+    /// Discarding it costs real bandwidth forever: the sender keeps diffing
+    /// against an older base than it needs to, and the ring never drains.
+    /// Nothing on the happy path shows this, because stale frames appear only
+    /// under reordering and loss.
+    #[test]
+    fn a_stale_frame_still_advances_the_peers_ack() {
+        let mut tx = Sender::new(screen());
+        tx.update(screen());
+        let fresh = tx.make_frame(10).expect("make_frame").expect("frame");
+
+        let mut rx = Receiver::new(screen());
+        assert!(
+            rx.on_frame(&fresh).expect("apply"),
+            "the first frame applies"
+        );
+        assert_eq!(rx.peer_ack(), 10);
+
+        // The very same frame again — a duplicate, which the network produces
+        // on its own — but the peer has since acknowledged more of our state.
+        let mut duplicate = fresh.clone();
+        duplicate.ack_state = 42;
+        assert!(
+            !rx.on_frame(&duplicate)
+                .expect("a duplicate is never an error"),
+            "a duplicate must not advance the state"
+        );
+        assert_eq!(
+            rx.peer_ack(),
+            42,
+            "the acknowledgement carried by a stale frame was thrown away"
+        );
+    }
+
+    /// Reordering can deliver an OLDER acknowledgement after a newer one.
+    /// Taking it at face value would walk the sender's view of the peer
+    /// backwards and un-retire states it had already dropped.
+    #[test]
+    fn the_peers_ack_never_moves_backwards() {
+        let mut tx = Sender::new(screen());
+        tx.update(screen());
+        let f = tx.make_frame(50).expect("make_frame").expect("frame");
+
+        let mut rx = Receiver::new(screen());
+        rx.on_frame(&f).expect("apply");
+        assert_eq!(rx.peer_ack(), 50);
+
+        let mut older = f.clone();
+        older.ack_state = 7;
+        rx.on_frame(&older).expect("stale is not an error");
+        assert_eq!(rx.peer_ack(), 50, "the peer's ack went backwards");
     }
 
     #[test]

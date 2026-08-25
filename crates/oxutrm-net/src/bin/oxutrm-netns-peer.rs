@@ -149,8 +149,69 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
 
+        // Ask TWO different server IPs, from ONE socket, what address they
+        // saw. This asserts the PREMISE of NAT typing rather than its
+        // conclusion: a symmetric NAT allocates a different external port per
+        // destination, and a cone reuses one.
+        "probe-pair" => {
+            let a: SocketAddr = arg(&args, "--stun")
+                .context("probe-pair needs --stun")?
+                .parse()?;
+            let b: SocketAddr = arg(&args, "--stun2")
+                .context("probe-pair needs --stun2")?
+                .parse()?;
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+            let one = query_one(&socket, a).await;
+            let two = query_one(&socket, b).await;
+            match (one, two) {
+                (Some(x), Some(y)) => println!(
+                    "probe-pair local={} first={x} second={y} same_port={}",
+                    socket.local_addr()?,
+                    x.port() == y.port()
+                ),
+                _ => println!(
+                    "probe-pair local={} first=none second=none",
+                    socket.local_addr()?
+                ),
+            }
+            Ok(())
+        }
+
+        // Rung 3, through whatever NAT is in front of us.
+        "blast" => {
+            let base: SocketAddr = arg(&args, "--peer")
+                .context("blast needs --peer")?
+                .parse()?;
+            let psk = psk_from(&arg(&args, "--psk").unwrap_or_else(|| "0".repeat(64)))?;
+            let cfg = NetConfig {
+                birthday_sockets: arg(&args, "--sockets")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4),
+                birthday_ports: arg(&args, "--ports")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32),
+                birthday_budget: std::time::Duration::from_secs(8),
+                ..NetConfig::default()
+            };
+            match oxutrm_net::birthday_blast(psk, IceRole::Controlling, base, &cfg).await? {
+                Some(r) => println!("blast found remote={} probes={}", r.remote, r.probes),
+                None => {
+                    println!("blast none");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
+
         other => anyhow::bail!("unknown role {other:?}"),
     }
+}
+
+/// One STUN Binding query, reporting the address that server saw.
+async fn query_one(socket: &tokio::net::UdpSocket, server: SocketAddr) -> Option<SocketAddr> {
+    let mut client = stunclient::StunClient::new(server);
+    client.set_timeout(std::time::Duration::from_secs(2));
+    client.query_external_address_async(socket).await.ok()
 }
 
 /// Wait for the peer to publish its address. Stands in for the SSH signalling

@@ -131,6 +131,29 @@ fn a_cone_nat_is_classified_and_traversed() {
         nat, "EndpointIndependent",
         "a plain masquerade must classify as a cone, not {nat}"
     );
+
+    // Assert the PREMISE, not only the conclusion. A cone reuses one external
+    // port across destinations; if this ever read `same_port=false` the
+    // topology would not be a cone and the classification above would be
+    // right for the wrong reason.
+    let pair = in_topology(
+        "cone",
+        &[
+            &helper_binary(),
+            "probe-pair",
+            "--stun",
+            "10.0.2.2:3478",
+            "--stun2",
+            "10.0.2.3:3478",
+        ],
+    )
+    .expect("probe-pair in the cone topology");
+    eprintln!("{pair}");
+    assert_eq!(
+        field(&pair, "same_port"),
+        Some("true"),
+        "a cone NAT gave two different ports to two destinations: {pair}"
+    );
     // The mapped address must be the NAT's outside address, not our own.
     assert!(
         mapped.starts_with("10.0.2."),
@@ -164,6 +187,101 @@ fn a_symmetric_nat_is_recognised_as_symmetric() {
         "the topology is not actually symmetric ({nat}), so rung 3 is untested here"
     );
     assert_ne!(field(&out, "mapped"), Some("none"));
+
+    // The premise the classifier infers from: a DIFFERENT external port per
+    // destination. Without this the `Symmetric` above could be right for some
+    // other reason, and rung 3 would go untested by the test that exists to
+    // test it.
+    let pair = in_topology(
+        "symmetric",
+        &[
+            &helper_binary(),
+            "probe-pair",
+            "--stun",
+            "10.0.2.2:3478",
+            "--stun2",
+            "10.0.2.3:3478",
+        ],
+    )
+    .expect("probe-pair in the symmetric topology");
+    eprintln!("{pair}");
+    assert_eq!(
+        field(&pair, "same_port"),
+        Some("false"),
+        "the two destinations saw the SAME external port, so this NAT is not \
+         symmetric — check the nft rule says `fully-random`, not the iptables \
+         spelling `random-fully`: {pair}"
+    );
+    let first = field(&pair, "first").expect("first=");
+    let second = field(&pair, "second").expect("second=");
+    assert_ne!(first, second, "identical mappings: {pair}");
+}
+
+/// Rung 3 itself, through a genuinely symmetric NAT.
+///
+/// The blast is told a base three ports below where the peer actually listens,
+/// so it has to search outward rather than hitting it on the first guess. If
+/// rung 2 could quietly have succeeded here, the topology would not be
+/// symmetric and the premise assertion above would have failed first.
+#[test]
+fn the_birthday_blast_punches_through_a_symmetric_nat() {
+    skip_unless_supported!("blast");
+
+    let dir = std::env::temp_dir().join(format!("oxutrm-blast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let peer_log = dir.join("peer.log");
+
+    let psk = "5a".repeat(32);
+    let bin = helper_binary();
+    // A peer that answers authenticated checks. Its own remote is a dead
+    // address; all it has to do here is reply to what the blast sends.
+    let peer_cmd = format!(
+        "{bin} ice --role controlled --bind 10.0.2.2:46000 --remote 10.0.2.9:1 --psk {psk}"
+    );
+
+    let out = in_topology_with_peer(
+        "symmetric",
+        &[
+            &bin,
+            "blast",
+            "--peer",
+            "10.0.2.2:45997",
+            "--ports",
+            "32",
+            "--sockets",
+            "4",
+            "--psk",
+            &psk,
+        ],
+        Some(&peer_cmd),
+        peer_log.to_str(),
+    );
+    let out = match out {
+        Ok(t) => t,
+        Err(t) => panic!("the blast found no hole through the symmetric NAT:\n{t}"),
+    };
+    eprintln!("{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        field(&out, "remote"),
+        Some("10.0.2.2:46000"),
+        "the blast reported a hole somewhere other than the listening peer"
+    );
+    let probes: u32 = field(&out, "probes")
+        .expect("no probes= field")
+        .parse()
+        .expect("probes is not a number");
+    assert!(
+        probes > 0,
+        "a hole was reported without any probe being sent"
+    );
+    // Told :45997, found :46000 — three ports out, so the search really ran.
+    assert!(
+        probes > 4,
+        "only {probes} probes: the peer was found too easily for the search to \
+         have been exercised"
+    );
 }
 
 /// Two nested NATs. The point is the FALLBACK: no router will map a port for
