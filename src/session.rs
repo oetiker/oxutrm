@@ -857,7 +857,7 @@ mod tests {
         let fill_by = Instant::now() + Duration::from_secs(30);
         // The largest frame observed going out on a stream, against the
         // datagram limit in force when it went.
-        let mut streamed_over_the_limit: Option<usize> = None;
+        let mut streamed_over_the_limit: Option<(usize, usize)> = None;
         while Instant::now() < fill_by {
             let t = host.turn().expect("host turn");
             if let Some(SendOutcome::Stream { bytes, .. }) = t.sent {
@@ -867,9 +867,18 @@ mod tests {
                     .connection()
                     .max_datagram_size()
                     .expect("datagrams must not have gone away mid-test");
-                assert_eq!(now, limit, "the datagram limit moved under the test");
-                if bytes > limit {
-                    streamed_over_the_limit = Some(bytes);
+                // Compare against the limit in force AT THIS MOMENT, never a
+                // cached one. quinn raises the datagram limit as path-MTU
+                // discovery completes (observed here: 1382 -> 1414 mid-test),
+                // so pinning the opening value made this test fail whenever
+                // discovery happened to finish inside the window. That is the
+                // very mistake `FrameSink::send` documents avoiding -- it asks
+                // the connection per frame precisely because the limit moves.
+                // The property under test is unchanged and still exact: this
+                // frame took a stream BECAUSE it exceeded the limit that
+                // applied when it was sent.
+                if bytes > now {
+                    streamed_over_the_limit = Some((bytes, now));
                 }
             }
             if streamed_over_the_limit.is_some() && text(host.screen()).contains("-59") {
@@ -883,7 +892,7 @@ mod tests {
              offered\n--- host ---\n{}",
             text(host.screen())
         );
-        let bytes = streamed_over_the_limit.unwrap_or_else(|| {
+        let (bytes, limit_then) = streamed_over_the_limit.unwrap_or_else(|| {
             panic!(
                 "no frame went on a stream BECAUSE it exceeded the {limit}-byte \
                  datagram limit, even with a full 200x60 truecolor screen and no ack \
@@ -891,7 +900,7 @@ mod tests {
                  or nothing large was ever built"
             )
         });
-        assert!(bytes > limit);
+        assert!(bytes > limit_then);
 
         // Now let the client in and wait for the screens to agree.
         let converged = drive(

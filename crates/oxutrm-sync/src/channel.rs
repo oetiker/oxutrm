@@ -284,7 +284,14 @@ impl<S: SyncState> Receiver<S> {
         // rule is paid for: the check runs against a CLONE, so a failure
         // leaves `self.state` and `ack()` exactly as they were, and the
         // session loop logs and carries on.
-        next.validate_transition(&self.state)?;
+        // `self.state()` is the ring's newest entry, which is what the single
+        // `state` field was before the receiver gained a ring. It is the right
+        // `previous` even when the diff was applied to an OLDER base out of the
+        // ring: I5 and I6 are monotonic over the host's whole sequence, so the
+        // newest state we have seen is the floor they must not fall below.
+        // Checking against the base instead would let a bell counter go
+        // backwards relative to a state we already hold.
+        next.validate_transition(self.state())?;
 
         // Everything we held before the peer's first frame we invented
         // ourselves. Those sequence numbers name our screens, never the
