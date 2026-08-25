@@ -103,6 +103,11 @@ oxutrm-client.workspace = true
 # Only for making the keyboard non-blocking; the terminal itself belongs to
 # oxutrm-client's RawGuard.
 rustix.workspace = true
+# src/link.rs adapts a Frame onto a QUIC connection - datagram if it fits, a
+# fresh unidirectional stream if not. It lives here rather than in oxutrm-net
+# because it is transport POLICY for the session loops, not connectivity, and
+# because oxutrm-net has no business knowing what a Frame is.
+quinn.workspace = true
 
 [dev-dependencies]
 # The loopback test replays the ANSI the renderer emitted through a real

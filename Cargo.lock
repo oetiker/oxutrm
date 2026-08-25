@@ -1273,6 +1273,7 @@ dependencies = [
  "oxutrm-proto",
  "oxutrm-sync",
  "oxutrm-term",
+ "quinn",
  "rustix",
  "tokio",
 ]

@@ -12,7 +12,17 @@
 //! oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes the
 //! user has already made `ssh <target>` work, by whatever means.
 
+// M4's session loops and the QUIC framing under them. Nothing in `main`
+// reaches them yet: `oxutrm host --serve` and the connect path are M3's, and
+// they are what will call `HostSession` and `ClientSession`. The allow is
+// temporary and should come off with that wiring - it is here rather than a
+// fabricated call site because inventing a use to satisfy the linter hides
+// exactly the fact worth knowing, which is that this code has no caller yet.
+#[allow(dead_code)]
+mod link;
 mod loopback;
+#[allow(dead_code)]
+mod session;
 
 use std::io::{Read as _, Write as _};
 
