@@ -63,9 +63,21 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 pub struct Turn {
     pub sent: Option<SendOutcome>,
     pub applied: usize,
-    /// Frames that arrived but could not be applied. A steady stream of these
-    /// means the two ends disagree about the base, which is a deadlock rather
-    /// than a slow link.
+    /// Frames that arrived but could not be applied: the two ends disagree
+    /// about the base.
+    ///
+    /// This should be **zero**, and a steady stream of it is a defect however
+    /// healthy the screen looks. That warning was originally written as "a
+    /// deadlock rather than a slow link", and when the flood test finally made
+    /// it fire, it was neither: the session converged and every test passed,
+    /// while half of every frame the host sent was thrown away and the client
+    /// painted a screen it was holding a newer copy of. Convergence was doing
+    /// the job of hiding it — the sender re-diffs from the same ack, so the
+    /// content always arrives eventually, one round trip later than it should.
+    /// See contract rules R4 and R5.
+    ///
+    /// So: not necessarily a deadlock. Necessarily wasted work, and the waste
+    /// is invisible to any assertion about the screen.
     pub rejected: usize,
     pub exited: Option<i32>,
 }
@@ -728,6 +740,8 @@ mod tests {
 
         let mut turns = 0u64;
         let mut frames = 0u64;
+        let mut applied = 0u64;
+        let mut rejected = 0u64;
         let started = Instant::now();
         let deadline = started + Duration::from_secs(4);
         while Instant::now() < deadline {
@@ -735,7 +749,9 @@ mod tests {
             if t.sent.is_some() {
                 frames += 1;
             }
-            client.turn(&[], &mut out).expect("client turn");
+            let ct = client.turn(&[], &mut out).expect("client turn");
+            applied += ct.applied as u64;
+            rejected += ct.rejected as u64;
             turns += 1;
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -744,8 +760,29 @@ mod tests {
         // happened rather than inferred from the screen.
         let scrolled = host.screen().scrollback_len;
 
-        eprintln!("{turns} turns, {frames} frames, {scrolled} lines scrolled in {elapsed:?}");
+        eprintln!(
+            "{turns} turns, {frames} frames, {applied} applied, {rejected} rejected, \
+             {scrolled} lines scrolled in {elapsed:?}"
+        );
         assert!(turns > 40, "only {turns} turns; the test proves little");
+        // Under a flood the sender is always ahead of the acknowledgement, so
+        // every frame it sends names a base the client has already left. That
+        // is the normal condition here, not an edge case — and the client must
+        // apply those frames, because each carries a screen strictly NEWER
+        // than the one it is showing. Rejecting them halves the delivered
+        // frame rate and throws away the freshest screen in the client's own
+        // hand; measured before this was fixed, 44 of 89 frames were dropped
+        // this way, carrying 1196 of 1788 payload bytes.
+        //
+        // Zero, not "few": there is no loss on this loopback link and no
+        // reordering that would make a rejection legitimate.
+        assert_eq!(
+            rejected,
+            0,
+            "{rejected} of {} frames were dropped as unapplicable; the client is \
+             painting a screen it knows to be superseded",
+            applied + rejected
+        );
         assert!(
             scrolled > 10_000,
             "only {scrolled} lines scrolled past in {elapsed:?}; that is not a flood, \

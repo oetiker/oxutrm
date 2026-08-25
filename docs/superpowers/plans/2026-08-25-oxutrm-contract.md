@@ -538,6 +538,7 @@ impl<S: SyncState> Sender<S> {
     pub fn make_frame(&self, ack_state: u64) -> Result<Option<Frame>, ApplyError>;
 }
 
+/// Keeps a ring of recent states too, so a diff can name a base it has left.
 pub struct Receiver<S: SyncState> { /* private */ }
 
 impl<S: SyncState> Receiver<S> {
@@ -547,6 +548,7 @@ impl<S: SyncState> Receiver<S> {
     pub fn on_frame(&mut self, f: &Frame) -> Result<bool, ApplyError>;
     pub fn state(&self) -> &S;
     /// The sequence number to put in our outgoing `ack_state`.
+    /// ZERO until the peer's first frame has been applied — see R5.
     pub fn ack(&self) -> u64;
     /// The peer's `ack_state` from the last frame we accepted.
     pub fn peer_ack(&self) -> u64;
@@ -576,6 +578,39 @@ impl<S: SyncState> Receiver<S> {
 //     ring, `from_state == 0` re-synchronises unconditionally.
 //
 // Do not "optimise" R2 back into a plain `>` comparison.
+//
+// R4. **A diff applies against whichever state the receiver HELD at
+//     `from_state`, not only against the one it holds now.** The `Receiver`
+//     keeps a ring for the same reason the `Sender` does. The sender diffs
+//     against the newest state the peer ACKNOWLEDGED, and an ack takes a round
+//     trip, so every frame sent inside that window names a base the receiver
+//     has already left. Requiring `from_state == state.seq()` throws all of
+//     them away — and each one carries a state strictly NEWER than the one
+//     being shown. Measured under the runaway-writer flood: 44 of 89 screen
+//     frames dropped at one round trip of ack latency, 63 of 72 at eight, with
+//     the client's screen running 15 generations behind the host. It never
+//     deadlocks, because the sender re-diffs from the same ack, which is
+//     exactly why it was invisible.
+//
+//     The ring is self-pruning: a frame's `from_state` reveals which base the
+//     sender is still working from, and nothing older can be named again.
+//     Steady state is two entries. `STATE_RING` is the cap, for a peer whose
+//     acks are all being lost. A base older than the ring is still a
+//     `BaseMismatch` — refused, never guessed at.
+//
+// R5. **A receiver MUST NOT acknowledge a state it invented.** `ack()` is 0
+//     until the peer's first frame has been applied. This is R1 seen from the
+//     acknowledging side: the receiver's initial state is numbered 1 like
+//     everyone else's, and acknowledging that 1 tells the sender "I hold YOUR
+//     state 1", so the sender diffs against a state the receiver has never
+//     seen and never can. Zero means "I have nothing of yours" — true, and the
+//     one value `make_frame` cannot find in its ring, so it sends the full
+//     state R1 requires. Without R5 the very first frame after an attach is
+//     unapplicable, and the session is rescued only by ring eviction later.
+//
+// R4 and R5 are the same lesson as R2, and it is the lesson of this whole
+// section: a sequence number names a GENERATION, never a piece of content, and
+// it means nothing at all unless both ends agree who AUTHORED that generation.
 
 /// Trim consumed input after the host acknowledges it.
 impl InputState {
