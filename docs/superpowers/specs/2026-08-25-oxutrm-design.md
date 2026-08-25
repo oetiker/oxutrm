@@ -580,7 +580,8 @@ supplies the parts Mosh had to build.
 
 > **The interface contract defines `ScreenState`, `Cell`, `ScreenDiff`,
 > `RowPatch` and `Run`.** Field lists and types are normative there. This section
-> explains what the state holds and why.
+> explains what the state holds and why; §8.6 explains the six invariants that
+> constrain it and why each is what it is.
 
 A `ScreenState` is a complete picture of the terminal at one instant: its
 sequence number, its dimensions, a row-major grid of cells exactly `rows * cols`
@@ -733,6 +734,67 @@ State numbers are scoped to a single **attach**, not to the session:
 This is also what makes host-side and client-side updates independent: each
 direction has its own counter, its own ring, and its own acknowledgement, so
 simultaneous updates in both directions need no arbitration at all.
+
+### 8.6 The invariants, and why each is what it is
+
+> **The interface contract states and enforces six invariants on `ScreenState`**,
+> checked by `ScreenState::validate()` from every constructor and from
+> `Receiver::on_frame` after `apply`. The list there is normative. This section
+> explains why each exists, because three of them look arbitrary and the
+> reflexive "improvement" to each is wrong.
+
+**The governing rule first: a diff that would violate an invariant is rejected
+wholesale and never applied partially.** This is not fastidiousness. §8.1's
+recovery story rests on one property — the receiver's state is always a state the
+*sender actually held* — and everything follows from it: a dropped datagram costs
+nothing precisely because the next diff is computed against a base the sender
+still has in its ring. A partially applied diff breaks exactly that. It leaves the
+receiver holding a state that existed nowhere, that no sender ring contains, and
+that no subsequent diff was computed against. That is strictly worse than dropping
+the datagram, because dropping is a state the protocol already knows how to
+recover from and half-applying is not.
+
+**The cursor is rejected when out of range, never clamped (I2).** Clamping is the
+reflexive choice, it is one line, and it is wrong. A cursor outside the grid is
+not a rounding error to be tidied — it means the two ends have genuinely
+desynchronised, because a sender that held a valid state cannot produce a diff
+that puts the cursor outside it. Clamping converts that into a session which
+*looks* healthy while the two screens drift further apart with every frame, which
+is the precise failure this entire design exists to make impossible. Rejecting is
+loud, and loud is the point: the state is discarded, the acknowledgement does not
+advance, and the sender's next diff — computed from the same base — repairs it.
+Anyone reading `CursorOutOfBounds` and reaching for a `min()` should read this
+paragraph first.
+
+**`bell` is monotonic and is never reset (I5).** The client rings on an
+*increase*, so the counter's monotonicity is not bookkeeping — it *is* the
+semantics. Reset it at any point and the client sees the counter jump from its
+last observed value, interprets the difference as that many new bells, and rings
+the user's terminal once for every bell in the session's entire history. A
+counter also survives loss in a way a flag cannot: a dropped datagram carrying a
+flag loses the bell, whereas a dropped datagram carrying a counter loses nothing,
+because the next state still reports the higher number.
+
+**`scrollback_len` is advertised in a datagram but counts lines that only ever
+travel on a stream (I6).** It is a pointer, not a payload: the number tells the
+client how much history exists so it can decide what to request over the
+Scrollback stream (§7.2), and the lines themselves never enter a datagram. The
+second half is easier to get wrong in the opposite direction — the number is
+**synthesized, not read**. `Term::history_size()` saturates at the ring's
+capacity, so once scrollback is full it stops growing and reports occupancy
+rather than a total. §9.1.1 accumulates `saturating_sub` across each `advance()`
+to recover a genuine monotonic count. Reading `history_size()` directly produces a
+`scrollback_len` that silently stops advancing on long-lived sessions — the exact
+sessions the feature is for.
+
+The remaining three are quieter but not weaker. **`cells.len()` is exactly
+`rows * cols` (I1)** — exactly, not "at least", because every access is a computed
+row-major offset: a short vector panics and a long one silently addresses the
+wrong cell, and the second failure is far more expensive to find than the first.
+**`seq >= 1` (I3)** falls out of §8.5's sentinel: zero means "full state, not a
+diff", so zero can never also be a real state number. **`title` comes from `OSC 0`
+and `OSC 2` only (I4)** because `vte` discards `OSC 1` outright, which is why
+there is no icon field at all (§1.2, §18.1).
 
 ---
 
