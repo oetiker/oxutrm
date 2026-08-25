@@ -765,7 +765,40 @@ impl Drop for RegistryGuard;           // removes the directory
 
 /// Double fork, setsid, chdir /, close every inherited descriptor,
 /// reopen 0/1/2 on /dev/null. Must be called only after HostHello is flushed.
+///
+/// Kept for callers with nothing left to say over the ssh pipes. `host --serve`
+/// cannot use it: see the two phases below.
 pub fn daemonize() -> anyhow::Result<()>;
+
+/// Detaching is TWO operations, and they are not safe at the same moment.
+/// Forking must happen before any thread exists; the rung that decides whether
+/// severing is allowed cannot be known without an async ICE ladder, which needs
+/// a runtime, whose threads do not survive a fork. Welded together they are
+/// unsatisfiable. Split, the ladder runs BETWEEN them.
+///
+/// Phase 1: fork, setsid, fork, umask. NO DESCRIPTOR IS TOUCHED, so it needs no
+/// DetachPermit — forking is harmless for every rung, rung 4 included. Designed
+/// to be the first statement of `host --serve`, which is what makes "fork
+/// before any thread exists" structural rather than remembered.
+///
+/// The grandchild keeps 0/1/2 — sshd's pipes. sshd sends exit-status when the
+/// process it spawned exits (the fork parent, immediately) but does not close
+/// the channel until stdout and stderr reach EOF, so the local ssh stays alive
+/// for the whole handshake and ladder. That is what bidirectional candidate
+/// exchange requires. Do NOT move descriptor closure into this phase.
+pub fn detach_process() -> anyhow::Result<Detached>;
+
+/// Proof that detach_process already ran in THIS process. Severing before
+/// forking closes ssh's pipes while still in ssh's session holding ssh's
+/// controlling terminal: ssh exits, SIGHUP arrives, the session dies.
+pub struct Detached { /* private */ }
+
+/// Phase 2: chdir /, close every inherited descriptor, reopen 0/1/2 on
+/// /dev/null. Call after Established is flushed. THIS is what DetachPermit
+/// gates, and it is the operation the permit's own documentation describes:
+/// a rung-4 session never obtains one and therefore keeps its pipes for life.
+/// When this returns, ssh sees EOF and exits — the session is now detached.
+pub fn sever_from_ssh(detached: Detached, permit: DetachPermit) -> anyhow::Result<()>;
 ```
 
 ### `oxutrm-client`

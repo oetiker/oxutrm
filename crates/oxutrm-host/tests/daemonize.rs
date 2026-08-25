@@ -11,6 +11,29 @@
 //! * **Nothing points at the pipes we handed it.** Enumerated, not sampled.
 //! * **It outlives its parent.** The probe sleeps before reporting, so the
 //!   report existing at all proves the parent was already reaped.
+//!
+//! # The split, and why the other half needs proving too
+//!
+//! `daemonize` is two operations welded together: [`detach_process`] (fork,
+//! setsid, fork, umask) and [`sever_from_ssh`] (chdir, close everything,
+//! reopen 0/1/2). Everything above tests the *end* state. It says nothing
+//! about the state *between* them — and that intermediate state is what the
+//! whole wiring of `oxutrm host --serve` rests on: the grandchild must still be
+//! able to talk to sshd over the inherited pipes, for the whole handshake and
+//! ICE ladder, before it severs.
+//!
+//! So the second probe mode proves both halves from outside the process:
+//!
+//! * **Survive phase 1.** A marker written *after* the double fork, on stdout
+//!   and on a descriptor leaked before it, reaches the test. If it does not,
+//!   signalling across the fork is impossible and the design is dead.
+//! * **Die at phase 2.** A second marker written after the sever reaches
+//!   nobody, the same write on the leaked descriptor fails `EBADF`, and the
+//!   descriptor enumeration is as strict as for `daemonize` itself. If that
+//!   fails, the detach is incomplete — a straight regression.
+//!
+//! [`detach_process`]: oxutrm_host::detach_process
+//! [`sever_from_ssh`]: oxutrm_host::sever_from_ssh
 
 use std::io::Read;
 use std::path::Path;
@@ -53,8 +76,14 @@ fn field<'a>(report: &'a str, key: &str) -> &'a str {
 /// Spawn the probe with piped stdio, wait for its first process to exit, and
 /// return that pid together with the still-open child handle.
 fn spawn_probe(report_path: &Path) -> (u32, std::process::Child) {
+    spawn_probe_with(report_path, &[])
+}
+
+/// As [`spawn_probe`], with extra arguments selecting the probe's mode.
+fn spawn_probe_with(report_path: &Path, extra: &[&str]) -> (u32, std::process::Child) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxutrm-daemon-probe"))
         .arg(report_path)
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -126,7 +155,13 @@ fn the_daemon_outlives_its_parent_and_keeps_no_inherited_descriptor() {
         "without a high-numbered descriptor, a bounded close loop would pass: {held:?}"
     );
 
-    let targets = fd_targets(&report);
+    assert_nothing_but_dev_null_survived(&report);
+}
+
+/// The descriptor bar, applied identically to `daemonize` and to the two-phase
+/// split: exactly 0, 1 and 2 survive, and each points at `/dev/null`.
+fn assert_nothing_but_dev_null_survived(report: &str) {
+    let targets = fd_targets(report);
     assert!(
         !targets.is_empty(),
         "the probe reported no descriptors at all, so it checked nothing"
@@ -210,4 +245,122 @@ fn the_daemon_leaves_the_terminals_session_and_cannot_reacquire_one() {
     );
 
     assert_eq!(field(&report, "cwd"), "/", "the daemon must chdir to /");
+}
+
+/// Written by the split probe after `detach_process` and before
+/// `sever_from_ssh`, on descriptors it inherited from us.
+const PHASE1_STDOUT: &str = "phase1-stdout-marker";
+const PHASE1_FILE: &str = "phase1-file-marker";
+/// Written after `sever_from_ssh`, on the same two descriptors. Neither may
+/// ever arrive: by then one is `/dev/null` and the other is closed.
+const PHASE2_STDOUT: &str = "phase2-stdout-marker";
+const PHASE2_FILE: &str = "phase2-file-marker";
+
+#[test]
+fn inherited_descriptors_survive_the_fork_and_die_at_the_sever() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let report_path = tmp.path().join("split.txt");
+    // The probe leaks this one before forking and writes both markers on it.
+    let inherited = tmp.path().join("split.txt.marker.0");
+
+    let (child_pid, mut child) = spawn_probe_with(&report_path, &["--split"]);
+
+    // As in the daemonize test: the probe sleeps between the two phases, so a
+    // report that exists already means no fork happened and everything below
+    // would be measuring this test's own child rather than a grandchild.
+    assert!(
+        !report_path.exists(),
+        "the probe reported before its parent died; the test proves nothing"
+    );
+
+    // Reading to EOF is itself part of the proof. The write end is held by the
+    // grandchild alone once the two intermediates have `_exit`ed, so this call
+    // cannot return until the grandchild severs.
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read stdout");
+
+    // HALF ONE, on stdout. Written by the grandchild, on the descriptor sshd
+    // would own. Without this the host could not send `HostHello` or run the
+    // ladder after forking, and the whole two-phase design is dead.
+    assert!(
+        out.contains(PHASE1_STDOUT),
+        "the grandchild could not write to the stdout it inherited across the \
+         fork, so signalling after `detach_process` is impossible; got {out:?}"
+    );
+
+    // HALF TWO, on the same descriptor. `/dev/null` swallows the second
+    // marker; an incomplete sever would deliver it here.
+    assert!(
+        !out.contains(PHASE2_STDOUT),
+        "stdout still reached us after `sever_from_ssh`, so the ssh pipes are \
+         still open and closing the laptop lid would kill this session; got {out:?}"
+    );
+
+    let report = wait_for(&report_path, Duration::from_secs(10));
+
+    let ppid: u32 = field(&report, "ppid").parse().expect("ppid");
+    assert_ne!(
+        ppid, child_pid,
+        "still parented to the process ssh waited on"
+    );
+    assert_ne!(
+        ppid,
+        std::process::id(),
+        "still parented to the test harness"
+    );
+
+    // HALF ONE and HALF TWO again, on a plain descriptor leaked before the
+    // fork rather than on 0/1/2 -- so this is a claim about inheritance in
+    // general, not about the three descriptors `sever_from_ssh` reopens.
+    let text = std::fs::read_to_string(&inherited).unwrap_or_else(|e| {
+        panic!(
+            "reading the descriptor the probe leaked before forking ({}): {e}",
+            inherited.display()
+        )
+    });
+    assert!(
+        text.contains(PHASE1_FILE),
+        "a descriptor leaked before `detach_process` did not survive it; \
+         file held {text:?}\n\nfull report:\n{report}"
+    );
+    assert!(
+        !text.contains(PHASE2_FILE),
+        "a descriptor leaked before the fork was still writable after \
+         `sever_from_ssh`; file held {text:?}\n\nfull report:\n{report}"
+    );
+
+    // And the same, as the probe saw it from inside: the write that landed,
+    // then the two that could not.
+    assert_eq!(
+        field(&report, "phase1_file"),
+        "ok",
+        "the probe could not write to its inherited descriptor after the \
+         fork:\n{report}"
+    );
+    assert_eq!(
+        field(&report, "after_sever_file"),
+        "EBADF",
+        "the inherited descriptor was still open after `sever_from_ssh`:\n{report}"
+    );
+    assert_eq!(
+        field(&report, "after_sever_high"),
+        "EBADF",
+        "the high-numbered descriptor was still open after `sever_from_ssh`; \
+         a bounded close loop would look exactly like this:\n{report}"
+    );
+
+    assert_eq!(
+        field(&report, "cwd"),
+        "/",
+        "`sever_from_ssh` must chdir to /"
+    );
+
+    // The split must end in exactly the state `daemonize` ends in. Same bar,
+    // same helper, so the two cannot drift apart.
+    assert_nothing_but_dev_null_survived(&report);
 }
