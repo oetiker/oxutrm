@@ -63,7 +63,7 @@
 | `hmac` | `0.12` | net (STUN MESSAGE-INTEGRITY) |
 | `hkdf` | `0.12` | net (direction-labelled ICE credentials) |
 | `sha1` | `0.10` | net (STUN MESSAGE-INTEGRITY is HMAC-SHA1) |
-| `rtnetlink` or `/proc/net/route` parsing | — | net (`crab_nat` needs the gateway address and ships no discovery) |
+| `netdev` | `0.46` | net — default-gateway discovery (`crab_nat` needs the gateway and ships no discovery). Chosen over `/proc/net/route`, which is Linux-only, because §1.2 scopes the project to Unix. |
 | `base64` | `0.22` | proto |
 | `unicode-width` | `0.2` | client |
 | `proptest` | `1` | sync (dev) |
@@ -503,7 +503,8 @@ impl StunDemuxSocket {
 }
 
 /// The default gateway, needed because `crab_nat` takes the gateway address
-/// and ships no discovery of its own. Read from netlink or /proc/net/route.
+/// and ships no discovery of its own. Use `netdev::get_default_gateway()`:
+/// netlink on Linux, the route socket on the BSDs and macOS.
 pub fn default_gateway() -> Option<std::net::IpAddr>;
 
 /// Self-signed certificate plus the SHA-256 of its SPKI.
