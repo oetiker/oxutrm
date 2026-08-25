@@ -4,8 +4,10 @@ A remote terminal that survives bad networks, changing IP addresses, and NAT on
 both ends.
 
 It is, deliberately, **Mosh rebuilt in Rust with a real terminal emulator on
-both ends**, plus the two things Mosh never solved: NAT traversal and working
-scrollback.
+both ends**, and it sets out to solve the two things Mosh never did: NAT
+traversal and working scrollback. NAT traversal works today. **Scrollback does
+not yet** — the host keeps it, nothing serves it to a client, and that is phase
+C work.
 
 > **Status: phase A+B.** The transport, the terminal core and the session loops
 > work and are tested. It is not yet something to put on a machine you care
@@ -95,9 +97,12 @@ anyone else's domain in SNI to look like something it is not.
 Phase A+B is the transport, the terminal core and the session loops. In
 progress or not started:
 
-- **`oxutrm <ssh-target>` is not wired.** The SSH bootstrap, candidate
-  signalling, daemonizing and the session registry are phase A's remaining
-  work. `oxutrm loopback` is what runs today.
+- **`oxutrm <ssh-target>` and `oxutrm host` are not wired, and they panic
+  rather than saying so.** Running either prints a Rust panic and a
+  `not implemented` message instead of a sentence. The pieces beneath them
+  exist and are tested — the SSH bootstrap and its failure taxonomy, the
+  session registry, `daemonize`, the attach path — but the subcommand dispatch
+  does not call them yet. `oxutrm loopback` is what runs today.
 - **Scrollback is not synced.** The host keeps it; the client cannot fetch it
   yet. Phase C.
 - **No speculative local echo.** Typing waits for the round trip. Phase C.
@@ -134,6 +139,12 @@ Real ones, found by testing rather than guessed at:
   into scrollback; widening again does not pull them back down. That matches
   what a local terminal does, but "lossless in both directions" is too strong a
   claim for what a client actually sees.
+- **"Both ends behind NAT" is a design property, not yet a tested one.** The
+  network-namespace tests put one end behind a NAT — cone, symmetric, and
+  nested double NAT — and prove traversal, ICE nomination and the birthday
+  blast against it. No topology yet NATs *both* ends simultaneously. The ladder
+  is symmetric by construction and candidate exchange runs both ways, so there
+  is no known reason it would fail, but that is reasoning rather than evidence.
 - **A better path found after connect is lost until the next attach.** QUIC
   migration lets a client change its own *local* address; there is no mechanism
   to repoint an established connection at a different *remote* address.
