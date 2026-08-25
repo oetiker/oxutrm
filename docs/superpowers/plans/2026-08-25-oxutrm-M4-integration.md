@@ -4,7 +4,7 @@
 
 **Goal:** Wire M1's terminal core and sync engine, M2's QUIC transport and NAT ladder, and M3's SSH bootstrap and session registry into a remote terminal that is usable daily.
 
-**Architecture:** Two symmetric session loops joined by QUIC. The host drains its PTY into `alacritty_terminal`, feeds a `Sender<ScreenState>`, and paces `Frame`s onto QUIC datagrams, fragmenting any diff too large for one datagram. The client feeds local input into a `Sender<InputState>`, applies incoming `ScreenDiff`s, and re-renders through a `Renderer` that down-converts colour to whatever the user's real terminal can show, so the host's state stays full fidelity.
+**Architecture:** Two symmetric session loops joined by QUIC. The host drains its PTY into `alacritty_terminal`, feeds a `Sender<ScreenState>`, and paces `Frame`s onto QUIC datagrams, moving any diff too large for one datagram onto a fresh unidirectional stream. The client feeds local input into a `Sender<InputState>`, applies incoming `ScreenDiff`s, and re-renders through a `Renderer` that down-converts colour to whatever the user's real terminal can show, so the host's state stays full fidelity.
 
 **Tech Stack:** Rust 2024 (MSRV 1.85), `quinn` 0.11 (datagrams, connection migration, `Endpoint::rebind_abstract`), `tokio` 1 (`select!`, `AsyncFd`, unix signals), `alacritty_terminal` 0.26 with its re-exported `vte`, `rustix` 1 termios, `postcard` 1.
 
@@ -59,8 +59,7 @@ root `[dev-dependencies]` entry added in Task 8. Nothing else new.
 |---|---|
 | `crates/oxutrm-net/src/pace.rs` | `Pacer` — the §10.4 send-interval policy, pure, clock injected |
 | `crates/oxutrm-net/src/link.rs` | `LinkStats` + `link_stats()` — the *only* place that touches `quinn::ConnectionStats` |
-| `crates/oxutrm-net/src/frag.rs` | `fragment()` / `Reassembler` — §7.1.1, pure, no sockets |
-| `crates/oxutrm-net/src/xport.rs` | `FrameSink` / `FrameSource` — fragmenting send, reassembling receive |
+| `crates/oxutrm-net/src/xport.rs` | `FrameSink` / `FrameSource` — size picks the channel, supersede-and-reset |
 | `crates/oxutrm-net/src/tunnel.rs` | Rung 4: a loopback UDP relay over the SSH channel |
 | `crates/oxutrm-net/src/testkit.rs` | `loopback_pair()` — two connected `quinn::Connection`s, behind feature `testkit` |
 | `crates/oxutrm-host/src/input_cursor.rs` | `InputCursor` — which client input bytes have reached the PTY, pure |
@@ -92,44 +91,45 @@ root `[dev-dependencies]` entry added in Task 8. Nothing else new.
 
 ---
 
-## Fragmentation, stated once (spec §7.1.1)
+## Channel selection, stated once
 
 `quinn::Connection::max_datagram_size()` is on the order of 1200 bytes after
-overhead. A full `ScreenState` for 80×24 with truecolor cells postcard-encodes to
-well over 10 KB, and even a several-row `ScreenDiff` can exceed the limit. QUIC
-datagrams are never fragmented by the transport: `send_datagram` rejects an
-oversized payload with `SendDatagramError::TooLarge`.
+overhead. A full `ScreenState` for 80x24 with truecolor cells postcard-encodes to
+well over 10 KB, and `send_datagram` rejects an oversized payload with
+`SendDatagramError::TooLarge`. This is not merely a large-repaint problem: it
+also hits §8.2's "the peer's acknowledged state has left the ring, send a full
+state", which produces the single largest message the protocol can construct.
 
-This is not merely a large-repaint problem. It **breaks the sync engine's own
-recovery path**: §8.2's "the peer's acknowledged state has left the ring, send a
-full state" produces the single largest message the protocol can construct. Without
-fragmentation the protocol cannot recover from its own worst case.
+**Fragmentation was specified, reviewed and removed. Do not re-introduce it.**
+A state split into F fragments is delivered only if all F arrive, and there are
+no retransmissions, so delivery probability is (1-p)^F. A 200x60 truecolor full
+state is about 125 fragments: **28% delivery at 1% loss, 0.16% at 5%.** And a
+failed attempt does not advance the ack, so the next attempt is another full
+state and another 125 fragments. The mechanism most needed after a burst of loss
+was the one least able to survive it. `Frame` carries no `frag_index` and no
+`frag_count`, and a task that adds them is wrong.
 
-**oxutrm therefore fragments diffs itself.** `Frame` carries `frag_index: u16` and
-`frag_count: u16`; the encoded diff is split into pieces that each fit
-`max_datagram_size()`, and every piece is sent as its own datagram carrying the
-same `my_state` and `from_state`. Compression happens **before** fragmentation, so
-the `flags` byte is identical across every fragment of one state.
+**Size picks the channel instead:**
 
-Four rules, normative, all from §7.1.1:
+| Encoded size | Channel | Why |
+|---|---|---|
+| Fits one datagram | QUIC unreliable datagram | The common case — incremental diffs and keystrokes. Latency wins, and a loss costs nothing because the next diff re-diffs from the same ack and contains it. §8.1 intact. |
+| Larger | A **fresh** unidirectional QUIC stream | A full state is a recovery mechanism, not a latency-critical one, so reliable and ordered is the right trade. |
 
-1. **A state is applied only when all of its fragments have arrived.** An
-   incomplete set is **discarded wholesale** — never partially applied, never held
-   waiting for a retransmission, because there are no retransmissions. This is what
-   preserves §8.1: the receiver's acknowledged state is unchanged by a lost
-   fragment, so the sender's next diff is computed against that same base and
-   therefore *contains* everything the dropped set was carrying. Losing one
-   fragment costs exactly one send interval and nothing else.
-2. **The receiver holds at most one incomplete set.** A fragment naming a
-   `my_state` newer than the set in progress **replaces** it; the older partial set
-   is dropped at once rather than kept in hope.
-3. **Fragments of a state older than the receiver's current state are discarded
-   on arrival.**
-4. **`frag_count` is bounded by configuration.** A diff exceeding the bound is a
-   bug in diff generation, not a runtime condition to handle.
+Three rules the implementation must honour:
 
-Unidirectional QUIC streams are **not** used for screen state. Control,
-scrollback and clipboard remain bidirectional streams (§7.2).
+1. **A stream superseded mid-flight is `RESET_STREAM`ed, never queued.** If a
+   newer state becomes current while a stream is still in flight, reset it and
+   open a fresh stream for the current state. The receiver then gets nothing
+   rather than something out of date, which is what keeps "never stale, never
+   behind" true.
+2. **Streams may complete out of order.** Apply one only if its `my_state` is
+   newer than what the receiver holds. `Frame`'s sequence numbers already answer
+   that, so no extra machinery is needed.
+3. **Never guess a datagram size.** When `max_datagram_size()` is `None`,
+   datagrams are unavailable and everything takes a stream. Substituting a
+   constant emits datagrams that a capped path — rung 4's relay, which drops
+   anything above `TUNNEL_MAX_PAYLOAD` — discards silently.
 
 ## Rejection is wholesale, and rejection is not disconnection
 
@@ -482,18 +482,11 @@ EOF
 
 ---
 
-### Task 2: Fragmentation and reassembly — the highest-risk task in M4
+### Task 2: Channel selection — datagram below the MTU, a fresh stream above it
 
-Read "Fragmentation, stated once" above before starting. This task is why the
-protocol can recover from its own worst case.
-
-The split is deliberate: `frag.rs` is **pure** — it takes a `Frame` and a size
-limit and returns `Frame`s, and it reassembles `Frame`s into a `Frame`. It has no
-sockets and no clock, so the rules of §7.1.1 are tested exhaustively without a
-network. `xport.rs` is the thin I/O shell around it.
+Read "Channel selection, stated once" above before starting.
 
 **Files:**
-- Create: `crates/oxutrm-net/src/frag.rs`
 - Create: `crates/oxutrm-net/src/xport.rs`
 - Create: `crates/oxutrm-net/src/testkit.rs`
 - Modify: `crates/oxutrm-net/src/lib.rs`
@@ -501,71 +494,49 @@ network. `xport.rs` is the thin I/O shell around it.
 
 **Interfaces:**
 - Consumes: `oxutrm_proto::Frame` — **the contract defines its fields, types and
-  order; do not re-derive them from this plan or from the spec, which no longer
-  carries wire types at all.** This task uses `my_state`, `from_state`,
-  `ack_state`, `frag_index`, `frag_count`, `flags` and `payload`, and copies all
-  but the fragment pair unchanged onto every piece. Also
-  `Frame::encode() -> Result<Vec<u8>, ProtoError>` and
+  order; do not re-derive them from this plan, and do not re-add `frag_index` or
+  `frag_count`, which were removed deliberately.** Also
+  `Frame::encode() -> Result<Vec<u8>, ProtoError>`,
   `Frame::decode(&[u8]) -> Result<Frame, ProtoError>`;
-  `oxutrm_sync::{Receiver, Sender, ScreenDiff, RowPatch, Run, ApplyError}` and
-  `oxutrm_term::{ScreenState, Cell, CellText, Cursor, CursorShape}` (dev only,
-  for the worst-case and invariant tests) — `ApplyError` has the variants
-  `LengthMismatch` and `CursorOutOfBounds` that `ScreenState::validate` raises;
-  `oxutrm_net::{generate_cert, quic_server, quic_client}` from M2. M2's
-  `quic_server` / `quic_client` **must** have set
-  `TransportConfig::datagram_receive_buffer_size(Some(_))` (its default is
-  `None`, which disables incoming datagrams outright) and
-  `datagram_send_buffer_size` — Step 6's test asserts this.
+  `oxutrm_net::{generate_cert, quic_server, quic_client}` from M2, whose
+  `TransportConfig` must set `datagram_receive_buffer_size(Some(_))` — its
+  default is `None`, which disables incoming datagrams outright — and
+  `datagram_send_buffer_size`; `oxutrm_sync::{Sender, Receiver, ApplyError}` and
+  `oxutrm_term::{ScreenState, Cell, CellText}` (dev only).
 - Produces:
   ```rust
-  // crates/oxutrm-net/src/frag.rs
-  /// Headroom below `max_datagram_size()` for the postcard `Frame` header:
-  /// three varint u64s, two u16s, a flags byte and the payload length prefix.
-  pub const FRAG_HEADER_BUDGET: usize = 48;
-  /// A diff needing more fragments than this is a bug in diff generation
-  /// (§7.1.1), not a runtime condition. 200 x 1200 bytes is 240 KB.
-  pub const MAX_FRAGMENTS: u16 = 200;
-
-  #[derive(thiserror::Error, Debug, PartialEq, Eq)]
-  pub enum FragError {
-      #[error("datagram budget {budget} is too small to carry any payload")]
-      BudgetTooSmall { budget: usize },
-      #[error("diff of {len} bytes needs more than {max} fragments")]
-      TooManyFragments { len: usize, max: u16 },
-  }
-
-  /// Split one logical `Frame` into datagram-sized pieces. Always returns at
-  /// least one `Frame`; `frag_count == 1` when the whole thing fits.
-  pub fn fragment(f: &oxutrm_proto::Frame, max_datagram: usize)
-      -> Result<Vec<oxutrm_proto::Frame>, FragError>;
-
-  /// Rebuilds fragmented states. Holds at most one incomplete set.
-  #[derive(Debug, Default)]
-  pub struct Reassembler { /* private */ }
-  impl Reassembler {
-      pub fn new() -> Reassembler;
-      /// `Some(frame)` when this fragment completed a state. Anything stale,
-      /// duplicate or superseded returns `None` and is never an error.
-      pub fn accept(&mut self, f: &oxutrm_proto::Frame) -> Option<oxutrm_proto::Frame>;
-      /// The receiver's current state, so older fragments can be discarded.
-      pub fn set_current_state(&mut self, seq: u64);
-      /// Fragment sets abandoned because a newer state superseded them.
-      pub fn dropped_sets(&self) -> u64;
-  }
-
   // crates/oxutrm-net/src/xport.rs
+  /// Headroom below the datagram limit for the postcard `Frame` header.
+  pub const DATAGRAM_MARGIN: usize = 64;
+  /// Refuse to buffer a stream frame larger than this.
+  pub const MAX_STREAM_FRAME: usize = 8 * 1024 * 1024;
+  /// "This path imposes no cap of its own beyond what quinn reports."
+  pub const NO_PATH_CAP: usize = usize::MAX;
+
+  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+  pub enum Channel { Datagram, Stream }
+
+  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+  pub enum Sent { Datagram, Stream }
+
+  /// `usable` is the byte budget actually available on this path: zero means
+  /// datagrams are unavailable and everything takes a stream.
+  pub fn choose_channel(encoded_len: usize, usable: usize) -> Channel;
+
   pub struct FrameSink { /* private */ }
   impl FrameSink {
-      pub fn new(conn: quinn::Connection) -> FrameSink;
-      /// Fragments as needed and sends every piece. `Ok(n)` is the number of
-      /// datagrams sent.
-      pub fn send(&self, f: &oxutrm_proto::Frame) -> anyhow::Result<usize>;
+      /// `path_cap` is the hard ceiling the ACTIVE PATH imposes, independent of
+      /// what quinn reports. Pass `NO_PATH_CAP` for an ordinary UDP path and
+      /// `tunnel::TUNNEL_MAX_PAYLOAD` for rung 4.
+      pub fn new(conn: quinn::Connection, path_cap: usize) -> FrameSink;
+      /// Bytes a datagram can carry on this path right now. Zero means none.
+      pub fn usable_datagram(&self) -> usize;
+      pub fn send(&self, f: &oxutrm_proto::Frame) -> anyhow::Result<Sent>;
   }
 
   pub struct FrameSource { /* private */ }
   impl FrameSource {
       pub fn new(conn: quinn::Connection) -> FrameSource;
-      /// The next COMPLETE frame. Incomplete sets never surface.
       pub async fn recv(&mut self) -> anyhow::Result<oxutrm_proto::Frame>;
       pub fn set_current_state(&mut self, seq: u64);
   }
@@ -574,445 +545,24 @@ network. `xport.rs` is the thin I/O shell around it.
   pub async fn loopback_pair() -> anyhow::Result<(quinn::Connection, quinn::Connection)>;
   ```
 
-- [ ] **Step 1: Add the `bytes` dependency and the `testkit` feature**
+- [ ] **Step 1: Add the dependencies and the `testkit` feature**
 
 In `crates/oxutrm-net/Cargo.toml`:
 
 ```toml
 [dependencies]
-bytes = "1"
-thiserror = "2"
+bytes.workspace = true
 
 [features]
 testkit = []
+
+[dev-dependencies]
+oxutrm-sync.workspace = true
+oxutrm-term.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 ```
 
-- [ ] **Step 2: Write the failing tests for the pure fragmenter**
-
-Create `crates/oxutrm-net/src/frag.rs` containing only:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use oxutrm_proto::Frame;
-
-    /// Deterministic pseudo-random bytes, so a failure is reproducible.
-    fn noise(n: usize) -> Vec<u8> {
-        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
-        (0..n)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                (s >> 24) as u8
-            })
-            .collect()
-    }
-
-    fn frame(my: u64, from: u64, payload: Vec<u8>) -> Frame {
-        Frame {
-            my_state: my,
-            from_state: from,
-            ack_state: 0,
-            frag_index: 0,
-            frag_count: 1,
-            flags: 0,
-            payload,
-        }
-    }
-
-    #[test]
-    fn a_small_frame_is_one_unfragmented_piece() {
-        let f = frame(7, 6, noise(200));
-        let out = fragment(&f, 1200).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].frag_count, 1);
-        assert_eq!(out[0].frag_index, 0);
-        assert_eq!(out[0].payload, f.payload);
-    }
-
-    #[test]
-    fn a_large_frame_splits_into_pieces_that_all_fit() {
-        let f = frame(9, 0, noise(50_000));
-        let out = fragment(&f, 1200).unwrap();
-        assert!(out.len() > 40, "expected many fragments, got {}", out.len());
-        for (i, p) in out.iter().enumerate() {
-            assert_eq!(p.frag_index, i as u16);
-            assert_eq!(p.frag_count, out.len() as u16);
-            assert_eq!(p.my_state, 9);
-            assert_eq!(p.from_state, 0);
-            assert!(
-                p.encode().unwrap().len() <= 1200,
-                "fragment {i} encodes to {} bytes, over the datagram limit",
-                p.encode().unwrap().len()
-            );
-        }
-    }
-
-    /// Compression happens before fragmentation, so every fragment of one
-    /// state carries the same flags byte (§7.1).
-    #[test]
-    fn the_flags_byte_is_identical_across_a_fragment_set() {
-        let mut f = frame(3, 2, noise(10_000));
-        f.flags = oxutrm_proto::FLAG_ZSTD;
-        let out = fragment(&f, 1200).unwrap();
-        assert!(out.len() > 1);
-        assert!(out.iter().all(|p| p.flags == oxutrm_proto::FLAG_ZSTD));
-    }
-
-    #[test]
-    fn the_payload_concatenates_back_to_the_original() {
-        let f = frame(4, 1, noise(31_337));
-        let out = fragment(&f, 1200).unwrap();
-        let rejoined: Vec<u8> = out.iter().flat_map(|p| p.payload.clone()).collect();
-        assert_eq!(rejoined, f.payload);
-    }
-
-    #[test]
-    fn an_absurd_diff_is_refused_rather_than_silently_truncated() {
-        let f = frame(1, 0, noise(4 * 1024 * 1024));
-        assert!(matches!(
-            fragment(&f, 1200),
-            Err(FragError::TooManyFragments { .. })
-        ));
-    }
-
-    #[test]
-    fn a_budget_too_small_for_any_payload_is_an_error_not_an_infinite_loop() {
-        let f = frame(1, 0, noise(100));
-        assert!(matches!(
-            fragment(&f, FRAG_HEADER_BUDGET),
-            Err(FragError::BudgetTooSmall { .. })
-        ));
-    }
-
-    #[test]
-    fn an_empty_payload_still_produces_exactly_one_fragment() {
-        let f = frame(2, 1, Vec::new());
-        let out = fragment(&f, 1200).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].frag_count, 1);
-    }
-
-    // ---- reassembly ----
-
-    #[test]
-    fn an_unfragmented_frame_passes_straight_through() {
-        let mut r = Reassembler::new();
-        let f = frame(5, 4, noise(100));
-        let got = r.accept(&f).expect("a single fragment completes at once");
-        assert_eq!(got.payload, f.payload);
-        assert_eq!(got.my_state, 5);
-    }
-
-    #[test]
-    fn a_complete_set_reassembles_in_order() {
-        let mut r = Reassembler::new();
-        let f = frame(6, 0, noise(20_000));
-        let parts = fragment(&f, 1200).unwrap();
-        let last = parts.len() - 1;
-        for (i, p) in parts.iter().enumerate() {
-            let got = r.accept(p);
-            if i < last {
-                assert!(got.is_none(), "completed early at fragment {i}");
-            } else {
-                let got = got.expect("the last fragment completes the set");
-                assert_eq!(got.payload, f.payload);
-                assert_eq!(got.frag_count, 1, "a reassembled frame is logically whole");
-                assert_eq!(got.from_state, 0);
-                assert_eq!(got.flags, f.flags);
-            }
-        }
-    }
-
-    #[test]
-    fn a_set_reassembles_when_fragments_arrive_out_of_order() {
-        let mut r = Reassembler::new();
-        let f = frame(6, 0, noise(20_000));
-        let mut parts = fragment(&f, 1200).unwrap();
-        parts.reverse();
-        let last = parts.len() - 1;
-        for (i, p) in parts.iter().enumerate() {
-            let got = r.accept(p);
-            assert_eq!(got.is_some(), i == last);
-            if let Some(got) = got {
-                assert_eq!(got.payload, f.payload);
-            }
-        }
-    }
-
-    #[test]
-    fn a_duplicated_fragment_does_not_complete_a_set_early() {
-        let mut r = Reassembler::new();
-        let f = frame(6, 0, noise(20_000));
-        let parts = fragment(&f, 1200).unwrap();
-        for _ in 0..5 {
-            assert!(r.accept(&parts[0]).is_none());
-        }
-        for p in &parts[1..parts.len() - 1] {
-            assert!(r.accept(p).is_none());
-        }
-        assert!(r.accept(&parts[parts.len() - 1]).is_some());
-    }
-
-    /// The §8.1 property: an incomplete set is discarded wholesale, and the
-    /// receiver's acknowledged state is untouched by the loss.
-    #[test]
-    fn an_incomplete_set_never_yields_a_partial_state() {
-        let mut r = Reassembler::new();
-        let f = frame(6, 0, noise(20_000));
-        let parts = fragment(&f, 1200).unwrap();
-        for p in &parts[..parts.len() - 1] {
-            assert!(r.accept(p).is_none());
-        }
-        // The last fragment is lost. Nothing is ever produced for state 6.
-        assert_eq!(r.dropped_sets(), 0);
-
-        // The sender re-diffs from the same base and sends state 7.
-        let g = frame(7, 0, noise(20_000));
-        let parts7 = fragment(&g, 1200).unwrap();
-        let last = parts7.len() - 1;
-        for (i, p) in parts7.iter().enumerate() {
-            let got = r.accept(p);
-            if i == last {
-                assert_eq!(got.expect("state 7 completes").payload, g.payload);
-            } else {
-                assert!(got.is_none());
-            }
-        }
-        assert_eq!(r.dropped_sets(), 1, "the abandoned state-6 set must be counted");
-    }
-
-    #[test]
-    fn a_newer_state_replaces_an_incomplete_older_one_immediately() {
-        let mut r = Reassembler::new();
-        let old = fragment(&frame(6, 0, noise(20_000)), 1200).unwrap();
-        let new_payload = noise(20_000);
-        let new = fragment(&frame(9, 0, new_payload.clone()), 1200).unwrap();
-
-        assert!(r.accept(&old[0]).is_none());
-        assert!(r.accept(&new[0]).is_none());
-        assert_eq!(r.dropped_sets(), 1);
-
-        // Late fragments of the superseded set must not resurrect it.
-        for p in &old[1..] {
-            assert!(r.accept(p).is_none(), "a superseded set was completed");
-        }
-        let last = new.len() - 1;
-        for (i, p) in new.iter().enumerate().skip(1) {
-            let got = r.accept(p);
-            assert_eq!(got.is_some(), i == last);
-            if let Some(got) = got {
-                assert_eq!(got.payload, new_payload);
-            }
-        }
-    }
-
-    #[test]
-    fn fragments_older_than_the_current_state_are_discarded_on_arrival() {
-        let mut r = Reassembler::new();
-        r.set_current_state(50);
-        let old = fragment(&frame(20, 0, noise(20_000)), 1200).unwrap();
-        for p in &old {
-            assert!(r.accept(p).is_none(), "a state older than current was applied");
-        }
-        // A current-enough state still works.
-        let f = frame(51, 50, noise(100));
-        assert!(r.accept(&f).is_some());
-    }
-}
-```
-
-- [ ] **Step 3: Run tests to verify they fail**
-
-Add `pub mod frag;` to `crates/oxutrm-net/src/lib.rs`, then run:
-
-`cargo test --jobs 4 -p oxutrm-net frag:: -- --test-threads 4`
-
-Expected: FAIL to compile — `cannot find function fragment`, `cannot find type Reassembler`.
-
-- [ ] **Step 4: Write minimal implementation**
-
-Put this above the test module in `crates/oxutrm-net/src/frag.rs`:
-
-```rust
-//! Fragmentation and reassembly, spec §7.1.1.
-//!
-//! A diff is not guaranteed to fit in a QUIC datagram, and the diff that is
-//! guaranteed NOT to fit is the one §8.2's ring-miss recovery has to send. QUIC
-//! never fragments datagrams itself, so oxutrm does.
-//!
-//! **A state is applied only when all of its fragments have arrived**, and an
-//! incomplete set is discarded wholesale. Note the division of labour: this
-//! module decides only whether the BYTES are all present. Whether the state they
-//! decode to is legal is `ScreenState::validate`'s job, and a state that fails
-//! there is rejected just as wholesale — see spec §8.6. That is what preserves §8.1: the
-//! receiver's acknowledged state is unchanged by the loss, so the sender's next
-//! diff is computed against the same base and contains everything the dropped
-//! set was carrying. One lost fragment costs one send interval, nothing more.
-//!
-//! No sockets, no clock: every rule here is tested without a network.
-
-use oxutrm_proto::Frame;
-use std::collections::BTreeMap;
-
-/// Headroom below `max_datagram_size()` for the postcard `Frame` header: three
-/// varint `u64`s, two `u16`s, a flags byte and the payload's length prefix.
-pub const FRAG_HEADER_BUDGET: usize = 48;
-
-/// More fragments than this means diff generation is broken, not that the link
-/// is slow (§7.1.1). 200 x ~1200 bytes is 240 KB.
-pub const MAX_FRAGMENTS: u16 = 200;
-
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-pub enum FragError {
-    #[error("datagram budget {budget} is too small to carry any payload")]
-    BudgetTooSmall { budget: usize },
-    #[error("diff of {len} bytes needs more than {max} fragments")]
-    TooManyFragments { len: usize, max: u16 },
-}
-
-/// Split one logical `Frame` into datagram-sized pieces, each carrying the same
-/// `my_state`, `from_state`, `ack_state` and `flags`.
-pub fn fragment(f: &Frame, max_datagram: usize) -> Result<Vec<Frame>, FragError> {
-    let chunk = max_datagram.saturating_sub(FRAG_HEADER_BUDGET);
-    if chunk == 0 {
-        return Err(FragError::BudgetTooSmall { budget: max_datagram });
-    }
-
-    // An empty payload is still exactly one fragment: `frag_count` is never 0.
-    let count = f.payload.len().div_ceil(chunk).max(1);
-    if count > MAX_FRAGMENTS as usize {
-        return Err(FragError::TooManyFragments {
-            len: f.payload.len(),
-            max: MAX_FRAGMENTS,
-        });
-    }
-
-    Ok((0..count)
-        .map(|i| {
-            let start = i * chunk;
-            let end = ((i + 1) * chunk).min(f.payload.len());
-            Frame {
-                my_state: f.my_state,
-                from_state: f.from_state,
-                ack_state: f.ack_state,
-                frag_index: i as u16,
-                frag_count: count as u16,
-                flags: f.flags,
-                payload: f.payload[start..end].to_vec(),
-            }
-        })
-        .collect())
-}
-
-/// Rebuilds fragmented states. Holds **at most one** incomplete set: a fragment
-/// naming a newer `my_state` replaces the set in progress rather than the
-/// receiver hoping the older one still completes.
-#[derive(Debug, Default)]
-pub struct Reassembler {
-    /// The state the partial set belongs to.
-    seq: u64,
-    from_state: u64,
-    ack_state: u64,
-    flags: u8,
-    expected: u16,
-    /// Fragment index -> payload piece. A map, so duplicates overwrite rather
-    /// than counting twice and completing the set early.
-    parts: BTreeMap<u16, Vec<u8>>,
-    /// The receiver's current applied state; anything older is discarded.
-    current: u64,
-    dropped: u64,
-}
-
-impl Reassembler {
-    pub fn new() -> Reassembler {
-        Reassembler::default()
-    }
-
-    /// Tell the reassembler what the receiver has applied, so fragments of an
-    /// already-superseded state are dropped on arrival.
-    pub fn set_current_state(&mut self, seq: u64) {
-        self.current = self.current.max(seq);
-    }
-
-    /// Fragment sets abandoned because a newer state arrived. Diagnostic only.
-    pub fn dropped_sets(&self) -> u64 {
-        self.dropped
-    }
-
-    /// `Some(frame)` when this fragment completed a state. Stale, duplicate and
-    /// superseded fragments return `None`; none of them is an error.
-    pub fn accept(&mut self, f: &Frame) -> Option<Frame> {
-        // Rule 3: older than what the receiver already has.
-        if f.my_state <= self.current {
-            return None;
-        }
-        // A malformed set is a lost set, never a panic.
-        if f.frag_count == 0 || f.frag_index >= f.frag_count {
-            return None;
-        }
-
-        // The common case: nothing to reassemble.
-        if f.frag_count == 1 {
-            if self.expected != 0 && self.seq < f.my_state {
-                self.abandon();
-            }
-            return Some(f.clone());
-        }
-
-        if self.expected == 0 || f.my_state > self.seq {
-            // Rule 2: a newer state replaces the set in progress at once.
-            if self.expected != 0 {
-                self.abandon();
-            }
-            self.seq = f.my_state;
-            self.from_state = f.from_state;
-            self.ack_state = f.ack_state;
-            self.flags = f.flags;
-            self.expected = f.frag_count;
-            self.parts.clear();
-        } else if f.my_state < self.seq {
-            // A late fragment of a set we already gave up on.
-            return None;
-        }
-
-        self.parts.insert(f.frag_index, f.payload.clone());
-        if self.parts.len() < self.expected as usize {
-            return None;
-        }
-
-        let payload: Vec<u8> = std::mem::take(&mut self.parts).into_values().flatten().collect();
-        let out = Frame {
-            my_state: self.seq,
-            from_state: self.from_state,
-            ack_state: self.ack_state,
-            // Logically whole: downstream never sees fragmentation.
-            frag_index: 0,
-            frag_count: 1,
-            flags: self.flags,
-            payload,
-        };
-        self.expected = 0;
-        Some(out)
-    }
-
-    fn abandon(&mut self) {
-        self.dropped += 1;
-        self.parts.clear();
-        self.expected = 0;
-    }
-}
-```
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-`cargo test --jobs 4 -p oxutrm-net frag:: -- --test-threads 4`
-
-Expected: PASS, 13 tests.
-
-- [ ] **Step 6: Write the loopback harness and the failing transport tests**
+- [ ] **Step 2: Write the loopback harness**
 
 Create `crates/oxutrm-net/src/testkit.rs`:
 
@@ -1048,6 +598,8 @@ pub async fn loopback_pair() -> anyhow::Result<(quinn::Connection, quinn::Connec
 }
 ```
 
+- [ ] **Step 3: Write the failing tests**
+
 Create `crates/oxutrm-net/src/xport.rs` containing only:
 
 ```rust
@@ -1055,9 +607,14 @@ Create `crates/oxutrm-net/src/xport.rs` containing only:
 mod tests {
     use super::*;
     use oxutrm_proto::Frame;
+    use std::time::Duration;
+
+    fn frame(my: u64, from: u64, payload: Vec<u8>) -> Frame {
+        Frame { my_state: my, from_state: from, ack_state: 0, flags: 0, payload }
+    }
 
     fn noise(n: usize) -> Vec<u8> {
-        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
         (0..n)
             .map(|_| {
                 s ^= s << 13;
@@ -1068,50 +625,56 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn size_picks_the_channel() {
+        assert_eq!(choose_channel(100, 1200), Channel::Datagram);
+        assert_eq!(choose_channel(1200 - DATAGRAM_MARGIN, 1200), Channel::Datagram);
+        assert_eq!(choose_channel(1200 - DATAGRAM_MARGIN + 1, 1200), Channel::Stream);
+        assert_eq!(choose_channel(50_000, 1200), Channel::Stream);
+    }
+
+    /// Zero budget means datagrams are unavailable on this path — either the
+    /// peer disabled them or the path caps below the header. Everything then
+    /// takes a stream; nothing is ever emitted at a guessed size.
+    #[test]
+    fn a_zero_budget_sends_everything_on_a_stream() {
+        assert_eq!(choose_channel(1, 0), Channel::Stream);
+        assert_eq!(choose_channel(1, DATAGRAM_MARGIN), Channel::Stream);
+    }
+
     #[tokio::test]
-    async fn a_small_frame_makes_one_datagram_and_arrives_whole() -> anyhow::Result<()> {
+    async fn a_small_frame_takes_a_datagram_and_arrives_whole() -> anyhow::Result<()> {
         let (server, client) = crate::testkit::loopback_pair().await?;
         assert!(
             server.max_datagram_size().is_some(),
-            "M2's quic_server/quic_client must set datagram_receive_buffer_size \
-             and datagram_send_buffer_size, or QUIC datagrams are disabled"
+            "M2 must set datagram_receive_buffer_size and datagram_send_buffer_size, \
+             or QUIC datagrams are disabled entirely"
         );
-
-        let sink = FrameSink::new(server);
+        let sink = FrameSink::new(server, NO_PATH_CAP);
         let mut source = FrameSource::new(client);
-        let f = Frame {
-            my_state: 7,
-            from_state: 6,
-            ack_state: 3,
-            frag_index: 0,
-            frag_count: 1,
-            flags: 0,
-            payload: noise(200),
-        };
-        assert_eq!(sink.send(&f)?, 1);
 
+        let f = frame(7, 6, noise(200));
+        assert_eq!(sink.send(&f)?, Sent::Datagram);
         let got = source.recv().await?;
-        assert_eq!((got.my_state, got.from_state, got.ack_state), (7, 6, 3));
+        assert_eq!((got.my_state, got.from_state), (7, 6));
         assert_eq!(got.payload, f.payload);
         Ok(())
     }
 
-    /// The one that matters: a 200x60 truecolor full state, which is exactly
-    /// what §8.2's ring-miss recovery sends, must arrive intact.
+    /// The case fragmentation could not survive: a 200x60 truecolor full state,
+    /// which is exactly what the ring-miss recovery path must send.
     #[tokio::test]
-    async fn a_full_200x60_truecolor_state_arrives_intact() -> anyhow::Result<()> {
+    async fn a_full_200x60_truecolor_state_arrives_intact_on_a_stream() -> anyhow::Result<()> {
         use oxutrm_proto::TermSize;
-        use oxutrm_sync::{ScreenDiff, Sender};
-        use oxutrm_term::{Attrs, Cell, Color, ScreenState};
+        use oxutrm_sync::{Receiver, Sender};
+        use oxutrm_term::{Attrs, Cell, CellText, Color, ScreenState};
 
         let size = TermSize { cols: 200, rows: 60 };
-        // Every cell distinct, so run-length collapsing cannot shrink it and
-        // the test really exercises the worst case.
+        // Every cell distinct, so run-length collapsing cannot shrink it.
         let mut s = ScreenState::blank(size.rows, size.cols);
         for (i, c) in s.cells.iter_mut().enumerate() {
             *c = Cell {
-                // `Cell.text` is `CellText` (a `CompactString`), not `String`.
-                text: oxutrm_term::CellText::from(
+                text: CellText::from(
                     char::from_u32(0x41 + (i as u32 % 26)).unwrap().to_string().as_str(),
                 ),
                 fg: Color::Rgb((i % 251) as u8, ((i / 7) % 251) as u8, ((i / 13) % 251) as u8),
@@ -1121,161 +684,113 @@ mod tests {
         }
         s.seq = 1;
 
-        // The real thing: a full diff from the sync engine, framed and paced
-        // exactly as the host session loop would.
         let sender: Sender<ScreenState> = Sender::new(s.clone());
-        let frame = sender
-            .make_frame(0)?
-            .expect("a fresh sender owes the peer a full state");
-        let encoded_len = frame.payload.len();
-        assert!(
-            encoded_len > 10_000,
-            "a 200x60 truecolor state must be well over 10 KB, got {encoded_len}"
-        );
+        let f = sender.make_frame(0)?.expect("a fresh sender owes a full state");
+        assert!(f.payload.len() > 10_000, "got {} bytes", f.payload.len());
 
         let (server, client) = crate::testkit::loopback_pair().await?;
-        let max = server.max_datagram_size().expect("datagrams enabled");
+        let sink = FrameSink::new(server, NO_PATH_CAP);
         assert!(
-            encoded_len > max,
-            "this test is meaningless unless the state exceeds one datagram \
-             ({encoded_len} vs {max})"
+            f.payload.len() > sink.usable_datagram(),
+            "this test is meaningless unless the state exceeds one datagram"
         );
-
-        let sink = FrameSink::new(server);
         let mut source = FrameSource::new(client);
-        let sent = sink.send(&frame)?;
-        assert!(sent > 1, "the state must have been fragmented, got {sent} datagram(s)");
+        assert_eq!(sink.send(&f)?, Sent::Stream);
 
-        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
-        assert_eq!(got.my_state, frame.my_state);
-        assert_eq!(got.from_state, frame.from_state);
-        assert_eq!(got.flags, frame.flags, "the flags byte must survive fragmentation");
-        assert_eq!(got.payload.len(), encoded_len, "reassembled payload truncated");
-        assert_eq!(got.payload, frame.payload, "reassembled payload corrupted");
+        let got = tokio::time::timeout(Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.payload, f.payload, "the state did not survive the stream");
 
-        // And it must still decode into the state it started as.
-        let mut rx: oxutrm_sync::Receiver<ScreenState> =
-            oxutrm_sync::Receiver::new(ScreenState::blank(size.rows, size.cols));
+        let mut rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size.rows, size.cols));
         assert!(rx.on_frame(&got)?);
         assert_eq!(rx.state().cells, s.cells, "the screen did not survive the round trip");
-        let _: Option<ScreenDiff> = None;
         Ok(())
     }
 
-    /// Where fragmentation meets the invariants. A state that reassembles
-    /// perfectly but violates an invariant must be rejected WHOLESALE: the
-    /// receiver's state and its acknowledgement must both be untouched, so the
-    /// peer's next diff — computed from the same base — repairs it.
+    /// A stream superseded mid-flight is RESET, never queued: the receiver gets
+    /// nothing rather than something out of date.
     #[tokio::test]
-    async fn a_reassembled_but_invalid_state_is_rejected_without_disturbing_the_receiver()
-    -> anyhow::Result<()> {
-        use oxutrm_proto::TermSize;
-        use oxutrm_sync::{Receiver, RowPatch, Run, ScreenDiff};
-        use oxutrm_term::{Cell, CursorShape, ScreenState};
-
-        let size = TermSize { cols: 80, rows: 24 };
-
-        // Large enough to fragment, and deliberately invalid: the cursor sits
-        // outside the grid. Per I2 this is rejected, never clamped.
-        let bad = ScreenDiff {
-            resize: None,
-            rows: (0..24)
-                .map(|row| RowPatch {
-                    row,
-                    runs: vec![Run { start_col: 0, repeat: 0, cells: vec![Cell::blank(); 80] }],
-                })
-                .collect(),
-            cursor: Some(oxutrm_term::Cursor {
-                row: 999,
-                col: 999,
-                visible: true,
-                shape: CursorShape::Block,
-            }),
-            modes: None,
-            title: None,
-            bell: None,
-            scrollback_len: None,
-        };
-        let payload = postcard::to_stdvec(&bad)?;
-
+    async fn a_superseded_stream_is_reset_and_the_newer_state_wins() -> anyhow::Result<()> {
         let (server, client) = crate::testkit::loopback_pair().await?;
-        let max = server.max_datagram_size().expect("datagrams enabled");
-        assert!(payload.len() > max, "this test needs a fragmented diff");
-
-        let sink = FrameSink::new(server);
+        let sink = FrameSink::new(server, NO_PATH_CAP);
         let mut source = FrameSource::new(client);
-        let f = Frame {
-            my_state: 2,
-            from_state: 1,
-            ack_state: 0,
-            frag_index: 0,
-            frag_count: 1,
-            flags: 0,
-            payload,
-        };
-        assert!(sink.send(&f)? > 1, "the diff must have been fragmented");
 
-        // Reassembly itself succeeds: the bytes are all there.
-        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
-        assert_eq!(got.my_state, 2);
+        // Two large states in quick succession. The first must not be delivered
+        // stale after the second.
+        let stale = frame(1, 0, noise(2 * 1024 * 1024));
+        let fresh = frame(2, 0, noise(4096));
+        assert_eq!(sink.send(&stale)?, Sent::Stream);
+        assert_eq!(sink.send(&fresh)?, Sent::Stream);
 
-        // The sync engine is what rejects it, and it must reject wholesale.
+        let got = tokio::time::timeout(Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.my_state, 2, "a superseded state reached the receiver");
+        assert_eq!(got.payload, fresh.payload);
+
+        // And nothing further arrives: the reset stream produced no frame.
+        let extra = tokio::time::timeout(Duration::from_millis(500), source.recv()).await;
+        assert!(extra.is_err(), "the reset stream still delivered something");
+        Ok(())
+    }
+
+    /// Streams may complete out of order. An older state must be ignored.
+    #[tokio::test]
+    async fn a_stream_completing_out_of_order_is_ignored() -> anyhow::Result<()> {
+        let (server, client) = crate::testkit::loopback_pair().await?;
+        let sink = FrameSink::new(server, NO_PATH_CAP);
+        let mut source = FrameSource::new(client);
+        source.set_current_state(50);
+
+        sink.send(&frame(20, 0, noise(4096)))?;
+        let stale = tokio::time::timeout(Duration::from_millis(500), source.recv()).await;
+        assert!(stale.is_err(), "a state older than current was delivered");
+
+        sink.send(&frame(51, 50, noise(4096)))?;
+        let got = tokio::time::timeout(Duration::from_secs(10), source.recv()).await??;
+        assert_eq!(got.my_state, 51);
+        Ok(())
+    }
+
+    /// The §8.1 property, executed rather than asserted: the SENDER's next diff
+    /// contains what the lost one carried. Both halves are real here — a real
+    /// `Sender` computes the repair, and the ack it diffs from is the one the
+    /// receiver actually still holds.
+    #[test]
+    fn a_lost_frame_is_recovered_by_the_senders_next_diff() -> anyhow::Result<()> {
+        use oxutrm_proto::TermSize;
+        use oxutrm_sync::{Receiver, Sender};
+        use oxutrm_term::{Cell, CellText, ScreenState};
+
+        let size = TermSize { cols: 20, rows: 4 };
         let mut initial = ScreenState::blank(size.rows, size.cols);
         initial.seq = 1;
+
+        let mut tx: Sender<ScreenState> = Sender::new(initial.clone());
         let mut rx: Receiver<ScreenState> = Receiver::new(initial.clone());
-        let before_ack = rx.ack();
 
-        let err = rx.on_frame(&got).expect_err("an out-of-range cursor must be rejected");
-        assert!(
-            matches!(err, oxutrm_sync::ApplyError::CursorOutOfBounds { .. }),
-            "expected CursorOutOfBounds, got {err:?}"
-        );
-        assert_eq!(rx.ack(), before_ack, "a rejected frame must not advance the ack");
-        assert_eq!(
-            rx.state(),
-            &initial,
-            "a rejected diff must not be applied even partially"
-        );
+        // State 2 is produced and then DROPPED on the floor.
+        let mut s2 = initial.clone();
+        s2.cells[0] = Cell { text: CellText::from("A"), ..Cell::blank() };
+        tx.update(s2);
+        let _lost = tx.make_frame(0)?.expect("state 2 owes the peer a diff");
+        assert_eq!(rx.state().cell(0, 0).text.as_str(), " ", "the drop must be a real drop");
 
-        // And the receiver still works: the next valid diff from the SAME base
-        // is what repairs the screen.
-        let mut good = ScreenState::blank(size.rows, size.cols);
-        good.seq = 1;
-        good.cells[0] = Cell { text: oxutrm_term::CellText::from("Z"), ..Cell::blank() };
-        let sender: oxutrm_sync::Sender<ScreenState> = oxutrm_sync::Sender::new(good.clone());
-        let repair = sender.make_frame(0)?.expect("a fresh sender owes a full state");
-        assert!(rx.on_frame(&repair)?, "the repairing diff must apply");
-        assert_eq!(rx.state().cell(0, 0).text.as_str(), "Z");
-        Ok(())
-    }
+        // State 3 arrives. The sender diffs from the receiver's UNCHANGED ack,
+        // so this frame must carry the 'A' the lost one held as well as the 'B'.
+        let mut s3 = initial.clone();
+        s3.cells[0] = Cell { text: CellText::from("A"), ..Cell::blank() };
+        s3.cells[1] = Cell { text: CellText::from("B"), ..Cell::blank() };
+        tx.update(s3);
+        let repair = tx.make_frame(rx.ack())?.expect("state 3 owes the peer a diff");
+        assert!(rx.on_frame(&repair)?);
 
-    #[tokio::test]
-    async fn a_frame_far_beyond_one_datagram_arrives_intact() -> anyhow::Result<()> {
-        let (server, client) = crate::testkit::loopback_pair().await?;
-        let sink = FrameSink::new(server);
-        let mut source = FrameSource::new(client);
-
-        let payload = noise(150_000);
-        let f = Frame {
-            my_state: 42,
-            from_state: 0,
-            ack_state: 0,
-            frag_index: 0,
-            frag_count: 1,
-            flags: 0,
-            payload: payload.clone(),
-        };
-        let sent = sink.send(&f)?;
-        assert!(sent > 100, "expected many fragments, got {sent}");
-
-        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
-        assert_eq!(got.payload, payload);
+        assert_eq!(rx.state().cell(0, 0).text.as_str(), "A", "the lost cell was never recovered");
+        assert_eq!(rx.state().cell(0, 1).text.as_str(), "B");
+        assert_eq!(rx.state().cells, tx.current().cells, "receiver did not converge on sender");
         Ok(())
     }
 }
 ```
 
-- [ ] **Step 7: Run tests to verify they fail**
+- [ ] **Step 4: Run tests to verify they fail**
 
 Add to `crates/oxutrm-net/src/lib.rs`:
 
@@ -1285,111 +800,240 @@ pub mod xport;
 pub mod testkit;
 ```
 
-Add `oxutrm-sync`, `oxutrm-term` and `oxutrm-proto` to `crates/oxutrm-net/Cargo.toml`
-under `[dev-dependencies]` so the worst-case test can build a real state.
+Run: `cargo test --workspace --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
 
-Run: `cargo test --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
+Expected: FAIL to compile — `cannot find function choose_channel`.
 
-Expected: FAIL to compile — `cannot find type FrameSink`.
-
-- [ ] **Step 8: Write minimal implementation**
+- [ ] **Step 5: Write minimal implementation**
 
 Put this above the test module in `crates/oxutrm-net/src/xport.rs`:
 
 ```rust
-//! Getting a `Frame` from one peer to the other.
+//! Getting a `Frame` from one peer to the other. Size picks the channel.
 //!
-//! Screen and input state travel as QUIC datagrams: unreliable and never
-//! retransmitted, which is exactly what §8.1 wants. Anything too large for one
-//! datagram is fragmented by `crate::frag`; unidirectional streams are NOT used
-//! for state. Control, scrollback and clipboard are bidirectional streams and
-//! belong elsewhere (§7.2).
+//! There is NO fragmentation. It was specified, reviewed and removed: a state
+//! of F fragments needs all F to arrive with no retransmission, so delivery is
+//! (1-p)^F — about 28% at 1% loss for a 200x60 truecolor state, and the
+//! ring-miss recovery path is obliged to send exactly that. The mechanism most
+//! needed after a burst of loss was the one least able to survive it.
+//!
+//! Instead: a frame that fits goes in an unreliable datagram, which is what
+//! incremental diffs and keystrokes want. A frame that does not fit goes on a
+//! fresh unidirectional stream, reliable and ordered, which is what a full
+//! state — a recovery mechanism, not a latency-critical one — wants.
 
-use crate::frag::{fragment, Reassembler};
 use oxutrm_proto::Frame;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Sends `Frame`s, fragmenting whatever will not fit.
+/// Headroom below the datagram limit for the postcard `Frame` header.
+pub const DATAGRAM_MARGIN: usize = 64;
+
+/// A stream frame larger than this is a bug, not a repaint.
+pub const MAX_STREAM_FRAME: usize = 8 * 1024 * 1024;
+
+/// The active path imposes no ceiling of its own.
+pub const NO_PATH_CAP: usize = usize::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+    Datagram,
+    Stream,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sent {
+    Datagram,
+    Stream,
+}
+
+/// `usable` is the budget actually available on this path. Zero means datagrams
+/// are unavailable, and everything takes a stream — never a guessed size.
+pub fn choose_channel(encoded_len: usize, usable: usize) -> Channel {
+    if usable > DATAGRAM_MARGIN && encoded_len + DATAGRAM_MARGIN <= usable {
+        Channel::Datagram
+    } else {
+        Channel::Stream
+    }
+}
+
+/// Cancels an in-flight stream when a newer state supersedes it.
+struct InFlight {
+    my_state: u64,
+    cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 pub struct FrameSink {
     conn: quinn::Connection,
+    /// The ceiling the ACTIVE PATH imposes, independent of what quinn reports.
+    /// Rung 4's relay drops anything above `TUNNEL_MAX_PAYLOAD`, and quinn does
+    /// not know that, so a constant fallback here would emit datagrams the
+    /// tunnel silently discards.
+    path_cap: usize,
+    in_flight: Arc<Mutex<Option<InFlight>>>,
+    newest: Arc<AtomicU64>,
 }
 
 impl FrameSink {
-    pub fn new(conn: quinn::Connection) -> FrameSink {
-        FrameSink { conn }
+    pub fn new(conn: quinn::Connection, path_cap: usize) -> FrameSink {
+        FrameSink {
+            conn,
+            path_cap,
+            in_flight: Arc::new(Mutex::new(None)),
+            newest: Arc::new(AtomicU64::new(0)),
+        }
     }
 
-    /// Returns the number of datagrams sent.
-    pub fn send(&self, f: &Frame) -> anyhow::Result<usize> {
-        // `None` means the peer disabled datagrams, which M2's TransportConfig
-        // must not allow; 1200 is QUIC's floor and a safe last resort.
-        let max = self.conn.max_datagram_size().unwrap_or(1200);
-        let parts = fragment(f, max)?;
-        for p in &parts {
-            self.conn.send_datagram(bytes::Bytes::from(p.encode()?))?;
+    /// Bytes a datagram can carry on this path right now. Zero means none:
+    /// either the peer disabled datagrams or the path caps below the header.
+    pub fn usable_datagram(&self) -> usize {
+        // `None` means datagrams are unavailable. Do NOT substitute a constant:
+        // guessing 1200 here is exactly what emits datagrams a tunnelled path
+        // drops on the floor.
+        let quinn_limit = self.conn.max_datagram_size().unwrap_or(0);
+        quinn_limit.min(self.path_cap).saturating_sub(0)
+    }
+
+    pub fn send(&self, f: &Frame) -> anyhow::Result<Sent> {
+        let bytes = f.encode()?;
+        match choose_channel(bytes.len(), self.usable_datagram()) {
+            Channel::Datagram => {
+                self.conn.send_datagram(bytes::Bytes::from(bytes))?;
+                Ok(Sent::Datagram)
+            }
+            Channel::Stream => {
+                anyhow::ensure!(
+                    bytes.len() <= MAX_STREAM_FRAME,
+                    "frame of {} bytes exceeds MAX_STREAM_FRAME",
+                    bytes.len()
+                );
+                self.newest.fetch_max(f.my_state, Ordering::SeqCst);
+
+                // Never queue. A stream still carrying an older state is reset,
+                // so the receiver gets nothing rather than something stale.
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut slot = self.in_flight.lock().expect("in_flight poisoned");
+                    if let Some(prev) = slot.take() {
+                        if prev.my_state < f.my_state {
+                            // Dropping the sender fires the cancel branch, which
+                            // issues RESET_STREAM.
+                            drop(prev.cancel);
+                        } else {
+                            // A newer state is already in flight; this one is
+                            // the stale one and is simply not sent.
+                            *slot = Some(prev);
+                            return Ok(Sent::Stream);
+                        }
+                    }
+                    *slot = Some(InFlight { my_state: f.my_state, cancel: cancel_tx });
+                }
+
+                let conn = self.conn.clone();
+                let in_flight = self.in_flight.clone();
+                let my_state = f.my_state;
+                tokio::spawn(async move {
+                    let result = async {
+                        let mut s = conn.open_uni().await?;
+                        tokio::select! {
+                            r = s.write_all(&bytes) => {
+                                r?;
+                                s.finish()?;
+                                let _ = s.stopped().await;
+                            }
+                            // Superseded: abandon this state entirely.
+                            _ = cancel_rx => {
+                                let _ = s.reset(quinn::VarInt::from_u32(0));
+                            }
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        // A dead connection is the session loop's problem; it
+                        // observes `conn.closed()`.
+                        eprintln!("oxutrm: state {my_state} not delivered: {e}");
+                    }
+                    let mut slot = in_flight.lock().expect("in_flight poisoned");
+                    if slot.as_ref().is_some_and(|f| f.my_state == my_state) {
+                        *slot = None;
+                    }
+                });
+                Ok(Sent::Stream)
+            }
         }
-        Ok(parts.len())
     }
 }
 
-/// Receives `Frame`s, reassembling fragment sets.
 pub struct FrameSource {
     conn: quinn::Connection,
-    reassembler: Reassembler,
+    current: u64,
 }
 
 impl FrameSource {
     pub fn new(conn: quinn::Connection) -> FrameSource {
-        FrameSource { conn, reassembler: Reassembler::new() }
+        FrameSource { conn, current: 0 }
     }
 
-    /// Tell the source what the receiver has applied, so fragments of an
-    /// already-superseded state are discarded on arrival (§7.1.1).
+    /// Tell the source what the receiver has applied. Streams may complete out
+    /// of order, so an older state must be discarded on arrival.
     pub fn set_current_state(&mut self, seq: u64) {
-        self.reassembler.set_current_state(seq);
+        self.current = self.current.max(seq);
     }
 
-    /// The next COMPLETE frame. Incomplete sets never surface: they are
-    /// discarded wholesale, and the peer's next diff carries what they held.
     pub async fn recv(&mut self) -> anyhow::Result<Frame> {
         loop {
-            let bytes = self.conn.read_datagram().await?;
-            match Frame::decode(&bytes) {
-                Ok(f) => {
-                    if let Some(whole) = self.reassembler.accept(&f) {
-                        return Ok(whole);
+            let bytes = tokio::select! {
+                d = self.conn.read_datagram() => d?.to_vec(),
+                s = self.conn.accept_uni() => {
+                    let mut recv = s?;
+                    match recv.read_to_end(MAX_STREAM_FRAME).await {
+                        Ok(b) => b,
+                        // A reset stream is a superseded state. Not an error:
+                        // a newer one is already on its way.
+                        Err(_) => continue,
                     }
                 }
+            };
+            match Frame::decode(&bytes) {
+                Ok(f) if f.my_state <= self.current => continue,
+                Ok(f) => return Ok(f),
                 // A malformed datagram is a lost datagram: the next diff comes
                 // from the same acknowledged base and contains what it held.
-                Err(e) => eprintln!("oxutrm: dropping undecodable datagram: {e}"),
+                Err(e) => eprintln!("oxutrm: dropping undecodable frame: {e}"),
             }
         }
     }
 }
 ```
 
-- [ ] **Step 9: Run tests to verify they pass**
+- [ ] **Step 6: Run tests to verify they pass**
 
-`cargo test --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
+`cargo test --workspace --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
 
-Expected: PASS, 4 tests, including `a_full_200x60_truecolor_state_arrives_intact`
-and `a_reassembled_but_invalid_state_is_rejected_without_disturbing_the_receiver`.
+Expected: PASS, 7 tests, including
+`a_full_200x60_truecolor_state_arrives_intact_on_a_stream`,
+`a_superseded_stream_is_reset_and_the_newer_state_wins` and
+`a_lost_frame_is_recovered_by_the_senders_next_diff`.
 
-- [ ] **Step 10: Run the gates and commit**
+- [ ] **Step 7: Run the gates and commit**
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --jobs 4 -- --test-threads 4
-git add crates/oxutrm-net/src/frag.rs crates/oxutrm-net/src/xport.rs \
-        crates/oxutrm-net/src/testkit.rs crates/oxutrm-net/src/lib.rs \
-        crates/oxutrm-net/Cargo.toml
+make lint
+make test
+git add crates/oxutrm-net/src/xport.rs crates/oxutrm-net/src/testkit.rs \
+        crates/oxutrm-net/src/lib.rs crates/oxutrm-net/Cargo.toml
 git commit -m "$(cat <<'EOF'
-feat(net): fragment diffs across datagrams, reassemble whole states only
+feat(net): size picks the channel, datagram below the MTU and a stream above it
 
-A full ScreenState is well over 10 KB and send_datagram refuses anything past
-max_datagram_size, so the sync engine's own ring-miss recovery could not send.
-Frames now carry frag_index/frag_count; an incomplete set is discarded whole,
-which is what keeps "a lost datagram costs nothing" true.
+Incremental diffs and keystrokes take an unreliable datagram, where latency
+wins and a loss costs nothing. A full state — the ring-miss recovery path, and
+the largest message the protocol builds — takes a fresh unidirectional stream,
+where reliability is the right trade. A stream superseded mid-flight is reset
+rather than queued, so the receiver gets nothing rather than something stale.
+
+No fragmentation: (1-p)^F delivery made the recovery path least survivable
+exactly when it was most needed.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 EOF
@@ -2584,11 +2228,15 @@ instead of spinning. That needs the fd, and it needs the fd to be non-blocking.
   // crates/oxutrm-host/src/session.rs
   /// Runs until the child exits or the connection dies.
   /// Returns the child's exit status, or `None` if the peer went away first.
+  /// `path_cap` is the datagram ceiling the ACTIVE PATH imposes:
+  /// `xport::NO_PATH_CAP` on ordinary UDP, `tunnel::TUNNEL_MAX_PAYLOAD` on
+  /// rung 4.
   pub async fn run_host_session(
       term: oxutrm_term::HostTerm,
       conn: quinn::Connection,
       local: std::net::SocketAddr,
       initial: oxutrm_proto::TermSize,
+      path_cap: usize,
   ) -> anyhow::Result<Option<i32>>;
   ```
 
@@ -2701,10 +2349,10 @@ async fn typed_input_reaches_the_shell_and_the_output_comes_back() -> anyhow::Re
         200,
     )?;
 
-    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size(), oxutrm_net::xport::NO_PATH_CAP));
 
     // Play the client by hand.
-    let sink = FrameSink::new(client_conn.clone());
+    let sink = FrameSink::new(client_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut source = FrameSource::new(client_conn.clone());
     let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
     let mut input_tx: Sender<InputState> =
@@ -2756,9 +2404,9 @@ async fn an_unapplicable_frame_does_not_kill_the_session() -> anyhow::Result<()>
         size(),
         200,
     )?;
-    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size(), oxutrm_net::xport::NO_PATH_CAP));
 
-    let sink = FrameSink::new(client_conn.clone());
+    let sink = FrameSink::new(client_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut source = FrameSource::new(client_conn.clone());
     let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
     let mut input_tx: Sender<InputState> =
@@ -2770,8 +2418,6 @@ async fn an_unapplicable_frame_does_not_kill_the_session() -> anyhow::Result<()>
         my_state: 900,
         from_state: 0,
         ack_state: 0,
-        frag_index: 0,
-        frag_count: 1,
         flags: 0,
         payload: vec![0xFF; 64],
     })?;
@@ -2824,9 +2470,9 @@ async fn a_resize_in_the_input_state_resizes_the_pty() -> anyhow::Result<()> {
         size(),
         200,
     )?;
-    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size(), oxutrm_net::xport::NO_PATH_CAP));
 
-    let sink = FrameSink::new(client_conn.clone());
+    let sink = FrameSink::new(client_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut source = FrameSource::new(client_conn.clone());
     let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
     let mut input_tx: Sender<InputState> =
@@ -2919,6 +2565,7 @@ pub async fn run_host_session(
     conn: quinn::Connection,
     local: SocketAddr,
     initial: TermSize,
+    path_cap: usize,
 ) -> anyhow::Result<Option<i32>> {
     term.set_nonblocking()?;
     let pty = AsyncFd::with_interest(
@@ -2926,7 +2573,7 @@ pub async fn run_host_session(
         Interest::READABLE,
     )?;
 
-    let sink = FrameSink::new(conn.clone());
+    let sink = FrameSink::new(conn.clone(), path_cap);
     let mut source = FrameSource::new(conn.clone());
 
     // `ScreenState.seq` starts at 1 and resets to 1 at every attach; 0 is
@@ -3015,11 +2662,22 @@ pub async fn run_host_session(
                     // whole-grid comparison here and there must not be one.
                     screen_tx.update(term.snapshot(screen_tx.current().seq));
                     if let Some(frame) = screen_tx.make_frame(input_rx.ack())? {
-                        let sent = sink.send(&frame)?;
-                        debug_assert!(sent >= 1);
-                        cursor.on_ack_sent(frame.my_state);
-                        pacer.on_sent(now);
-                        dirty = false;
+                        // A send failure is a DROPPED frame, not a dead
+                        // session — the same discipline §8.6 imposes on the
+                        // receive side. The next pacing tick re-diffs from the
+                        // same ack, so nothing is lost but one interval.
+                        // Propagating with `?` would end a healthy session.
+                        match sink.send(&frame) {
+                            Ok(_) => {
+                                cursor.on_ack_sent(frame.my_state);
+                                pacer.on_sent(now);
+                                dirty = false;
+                            }
+                            Err(e) => {
+                                eprintln!("oxutrm: screen frame not sent: {e}");
+                                pacer.on_sent(now);
+                            }
+                        }
                     } else {
                         dirty = false;
                         // Nothing outstanding: the next change goes out at once.
@@ -4169,12 +3827,16 @@ and a shell that inherits a non-blocking stdin misbehaves after oxutrm exits.
   /// `endpoint` is the client's own endpoint. It is needed because a
   /// migration is a change of OUR local address, which only the endpoint
   /// reports; `Connection::remote_address()` cannot change within an attach.
+  /// `path_cap` is the datagram ceiling the ACTIVE PATH imposes, independent
+  /// of what quinn reports: `xport::NO_PATH_CAP` on an ordinary UDP path, and
+  /// `tunnel::TUNNEL_MAX_PAYLOAD` on rung 4, whose relay drops anything larger.
   pub async fn run_client_session(
       conn: quinn::Connection,
       endpoint: quinn::Endpoint,
       path: oxutrm_proto::PathDescription,
       session_id: String,
       caps: oxutrm_proto::TerminalCaps,
+      path_cap: usize,
   ) -> anyhow::Result<()>;
 
   pub async fn wait_for_terminating_signal();   // from Task 8
@@ -4293,6 +3955,10 @@ pub async fn run_client_session(
     mut path: PathDescription,
     session_id: String,
     caps: TerminalCaps,
+    // The ceiling the active path imposes. `NO_PATH_CAP` for ordinary UDP;
+    // `tunnel::TUNNEL_MAX_PAYLOAD` for rung 4, whose relay drops larger
+    // payloads and about which quinn knows nothing.
+    path_cap: usize,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut size = crate::terminal_size()?;
@@ -4305,7 +3971,7 @@ pub async fn run_client_session(
     let mut renderer = Renderer::new(size, caps);
     let mut out = std::io::stdout();
 
-    let sink = FrameSink::new(conn.clone());
+    let sink = FrameSink::new(conn.clone(), path_cap);
     let mut source = FrameSource::new(conn.clone());
     let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size.rows, size.cols));
     let mut input = InputQueue::new(size);
@@ -4431,7 +4097,12 @@ pub async fn run_client_session(
                 let now = Instant::now();
                 if pacer.may_send(now, rtt) {
                     if let Some(f) = input.sender().make_frame(screen_rx.ack())? {
-                        sink.send(&f)?;
+                        // Dropped, not fatal: unacknowledged input is still in
+                        // `pending`, so the next tick re-sends it from the same
+                        // base. Never `?` here.
+                        if let Err(e) = sink.send(&f) {
+                            eprintln!("oxutrm: input frame not sent: {e}");
+                        }
                         pacer.on_sent(now);
                     }
                 }
@@ -4589,9 +4260,9 @@ mod tests {
         let client = crate::quic_client(client_ep.socket, client_ep.peer, spki).await?;
         let (server, _keepalive) = accepting.await??;
 
-        let sink = FrameSink::new(server);
+        let sink = FrameSink::new(server, TUNNEL_MAX_PAYLOAD);
         let mut source = FrameSource::new(client);
-        let f = Frame { my_state: 3, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: vec![9u8; 500] };
+        let f = Frame { my_state: 3, from_state: 0, ack_state: 0, flags: 0, payload: vec![9u8; 500] };
         sink.send(&f)?;
         let got = source.recv().await?;
         assert_eq!(got.my_state, 3);
@@ -4599,11 +4270,11 @@ mod tests {
         Ok(())
     }
 
-    /// Fragmentation and the tunnel compose: a state far larger than one
-    /// datagram is split by `crate::frag`, every piece stays under
-    /// TUNNEL_MAX_PAYLOAD, and it reassembles on the far side.
+    /// Channel selection and the tunnel compose: a state far larger than one
+    /// datagram takes a stream, so the relay never has to carry more than
+    /// TUNNEL_MAX_PAYLOAD in a single frame.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_fragmented_state_survives_the_tunnel() -> anyhow::Result<()> {
+    async fn a_large_state_takes_a_stream_through_the_tunnel() -> anyhow::Result<()> {
         let (a, b) = tokio::io::duplex(1 << 20);
         let (a_read, a_write) = tokio::io::split(a);
         let (b_read, b_write) = tokio::io::split(b);
@@ -4625,12 +4296,12 @@ mod tests {
             "the tunnel must not let quinn discover an MTU it cannot carry"
         );
 
-        let sink = FrameSink::new(server);
+        // The tunnel's cap, not quinn's: the relay drops anything larger.
+        let sink = FrameSink::new(server, TUNNEL_MAX_PAYLOAD);
         let mut source = FrameSource::new(client);
         let payload: Vec<u8> = (0..120_000).map(|i| (i % 251) as u8).collect();
-        let f = Frame { my_state: 5, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: payload.clone() };
-        let sent = sink.send(&f)?;
-        assert!(sent > 90, "expected many fragments through the tunnel, got {sent}");
+        let f = Frame { my_state: 5, from_state: 0, ack_state: 0, flags: 0, payload: payload.clone() };
+        assert_eq!(sink.send(&f)?, Sent::Stream, "a large state must take a stream");
         let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
         assert_eq!(got.payload, payload);
         Ok(())
@@ -4788,7 +4459,7 @@ would desynchronise the stream.
 
 `cargo test --jobs 4 -p oxutrm-net tunnel:: -- --test-threads 4`
 
-Expected: PASS, 3 tests, including `a_fragmented_state_survives_the_tunnel`.
+Expected: PASS, 3 tests, including `a_large_state_takes_a_stream_through_the_tunnel`.
 
 - [ ] **Step 5: Wire rung 4 into the ladder**
 
@@ -4962,7 +4633,7 @@ use oxutrm_proto::Frame;
 use std::time::{Duration, Instant};
 
 fn frame(n: u64) -> Frame {
-    Frame { my_state: n, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: vec![(n % 251) as u8; 200] }
+    Frame { my_state: n, from_state: 0, ack_state: 0, flags: 0, payload: vec![(n % 251) as u8; 200] }
 }
 
 /// The client's socket is rebound to a different local port mid-session. QUIC
@@ -4986,9 +4657,9 @@ async fn the_session_survives_a_forced_rebind_of_the_client_socket() -> anyhow::
     let (server_conn, _keep) = accepting.await??;
 
 
-    let server_sink = FrameSink::new(server_conn.clone());
+    let server_sink = FrameSink::new(server_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut client_source = FrameSource::new(client_conn.clone());
-    let client_sink = FrameSink::new(client_conn.clone());
+    let client_sink = FrameSink::new(client_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut server_source = FrameSource::new(server_conn.clone());
 
     // A round trip before the rebind, so we know the path works at all.
@@ -5294,9 +4965,9 @@ async fn the_clients_painted_screen_equals_the_hosts_state() -> anyhow::Result<(
 
     // The host's authoritative state is read back through a second snapshot at
     // the end, so keep a handle on the loop's result rather than the term.
-    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size(), oxutrm_net::xport::NO_PATH_CAP));
 
-    let sink = FrameSink::new(client_conn.clone());
+    let sink = FrameSink::new(client_conn.clone(), oxutrm_net::xport::NO_PATH_CAP);
     let mut source = FrameSource::new(client_conn.clone());
     let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
     let mut input_tx: Sender<InputState> =
@@ -5726,9 +5397,10 @@ Task 11. §6's "0-RTT is deliberately not used": stated in the header, no task.
 §12's end-to-end row: Task 13. Roaming (§5, §1.3): Task 12.
 
 **Decisions taken from the spec rather than re-derived.**
-- Fragmentation, not a stream fallback: `Frame` carries `frag_index`/`frag_count`,
-  a state applies only when every fragment arrives, and an incomplete set is
-  discarded wholesale (§7.1.1).
+- Size picks the channel: a frame that fits takes an unreliable datagram, a
+  larger one takes a fresh unidirectional stream, and a stream superseded
+  mid-flight is reset rather than queued. There is no fragmentation, and
+  `Frame` carries no fragment fields.
 - `negotiate_term()` takes no argument. Client capabilities never reach the child
   environment (§9.4).
 - Migration is the client's own **local** address only. No task attempts to
@@ -5743,8 +5415,8 @@ Multi-client attach stays possible (§9.5) because nothing here mutates
 `Ctrl-]` is spec'd as configurable and is a fixed constant here.
 
 **Type consistency.** `TermSize { cols, rows }` everywhere, never a bare tuple.
-`Frame` is `my_state` / `from_state` / `ack_state` / `frag_index` / `frag_count`
-/ `flags` / `payload`, and `base`/`target` live **only** in `Frame` — the diff
+`Frame` is `my_state` / `from_state` / `ack_state` / `flags` / `payload`, and
+`base`/`target` live **only** in `Frame` — the diff
 structs never repeat them. `ScreenState.seq` starts at 1; 0 is the full-state
 sentinel. `ScreenState` has no `icon` field. `FrameSink::send` returns the
 datagram count. `TerminalGuard` replaces `RawGuard`, and Task 7 amends the
