@@ -33,7 +33,7 @@ tokio = { workspace = true }
 
 # A test fixture, not part of the product: it daemonizes and then reports what
 # survived, so tests/daemonize.rs can assert against a real detached process
-# rather than a mock. Uncommented once the file exists.
-# [[bin]]
-# name = "oxutrm-daemon-probe"
-# path = "src/bin/oxutrm-daemon-probe.rs"
+# rather than a mock.
+[[bin]]
+name = "oxutrm-daemon-probe"
+path = "src/bin/oxutrm-daemon-probe.rs"

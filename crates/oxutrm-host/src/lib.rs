@@ -27,8 +27,10 @@
 //! *nominated* rung with [`SessionMeta::set_detachable`], and only then may a
 //! session daemonize.
 
+pub mod daemon;
 pub mod registry;
 
+pub use daemon::daemonize;
 pub use registry::{
     META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot,
     RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, check_socket_path_length,
