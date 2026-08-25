@@ -296,7 +296,19 @@ fn a_screen_that_never_changes_produces_no_frames() {
     let mut tx = Sender::new(s.clone());
     let mut rx = Receiver::new(s);
 
+    // One frame first: acknowledgements travel only on frames, so until the
+    // peer has heard our ack once there IS something to say. Both ends start
+    // holding a state numbered 1, but neither has heard that from the other.
+    let hello = tx
+        .make_frame(rx.ack())
+        .expect("make_frame")
+        .expect("the first ack has to travel somehow");
+    rx.on_frame(&hello).expect("apply");
     tx.on_ack(rx.ack());
+
+    // From here, nothing changes and nothing is sent. Staying detached for a
+    // week costs no bandwidth (spec §9.3).
+    assert!(tx.make_frame(rx.ack()).expect("make_frame").is_none());
     assert!(tx.make_frame(rx.ack()).expect("make_frame").is_none());
 
     let mut next = tx.current().clone();
@@ -309,10 +321,31 @@ fn a_screen_that_never_changes_produces_no_frames() {
     rx.on_frame(&f).expect("apply");
 
     tx.on_ack(rx.ack());
+
+    // One more frame is owed, and it is not the state: the peer has moved to
+    // state 2 and has not yet heard us say so. An acknowledgement can only
+    // travel on a frame, so a side with nothing of its own to say still sends
+    // exactly one — carrying an empty diff.
+    let ack_only = tx
+        .make_frame(rx.ack())
+        .expect("make_frame")
+        .expect("the ack for state 2 has not been sent yet");
+    assert_eq!(
+        ack_only.ack_state, 2,
+        "the ack-only frame must carry the ack it exists to deliver"
+    );
+    assert_eq!(
+        ack_only.my_state, ack_only.from_state,
+        "an ack-only frame describes no change of our own"
+    );
+
+    // And then silence, for as long as nothing moves.
     assert!(
         tx.make_frame(rx.ack()).expect("make_frame").is_none(),
-        "with the peer caught up there is nothing left to send"
+        "with the peer caught up and the ack delivered there is nothing left \
+         to send"
     );
+    assert!(tx.make_frame(rx.ack()).expect("make_frame").is_none());
 }
 
 #[test]

@@ -32,13 +32,24 @@ pub struct Sender<S: SyncState> {
     ring: VecDeque<S>,
     /// The highest state of ours the peer has acknowledged.
     peer_saw: u64,
+    /// The last `ack_state` we actually put on the wire.
+    ///
+    /// Without this an acknowledgement can only travel piggybacked on data,
+    /// so a side with nothing of its own to say can never acknowledge
+    /// anything — and a user who is only WATCHING output never types, so
+    /// never acks, so the sender stays pinned to an ancient base forever.
+    last_ack_sent: u64,
 }
 
 impl<S: SyncState> Sender<S> {
     pub fn new(initial: S) -> Sender<S> {
         let mut ring = VecDeque::with_capacity(STATE_RING);
         ring.push_back(initial);
-        Sender { ring, peer_saw: 0 }
+        Sender {
+            ring,
+            peer_saw: 0,
+            last_ack_sent: 0,
+        }
     }
 
     /// Replace the current state, assigning it the next sequence number.
@@ -83,11 +94,20 @@ impl<S: SyncState> Sender<S> {
     /// That is measured every time rather than assumed from a size threshold:
     /// a small diff of high-entropy bytes grows under zstd, and sending it
     /// grown would be a silent regression on the keystroke path.
-    pub fn make_frame(&self, ack_state: u64) -> Result<Option<Frame>, ApplyError> {
-        let current = self.current();
-        if self.peer_saw == current.seq() {
+    pub fn make_frame(&mut self, ack_state: u64) -> Result<Option<Frame>, ApplyError> {
+        let current_seq = self.current().seq();
+        // Two reasons to send. The obvious one is that our own state moved.
+        // The other is that we owe the peer an acknowledgement it has not
+        // heard yet: acks travel only on frames, so if we never send one
+        // because nothing of ours changed, the peer's sender is stranded on
+        // whatever base it last heard about. The resulting frame carries an
+        // empty diff and exists purely to move the ack.
+        let state_moved = self.peer_saw != current_seq;
+        let ack_owed = ack_state > self.last_ack_sent;
+        if !state_moved && !ack_owed {
             return Ok(None);
         }
+        let current = self.current();
 
         // Diff against the peer's acknowledged state if we still hold it.
         let base = self.ring.iter().find(|s| s.seq() == self.peer_saw);
@@ -109,8 +129,9 @@ impl<S: SyncState> Sender<S> {
             _ => (raw, 0),
         };
 
+        self.last_ack_sent = ack_state;
         Ok(Some(Frame {
-            my_state: current.seq(),
+            my_state: current_seq,
             from_state,
             ack_state,
             flags,
@@ -146,26 +167,24 @@ impl<S: SyncState> Receiver<S> {
     /// the sender "I have state N" while holding N-1, and the sender would
     /// then diff against N forever while the receiver rejected every one.
     pub fn on_frame(&mut self, f: &Frame) -> Result<bool, ApplyError> {
-        // The peer's acknowledgement is recorded FIRST, and from every frame
-        // including stale and duplicate ones. `ack_state` is a statement about
-        // what the PEER holds; whether this frame's payload happens to be
-        // applicable to US is a separate question. Throwing it away would
-        // leave our sender diffing from an older base than it needs to, and
-        // never retiring states from its ring — a permanent bandwidth cost
-        // that only reordering and loss ever trigger, so no happy-path test
-        // would show it.
+        // The peer's acknowledgement is recorded FIRST, and from EVERY frame
+        // including stale and duplicate ones. `ack_state` describes what the
+        // PEER holds; whether this frame's payload is applicable to US is a
+        // separate question.
+        //
+        // This is not an optimisation, it is half of a matched pair. A side
+        // with nothing of its own to say sends an ACK-ONLY frame, which by
+        // construction repeats its current state number and is therefore
+        // always stale right here. Drop the ack and that frame accomplishes
+        // nothing, and a peer that has stopped typing never acknowledges the
+        // screen again — which strands the other end's sender on an ancient
+        // base until ring eviction accidentally rescues it.
         //
         // Monotonic, because reordering can deliver an older acknowledgement
-        // after a newer one and taking that at face value would un-retire
-        // states the sender had already dropped.
-        //
-        // And ONLY once the peer has actually reached us. Before that, both
-        // ends hold a locally-invented initial state that happens to be
-        // numbered 1, so a peer's `ack_state` of 1 is not a claim about
-        // anything we sent — it is that peer describing its own blank screen.
-        // Believing it makes our sender diff against ITS OWN state 1, a
-        // different screen with the same number, and the peer then silently
-        // never learns what was already on ours.
+        // after a newer one, and believing it would un-retire states the
+        // sender had already dropped.
+        self.peer_ack = self.peer_ack.max(f.ack_state);
+
         if f.my_state <= self.state.seq() {
             return Ok(false);
         }
@@ -372,8 +391,6 @@ mod tests {
     /// Nothing on the happy path shows this, because stale frames appear only
     /// under reordering and loss.
     #[test]
-    #[ignore = "known limitation: absorbing a stale frame's ack destabilises \
-                the session loop; see the comment above"]
     fn a_stale_frame_still_advances_the_peers_ack() {
         let mut tx = Sender::new(screen());
         tx.update(screen());

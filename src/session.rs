@@ -63,6 +63,10 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 pub struct Turn {
     pub sent: Option<SendOutcome>,
     pub applied: usize,
+    /// Frames that arrived but could not be applied. A steady stream of these
+    /// means the two ends disagree about the base, which is a deadlock rather
+    /// than a slow link.
+    pub rejected: usize,
     pub exited: Option<i32>,
 }
 
@@ -132,7 +136,13 @@ impl HostSession {
                     self.drain_input()?;
                 }
                 Ok(false) => {}
-                Err(_) => {}
+                // Not a disconnection, but not nothing either: a BaseMismatch
+                // is the peer diffing from a base we do not hold, and silence
+                // here once hid a deadlock for a whole day.
+                Err(e) => {
+                    turn.rejected += 1;
+                    eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
+                }
             }
         }
 
@@ -329,7 +339,12 @@ impl ClientSession {
                     painted = true;
                 }
                 Ok(false) => {}
-                Err(_) => {}
+                // See the host's copy of this arm: a silently swallowed
+                // BaseMismatch is a frozen screen that looks like a slow one.
+                Err(e) => {
+                    turn.rejected += 1;
+                    eprintln!("oxutrm: client dropped an unapplicable screen frame: {e}");
+                }
             }
         }
         if painted {
@@ -477,6 +492,64 @@ mod tests {
         let mut host = host;
         host.term.write_input(shell.as_bytes()).unwrap();
         (host, client)
+    }
+
+    /// The bug the loopback tests structurally could not catch.
+    ///
+    /// `loopback.rs` calls `on_ack(rx.ack())` directly, handing the sender the
+    /// receiver's ack in-process and bypassing the frame entirely. On a real
+    /// link an ack travels ONLY on a frame — so a side that has nothing of its
+    /// own to say must still send one, or it never acknowledges anything.
+    ///
+    /// A user who is only watching output never types. Before the fix the host
+    /// stayed pinned to whatever base it last heard about, every subsequent
+    /// diff arrived as `BaseMismatch`, and the screen froze — recovering only
+    /// by accident, when 32 further updates evicted that base from the ring and
+    /// the sender fell back to full states.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_stops_typing_keeps_receiving_output() {
+        let (mut host, mut client) = pair_on("127.0.0.1:0", "").await;
+        let mut out = Vec::new();
+
+        // One burst of typing, then the client goes quiet for good.
+        host.term
+            .write_input(b"printf 'first\r\n'\n")
+            .expect("write");
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| { text(c.screen()).contains("first") }
+            )
+            .await,
+            "the client never saw the first output at all"
+        );
+
+        // Well past STATE_RING updates, so a run that only recovered by ring
+        // eviction would still be frozen here. Nothing is typed from now on.
+        for i in 0..40 {
+            host.term
+                .write_input(format!("printf 'line-{i}\\r\\n'\n").as_bytes())
+                .expect("write");
+        }
+
+        let caught_up = drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            Duration::from_secs(30),
+            |_, c| text(c.screen()).contains("line-39"),
+        )
+        .await;
+        assert!(
+            caught_up,
+            "the client stopped receiving once it stopped typing: an ack can \
+             only travel on a frame, so a silent side must still send one\n\
+             --- client ---\n{}",
+            text(client.screen())
+        );
     }
 
     /// Turn both loops until `f` holds, or give up.
@@ -698,26 +771,55 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
+
+        // Fill the host's screen with the CLIENT HELD BACK. With no ack from
+        // the client the host has nothing to diff against, so every frame is a
+        // full state — and a full state for a 200x60 screen of distinct
+        // truecolor cells cannot fit in a datagram. That is the ring-miss and
+        // first-attach case the stream path exists for, and holding the client
+        // back reproduces it deterministically instead of hoping a diff
+        // happens to come out large.
+        let fill_by = Instant::now() + Duration::from_secs(30);
         let mut used_stream = false;
-        let deadline = Instant::now() + Duration::from_secs(25);
-        while Instant::now() < deadline {
+        while Instant::now() < fill_by {
             let t = host.turn().expect("host turn");
             if matches!(t.sent, Some(SendOutcome::Stream { .. })) {
                 used_stream = true;
             }
-            client.turn(&[], &mut out).expect("client turn");
-            if used_stream && client.screen().seq == host.screen().seq {
+            if used_stream && text(host.screen()).contains("-59") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(3)).await;
         }
-
+        assert!(
+            text(host.screen()).contains("-59"),
+            "the shell never filled the screen, so nothing large was ever \
+             offered\n--- host ---\n{}",
+            text(host.screen())
+        );
         assert!(
             used_stream,
-            "a frame larger than a datagram must go on a stream"
+            "no frame exceeded a datagram even with a full 200x60 truecolor \
+             screen and no ack to diff against, so the stream path was never \
+             taken and this test proved nothing"
+        );
+
+        // Now let the client in and wait for the screens to agree.
+        let converged = drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            Duration::from_secs(30),
+            |h, c| text(c.screen()) == text(h.screen()),
+        )
+        .await;
+        assert!(
+            converged,
+            "the client never caught up after the oversized state\n--- host ---\n{}\n--- client ---\n{}",
+            text(host.screen()),
+            text(client.screen())
         );
         assert_eq!(client.screen().validate(), Ok(()));
-        assert_eq!(text(client.screen()), text(host.screen()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
