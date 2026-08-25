@@ -147,10 +147,15 @@ pub enum Signal {
         candidates: Vec<Candidate>,
         nat_type: NatType,
         bound_port: u16,
-        /// False once the session has fallen back to rung 4 (SSH tunnel): it
-        /// cannot close its SSH descriptors, so it never daemonizes and can
-        /// never be reattached. The client needs this at handshake to render
-        /// the connect-time warning.
+        /// The host's INTENT, not the outcome. `HostHello` is written BEFORE
+        /// the ladder runs — the candidates travel in it — so at this point
+        /// nobody yet knows which rung will be nominated. False here only when
+        /// the host already knows it cannot detach.
+        ///
+        /// Actual detachability is settled LATER, by the nominated rung, and
+        /// that is the only place it becomes `SessionMeta.detachable`. A
+        /// session that daemonized on intent and then landed on rung 4 would
+        /// have closed the very SSH descriptors it needs to carry its data.
         detachable: bool,
     },
     ClientHello {
@@ -627,8 +632,11 @@ pub struct SessionMeta {
     pub created_unix: u64,
     pub shell: String,
     pub size: TermSize,
-    /// False for a rung-4 (SSH-tunnelled) session: it cannot daemonize,
-    /// so it dies with its SSH connection and cannot be reattached.
+    /// Settled by the NOMINATED RUNG, never at handshake time:
+    /// `detachable = rung != Rung::SshTunnel`. A rung-4 session tunnels QUIC
+    /// over the SSH connection for its whole life, so it cannot close those
+    /// descriptors, cannot daemonize, dies with its SSH, and cannot be
+    /// reattached. Daemonization happens only AFTER this is settled.
     pub detachable: bool,
 }
 
