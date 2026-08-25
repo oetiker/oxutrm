@@ -26,9 +26,11 @@ scrollback.
 - **Detach and reattach**: the remote session outlives the client indefinitely.
 - **Working scrollback**, which Mosh cannot provide.
 - **Full fidelity**: 24-bit colour, SGR mouse reporting, resize **with reflow**,
-  window title, OSC 52 clipboard, and the full SGR attribute set including
-  strikethrough, blink and hidden. This is meant literally — no attribute in the
-  model is a field the emulator cannot fill.
+  window title, OSC 52 clipboard, and a genuinely complete attribute set —
+  inverse, bold, italic, dim, hidden and strikeout natively, **five** underline
+  styles (single, double, undercurl, dotted, dashed), **per-cell underline
+  colour** (SGR 58/59) and OSC 8 hyperlinks. Blink is the one attribute the
+  emulator parses but drops, and §9.1.1 recovers it. This is meant literally.
 - **Bandwidth adaptation** so a poor link degrades gracefully instead of
   falling behind.
 - **`tmux -CC` control mode integration** (phase D), so window switching and the
@@ -43,6 +45,12 @@ scrollback.
 - Replacing tmux. oxutrm integrates with it (phase D) rather than competing.
 - Being a general-purpose VPN or port forwarder.
 - Windows support in v1. Unix PTY semantics are assumed throughout.
+- **Icon name (`OSC 1`).** The emulator's `osc_dispatch` matches only `0` and `2`;
+  there is no `1` arm and no handler method, so `ESC ] 1 ; name BEL` is silently
+  discarded — verified empirically, it raises no event at all. Recovering it would
+  mean pre-scanning the PTY byte stream, reintroducing the second parser §9.1.1
+  exists to avoid. `ScreenState` therefore carries **no `icon` field**. `OSC 0`,
+  which sets both title and icon, still yields the title.
 
 ### 1.3 What differs from Mosh, and why it matters
 
@@ -573,8 +581,7 @@ struct ScreenState {
     cells: Vec<Cell>,          // rows * cols, row-major
     cursor: Cursor,            // row, col, visible, shape
     modes: Modes,              // alt-screen, bracketed paste, mouse mode, keypad/cursor app
-    title: String,
-    icon: String,
+    title: String,             // OSC 0 and OSC 2; there is no icon field, see §1.2
     bell: u32,                 // monotonic counter; client rings on increase
     scrollback_len: u64,       // total lines ever scrolled off; lines travel on a stream
 }
@@ -586,11 +593,11 @@ struct Cell { text: CompactString, fg: Color, bg: Color, attrs: Attrs }
 marks survive intact. Wide-character continuation cells are represented
 explicitly, not as spaces.
 
-`Attrs` carries **bold, dim, italic, underline, inverse, strikethrough, blink and
-hidden**. All eight are real: `alacritty_terminal` parses SGR 5, 8 and 9 into its
-cell flags, so the last three are values the emulator actually holds rather than
-fields that would always read false. This is what lets §1.1's "full fidelity"
-claim stand without qualification.
+`Attrs` carries **inverse, bold, italic, dim, hidden and strikeout** as native
+cell flags, **five underline styles** (single, double, undercurl, dotted, dashed)
+and a **per-cell underline colour** from SGR 58/59. **Blink** is carried too, but
+is the one attribute the emulator parses and then discards, so §9.1.1 recovers it
+explicitly. OSC 8 hyperlinks are available per cell and are not modelled in v1.
 
 ```rust
 struct ScreenDiff {
@@ -599,7 +606,6 @@ struct ScreenDiff {
     cursor: Option<Cursor>,
     modes: Option<Modes>,
     title: Option<String>,
-    icon: Option<String>,
     bell: Option<u32>,
     scrollback_len: Option<u64>,
 }
@@ -616,6 +622,13 @@ times consecutively**, starting at `start_col`. So `repeat == 0` means the
 sequence appears once, and a run of 40 identical blanks is
 `Run { start_col, repeat: 39, cells: vec![blank] }`. A run therefore covers
 `cells.len() * (repeat + 1)` columns, and a `RowPatch`'s runs must not overlap.
+
+**Finding the changed rows is not oxutrm's problem to solve.** `Term::damage()`
+returns per-line dirty ranges and `reset_damage()` clears them, which is exactly
+the question `ScreenDiff.rows` asks of every frame. The diff engine consults
+damage to decide which rows to examine rather than comparing the whole grid, and
+`oxutrm-sync` stays pure regardless — damage is an input handed to it, not a
+source of I/O.
 
 The host retains a ring of its last **32** states so it can diff from whatever
 the client last acknowledged. If the client's acknowledged state has fallen out
@@ -719,19 +732,54 @@ in phase A+B it always has exactly one member.
 the PTY's output bytes. It is the only thing that touches that byte stream, and
 it is the single source of truth for the session.
 
-Nothing is hand-rolled around it. Everything `ScreenState` needs, the crate
-already provides:
+Most of what `ScreenState` needs, the crate supplies directly:
 
 | `ScreenState` field | Source |
 |---|---|
 | `cells`, `cursor`, `modes` | the `Term` grid and its mode flags |
-| `title`, `icon` | `EventListener` events, raised as the emulator parses `OSC 0/1/2` |
+| `title` | `EventListener`, from `OSC 0` and `OSC 2` (`OSC 1` is discarded — §1.2) |
 | `bell` | the `EventListener` bell event, counted monotonically |
-| `scrollback_len` | the crate's own scrollback, which is addressable by line index |
+| `scrollback_len` | synthesised from the grid's history, below |
 
-OSC 52 likewise arrives as an `EventListener` clipboard event and is forwarded to
-the Clipboard stream (§7.2). `HostTerm` implements the listener; it does not
-re-parse escape sequences that the emulator has already parsed.
+OSC 52 arrives as an `EventListener` clipboard event. `HostTerm` implements the
+listener and does **not** re-parse escape sequences the emulator has already
+parsed.
+
+Four obligations are not obvious from the crate's surface and are load-bearing.
+
+**1. Blink must be intercepted.** The parser recognises SGR 5, 6 and 25 and turns
+them into `Attr::BlinkSlow`, `Attr::BlinkFast` and `Attr::CancelBlink`, but
+`Term::terminal_attribute` then drops all three into a `debug!` and they never
+reach a cell flag. `HostTerm` therefore wraps `Term` in a newtype implementing
+`vte::ansi::Handler` that forwards every method unchanged, except that it
+intercepts those three attributes and records them in a **parallel blink plane**
+keyed by `term.grid().cursor.point`. The plane is read alongside the grid when
+building `ScreenState`. Hidden and strikeout need none of this — they are native
+flags.
+
+**2. There is no monotonic scrolled-off counter.** `history_size()` reports
+current occupancy and **saturates** at `scrolling_history`, so it stops growing
+once the ring is full and cannot serve `scrollback_len`. `HostTerm` synthesises
+the counter: it keeps `prev_history` across each `advance()` and accumulates
+`history_size().saturating_sub(prev_history)`. This is one line of code and it is
+written down here because everything about the crate's API invites the assumption
+that it is provided.
+
+**3. Cell indexing panics.** `Index<Point>` carries only a `debug_assert`, so an
+out-of-range point is **unchecked in release** and reads out of bounds rather than
+failing loudly. Every access must clamp with
+`Point::grid_clamp(&dims, Boundary::Grid)` or go through a checked wrapper
+returning `Option<&Cell>`. This is a hard requirement, not a style preference: the
+diff engine indexes by coordinates that arrive over the network, and the previous
+emulator's `Screen::cell()` returned an `Option`, so code ported from it will be
+written against the safer contract.
+
+**4. The crate ships no colour palette.** `Term::colors()` is an **override**
+table fed by `OSC 4`, `10` and `11`, and every entry is `None` by default —
+indexed and named colours resolve to nothing until something supplies them.
+oxutrm owns its own 269-entry table (16 system + 216 cube + 24 greyscale +
+foreground, background and cursor) and consults `colors()` only as an override
+layer on top of it.
 
 **Scrollback is the crate's, not ours.** `alacritty_terminal` retains scrolled-off
 lines in an addressable buffer, so `ScrollbackReq { from, to }` (§7.2) is answered
@@ -740,10 +788,12 @@ parallel scrollback ring: a second copy would be a second source of truth, and
 keeping it consistent with the grid across resize and reflow is exactly the kind
 of bug the "single source of truth" property exists to prevent.
 
-**Resize reflows.** `Term::resize` rewraps previously wrapped lines rather than
-truncating them, so a narrowed and then re-widened window recovers its text. The
-host resizes the `Term` and the PTY together and lets the next diff carry the
-result; the client does not attempt to predict a reflow.
+**Resize reflows, losslessly.** `Term::resize` rewraps previously wrapped lines
+rather than truncating them — verified in both directions: shrinking pushes rows
+into history, and growing pulls them back and re-joins the text. This applies to
+the **primary grid only**; the alternate screen never reflows, which is correct
+and matches every other emulator. The host resizes the `Term` and the PTY together
+and lets the next diff carry the result; the client does not predict a reflow.
 
 ### 9.2 Registry
 
@@ -1027,7 +1077,7 @@ risky about the protocol is therefore testable in isolation.
 |---|---|---|
 | `quinn` | 0.11 | QUIC transport; `new_with_abstract_socket` (§5.3.1) |
 | `rustls` | 0.23, via `quinn`'s re-export | TLS 1.3, custom pinning verifier (§6.1) |
-| `alacritty_terminal` | 0.26 | terminal emulation, both ends |
+| `alacritty_terminal` | 0.26, `default-features = false` | terminal emulation, both ends |
 | `rustix`, `rustix-openpty` | 1 / 0.2 | PTY, termios, process control |
 | `stunclient` | 0.4 | pre-QUIC address discovery **only** (§5.3.1) |
 | `stun_codec` | 0.4 | ICE checks, nomination, keepalive, test STUN server |
@@ -1049,16 +1099,29 @@ sharing a `digest` generation with them must stay on the 0.10-era releases.
 `hkdf` 0.13 and `sha2` 0.11 belong to the next generation and cannot coexist with
 them in one graph.
 
-**The emulator is a released crate, not a fork.** `alacritty_terminal` 0.26 is
+**The emulator is a released crate, not a fork.** `alacritty_terminal` 0.26.0 is
 published on crates.io and is depended on by version, so there is no branch to
 move underneath the build and no commit to pin. That is a deliberate change from
-an earlier draft, which pinned a fork of `vt100`; §18 records why.
+an earlier draft, which pinned a fork of `vt100`; §18.1 records why.
 
-It is relied on for the whole of the terminal layer, not merely the grid: cells
-and the full attribute set, wrapping, wide characters, the mode flags, resize
-**with reflow**, addressable scrollback, and the `EventListener` events that
-carry title, icon, bell and OSC 52. No `ScreenState` field depends on anything
-oxutrm has to hand-roll around it (§9.1.1).
+It is relied on for the whole of the terminal layer: cells and the full attribute
+set, wrapping, wide characters, the mode flags, resize **with reflow**,
+addressable scrollback, per-line damage tracking, and the `EventListener` events
+that carry title, bell and OSC 52. The four things oxutrm must still do for
+itself are enumerated in §9.1.1.
+
+Three facts about the dependency, recorded because they constrain the workspace:
+
+- **`serde` is a default feature and is switched off.** oxutrm's wire encoding is
+  `postcard` over its own types (§7), so the emulator's `serde` impls are weight
+  with no purpose.
+- **It is heavier than its role suggests.** There is no feature flag separating
+  the grid from the crate's `tty` and `event_loop` modules, so a PTY
+  implementation, `polling` and `signal-hook` come along with it. oxutrm drives
+  its own PTY (`rustix-openpty`) and does not use those modules. This is an
+  accepted cost, not an oversight.
+- **Edition 2024, `rust-version = 1.85.0`, Apache-2.0.** That MSRV is the
+  workspace's floor, and the licence differs from the rest of the tree.
 
 ---
 
@@ -1153,7 +1216,7 @@ resolved above. Recorded here so the changes are auditable.
 | 4 | `InputDiff` could not express prefix removal, so input replayed | §8.3: `consumed: u64` added; `apply` is drop-then-append |
 | 5 | Rung 4 needs SSH alive, but §4.3 closed every SSH descriptor | §4.3, §5.5, §9.2: rung 4 skips daemonization, is not detachable, `SessionMeta.detachable` records it, registry entry dies with its SSH |
 | 6 | 0-RTT is impossible given fresh keys per attach | §6: removed from the table, with the reason stated |
-| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | Superseded by the emulator change below: `alacritty_terminal` supplies all of them natively, so §9.1.1 hand-rolls nothing |
+| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | Superseded by §18.1: `alacritty_terminal` supplies title, bell, OSC 52 and scrollback natively. Icon name is unavailable in either emulator and the field is dropped (§1.2) |
 | 8 | ICE had no roles, no tie-break, and one shared key for both directions | §5.3: client is deterministically controlling, only it nominates, credentials derived per direction via HKDF-SHA256 |
 | 9 | `$XDG_RUNTIME_DIR` is destroyed at logout, killing reattach | §9.2: `loginctl ... Linger` is checked, `$HOME/.local/state/oxutrm/` is the fallback, the fallback is announced loudly |
 | 10 | `crab_nat` has no gateway discovery | §5.2: `netdev::get_default_gateway` supplies it; rung 1 is skipped if unavailable |
@@ -1165,28 +1228,39 @@ resolved above. Recorded here so the changes are auditable.
 | 16 | Two STUN probes cannot separate `AddressDependent` from `Symmetric` | §5.3: three probes, with a second port on the same server IP, and an explicit truth table |
 | 17 | The pinning verifier's signature-checking duty was unstated | §6.1: the verifier checks the SPKI hash **and** performs real TLS 1.3 signature verification; `CryptoProvider` installation and TLS-1.3-only noted |
 
-### 18.1 Emulator change: `vt100` → `alacritty_terminal`
+### 18.1 Emulator selection
 
 Made after the seventeen findings above were applied, and recorded separately
-because it supersedes part of finding 7 rather than following from it.
+because it supersedes part of finding 7 rather than following from it. It was
+decided twice, and the second decision reversed the first.
 
-Finding 7 was resolved by having `HostTerm` hand-roll a sidecar scanner and a
-scrollback ring around a pinned fork of `vt100`. An audit of that fork
-(`Junyi-99/vt100-rust` `deck`, commit `4bca1b1ec4efbb73b55f6c229e38268dca836825`)
-then showed the workaround could not carry the whole load:
+**First: patch `vt100`.** Finding 7 was originally resolved by having `HostTerm`
+hand-roll a sidecar scanner over the PTY byte stream plus its own scrollback ring,
+wrapped around a pinned fork (`Junyi-99/vt100-rust` `deck`, commit
+`4bca1b1ec4efbb73b55f6c229e38268dca836825`). An audit of that commit found two
+gaps that no wrapper could close, because they are missing *values* rather than
+missing accessors: the parser discards SGR 5, 8 and 9 before they reach the grid,
+and scrolled-off rows sit in a private `VecDeque` with no indexed accessor and no
+fill counter. The plan became a small patch adding both.
 
-- it has **no way to read scrollback by line index** and **no scrolled-off line
-  counter**, and synced scrollback (§1.1, §14) is a stated v1 feature;
-- its parser **discards SGR 5, 8 and 9 outright**, so blink, hidden and
-  strikethrough never reach the grid — these were missing values, not missing
-  getters, and no wrapper could recover them.
+**Then: adopt `alacritty_terminal` 0.26.0 instead.** A probe program was compiled
+and run against the crate to establish what it does empirically rather than from
+documentation. It needs no fork at all, and it is better than the patched fork
+would have been: five underline styles, per-cell underline colour, OSC 8
+hyperlinks, lossless reflow in both directions, and per-line damage tracking that
+answers the diff engine's central question for free.
 
-The emulator is therefore **`alacritty_terminal` 0.26.0 on both ends**. It is a
-released crate rather than a fork, so the commit pin and its placeholder are gone.
-Consequences already applied above: §9.1.1 no longer hand-rolls anything, since
-title, icon, bell and OSC 52 arrive as `EventListener` events and scrollback is
-addressable by line index; §8.2's `Attrs` genuinely carries strikethrough, blink
-and hidden, so §1.1's "full fidelity" is now literal; and resize **reflows**
-wrapped lines rather than truncating them.
+**The accepted cost is the icon name.** `OSC 1` is silently discarded — the
+crate's `osc_dispatch` matches only `0` and `2`, with no `1` arm and no handler
+method, confirmed by feeding `ESC ] 1 ; MyIcon BEL` and observing no event.
+Recovering it would require pre-scanning the byte stream, which is the second
+parser this design removed. `ScreenState.icon` is therefore **dropped** (§1.2).
+This is a real loss, recorded rather than worked around.
+
+Four smaller obligations the probe surfaced are specified in §9.1.1: blink is
+parsed but dropped and must be intercepted through a `Handler` newtype;
+`history_size()` saturates and cannot serve `scrollback_len`; `Index<Point>` is
+unchecked in release and every access must clamp; and the crate ships no colour
+palette, only an override table.
 
 This document contains **no placeholders**.
