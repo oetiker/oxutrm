@@ -1035,7 +1035,7 @@ risky about the protocol is therefore testable in isolation.
 | `rustix`, `rustix-openpty` | 1 / 0.2 | PTY, termios, process control |
 | `stunclient` | 0.4 | pre-QUIC address discovery **only** (§5.3.1) |
 | `stun_codec` | 0.4 | ICE checks, nomination, keepalive, test STUN server |
-| `hkdf`, `sha2` | 0.13 / 0.11 | directional ICE credentials from the `psk` (§5.3) |
+| `hkdf`, `sha2` | 0.12 / 0.10 | directional ICE credentials from the `psk` (§5.3) |
 | `crab_nat` | 0.8 | NAT-PMP and PCP (caller supplies the gateway) |
 | `igd-next` | 0.17 | UPnP-IGD, including its own SSDP discovery |
 | `netdev` | 0.46 | default-gateway lookup for `crab_nat` (§5.2) |
@@ -1046,6 +1046,12 @@ risky about the protocol is therefore testable in isolation.
 | `zstd` | 0.13 | opportunistic payload compression |
 | `anyhow` | 1 | error handling, matching house style |
 | `proptest` | 1 | the convergence property |
+
+The RustCrypto versions above are not free choices: STUN `MESSAGE-INTEGRITY` is
+HMAC-SHA1, so `hmac` 0.12 and `sha1` 0.10 are already required, and everything
+sharing a `digest` generation with them must stay on the 0.10-era releases.
+`hkdf` 0.13 and `sha2` 0.11 belong to the next generation and cannot coexist with
+them in one graph.
 
 **`vt100` is pinned by commit hash, not by branch.** A branch name is not a
 reproducible dependency — `deck` can move underneath the build, and this is the
