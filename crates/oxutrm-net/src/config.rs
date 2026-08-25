@@ -7,6 +7,18 @@ pub struct NetConfig {
     /// `host:port` strings. Resolved lazily, in parallel. An entry that does
     /// not resolve is skipped rather than fatal: a STUN server list is a list
     /// of hopes, not of requirements.
+    ///
+    /// Two things are read out of the shape of this list, not just its
+    /// contents (see [`crate::stun_discover`]):
+    ///
+    /// - **entries whose IPs differ** are what makes NAT typing possible at
+    ///   all, so at least two distinct operators belong here;
+    /// - **two entries with the same resolved IP and different ports** declare
+    ///   that the server answers on both, which is the only way to separate
+    ///   `AddressDependent` from `Symmetric`. The defaults below cannot do
+    ///   this — no public server in the list publishes a second port — so the
+    ///   two verdicts stay merged. Adding the pair is an operator's call, and
+    ///   the classifier never guesses one.
     pub stun_servers: Vec<String>,
     /// The port to try first. UDP/443 (spec §5.6), because a network that
     /// blocks it breaks HTTP/3 for every browser on it.
@@ -91,6 +103,12 @@ mod tests {
 
         // Distinct operators: comparing the mapped port from two servers run by
         // the same operator can share a front end and reveal nothing.
+        //
+        // This also pins the fact the classifier is built around: no two
+        // default entries share a host, so the default list declares NO
+        // alternate port, so `AddressDependent` and `Symmetric` are merged out
+        // of the box. Anything that assumes an alternate port exists here is
+        // assuming something this assertion forbids.
         let hosts: std::collections::HashSet<_> = c
             .stun_servers
             .iter()

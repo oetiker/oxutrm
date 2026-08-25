@@ -286,6 +286,18 @@ Any probe that times out yields `Unknown`, which is treated as
 follows if it fails. A `Symmetric` verdict skips directly to rung 3 rather than
 burning several seconds failing.
 
+> **Correction (implemented behaviour).** The claim above that "both Cloudflare
+> and Google publish an alternate port" is wrong, and believing it cost a bug:
+> `stun.cloudflare.com` does not answer on 3479, so the alternate-port probe —
+> implemented as `port + 1` — timed out on every real run and `Symmetric` was
+> unreachable outside the test suite. As implemented, the deciding pair is `A1`
+> vs `B1`, two servers at **different IPs**: a mapping that differs between
+> them is reported `Symmetric`. The `A1` vs `A2` row survives as a refinement
+> that separates `AddressDependent` back out, and it runs only when the
+> configured server list actually names a second port on `A`'s IP; the default
+> list does not, so those two verdicts are merged there. `oxutrm-net::discover`
+> and the contract are normative on this.
+
 **Punching uses real ICE.** Probes are **STUN Binding Requests carrying a
 `MESSAGE-INTEGRITY` attribute**, keyed by credentials derived from the `psk`
 rather than by the `psk` itself — see "Credentials are derived" below — exactly

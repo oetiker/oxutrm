@@ -588,10 +588,25 @@ impl PortMapping {
 impl Drop for PortMapping;             // releases the mapping
 
 /// Query several STUN servers from `socket`; classify the NAT by comparing
-/// the mapped ports they report.
-/// THREE probes, not two: two servers at different IPs, plus a second port on
-/// the FIRST server's IP. Two probes can only separate `EndpointIndependent`
-/// from the rest; they cannot tell `AddressDependent` from `Symmetric`.
+/// the mapped addresses they report.
+///
+/// TWO probes decide, a third refines. P1 is the first server; P2 is a server
+/// at a genuinely DIFFERENT IP, and a mapping that differs between the two is
+/// `Symmetric`. P3 is a second port on P1's IP and separates
+/// `AddressDependent` from `Symmetric` — but it runs ONLY when
+/// `cfg.stun_servers` names such a port (two entries, same resolved IP,
+/// different ports). It is never `P1.port() + 1`.
+///
+/// CHANGED, and why: P3 used to be the guess `P1.port() + 1`, and no server in
+/// `NetConfig::default()` answers there, so P3 always timed out and the
+/// `Symmetric` arm — the one thing that sends the ladder straight to rung 3 —
+/// was unreachable outside the tests, which stood a responder up on `port + 1`
+/// to manufacture it. `P1` vs `P2` differing therefore now yields `Symmetric`
+/// where it used to yield `Unknown`; without P3 that verdict is merged with
+/// `AddressDependent`, which is deliberate. Rung 2's premise is a reusable
+/// server-reflexive candidate, and a per-destination mapping has already
+/// broken it, so the merged verdict skips a rung that could not have worked;
+/// the old `Unknown` instead burned the whole gather budget on it.
 pub async fn stun_discover(
     socket: &tokio::net::UdpSocket,
     cfg: &NetConfig,

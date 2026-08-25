@@ -9,32 +9,57 @@
 //! why an HTTP echo service is not an acceptable substitute: it answers over
 //! TCP and reports only the IP, while the port is the hard half.
 //!
-//! # Three probes, not two
-//!
-//! Two servers at two different IPs separate `EndpointIndependent` from
-//! everything else, and nothing more. They **cannot** tell `AddressDependent`
-//! from `Symmetric`, because both allocate a fresh mapping when the
-//! destination IP changes. The difference shows only when the destination
-//! **port** changes while the IP stays the same:
-//!
-//! - an **address-dependent** mapping keys on the destination IP alone, so a
-//!   second port on the same server reuses the mapping;
-//! - a **symmetric** mapping keys on both, so a second port on the same server
-//!   gets a new external port.
+//! # The probes, and which verdict each one can reach
 //!
 //! | Probe | Destination | What it isolates |
 //! |---|---|---|
-//! | **P1** | first server, its configured port | the baseline mapping |
-//! | **P2** | the same IP as P1, **port + 1** | whether the destination *port* moves the mapping |
-//! | **P3** | a **different** server IP | whether the destination *IP* moves the mapping |
+//! | **P1** | the first server, at its configured port | the baseline mapping |
+//! | **P2** | a **genuinely different server IP** | whether the destination *IP* moves the mapping |
+//! | **P3** | a **second configured port on P1's IP**, when the server list names one | whether the destination *port* moves the mapping |
 //!
-//! This matters concretely, not academically. `Symmetric` is what sends the
-//! ladder to rung 3, the birthday blast. Misclassifying it as
-//! `AddressDependent` means several seconds spent failing at ordinary hole
-//! punching first — on exactly the connections that are already hardest.
+//! P1 and P2 are the load-bearing pair, and they are the only two the default
+//! configuration can actually run. A mapping that differs between two
+//! destination IPs is per-destination — the address a STUN server reports is
+//! then not the address a peer will see — and that is the `Symmetric` verdict
+//! that sends the ladder to rung 3.
 //!
-//! **Anyone tempted to "simplify" this back to two probes is deleting a
-//! `NatType` variant.** The tests below encode the full table; they will fail.
+//! P3 is the refinement, and it is **best effort by configuration, never by
+//! guesswork**. An address-dependent mapping keys on the destination IP alone,
+//! so a second port on the same server reuses it; a symmetric mapping keys on
+//! both, so the second port gets a new external port. Only a server that
+//! genuinely answers on two ports can show the difference, so P3 runs only when
+//! [`crate::NetConfig::stun_servers`] names one — two entries with the same
+//! resolved IP and different ports. When it does not run, the two verdicts stay
+//! merged under `Symmetric`.
+//!
+//! ## Why P3 is not `P1.port() + 1`
+//!
+//! It used to be, and that made `Symmetric` unreachable in every real
+//! deployment. RFC 5780's 3478/3479 pairing is a convention some operators
+//! follow, not a property of a `host:port` string: nothing in the type says
+//! the neighbouring port is served, and no entry in `NetConfig::default()`
+//! promises it — the first one, `stun.cloudflare.com:3478`, does not answer on
+//! 3479, and `stun.nextcloud.com:443` plainly has nothing at 444. So the
+//! guessed probe timed out every time, the classifier never saw more than two
+//! answers, and the arm that fires the birthday blast was dead code outside
+//! the test suite — where a helper stood a responder up on `port + 1` and
+//! manufactured the one precondition production could never meet.
+//!
+//! A configured entry is a claim the operator can be held to; `port + 1` is a
+//! guess the configuration never made.
+//!
+//! ## What the merged verdict costs, and why it is the right way round
+//!
+//! Without P3, `AddressDependent` and `Symmetric` are indistinguishable and
+//! both are reported as `Symmetric`. Calling a genuinely address-dependent NAT
+//! symmetric skips rung 2, whose premise — that the server-reflexive candidate
+//! we advertised is an address the peer can reach — is already false for a
+//! mapping that changes per destination; rung 3 subsumes the attempt anyway.
+//! Calling a genuinely symmetric NAT `Unknown`, which is what the old table
+//! did, burns the whole gather budget on rung 2 to learn something the probes
+//! had already established. Neither loses the connection; the merged verdict
+//! is the cheaper mistake, and an operator who wants the distinction back can
+//! configure the alternate port that produces it.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -51,24 +76,27 @@ pub struct Probe {
 
 /// The truth table, as a pure function, so it is testable without a socket.
 ///
-/// | P1 vs P2 (same IP, different port) | P1 vs P3 (different IP) | result |
+/// The argument order is the order the probes are *described* in, not the
+/// order they run: `alt_port` is the optional refinement and `other_ip` is the
+/// probe that actually decides.
+///
+/// | P1 vs alt-port (same IP) | P1 vs other-IP | result |
 /// |---|---|---|
 /// | all equal, and equal to our own address | — | `None` |
-/// | same | same | `EndpointIndependent` |
+/// | same or absent | same | `EndpointIndependent` |
 /// | same | **different** | `AddressDependent` |
+/// | **absent** | **different** | `Symmetric` (merged with `AddressDependent`) |
 /// | **different** | anything | `Symmetric` |
 ///
-/// A probe can simply time out, and the degradations are deliberate: an
-/// honest `Unknown` costs one wasted rung, whereas a confident wrong answer
-/// costs the connection.
+/// A probe can simply time out, and the degradations are deliberate.
 ///
 /// | Answers in hand | result | why |
 /// |---|---|---|
 /// | none, or P1 alone | `Unknown` | nothing to compare |
-/// | P1 + P2 equal | `Unknown` | cannot rule out `AddressDependent` |
-/// | P1 + P2 different | `Symmetric` | the port alone moved the mapping; nothing else does that |
-/// | P1 + P3 equal | `EndpointIndependent` | neither IP nor port moved it |
-/// | P1 + P3 different | `Unknown` | could be `AddressDependent` or `Symmetric` |
+/// | P1 + alt-port equal | `Unknown` | one server cannot show whether the destination IP moves the mapping |
+/// | P1 + alt-port different | `Symmetric` | the port alone moved the mapping; nothing else does that |
+/// | P1 + other-IP equal | `EndpointIndependent` | the destination IP does not move the mapping |
+/// | P1 + other-IP different | `Symmetric` | the mapping is per-destination; without an alternate port this cannot be narrowed to `AddressDependent`, and the module docs explain why that is the cheaper mistake |
 pub fn classify(
     same_ip_same_port: Option<SocketAddr>,
     same_ip_alt_port: Option<SocketAddr>,
@@ -95,7 +123,7 @@ pub fn classify(
     match (same_ip_alt_port, other_ip) {
         // The destination port alone changed the mapping. Only an
         // address-and-port-dependent NAT does that, so this is conclusive even
-        // without P3.
+        // without the other-IP probe.
         (Some(p2), _) if p2 != p1 => NatType::Symmetric,
 
         // The port did not move it and the IP did not either.
@@ -104,13 +132,17 @@ pub fn classify(
         // The port did not move it but the IP did: keyed on destination IP.
         (Some(_), Some(_)) => NatType::AddressDependent,
 
-        // P2 agreed but P3 never answered: cannot rule out AddressDependent.
+        // The alternate port agreed but no other server IP answered. One
+        // server cannot show whether the destination IP moves the mapping, so
+        // nothing above EndpointIndependent is provable and nothing below it
+        // is ruled out.
         (Some(_), None) => NatType::Unknown,
 
-        // No P2. P3 alone can only confirm endpoint-independence; if it
-        // differs, AddressDependent and Symmetric are indistinguishable.
+        // No alternate port -- the ordinary case, because the default server
+        // list has none. The other-IP probe alone still settles the question
+        // the ladder asks: does the mapping change per destination?
         (None, Some(p3)) if p3 == p1 => NatType::EndpointIndependent,
-        (None, Some(_)) => NatType::Unknown,
+        (None, Some(_)) => NatType::Symmetric,
         (None, None) => NatType::Unknown,
     }
 }
@@ -147,28 +179,37 @@ pub async fn stun_discover(
     // P1: the baseline.
     let p1 = probe(socket, first, per_probe).await;
 
-    // P2: the same IP, port + 1. RFC 5780's convention (3478/3479), which
-    // dedicated STUN servers follow and `stun.l.google.com:19302` does not —
-    // hence best effort, degrading to `Unknown` rather than inventing a type.
-    let alt = SocketAddr::new(first.ip(), first.port().wrapping_add(1));
-    let p2 = probe(socket, alt, per_probe).await;
-
-    // P3: a genuinely different IP. A second server behind the same address
-    // would answer, agree, and prove nothing.
+    // P2: a genuinely different IP. A second server behind the same address
+    // would answer, agree, and prove nothing. This is the probe that reaches
+    // `Symmetric`, and the only one besides P1 the default list can supply.
     let other = servers.iter().copied().find(|s| s.ip() != first.ip());
-    let p3 = match other {
+    let p_other = match other {
+        Some(s) => probe(socket, s, per_probe).await,
+        None => None,
+    };
+
+    // P3: a second port on P1's IP, and ONLY one the server list actually
+    // names. Guessing `port + 1` looks like RFC 5780's 3478/3479 convention
+    // and is not one: none of the default servers answer there, so the probe
+    // timed out every time and the `Symmetric` arm it feeds was unreachable
+    // outside the tests. Configure the pair or do without the refinement.
+    let alt = servers
+        .iter()
+        .copied()
+        .find(|s| s.ip() == first.ip() && s.port() != first.port());
+    let p_alt = match alt {
         Some(s) => probe(socket, s, per_probe).await,
         None => None,
     };
 
     let local_ips = local_ip_set();
-    let nat = classify(p1, p2, p3, local, &local_ips);
+    let nat = classify(p1, p_alt, p_other, local, &local_ips);
 
     // Every distinct mapped address is a server-reflexive candidate, including
     // the extra ones a symmetric NAT produced: a peer may still be able to
     // reach one of them.
     let mut candidates: Vec<Candidate> = Vec::new();
-    for mapped in [p1, p2, p3].into_iter().flatten() {
+    for mapped in [p1, p_other, p_alt].into_iter().flatten() {
         let mapped = unmap(mapped);
         if candidates.iter().any(|c| c.addr == mapped) {
             continue;
@@ -297,10 +338,11 @@ mod tests {
         );
     }
 
-    /// P2 differing is conclusive on its own: nothing but an
-    /// address-and-port-dependent mapping reacts to the destination port.
+    /// The alternate port differing is conclusive on its own: nothing but an
+    /// address-and-port-dependent mapping reacts to the destination port, so
+    /// no other-IP probe is needed to say so.
     #[test]
-    fn symmetric_is_conclusive_without_the_third_probe() {
+    fn symmetric_is_conclusive_without_the_other_ip_probe() {
         let p1 = a("203.0.113.9:51000");
         let p2 = a("203.0.113.9:51001");
         assert_eq!(
@@ -309,18 +351,85 @@ mod tests {
         );
     }
 
-    /// Exactly the gap that makes two probes insufficient: with P2 missing,
-    /// a moved mapping could be either type, and guessing would send us down
-    /// the wrong rung.
+    /// The verdict that has to be reachable without an alternate port, because
+    /// no public STUN server in the default list serves one. Without the
+    /// alternate port the answer cannot be narrowed to `AddressDependent`, and
+    /// the merged verdict is deliberate — see the module docs.
     #[test]
-    fn two_probes_alone_cannot_separate_address_dependent_from_symmetric() {
+    fn a_mapping_that_differs_between_two_server_ips_is_symmetric() {
         let p1 = a("203.0.113.9:51000");
         let p3 = a("203.0.113.9:51002");
         assert_eq!(
             classify(Some(p1), None, Some(p3), a("10.0.0.2:443"), &[]),
-            NatType::Unknown,
-            "without P2 this is a guess, and a wrong guess costs the connection"
+            NatType::Symmetric,
         );
+    }
+
+    /// The alternate port is what buys the distinction back: the same evidence
+    /// as above, plus a same-IP second port that agreed, is address-dependent
+    /// and NOT a reason to fire the birthday blast.
+    #[test]
+    fn a_configured_alternate_port_narrows_symmetric_to_address_dependent() {
+        let p1 = a("203.0.113.9:51000");
+        let p3 = a("203.0.113.9:51002");
+        assert_eq!(
+            classify(Some(p1), Some(p1), Some(p3), a("10.0.0.2:443"), &[]),
+            NatType::AddressDependent,
+        );
+    }
+
+    /// The shape of `NetConfig::default()`: servers on distinct IPs, and
+    /// **nothing** answering on `port + 1` anywhere. If the classifier can
+    /// only reach `Symmetric` through an alternate port, this fails.
+    #[tokio::test]
+    async fn a_default_shaped_server_list_still_reaches_symmetric() {
+        let (s1, _hole) =
+            responder_with_a_silent_neighbour("127.0.0.1", MappingBehaviour::RewritePort(50_001))
+                .await;
+        let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::RewritePort(50_002))
+            .await
+            .expect("a second loopback IP");
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let cfg = NetConfig {
+            stun_servers: vec![s1.server_string(), s3.server_string()],
+            gather_timeout: std::time::Duration::from_secs(3),
+            ..NetConfig::default()
+        };
+        let (_cands, nat) = stun_discover(&sock, &cfg).await;
+        assert_eq!(
+            nat,
+            NatType::Symmetric,
+            "a per-destination mapping must be detectable from the servers the \
+             default configuration actually has"
+        );
+    }
+
+    /// Start a responder on `ip` and hold a **silent** socket on its
+    /// `port + 1`, so the alternate-port probe provably gets no answer. This
+    /// is the inverse of a helper that stands a responder up there: it
+    /// reproduces production rather than papering over it.
+    async fn responder_with_a_silent_neighbour(
+        ip: &str,
+        behaviour: MappingBehaviour,
+    ) -> (StunResponder, std::net::UdpSocket) {
+        let base = {
+            let probe = std::net::UdpSocket::bind(format!("{ip}:0")).expect("probe");
+            probe.local_addr().expect("addr").port()
+        };
+        for port in base..base.saturating_add(400) {
+            let Ok(responder) =
+                StunResponder::start_on(a(&format!("{ip}:{port}")), behaviour).await
+            else {
+                continue;
+            };
+            if let Ok(hole) = std::net::UdpSocket::bind(format!("{ip}:{}", port + 1)) {
+                return (responder, hole);
+            }
+        }
+        panic!("could not find a free port with a free neighbour on {ip}");
     }
 
     #[test]
@@ -332,12 +441,14 @@ mod tests {
         assert_eq!(classify(None, None, None, local, &[]), NatType::Unknown);
         // P1 alone compares with nothing.
         assert_eq!(classify(Some(p1), None, None, local, &[]), NatType::Unknown);
-        // P2 agreed, P3 silent: AddressDependent is still possible.
+        // The alternate port agreed but no second server IP answered: one
+        // server cannot show whether the destination IP moves the mapping.
         assert_eq!(
             classify(Some(p1), Some(p1), None, local, &[]),
             NatType::Unknown
         );
-        // P3 alone, agreeing, is enough for endpoint-independence.
+        // The other-IP probe alone, agreeing, is enough for
+        // endpoint-independence.
         assert_eq!(
             classify(Some(p1), None, Some(p1), local, &[]),
             NatType::EndpointIndependent
@@ -363,39 +474,12 @@ mod tests {
 
     // ---- end to end, against local responders ----
 
-    /// Find two adjacent free loopback ports on `ip`, so P1 and its alt-port
-    /// probe both land on a real responder.
-    async fn adjacent_pair(
-        ip: &str,
-        first: MappingBehaviour,
-        second: MappingBehaviour,
-    ) -> (StunResponder, StunResponder) {
-        let base = {
-            let probe = std::net::UdpSocket::bind(format!("{ip}:0")).expect("probe");
-            probe.local_addr().expect("addr").port()
-        };
-        for port in base..base.saturating_add(400) {
-            let Ok(a1) = StunResponder::start_on(a(&format!("{ip}:{port}")), first).await else {
-                continue;
-            };
-            if let Ok(a2) = StunResponder::start_on(a(&format!("{ip}:{}", port + 1)), second).await
-            {
-                return (a1, a2);
-            }
-        }
-        panic!("could not find an adjacent pair of free ports on {ip}");
-    }
-
-    /// The full three-probe path, end to end, against local responders only.
-    /// P1 and P2 share an IP; P3 is on a genuinely different one.
+    /// The whole path, end to end, against local responders only, in the shape
+    /// production actually has: two server IPs and nothing on `port + 1`.
     #[tokio::test]
-    async fn three_truthful_probes_classify_a_direct_path_as_no_nat() {
-        let (s1, _s2) = adjacent_pair(
-            "127.0.0.1",
-            MappingBehaviour::Truthful,
-            MappingBehaviour::Truthful,
-        )
-        .await;
+    async fn two_truthful_probes_classify_a_direct_path_as_no_nat() {
+        let (s1, _hole) =
+            responder_with_a_silent_neighbour("127.0.0.1", MappingBehaviour::Truthful).await;
         let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::Truthful)
             .await
             .expect("a second loopback IP");
@@ -418,15 +502,19 @@ mod tests {
         }
     }
 
-    /// A server list confined to ONE IP can never supply P3, so it can never
-    /// reach a confident answer. Worth asserting: it is the failure mode of a
-    /// well-meaning `stun_servers` list that names one host twice.
+    /// A server list confined to ONE IP can never supply the other-IP probe,
+    /// so it can never reach a confident answer. Worth asserting: it is the
+    /// failure mode of a well-meaning `stun_servers` list that names one host
+    /// twice.
     #[tokio::test]
     async fn servers_that_share_an_ip_cannot_classify() {
-        let s1 = StunResponder::start(MappingBehaviour::Truthful)
+        // Both rewrite to the SAME port, so the alternate-port probe agrees
+        // and the mapping is provably not our own address. What is left is
+        // exactly the gap one IP cannot close.
+        let s1 = StunResponder::start(MappingBehaviour::RewritePort(50_000))
             .await
             .expect("s1");
-        let s2 = StunResponder::start(MappingBehaviour::Truthful)
+        let s2 = StunResponder::start(MappingBehaviour::RewritePort(50_000))
             .await
             .expect("s2");
         assert_eq!(s1.addr().ip(), s2.addr().ip());
@@ -443,27 +531,29 @@ mod tests {
         assert_eq!(
             nat,
             NatType::Unknown,
-            "two servers on one IP give no third probe, so nothing is provable"
+            "two servers on one IP cannot show whether the destination IP \
+             moves the mapping, so nothing above EndpointIndependent is provable"
         );
         assert!(!cands.is_empty(), "discovery still learned our address");
     }
 
-    /// The case that sends us to rung 3. Responders on the same IP reporting
-    /// different ports are exactly what a symmetric NAT looks like.
+    /// The refinement, and the only way to reach it: the operator names a
+    /// second port on the first server's IP, and it disagrees.
     #[tokio::test]
-    async fn a_rewriting_pair_on_one_ip_classifies_as_symmetric() {
-        let (s1, _s2) = adjacent_pair(
-            "127.0.0.1",
-            MappingBehaviour::RewritePort(50_001),
-            MappingBehaviour::RewritePort(50_002),
-        )
-        .await;
+    async fn a_configured_alternate_port_that_disagrees_is_symmetric() {
+        let s1 = StunResponder::start(MappingBehaviour::RewritePort(50_001))
+            .await
+            .expect("s1");
+        let s1_alt = StunResponder::start(MappingBehaviour::RewritePort(50_002))
+            .await
+            .expect("s1 alt port");
+        assert_eq!(s1.addr().ip(), s1_alt.addr().ip());
 
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let cfg = NetConfig {
-            stun_servers: vec![s1.server_string()],
+            stun_servers: vec![s1.server_string(), s1_alt.server_string()],
             gather_timeout: std::time::Duration::from_secs(3),
             ..NetConfig::default()
         };
@@ -476,18 +566,20 @@ mod tests {
         );
     }
 
-    /// The distinction three probes exist to make: same port from P2, a
-    /// different one from P3 on another IP, is address-dependent — NOT
-    /// symmetric, and NOT a reason to fire the birthday blast.
+    /// The distinction the alternate port exists to make: the same port from
+    /// the alt-port probe, a different one from another IP, is
+    /// address-dependent — NOT symmetric, and NOT a reason to fire the
+    /// birthday blast. It needs a server list that names the alternate port,
+    /// because the default one does not.
     #[tokio::test]
     async fn a_mapping_keyed_on_destination_ip_alone_is_address_dependent() {
-        let (s1, _s2) = adjacent_pair(
-            "127.0.0.1",
-            MappingBehaviour::RewritePort(60_001),
-            // Same reported port: the destination PORT did not move it.
-            MappingBehaviour::RewritePort(60_001),
-        )
-        .await;
+        let s1 = StunResponder::start(MappingBehaviour::RewritePort(60_001))
+            .await
+            .expect("s1");
+        // Same reported port: the destination PORT did not move it.
+        let s1_alt = StunResponder::start(MappingBehaviour::RewritePort(60_001))
+            .await
+            .expect("s1 alt port");
         // Different IP, different reported port: the destination IP did.
         let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::RewritePort(60_002))
             .await
@@ -497,7 +589,11 @@ mod tests {
             .await
             .expect("bind");
         let cfg = NetConfig {
-            stun_servers: vec![s1.server_string(), s3.server_string()],
+            stun_servers: vec![
+                s1.server_string(),
+                s1_alt.server_string(),
+                s3.server_string(),
+            ],
             gather_timeout: std::time::Duration::from_secs(3),
             ..NetConfig::default()
         };
@@ -505,7 +601,8 @@ mod tests {
         assert_eq!(
             nat,
             NatType::AddressDependent,
-            "two probes would have called this Symmetric and wasted rung 3"
+            "without the configured alternate port this merges into Symmetric \
+             and rung 2 is skipped for nothing"
         );
     }
 
