@@ -24,12 +24,19 @@ libc.workspace = true
 oxutrm-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+# The signalling channel is a pair of pipes on a child `ssh`, and the attach
+# path is a Unix socket, so both are async.
+tokio.workspace = true
+# The PSK is 32 bytes from the OS CSPRNG, fresh per attach, and travels
+# base64-encoded in HostHello.
+rand.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 # Declared here rather than in [workspace.dependencies] so that adding it does
 # not touch the root manifest, which other crates are being written against.
 tempfile = "3"
-tokio = { workspace = true }
 
 # A test fixture, not part of the product: it daemonizes and then reports what
 # survived, so tests/daemonize.rs can assert against a real detached process
@@ -37,3 +44,10 @@ tokio = { workspace = true }
 [[bin]]
 name = "oxutrm-daemon-probe"
 path = "src/bin/oxutrm-daemon-probe.rs"
+
+# A stand-in for `ssh`, so the bootstrap can be tested without a server. It
+# emits a banner and a motd before its first Signal, because real SSH does and
+# a quiet local sshd would never catch a wrapper that cannot skip them.
+[[bin]]
+name = "oxutrm-fake-ssh"
+path = "src/bin/oxutrm-fake-ssh.rs"
