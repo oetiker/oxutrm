@@ -60,6 +60,14 @@ pub enum ApplyError {
         cols: u16,
     },
 
+    /// A run in a `RowPatch` writes past the end of its row.
+    ///
+    /// Truncating instead would leave a screen that still validates — the
+    /// length is unchanged — while disagreeing with the host about what is
+    /// painted on it.
+    #[error("a run on row {row} reaches column {end_col}, outside {cols} columns")]
+    RunOverflowsRow { row: u16, end_col: usize, cols: u16 },
+
     /// **I3.** Sequence zero is the full-state sentinel — the value a diff
     /// carries to mean "this is not a diff at all". A real state numbered
     /// zero would be indistinguishable from that request.
