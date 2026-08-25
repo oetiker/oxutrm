@@ -5,7 +5,7 @@
 //! test that only checks the happy path passes just as well after someone
 //! deletes the check.
 
-use oxutrm_term::{
+use oxutrm_proto::{
     ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, Modes, MouseMode, ScreenState,
 };
 

@@ -1,27 +1,30 @@
 //! The error a state or a diff is rejected with.
 //!
-//! # Why this type lives here and not in `oxutrm-sync`
+//! # Why this type lives here
 //!
-//! The interface contract lists `ApplyError` under `oxutrm-sync`, but
-//! `oxutrm-sync` already depends on `oxutrm-term` (it needs [`ScreenState`],
-//! [`Cell`] and [`Cursor`] to define its diffs), while `ScreenState::validate`
-//! has to return this type. Those two facts are a dependency cycle, which
-//! Cargo forbids.
+//! It travels with the thing it describes. [`ScreenState`] is a **wire type** —
+//! it is the replicated state, serialised and sent — so it belongs beside
+//! [`Frame`] and [`Signal`], and its validation error belongs beside it.
 //!
-//! It is defined in the crate that owns the thing being validated, and
-//! `oxutrm-sync` re-exports it:
+//! Putting it anywhere else creates a cycle or breaks a boundary that matters
+//! more than tidiness:
 //!
-//! ```ignore
-//! pub use oxutrm_term::ApplyError;
-//! ```
+//! * In `oxutrm-sync`: `sync` needs [`ScreenState`] to define its diffs, and
+//!   `ScreenState::validate` must return this error. That is a cycle, and
+//!   Cargo rejects it.
+//! * In `oxutrm-term`: `term` owns `alacritty_terminal`, which drags in a PTY,
+//!   `polling` and `signal-hook` with no feature flag to exclude them. Any
+//!   crate reaching for this error would then have a PTY in its dependency
+//!   tree — including `oxutrm-sync`, whose whole value is that it has no I/O
+//!   at all. The boundary would be gone quietly, and nobody would notice until
+//!   they wondered why the pure crate needs `signal-hook`.
 //!
-//! so `oxutrm_sync::ApplyError` — the contract's own spelling — keeps
-//! resolving for every consumer, and moving the definition again later costs
-//! one line.
+//! Here, `oxutrm-sync` depends on this crate alone and the boundary holds **by
+//! construction** rather than by anyone remembering it.
 //!
 //! [`ScreenState`]: crate::ScreenState
-//! [`Cell`]: crate::Cell
-//! [`Cursor`]: crate::Cursor
+//! [`Frame`]: crate::Frame
+//! [`Signal`]: crate::Signal
 
 /// Why a state or a diff was refused.
 ///

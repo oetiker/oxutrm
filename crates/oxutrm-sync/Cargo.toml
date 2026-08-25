@@ -18,7 +18,6 @@ postcard.workspace = true
 zstd.workspace = true
 thiserror.workspace = true
 oxutrm-proto.workspace = true
-oxutrm-term.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

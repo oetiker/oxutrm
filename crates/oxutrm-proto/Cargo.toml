@@ -8,6 +8,12 @@ description = "oxutrm wire types: signalling, datagram framing, stream messages"
 
 [dependencies]
 serde.workspace = true
+# `Attrs` derives Serialize/Deserialize inside the bitflags! macro, which needs
+# the generated internal type to implement them.
+bitflags.workspace = true
+# `CellText`. Inline for up to 24 bytes, so a screen that is mostly spaces
+# allocates nothing; the wire encoding is a plain str either way.
+compact_str.workspace = true
 postcard.workspace = true
 serde_json.workspace = true
 base64.workspace = true
