@@ -1109,11 +1109,37 @@ Testing effort is matched to where the risk actually is.
 
 | Layer | Method | What it proves |
 |---|---|---|
-| `oxutrm-sync` | **property tests** (`proptest`) | **the one that matters**: for any sequence of terminal output and any subset of resulting diffs — or individual **fragments** (§7.1.1) — dropped, duplicated or reordered, the client state converges to the host state |
-| `oxutrm-term` | golden tests over recorded `.ansi` fixtures (reusing `ansidrama`'s corpus), snapshotting `ScreenState` | emulation fidelity, wide characters, wrapping, attributes |
+| `oxutrm-sync` (happy path) | **property tests** (`proptest`) | **the one that matters**: for any sequence of terminal output and any subset of resulting diffs — or individual **fragments** (§7.1.1) — dropped, duplicated or reordered, the client state converges to the host state |
+| `oxutrm-sync` (reject path) | **fault injection**: diffs deliberately built to violate each §8.6 invariant | that rejection is real — the state is unchanged **and** the acknowledgement has not advanced |
+| `oxutrm-term` | golden tests over recorded `.ansi` fixtures, snapshotting `ScreenState` | emulation fidelity, wide characters, wrapping, attributes |
 | `oxutrm-proto` | round-trip and version-skew tests | wire compatibility, loud failure on mismatch |
 | `oxutrm-net` | **Linux network namespaces** with `nftables` NAT between them | NAT traversal actually works |
 | end-to-end | host and client on loopback, scripted shell, compare final screens | the whole pipeline |
+
+**`oxutrm-sync` is tested on both paths, and the second is not optional.** An
+invariant checked only on the happy path is indistinguishable from one that is
+not checked at all: every convergence test in the row above drives `apply` with
+diffs that are valid by construction, so none of them ever reaches the rejection
+branch. The reject tests exist to execute it deliberately — one per §8.6
+invariant, each handing `Receiver::on_frame` a diff built to violate exactly one.
+
+Each asserts **two** things, and the second is the one that will be forgotten.
+The state must be **byte-for-byte unchanged** — that is the wholesale-rejection
+rule of §8.6. And **`ack()` must not have advanced**. An implementation that
+rejects a frame but advances the acknowledgement anyway strands the sender
+permanently: the sender believes the receiver holds a state it does not have,
+computes every future diff against that base, and the two never reconverge. No
+happy-path test can see this, because on the happy path the acknowledgement is
+*supposed* to advance and the two assertions agree.
+
+**The `.ansi` corpus ports; the snapshots do not.** The fixtures are
+emulator-agnostic byte streams and come across from `ansidrama` directly. Its
+stored snapshots must be **regenerated**, not copied: `ansidrama` snapshotted a
+`vt100` screen, and `alacritty_terminal` differs from it in attribute set,
+reflow behaviour and scrollback. A ported snapshot that happens to pass is
+**worse than one that fails** — a failure is a prompt to look, whereas a pass
+silently certifies the new emulator against the old one's behaviour, which is
+precisely the thing these tests are supposed to be checking.
 
 ### 12.1 NAT testing with network namespaces
 
