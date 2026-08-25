@@ -27,10 +27,12 @@ scrollback.
 - **Working scrollback**, which Mosh cannot provide.
 - **Full fidelity**: 24-bit colour, SGR mouse reporting, resize **with reflow**,
   window title, OSC 52 clipboard, and a genuinely complete attribute set —
-  inverse, bold, italic, dim, hidden and strikeout natively, **five** underline
-  styles (single, double, undercurl, dotted, dashed), **per-cell underline
-  colour** (SGR 58/59) and OSC 8 hyperlinks. Blink is the one attribute the
-  emulator parses but drops, and §9.1.1 recovers it. This is meant literally.
+  inverse, bold, italic, dim, hidden and strikeout natively, plus **five**
+  underline styles (single, double, undercurl, dotted, dashed), **per-cell
+  underline colour** (SGR 58/59) and OSC 8 hyperlinks. Blink is the one attribute
+  the emulator parses but drops, and §9.1.1 recovers it. v1 collapses the five
+  underline styles to a single underline bit and does not carry underline colour
+  — the capability is there whenever the wire format wants it.
 - **Bandwidth adaptation** so a poor link degrades gracefully instead of
   falling behind.
 - **`tmux -CC` control mode integration** (phase D), so window switching and the
@@ -593,11 +595,16 @@ struct Cell { text: CompactString, fg: Color, bg: Color, attrs: Attrs }
 marks survive intact. Wide-character continuation cells are represented
 explicitly, not as spaces.
 
-`Attrs` carries **inverse, bold, italic, dim, hidden and strikeout** as native
-cell flags, **five underline styles** (single, double, undercurl, dotted, dashed)
-and a **per-cell underline colour** from SGR 58/59. **Blink** is carried too, but
-is the one attribute the emulator parses and then discards, so §9.1.1 recovers it
-explicitly. OSC 8 hyperlinks are available per cell and are not modelled in v1.
+`Attrs` carries **inverse, bold, italic, dim, hidden, strikeout, underline and
+blink**. The first six are native cell flags. **Blink** is the one attribute the
+emulator parses and then discards, so §9.1.1 recovers it explicitly.
+
+Three capabilities the emulator offers are deliberately **not** on the wire in
+v1, because each would widen `Cell` for something no caller needs yet: the five
+distinct underline styles (single, double, undercurl, dotted, dashed) all
+collapse to the one `UNDERLINE` bit; per-cell underline colour from SGR 58/59 is
+dropped; and OSC 8 hyperlinks are ignored. All three remain available to a later
+protocol version — the emulator holds them, `ScreenState` simply does not ask.
 
 ```rust
 struct ScreenDiff {
@@ -741,9 +748,10 @@ Most of what `ScreenState` needs, the crate supplies directly:
 | `bell` | the `EventListener` bell event, counted monotonically |
 | `scrollback_len` | synthesised from the grid's history, below |
 
-OSC 52 arrives as an `EventListener` clipboard event. `HostTerm` implements the
-listener and does **not** re-parse escape sequences the emulator has already
-parsed.
+OSC 52 arrives as an `EventListener` clipboard event carrying an **already-decoded
+`String`** — the crate does the base64 itself, so the host does no base64 work in
+either direction. `HostTerm` implements the listener and does **not** re-parse
+escape sequences the emulator has already parsed.
 
 Four obligations are not obvious from the crate's surface and are load-bearing.
 
@@ -776,23 +784,42 @@ written against the safer contract.
 
 **4. The crate ships no colour palette.** `Term::colors()` is an **override**
 table fed by `OSC 4`, `10` and `11`, and every entry is `None` by default —
-indexed and named colours resolve to nothing until something supplies them.
-oxutrm owns its own 269-entry table (16 system + 216 cube + 24 greyscale +
-foreground, background and cursor) and consults `colors()` only as an override
-layer on top of it.
+indexed and named colours resolve to nothing until something supplies them. This
+is the obligation most likely to be missed, because the type looks like a palette.
 
-**Scrollback is the crate's, not ours.** `alacritty_terminal` retains scrolled-off
-lines in an addressable buffer, so `ScrollbackReq { from, to }` (§7.2) is answered
-by reading the requested line range directly. `HostTerm` must **not** maintain a
-parallel scrollback ring: a second copy would be a second source of truth, and
-keeping it consistent with the grid across resize and reflow is exactly the kind
-of bug the "single source of truth" property exists to prevent.
+oxutrm owns a full **269-entry** table and consults `colors()` only as an override
+layer on top of it:
+
+| Index | Contents |
+|---|---|
+| `0..16` | the 16 named ANSI colours |
+| `16..232` | the 6×6×6 colour cube |
+| `232..256` | the 24-step greyscale ramp |
+| `256`, `257`, `258` | default foreground, background, cursor |
+| `259..267` | the dim variants |
+| `267`, `268` | bright foreground, dim foreground |
+
+Promotion is oxutrm's job too: mapping **DIM** and **BOLD** onto the dim and
+bright variants is a renderer decision, and the crate does none of it.
+
+**Scrollback is the crate's, not ours.** `Line` is a signed `pub i32`, and
+**negative lines reach history**: `Line(-1)` is the most recently scrolled-off
+line. A scrollback line is therefore just
+`&term.grid()[Point::new(Line(-n), Column(c))]` — O(1), and it does **not** move
+the viewport, so reading history never disturbs what the live screen shows. The
+valid span is `topmost_line()..=bottommost_line()`, and `ScrollbackReq { from, to }`
+(§7.2) maps onto it directly.
+
+`HostTerm` must **not** maintain a parallel scrollback ring: a second copy would
+be a second source of truth, and keeping it consistent with the grid across every
+scroll and resize is exactly the kind of bug the "single source of truth" property
+exists to prevent.
 
 **Resize reflows, losslessly.** `Term::resize` rewraps previously wrapped lines
 rather than truncating them — verified in both directions: shrinking pushes rows
 into history, and growing pulls them back and re-joins the text. This applies to
-the **primary grid only**; the alternate screen never reflows, which is correct
-and matches every other emulator. The host resizes the `Term` and the PTY together
+the **primary grid only**; the alternate screen has a history of 0 and never
+reflows, which is correct and matches every other emulator. The host resizes the `Term` and the PTY together
 and lets the next diff carry the result; the client does not predict a reflow.
 
 ### 9.2 Registry
@@ -1120,7 +1147,10 @@ Three facts about the dependency, recorded because they constrain the workspace:
   implementation, `polling` and `signal-hook` come along with it. oxutrm drives
   its own PTY (`rustix-openpty`) and does not use those modules. This is an
   accepted cost, not an oversight.
-- **Edition 2024, `rust-version = 1.85.0`, Apache-2.0.** That MSRV is the
+- **It re-exports `vte`**, which is where the `Handler` trait of §9.1.1 comes
+  from; oxutrm does not depend on `vte` separately.
+- **Edition 2024, `rust-version = 1.85.0`, Apache-2.0.** The workspace moves to
+  edition 2024 to match. That MSRV is the
   workspace's floor, and the licence differs from the rest of the tree.
 
 ---
@@ -1245,10 +1275,19 @@ fill counter. The plan became a small patch adding both.
 
 **Then: adopt `alacritty_terminal` 0.26.0 instead.** A probe program was compiled
 and run against the crate to establish what it does empirically rather than from
-documentation. It needs no fork at all, and it is better than the patched fork
-would have been: five underline styles, per-cell underline colour, OSC 8
-hyperlinks, lossless reflow in both directions, and per-line damage tracking that
-answers the diff engine's central question for free.
+documentation. It needs no fork, no patch and no vendoring, and it is better than
+the patched fork would have been: five underline styles, per-cell underline
+colour, OSC 8 hyperlinks, lossless reflow in both directions, and per-line damage
+tracking that answers the diff engine's central question for free.
+
+**What decided it.** The argument for staying on `vt100` was that the fork is
+already shared with `ansidrama`, and one emulator across two projects is worth
+something. That argument lost, and it is worth recording why it lost rather than
+just that it did: the three `vt100` deficiencies are **verified and concrete** —
+no indexed scrollback, no scrolled-off counter, SGR 5/8/9 discarded before
+reaching the grid — while the cost of switching is a single capability (below).
+A shared dependency is worth keeping only while it can do the job; this one
+could not, and patching it would have meant carrying a fork of a fork.
 
 **The accepted cost is the icon name.** `OSC 1` is silently discarded — the
 crate's `osc_dispatch` matches only `0` and `2`, with no `1` arm and no handler
