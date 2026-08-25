@@ -20,12 +20,20 @@
 //! [`registry::choose_registry_root`] uses the runtime directory only where
 //! lingering is known to keep it alive, and says so loudly when it falls back.
 //!
-//! **When it is safe to detach.** [`daemonize`] closes every inherited
+//! **When it is safe to detach.** Detaching is two operations, and they are
+//! not safe at the same moment. [`detach_process`] forks away from ssh and is
+//! harmless for every rung; [`sever_from_ssh`] closes every inherited
 //! descriptor, which is exactly right for an ordinary session and fatal for a
 //! rung-4 one, whose QUIC traffic runs inside the ssh connection those
 //! descriptors belong to. Detachability is therefore settled from the
 //! *nominated* rung with [`SessionMeta::set_detachable`], and only then may a
-//! session daemonize.
+//! session sever.
+//!
+//! Splitting them is what lets an async ICE ladder run at all: the fork must
+//! happen before any thread exists, the rung cannot be known without a runtime,
+//! and the pipes must stay open in between so candidates can still cross them.
+//! [`daemonize`] remains the two phases back to back, for callers with nothing
+//! left to say over ssh.
 
 pub mod attach;
 pub mod daemon;
@@ -36,7 +44,7 @@ pub mod signalling;
 pub mod ssh;
 pub mod transport;
 
-pub use daemon::{daemonize, daemonize_session};
+pub use daemon::{Detached, daemonize, daemonize_session, detach_process, sever_from_ssh};
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
 pub use ladder::{LadderError, LadderPlan, RungResult, RungRunner, nominate, status_line};
 pub use registry::{
