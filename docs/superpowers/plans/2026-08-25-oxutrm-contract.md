@@ -42,7 +42,7 @@
 | `quinn` | `0.11` | net |
 | `rustls` | whatever `quinn` 0.11 re-exports | net |
 | `rcgen` | `0.13` | net (self-signed cert) |
-| `alacritty_terminal` | `0.26` | term — the emulator, on BOTH ends |
+| `vt100` | patched fork of `Junyi-99/vt100-rust` @ `4bca1b1ec4efbb73b55f6c229e38268dca836825`, vendored at `vendor/vt100/` and wired in with a root `[patch]` entry | term — the emulator, on BOTH ends |
 | `rustix` | `1` (features `process`, `termios`, `stdio`, `fs`) | term, host, client |
 | `rustix-openpty` | `0.2` | term |
 | `stun_codec` | `0.4` | net — ALL ICE checks and keepalives |
@@ -65,7 +65,7 @@
 | `sha1` | `0.10` | net (STUN MESSAGE-INTEGRITY is HMAC-SHA1) |
 | `netdev` | `0.46` | net — default-gateway discovery (`crab_nat` needs the gateway and ships no discovery). Chosen over `/proc/net/route`, which is Linux-only, because §1.2 scopes the project to Unix. |
 | `base64` | `0.22` | proto |
-| `unicode-width` | `0.2` | client |
+| `unicode-width` | `0.2` | term, client |
 | `proptest` | `1` | sync (dev) |
 | `insta` | `1` | term (dev, snapshots) |
 
@@ -274,10 +274,23 @@ impl ScreenState {
     pub fn row(&self, row: u16) -> &[Cell];
 }
 
-/// PTY + `alacritty_terminal` `Term`. Owns the child process.
-/// Title, bell and OSC 52 arrive through alacritty's `EventListener`.
-/// Scrollback is the crate's own, read by (negative) line index — do NOT
-/// hand-roll a scrollback ring. `Term::resize` genuinely reflows.
+/// PTY + patched `vt100::Parser`. Owns the child process.
+///
+/// Title, icon, bell and OSC 52 arrive through the crate's `Callbacks` trait —
+/// `HostTerm` implements a `Callbacks` struct and reads it back via
+/// `Parser::callbacks()`. There is NO sidecar byte scanner. Note the crate does
+/// NOT base64-decode OSC 52 payloads; the caller does.
+/// Construct with `Parser::new_with_callbacks(rows, cols, scrollback_len, cb)`.
+///
+/// Scrollback comes from the PATCH (a monotonic scrolled-off counter plus an
+/// indexed accessor); do NOT hand-roll a ring. `Attrs::BLINK`, `STRIKE` and
+/// `HIDDEN` likewise exist only because of the patch.
+///
+/// `Screen::set_size` TRUNCATES: it clears every row's `wrapped` flag, pads or
+/// cuts each row, and drops bottom rows without pushing them to scrollback.
+/// This matches xterm and tmux. Reflow is out of scope — never claim it.
+/// `Callbacks::resize` is only the notification of a `CSI 8;rows;cols t`
+/// request; the handler must call `Screen::set_size` itself.
 pub struct HostTerm { /* private */ }
 
 impl HostTerm {
@@ -311,7 +324,7 @@ impl HostTerm {
 /// Detect the local terminal's capabilities from the environment.
 pub fn detect_caps() -> TerminalCaps;
 
-/// Derived SOLELY from what `alacritty_terminal` emulates. The client's
+/// Derived SOLELY from what the patched `vt100` emulates. The client's
 /// capabilities must NOT
 /// influence this: the child's TERM cannot change when a differently-capable
 /// client reattaches, and down-converting here would permanently degrade the
