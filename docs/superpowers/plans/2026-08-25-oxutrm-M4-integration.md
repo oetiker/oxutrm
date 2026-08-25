@@ -4,9 +4,9 @@
 
 **Goal:** Wire M1's terminal core and sync engine, M2's QUIC transport and NAT ladder, and M3's SSH bootstrap and session registry into a remote terminal that is usable daily.
 
-**Architecture:** Two symmetric session loops joined by QUIC. The host drains its PTY into `vt100`, feeds a `Sender<ScreenState>`, and paces `Frame`s onto QUIC datagrams; oversized frames go on a fresh unidirectional stream instead. The client feeds local input into a `Sender<InputState>`, applies incoming `ScreenDiff`s, and re-renders through a `Renderer` that down-converts colour to whatever the user's real terminal can show, so the host's state stays full fidelity.
+**Architecture:** Two symmetric session loops joined by QUIC. The host drains its PTY into `alacritty_terminal`, feeds a `Sender<ScreenState>`, and paces `Frame`s onto QUIC datagrams, fragmenting any diff too large for one datagram. The client feeds local input into a `Sender<InputState>`, applies incoming `ScreenDiff`s, and re-renders through a `Renderer` that down-converts colour to whatever the user's real terminal can show, so the host's state stays full fidelity.
 
-**Tech Stack:** Rust 2021, `quinn` 0.11 (datagrams, uni streams, connection migration, `Endpoint::rebind`), `tokio` 1 (`select!`, `AsyncFd`, unix signals), `vt100` (fork `Junyi-99/vt100-rust` branch `deck`), `rustix` 1 termios, `postcard` 1.
+**Tech Stack:** Rust 2024 (MSRV 1.85), `quinn` 0.11 (datagrams, connection migration, `Endpoint::rebind_abstract`), `tokio` 1 (`select!`, `AsyncFd`, unix signals), `alacritty_terminal` 0.26 with its re-exported `vte`, `rustix` 1 termios, `postcard` 1.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-oxutrm-design.md`
 **Contract:** `docs/superpowers/plans/2026-08-25-oxutrm-contract.md` — **normative, read it first.**
@@ -20,7 +20,9 @@
 Every task's requirements implicitly include the whole contract file. The load-bearing ones, repeated verbatim:
 
 - **Binary and product name is `oxutrm`.** Not `oxuterm`. The checkout directory is `oxuterm` for historical reasons; nothing inside it uses that spelling.
-- **Rust edition 2021**, workspace at the repo root, one binary `src/main.rs`.
+- **Rust edition 2024**, workspace at the repo root, one binary `src/main.rs`.
+  `alacritty_terminal` 0.26 is edition 2024 with MSRV 1.85, so that floor applies to
+  the whole build.
 - **Cap all parallelism at 4**: `cargo build --jobs 4`, `cargo test --jobs 4 -- --test-threads 4`.
 - **Workspace root `Cargo.toml` must contain:**
   ```toml
@@ -41,8 +43,11 @@ Every task's requirements implicitly include the whole contract file. The load-b
 | Crate | Version | Used by | Why |
 |---|---|---|---|
 | `bytes` | `1` | net | `quinn::Connection::send_datagram` takes `bytes::Bytes` |
+| `thiserror` | `2` | net | `FragError`, which callers must discriminate |
+| `libc` | `0.2` | root (dev) | raising signals at the real process in the exit-path tests |
 
-Add it to `crates/oxutrm-net/Cargo.toml` in Task 2. Nothing else new.
+Both crate additions go in `crates/oxutrm-net/Cargo.toml` in Task 2; `libc` is a
+root `[dev-dependencies]` entry added in Task 8. Nothing else new.
 
 ---
 
@@ -54,11 +59,12 @@ Add it to `crates/oxutrm-net/Cargo.toml` in Task 2. Nothing else new.
 |---|---|
 | `crates/oxutrm-net/src/pace.rs` | `Pacer` — the §10.4 send-interval policy, pure, clock injected |
 | `crates/oxutrm-net/src/link.rs` | `LinkStats` + `link_stats()` — the *only* place that touches `quinn::ConnectionStats` |
-| `crates/oxutrm-net/src/xport.rs` | `FrameSink` / `FrameSource` — datagram vs. stream selection, the MTU answer |
+| `crates/oxutrm-net/src/frag.rs` | `fragment()` / `Reassembler` — §7.1.1, pure, no sockets |
+| `crates/oxutrm-net/src/xport.rs` | `FrameSink` / `FrameSource` — fragmenting send, reassembling receive |
 | `crates/oxutrm-net/src/tunnel.rs` | Rung 4: a loopback UDP relay over the SSH channel |
 | `crates/oxutrm-net/src/testkit.rs` | `loopback_pair()` — two connected `quinn::Connection`s, behind feature `testkit` |
 | `crates/oxutrm-host/src/input_cursor.rs` | `InputCursor` — which client input bytes have reached the PTY, pure |
-| `crates/oxutrm-host/src/session.rs` | `run_host_session` — PTY ↔ `vt100` ↔ QUIC |
+| `crates/oxutrm-host/src/session.rs` | `run_host_session` — PTY ↔ `alacritty_terminal` ↔ QUIC |
 | `crates/oxutrm-client/src/color.rs` | Truecolor → 256 → 16 → 8 down-conversion, in the client |
 | `crates/oxutrm-client/src/input_queue.rs` | `InputQueue` — client-side mirror of the host's input bookkeeping, pure |
 | `crates/oxutrm-client/src/guard.rs` | `TerminalGuard` — raw mode, alt screen, panic hook, one idempotent restore |
@@ -86,16 +92,89 @@ Add it to `crates/oxutrm-net/Cargo.toml` in Task 2. Nothing else new.
 
 ---
 
-## The MTU decision, stated once
+## Fragmentation, stated once (spec §7.1.1)
 
-`quinn::Connection::max_datagram_size()` reports roughly 1400 bytes on a normal path. A full 200×60 truecolor repaint is 12 000 `Cell`s and does not fit, even zstd-compressed.
+`quinn::Connection::max_datagram_size()` is on the order of 1200 bytes after
+overhead. A full `ScreenState` for 80×24 with truecolor cells postcard-encodes to
+well over 10 KB, and even a several-row `ScreenDiff` can exceed the limit. QUIC
+datagrams are never fragmented by the transport: `send_datagram` rejects an
+oversized payload with `SendDatagramError::TooLarge`.
 
-**Decision: oversized frames go on a fresh unidirectional QUIC stream, one at a time; datagrams are never fragmented.** Fragmenting an unreliable datagram would mean that losing any one fragment loses the entire state, so 1 % packet loss becomes roughly 25 % state loss for a 30-fragment repaint, destroying the §8.1 property that a lost datagram costs nothing. QUIC already provides an ordered, reliable, congestion-controlled stream, and the oversized case is by construction a rare full repaint whose required semantics are exactly "arrive completely, eventually".
+This is not merely a large-repaint problem. It **breaks the sync engine's own
+recovery path**: §8.2's "the peer's acknowledged state has left the ring, send a
+full state" produces the single largest message the protocol can construct. Without
+fragmentation the protocol cannot recover from its own worst case.
 
-Two consequences the implementation must honour:
+**oxutrm therefore fragments diffs itself.** `Frame` carries `frag_index: u16` and
+`frag_count: u16`; the encoded diff is split into pieces that each fit
+`max_datagram_size()`, and every piece is sent as its own datagram carrying the
+same `my_state` and `from_state`. Compression happens **before** fragmentation, so
+the `flags` byte is identical across every fragment of one state.
 
-1. **Uni streams are reserved for oversized state frames.** Control, scrollback and clipboard are bidirectional (spec §7.2), so stream direction is the discriminator. No extra header is needed: a uni stream carries exactly one postcard-encoded `Frame` and then FIN.
-2. **While an oversized stream is in flight the sink sends nothing else.** States coalesce in the `Sender` instead of queueing, which is the same §8.1 property, and it removes any ordering hazard between the datagram path and the stream path.
+Four rules, normative, all from §7.1.1:
+
+1. **A state is applied only when all of its fragments have arrived.** An
+   incomplete set is **discarded wholesale** — never partially applied, never held
+   waiting for a retransmission, because there are no retransmissions. This is what
+   preserves §8.1: the receiver's acknowledged state is unchanged by a lost
+   fragment, so the sender's next diff is computed against that same base and
+   therefore *contains* everything the dropped set was carrying. Losing one
+   fragment costs exactly one send interval and nothing else.
+2. **The receiver holds at most one incomplete set.** A fragment naming a
+   `my_state` newer than the set in progress **replaces** it; the older partial set
+   is dropped at once rather than kept in hope.
+3. **Fragments of a state older than the receiver's current state are discarded
+   on arrival.**
+4. **`frag_count` is bounded by configuration.** A diff exceeding the bound is a
+   bug in diff generation, not a runtime condition to handle.
+
+Unidirectional QUIC streams are **not** used for screen state. Control,
+scrollback and clipboard remain bidirectional streams (§7.2).
+
+## Rejection is wholesale, and rejection is not disconnection
+
+Two rules meet in M4's session loops, and they are easy to get backwards.
+
+**Rule 1 — a diff violating an invariant is rejected wholesale and never applied
+partially** (spec §8.6, contract `ScreenState::validate`). `Receiver::on_frame`
+calls `validate` after `apply` and returns `ApplyError::LengthMismatch` or
+`ApplyError::CursorOutOfBounds`. §8.1's whole recovery story rests on the
+receiver's state always being a state *the sender actually held*; a partially
+applied diff leaves the receiver holding a state that existed nowhere, that no
+sender ring contains, and that no later diff was computed against. That is
+strictly worse than dropping the datagram, because dropping is a case the
+protocol already recovers from.
+
+A consequence M4 depends on and must not paper over: **`on_frame` must leave the
+receiver's state untouched when it returns `Err`.** Applying into a scratch copy
+and swapping only after `validate` succeeds is the implementation that satisfies
+this. Task 2 asserts the observable property.
+
+**Rule 2 — a rejected frame is a dropped frame, not a dead session.** Neither
+session loop may use `?` on `Receiver::on_frame`. When it returns `Err`, log and
+`continue`:
+
+- the receiver's state did not change, so `ack()` does not advance;
+- our next outgoing frame therefore still names a state the peer holds in its
+  ring;
+- the peer's next diff is computed from that same base and repairs everything.
+
+Tearing down the connection would turn a single bad frame into a lost session,
+and reconnecting cannot help because the peer would re-derive the same diff.
+
+**And do not reach for `min()` on an out-of-range cursor.** Clamping is one line
+and it is wrong: a sender holding a valid state cannot produce a diff that puts
+the cursor outside it, so an out-of-range cursor means the two ends have genuinely
+desynchronised. Clamping hides that behind a session which looks healthy while the
+screens drift apart — the exact failure this design exists to prevent.
+
+## 0-RTT is deliberately not used
+
+Spec §6 states this and it is repeated here so a later reader does not "fix" it:
+0-RTT needs a TLS resumption ticket issued under the same server configuration,
+and §11's fresh certificate per attach guarantees every attach meets a server that
+cannot decrypt any earlier ticket. Reattach pays a full handshake. **No task in
+this plan implements or tests 0-RTT, and none should be added.**
 
 ---
 
@@ -403,46 +482,92 @@ EOF
 
 ---
 
-### Task 2: Frame transport — datagram below the MTU, unidirectional stream above it
+### Task 2: Fragmentation and reassembly — the highest-risk task in M4
 
-This is the highest-risk task in M4. Read "The MTU decision, stated once" above before starting.
+Read "Fragmentation, stated once" above before starting. This task is why the
+protocol can recover from its own worst case.
+
+The split is deliberate: `frag.rs` is **pure** — it takes a `Frame` and a size
+limit and returns `Frame`s, and it reassembles `Frame`s into a `Frame`. It has no
+sockets and no clock, so the rules of §7.1.1 are tested exhaustively without a
+network. `xport.rs` is the thin I/O shell around it.
 
 **Files:**
+- Create: `crates/oxutrm-net/src/frag.rs`
 - Create: `crates/oxutrm-net/src/xport.rs`
 - Create: `crates/oxutrm-net/src/testkit.rs`
 - Modify: `crates/oxutrm-net/src/lib.rs`
 - Modify: `crates/oxutrm-net/Cargo.toml`
 
 **Interfaces:**
-- Consumes: `oxutrm_proto::Frame` with `Frame::encode() -> Result<Vec<u8>, ProtoError>` and `Frame::decode(&[u8]) -> Result<Frame, ProtoError>`; `oxutrm_net::{generate_cert, quic_server, quic_client}` from M2. M2's `quic_server` and `quic_client` **must** have set `TransportConfig::datagram_receive_buffer_size(Some(_))` and `datagram_send_buffer_size(Some(_))`, or datagrams are disabled — Step 3's test asserts this.
+- Consumes: `oxutrm_proto::Frame` — **the contract defines its fields, types and
+  order; do not re-derive them from this plan or from the spec, which no longer
+  carries wire types at all.** This task uses `my_state`, `from_state`,
+  `ack_state`, `frag_index`, `frag_count`, `flags` and `payload`, and copies all
+  but the fragment pair unchanged onto every piece. Also
+  `Frame::encode() -> Result<Vec<u8>, ProtoError>` and
+  `Frame::decode(&[u8]) -> Result<Frame, ProtoError>`;
+  `oxutrm_sync::{Receiver, Sender, ScreenDiff, RowPatch, Run, ApplyError}` and
+  `oxutrm_term::{ScreenState, Cell, CellText, Cursor, CursorShape}` (dev only,
+  for the worst-case and invariant tests) — `ApplyError` has the variants
+  `LengthMismatch` and `CursorOutOfBounds` that `ScreenState::validate` raises;
+  `oxutrm_net::{generate_cert, quic_server, quic_client}` from M2. M2's
+  `quic_server` / `quic_client` **must** have set
+  `TransportConfig::datagram_receive_buffer_size(Some(_))` (its default is
+  `None`, which disables incoming datagrams outright) and
+  `datagram_send_buffer_size` — Step 6's test asserts this.
 - Produces:
   ```rust
+  // crates/oxutrm-net/src/frag.rs
+  /// Headroom below `max_datagram_size()` for the postcard `Frame` header:
+  /// three varint u64s, two u16s, a flags byte and the payload length prefix.
+  pub const FRAG_HEADER_BUDGET: usize = 48;
+  /// A diff needing more fragments than this is a bug in diff generation
+  /// (§7.1.1), not a runtime condition. 200 x 1200 bytes is 240 KB.
+  pub const MAX_FRAGMENTS: u16 = 200;
+
+  #[derive(thiserror::Error, Debug, PartialEq, Eq)]
+  pub enum FragError {
+      #[error("datagram budget {budget} is too small to carry any payload")]
+      BudgetTooSmall { budget: usize },
+      #[error("diff of {len} bytes needs more than {max} fragments")]
+      TooManyFragments { len: usize, max: u16 },
+  }
+
+  /// Split one logical `Frame` into datagram-sized pieces. Always returns at
+  /// least one `Frame`; `frag_count == 1` when the whole thing fits.
+  pub fn fragment(f: &oxutrm_proto::Frame, max_datagram: usize)
+      -> Result<Vec<oxutrm_proto::Frame>, FragError>;
+
+  /// Rebuilds fragmented states. Holds at most one incomplete set.
+  #[derive(Debug, Default)]
+  pub struct Reassembler { /* private */ }
+  impl Reassembler {
+      pub fn new() -> Reassembler;
+      /// `Some(frame)` when this fragment completed a state. Anything stale,
+      /// duplicate or superseded returns `None` and is never an error.
+      pub fn accept(&mut self, f: &oxutrm_proto::Frame) -> Option<oxutrm_proto::Frame>;
+      /// The receiver's current state, so older fragments can be discarded.
+      pub fn set_current_state(&mut self, seq: u64);
+      /// Fragment sets abandoned because a newer state superseded them.
+      pub fn dropped_sets(&self) -> u64;
+  }
+
   // crates/oxutrm-net/src/xport.rs
-  /// Headroom left below `max_datagram_size()` so a frame never sits exactly
-  /// on the boundary that DPLPMTUD is still probing.
-  pub const DATAGRAM_MARGIN: usize = 64;
-  /// Refuse to buffer a stream frame larger than this.
-  pub const MAX_STREAM_FRAME: usize = 8 * 1024 * 1024;
-
-  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-  pub enum Channel { Datagram, Stream }
-
-  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-  pub enum Sent { Datagram, Stream, Skipped }
-
-  pub fn choose_channel(encoded_len: usize, max_datagram: Option<usize>) -> Channel;
-
   pub struct FrameSink { /* private */ }
   impl FrameSink {
       pub fn new(conn: quinn::Connection) -> FrameSink;
-      pub fn is_busy(&self) -> bool;
-      pub fn send(&self, f: &oxutrm_proto::Frame) -> anyhow::Result<Sent>;
+      /// Fragments as needed and sends every piece. `Ok(n)` is the number of
+      /// datagrams sent.
+      pub fn send(&self, f: &oxutrm_proto::Frame) -> anyhow::Result<usize>;
   }
 
   pub struct FrameSource { /* private */ }
   impl FrameSource {
       pub fn new(conn: quinn::Connection) -> FrameSource;
+      /// The next COMPLETE frame. Incomplete sets never surface.
       pub async fn recv(&mut self) -> anyhow::Result<oxutrm_proto::Frame>;
+      pub fn set_current_state(&mut self, seq: u64);
   }
 
   // crates/oxutrm-net/src/testkit.rs, behind feature "testkit"
@@ -456,12 +581,438 @@ In `crates/oxutrm-net/Cargo.toml`:
 ```toml
 [dependencies]
 bytes = "1"
+thiserror = "2"
 
 [features]
 testkit = []
 ```
 
-- [ ] **Step 2: Write the loopback test harness**
+- [ ] **Step 2: Write the failing tests for the pure fragmenter**
+
+Create `crates/oxutrm-net/src/frag.rs` containing only:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxutrm_proto::Frame;
+
+    /// Deterministic pseudo-random bytes, so a failure is reproducible.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn frame(my: u64, from: u64, payload: Vec<u8>) -> Frame {
+        Frame {
+            my_state: my,
+            from_state: from,
+            ack_state: 0,
+            frag_index: 0,
+            frag_count: 1,
+            flags: 0,
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_small_frame_is_one_unfragmented_piece() {
+        let f = frame(7, 6, noise(200));
+        let out = fragment(&f, 1200).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].frag_count, 1);
+        assert_eq!(out[0].frag_index, 0);
+        assert_eq!(out[0].payload, f.payload);
+    }
+
+    #[test]
+    fn a_large_frame_splits_into_pieces_that_all_fit() {
+        let f = frame(9, 0, noise(50_000));
+        let out = fragment(&f, 1200).unwrap();
+        assert!(out.len() > 40, "expected many fragments, got {}", out.len());
+        for (i, p) in out.iter().enumerate() {
+            assert_eq!(p.frag_index, i as u16);
+            assert_eq!(p.frag_count, out.len() as u16);
+            assert_eq!(p.my_state, 9);
+            assert_eq!(p.from_state, 0);
+            assert!(
+                p.encode().unwrap().len() <= 1200,
+                "fragment {i} encodes to {} bytes, over the datagram limit",
+                p.encode().unwrap().len()
+            );
+        }
+    }
+
+    /// Compression happens before fragmentation, so every fragment of one
+    /// state carries the same flags byte (§7.1).
+    #[test]
+    fn the_flags_byte_is_identical_across_a_fragment_set() {
+        let mut f = frame(3, 2, noise(10_000));
+        f.flags = oxutrm_proto::FLAG_ZSTD;
+        let out = fragment(&f, 1200).unwrap();
+        assert!(out.len() > 1);
+        assert!(out.iter().all(|p| p.flags == oxutrm_proto::FLAG_ZSTD));
+    }
+
+    #[test]
+    fn the_payload_concatenates_back_to_the_original() {
+        let f = frame(4, 1, noise(31_337));
+        let out = fragment(&f, 1200).unwrap();
+        let rejoined: Vec<u8> = out.iter().flat_map(|p| p.payload.clone()).collect();
+        assert_eq!(rejoined, f.payload);
+    }
+
+    #[test]
+    fn an_absurd_diff_is_refused_rather_than_silently_truncated() {
+        let f = frame(1, 0, noise(4 * 1024 * 1024));
+        assert!(matches!(
+            fragment(&f, 1200),
+            Err(FragError::TooManyFragments { .. })
+        ));
+    }
+
+    #[test]
+    fn a_budget_too_small_for_any_payload_is_an_error_not_an_infinite_loop() {
+        let f = frame(1, 0, noise(100));
+        assert!(matches!(
+            fragment(&f, FRAG_HEADER_BUDGET),
+            Err(FragError::BudgetTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_payload_still_produces_exactly_one_fragment() {
+        let f = frame(2, 1, Vec::new());
+        let out = fragment(&f, 1200).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].frag_count, 1);
+    }
+
+    // ---- reassembly ----
+
+    #[test]
+    fn an_unfragmented_frame_passes_straight_through() {
+        let mut r = Reassembler::new();
+        let f = frame(5, 4, noise(100));
+        let got = r.accept(&f).expect("a single fragment completes at once");
+        assert_eq!(got.payload, f.payload);
+        assert_eq!(got.my_state, 5);
+    }
+
+    #[test]
+    fn a_complete_set_reassembles_in_order() {
+        let mut r = Reassembler::new();
+        let f = frame(6, 0, noise(20_000));
+        let parts = fragment(&f, 1200).unwrap();
+        let last = parts.len() - 1;
+        for (i, p) in parts.iter().enumerate() {
+            let got = r.accept(p);
+            if i < last {
+                assert!(got.is_none(), "completed early at fragment {i}");
+            } else {
+                let got = got.expect("the last fragment completes the set");
+                assert_eq!(got.payload, f.payload);
+                assert_eq!(got.frag_count, 1, "a reassembled frame is logically whole");
+                assert_eq!(got.from_state, 0);
+                assert_eq!(got.flags, f.flags);
+            }
+        }
+    }
+
+    #[test]
+    fn a_set_reassembles_when_fragments_arrive_out_of_order() {
+        let mut r = Reassembler::new();
+        let f = frame(6, 0, noise(20_000));
+        let mut parts = fragment(&f, 1200).unwrap();
+        parts.reverse();
+        let last = parts.len() - 1;
+        for (i, p) in parts.iter().enumerate() {
+            let got = r.accept(p);
+            assert_eq!(got.is_some(), i == last);
+            if let Some(got) = got {
+                assert_eq!(got.payload, f.payload);
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicated_fragment_does_not_complete_a_set_early() {
+        let mut r = Reassembler::new();
+        let f = frame(6, 0, noise(20_000));
+        let parts = fragment(&f, 1200).unwrap();
+        for _ in 0..5 {
+            assert!(r.accept(&parts[0]).is_none());
+        }
+        for p in &parts[1..parts.len() - 1] {
+            assert!(r.accept(p).is_none());
+        }
+        assert!(r.accept(&parts[parts.len() - 1]).is_some());
+    }
+
+    /// The §8.1 property: an incomplete set is discarded wholesale, and the
+    /// receiver's acknowledged state is untouched by the loss.
+    #[test]
+    fn an_incomplete_set_never_yields_a_partial_state() {
+        let mut r = Reassembler::new();
+        let f = frame(6, 0, noise(20_000));
+        let parts = fragment(&f, 1200).unwrap();
+        for p in &parts[..parts.len() - 1] {
+            assert!(r.accept(p).is_none());
+        }
+        // The last fragment is lost. Nothing is ever produced for state 6.
+        assert_eq!(r.dropped_sets(), 0);
+
+        // The sender re-diffs from the same base and sends state 7.
+        let g = frame(7, 0, noise(20_000));
+        let parts7 = fragment(&g, 1200).unwrap();
+        let last = parts7.len() - 1;
+        for (i, p) in parts7.iter().enumerate() {
+            let got = r.accept(p);
+            if i == last {
+                assert_eq!(got.expect("state 7 completes").payload, g.payload);
+            } else {
+                assert!(got.is_none());
+            }
+        }
+        assert_eq!(r.dropped_sets(), 1, "the abandoned state-6 set must be counted");
+    }
+
+    #[test]
+    fn a_newer_state_replaces_an_incomplete_older_one_immediately() {
+        let mut r = Reassembler::new();
+        let old = fragment(&frame(6, 0, noise(20_000)), 1200).unwrap();
+        let new_payload = noise(20_000);
+        let new = fragment(&frame(9, 0, new_payload.clone()), 1200).unwrap();
+
+        assert!(r.accept(&old[0]).is_none());
+        assert!(r.accept(&new[0]).is_none());
+        assert_eq!(r.dropped_sets(), 1);
+
+        // Late fragments of the superseded set must not resurrect it.
+        for p in &old[1..] {
+            assert!(r.accept(p).is_none(), "a superseded set was completed");
+        }
+        let last = new.len() - 1;
+        for (i, p) in new.iter().enumerate().skip(1) {
+            let got = r.accept(p);
+            assert_eq!(got.is_some(), i == last);
+            if let Some(got) = got {
+                assert_eq!(got.payload, new_payload);
+            }
+        }
+    }
+
+    #[test]
+    fn fragments_older_than_the_current_state_are_discarded_on_arrival() {
+        let mut r = Reassembler::new();
+        r.set_current_state(50);
+        let old = fragment(&frame(20, 0, noise(20_000)), 1200).unwrap();
+        for p in &old {
+            assert!(r.accept(p).is_none(), "a state older than current was applied");
+        }
+        // A current-enough state still works.
+        let f = frame(51, 50, noise(100));
+        assert!(r.accept(&f).is_some());
+    }
+}
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Add `pub mod frag;` to `crates/oxutrm-net/src/lib.rs`, then run:
+
+`cargo test --jobs 4 -p oxutrm-net frag:: -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find function fragment`, `cannot find type Reassembler`.
+
+- [ ] **Step 4: Write minimal implementation**
+
+Put this above the test module in `crates/oxutrm-net/src/frag.rs`:
+
+```rust
+//! Fragmentation and reassembly, spec §7.1.1.
+//!
+//! A diff is not guaranteed to fit in a QUIC datagram, and the diff that is
+//! guaranteed NOT to fit is the one §8.2's ring-miss recovery has to send. QUIC
+//! never fragments datagrams itself, so oxutrm does.
+//!
+//! **A state is applied only when all of its fragments have arrived**, and an
+//! incomplete set is discarded wholesale. Note the division of labour: this
+//! module decides only whether the BYTES are all present. Whether the state they
+//! decode to is legal is `ScreenState::validate`'s job, and a state that fails
+//! there is rejected just as wholesale — see spec §8.6. That is what preserves §8.1: the
+//! receiver's acknowledged state is unchanged by the loss, so the sender's next
+//! diff is computed against the same base and contains everything the dropped
+//! set was carrying. One lost fragment costs one send interval, nothing more.
+//!
+//! No sockets, no clock: every rule here is tested without a network.
+
+use oxutrm_proto::Frame;
+use std::collections::BTreeMap;
+
+/// Headroom below `max_datagram_size()` for the postcard `Frame` header: three
+/// varint `u64`s, two `u16`s, a flags byte and the payload's length prefix.
+pub const FRAG_HEADER_BUDGET: usize = 48;
+
+/// More fragments than this means diff generation is broken, not that the link
+/// is slow (§7.1.1). 200 x ~1200 bytes is 240 KB.
+pub const MAX_FRAGMENTS: u16 = 200;
+
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum FragError {
+    #[error("datagram budget {budget} is too small to carry any payload")]
+    BudgetTooSmall { budget: usize },
+    #[error("diff of {len} bytes needs more than {max} fragments")]
+    TooManyFragments { len: usize, max: u16 },
+}
+
+/// Split one logical `Frame` into datagram-sized pieces, each carrying the same
+/// `my_state`, `from_state`, `ack_state` and `flags`.
+pub fn fragment(f: &Frame, max_datagram: usize) -> Result<Vec<Frame>, FragError> {
+    let chunk = max_datagram.saturating_sub(FRAG_HEADER_BUDGET);
+    if chunk == 0 {
+        return Err(FragError::BudgetTooSmall { budget: max_datagram });
+    }
+
+    // An empty payload is still exactly one fragment: `frag_count` is never 0.
+    let count = f.payload.len().div_ceil(chunk).max(1);
+    if count > MAX_FRAGMENTS as usize {
+        return Err(FragError::TooManyFragments {
+            len: f.payload.len(),
+            max: MAX_FRAGMENTS,
+        });
+    }
+
+    Ok((0..count)
+        .map(|i| {
+            let start = i * chunk;
+            let end = ((i + 1) * chunk).min(f.payload.len());
+            Frame {
+                my_state: f.my_state,
+                from_state: f.from_state,
+                ack_state: f.ack_state,
+                frag_index: i as u16,
+                frag_count: count as u16,
+                flags: f.flags,
+                payload: f.payload[start..end].to_vec(),
+            }
+        })
+        .collect())
+}
+
+/// Rebuilds fragmented states. Holds **at most one** incomplete set: a fragment
+/// naming a newer `my_state` replaces the set in progress rather than the
+/// receiver hoping the older one still completes.
+#[derive(Debug, Default)]
+pub struct Reassembler {
+    /// The state the partial set belongs to.
+    seq: u64,
+    from_state: u64,
+    ack_state: u64,
+    flags: u8,
+    expected: u16,
+    /// Fragment index -> payload piece. A map, so duplicates overwrite rather
+    /// than counting twice and completing the set early.
+    parts: BTreeMap<u16, Vec<u8>>,
+    /// The receiver's current applied state; anything older is discarded.
+    current: u64,
+    dropped: u64,
+}
+
+impl Reassembler {
+    pub fn new() -> Reassembler {
+        Reassembler::default()
+    }
+
+    /// Tell the reassembler what the receiver has applied, so fragments of an
+    /// already-superseded state are dropped on arrival.
+    pub fn set_current_state(&mut self, seq: u64) {
+        self.current = self.current.max(seq);
+    }
+
+    /// Fragment sets abandoned because a newer state arrived. Diagnostic only.
+    pub fn dropped_sets(&self) -> u64 {
+        self.dropped
+    }
+
+    /// `Some(frame)` when this fragment completed a state. Stale, duplicate and
+    /// superseded fragments return `None`; none of them is an error.
+    pub fn accept(&mut self, f: &Frame) -> Option<Frame> {
+        // Rule 3: older than what the receiver already has.
+        if f.my_state <= self.current {
+            return None;
+        }
+        // A malformed set is a lost set, never a panic.
+        if f.frag_count == 0 || f.frag_index >= f.frag_count {
+            return None;
+        }
+
+        // The common case: nothing to reassemble.
+        if f.frag_count == 1 {
+            if self.expected != 0 && self.seq < f.my_state {
+                self.abandon();
+            }
+            return Some(f.clone());
+        }
+
+        if self.expected == 0 || f.my_state > self.seq {
+            // Rule 2: a newer state replaces the set in progress at once.
+            if self.expected != 0 {
+                self.abandon();
+            }
+            self.seq = f.my_state;
+            self.from_state = f.from_state;
+            self.ack_state = f.ack_state;
+            self.flags = f.flags;
+            self.expected = f.frag_count;
+            self.parts.clear();
+        } else if f.my_state < self.seq {
+            // A late fragment of a set we already gave up on.
+            return None;
+        }
+
+        self.parts.insert(f.frag_index, f.payload.clone());
+        if self.parts.len() < self.expected as usize {
+            return None;
+        }
+
+        let payload: Vec<u8> = std::mem::take(&mut self.parts).into_values().flatten().collect();
+        let out = Frame {
+            my_state: self.seq,
+            from_state: self.from_state,
+            ack_state: self.ack_state,
+            // Logically whole: downstream never sees fragmentation.
+            frag_index: 0,
+            frag_count: 1,
+            flags: self.flags,
+            payload,
+        };
+        self.expected = 0;
+        Some(out)
+    }
+
+    fn abandon(&mut self) {
+        self.dropped += 1;
+        self.parts.clear();
+        self.expected = 0;
+    }
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+`cargo test --jobs 4 -p oxutrm-net frag:: -- --test-threads 4`
+
+Expected: PASS, 13 tests.
+
+- [ ] **Step 6: Write the loopback harness and the failing transport tests**
 
 Create `crates/oxutrm-net/src/testkit.rs`:
 
@@ -486,19 +1037,16 @@ pub async fn loopback_pair() -> anyhow::Result<(quinn::Connection, quinn::Connec
     let accepting = tokio::spawn(async move {
         let incoming = endpoint.accept().await.context("endpoint closed")?;
         let conn = incoming.await?;
-        // Keep the endpoint alive for the life of the connection.
+        // The endpoint must outlive the connection it drives.
         anyhow::Ok((conn, endpoint))
     });
 
     let client = crate::quic_client(client_sock, server_addr, spki).await?;
     let (server, server_endpoint) = accepting.await??;
-    // Leak the endpoint deliberately: a test pair lives for the test.
     std::mem::forget(server_endpoint);
     Ok((server, client))
 }
 ```
-
-- [ ] **Step 3: Write the failing tests**
 
 Create `crates/oxutrm-net/src/xport.rs` containing only:
 
@@ -508,9 +1056,8 @@ mod tests {
     use super::*;
     use oxutrm_proto::Frame;
 
-    /// Deterministic pseudo-random bytes, so a failure is reproducible.
     fn noise(n: usize) -> Vec<u8> {
-        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         (0..n)
             .map(|_| {
                 s ^= s << 13;
@@ -521,103 +1068,214 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn small_frames_take_the_datagram_path() {
-        assert_eq!(choose_channel(100, Some(1400)), Channel::Datagram);
-        assert_eq!(choose_channel(1400 - DATAGRAM_MARGIN, Some(1400)), Channel::Datagram);
-    }
-
-    #[test]
-    fn frames_within_the_margin_take_the_stream_path() {
-        assert_eq!(choose_channel(1400 - DATAGRAM_MARGIN + 1, Some(1400)), Channel::Stream);
-        assert_eq!(choose_channel(50_000, Some(1400)), Channel::Stream);
-    }
-
-    #[test]
-    fn everything_takes_the_stream_path_when_datagrams_are_unavailable() {
-        assert_eq!(choose_channel(1, None), Channel::Stream);
-    }
-
     #[tokio::test]
-    async fn a_small_frame_arrives_over_a_datagram() -> anyhow::Result<()> {
+    async fn a_small_frame_makes_one_datagram_and_arrives_whole() -> anyhow::Result<()> {
         let (server, client) = crate::testkit::loopback_pair().await?;
         assert!(
             server.max_datagram_size().is_some(),
-            "M2's quic_server/quic_client must set datagram buffer sizes, \
-             or QUIC datagrams are disabled entirely"
+            "M2's quic_server/quic_client must set datagram_receive_buffer_size \
+             and datagram_send_buffer_size, or QUIC datagrams are disabled"
         );
 
         let sink = FrameSink::new(server);
         let mut source = FrameSource::new(client);
-
-        let f = Frame { my_state: 7, from_state: 6, ack_state: 3, flags: 0, payload: noise(200) };
-        assert_eq!(sink.send(&f)?, Sent::Datagram);
+        let f = Frame {
+            my_state: 7,
+            from_state: 6,
+            ack_state: 3,
+            frag_index: 0,
+            frag_count: 1,
+            flags: 0,
+            payload: noise(200),
+        };
+        assert_eq!(sink.send(&f)?, 1);
 
         let got = source.recv().await?;
-        assert_eq!(got.my_state, 7);
-        assert_eq!(got.from_state, 6);
-        assert_eq!(got.ack_state, 3);
+        assert_eq!((got.my_state, got.from_state, got.ack_state), (7, 6, 3));
         assert_eq!(got.payload, f.payload);
         Ok(())
     }
 
-    /// The one that matters: a payload far larger than any datagram must
-    /// arrive byte-for-byte intact.
+    /// The one that matters: a 200x60 truecolor full state, which is exactly
+    /// what §8.2's ring-miss recovery sends, must arrive intact.
     #[tokio::test]
-    async fn an_oversized_frame_arrives_intact_over_a_stream() -> anyhow::Result<()> {
+    async fn a_full_200x60_truecolor_state_arrives_intact() -> anyhow::Result<()> {
+        use oxutrm_proto::TermSize;
+        use oxutrm_sync::{ScreenDiff, Sender};
+        use oxutrm_term::{Attrs, Cell, Color, ScreenState};
+
+        let size = TermSize { cols: 200, rows: 60 };
+        // Every cell distinct, so run-length collapsing cannot shrink it and
+        // the test really exercises the worst case.
+        let mut s = ScreenState::blank(size.rows, size.cols);
+        for (i, c) in s.cells.iter_mut().enumerate() {
+            *c = Cell {
+                // `Cell.text` is `CellText` (a `CompactString`), not `String`.
+                text: oxutrm_term::CellText::from(
+                    char::from_u32(0x41 + (i as u32 % 26)).unwrap().to_string().as_str(),
+                ),
+                fg: Color::Rgb((i % 251) as u8, ((i / 7) % 251) as u8, ((i / 13) % 251) as u8),
+                bg: Color::Rgb(((i / 3) % 251) as u8, ((i / 5) % 251) as u8, (i % 241) as u8),
+                attrs: Attrs::BOLD,
+            };
+        }
+        s.seq = 1;
+
+        // The real thing: a full diff from the sync engine, framed and paced
+        // exactly as the host session loop would.
+        let sender: Sender<ScreenState> = Sender::new(s.clone());
+        let frame = sender
+            .make_frame(0)?
+            .expect("a fresh sender owes the peer a full state");
+        let encoded_len = frame.payload.len();
+        assert!(
+            encoded_len > 10_000,
+            "a 200x60 truecolor state must be well over 10 KB, got {encoded_len}"
+        );
+
         let (server, client) = crate::testkit::loopback_pair().await?;
+        let max = server.max_datagram_size().expect("datagrams enabled");
+        assert!(
+            encoded_len > max,
+            "this test is meaningless unless the state exceeds one datagram \
+             ({encoded_len} vs {max})"
+        );
+
         let sink = FrameSink::new(server);
         let mut source = FrameSource::new(client);
+        let sent = sink.send(&frame)?;
+        assert!(sent > 1, "the state must have been fragmented, got {sent} datagram(s)");
 
-        // 400 KiB: comfortably larger than a 200x60 truecolor repaint, and
-        // roughly 300 datagrams' worth.
-        let payload = noise(400 * 1024);
-        let f = Frame { my_state: 42, from_state: 0, ack_state: 0, flags: 0, payload: payload.clone() };
-        assert_eq!(sink.send(&f)?, Sent::Stream);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.my_state, frame.my_state);
+        assert_eq!(got.from_state, frame.from_state);
+        assert_eq!(got.flags, frame.flags, "the flags byte must survive fragmentation");
+        assert_eq!(got.payload.len(), encoded_len, "reassembled payload truncated");
+        assert_eq!(got.payload, frame.payload, "reassembled payload corrupted");
 
-        let got = source.recv().await?;
-        assert_eq!(got.my_state, 42);
-        assert_eq!(got.from_state, 0);
-        assert_eq!(got.payload.len(), payload.len(), "truncated on the stream path");
-        assert_eq!(got.payload, payload, "corrupted on the stream path");
+        // And it must still decode into the state it started as.
+        let mut rx: oxutrm_sync::Receiver<ScreenState> =
+            oxutrm_sync::Receiver::new(ScreenState::blank(size.rows, size.cols));
+        assert!(rx.on_frame(&got)?);
+        assert_eq!(rx.state().cells, s.cells, "the screen did not survive the round trip");
+        let _: Option<ScreenDiff> = None;
         Ok(())
     }
 
-    /// While a stream frame is in flight the sink stays busy, so states
-    /// coalesce in the Sender instead of queueing on the wire.
+    /// Where fragmentation meets the invariants. A state that reassembles
+    /// perfectly but violates an invariant must be rejected WHOLESALE: the
+    /// receiver's state and its acknowledgement must both be untouched, so the
+    /// peer's next diff — computed from the same base — repairs it.
     #[tokio::test]
-    async fn the_sink_reports_busy_and_skips_while_a_stream_is_in_flight() -> anyhow::Result<()> {
+    async fn a_reassembled_but_invalid_state_is_rejected_without_disturbing_the_receiver()
+    -> anyhow::Result<()> {
+        use oxutrm_proto::TermSize;
+        use oxutrm_sync::{Receiver, RowPatch, Run, ScreenDiff};
+        use oxutrm_term::{Cell, CursorShape, ScreenState};
+
+        let size = TermSize { cols: 80, rows: 24 };
+
+        // Large enough to fragment, and deliberately invalid: the cursor sits
+        // outside the grid. Per I2 this is rejected, never clamped.
+        let bad = ScreenDiff {
+            resize: None,
+            rows: (0..24)
+                .map(|row| RowPatch {
+                    row,
+                    runs: vec![Run { start_col: 0, repeat: 0, cells: vec![Cell::blank(); 80] }],
+                })
+                .collect(),
+            cursor: Some(oxutrm_term::Cursor {
+                row: 999,
+                col: 999,
+                visible: true,
+                shape: CursorShape::Block,
+            }),
+            modes: None,
+            title: None,
+            bell: None,
+            scrollback_len: None,
+        };
+        let payload = postcard::to_stdvec(&bad)?;
+
+        let (server, client) = crate::testkit::loopback_pair().await?;
+        let max = server.max_datagram_size().expect("datagrams enabled");
+        assert!(payload.len() > max, "this test needs a fragmented diff");
+
+        let sink = FrameSink::new(server);
+        let mut source = FrameSource::new(client);
+        let f = Frame {
+            my_state: 2,
+            from_state: 1,
+            ack_state: 0,
+            frag_index: 0,
+            frag_count: 1,
+            flags: 0,
+            payload,
+        };
+        assert!(sink.send(&f)? > 1, "the diff must have been fragmented");
+
+        // Reassembly itself succeeds: the bytes are all there.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.my_state, 2);
+
+        // The sync engine is what rejects it, and it must reject wholesale.
+        let mut initial = ScreenState::blank(size.rows, size.cols);
+        initial.seq = 1;
+        let mut rx: Receiver<ScreenState> = Receiver::new(initial.clone());
+        let before_ack = rx.ack();
+
+        let err = rx.on_frame(&got).expect_err("an out-of-range cursor must be rejected");
+        assert!(
+            matches!(err, oxutrm_sync::ApplyError::CursorOutOfBounds { .. }),
+            "expected CursorOutOfBounds, got {err:?}"
+        );
+        assert_eq!(rx.ack(), before_ack, "a rejected frame must not advance the ack");
+        assert_eq!(
+            rx.state(),
+            &initial,
+            "a rejected diff must not be applied even partially"
+        );
+
+        // And the receiver still works: the next valid diff from the SAME base
+        // is what repairs the screen.
+        let mut good = ScreenState::blank(size.rows, size.cols);
+        good.seq = 1;
+        good.cells[0] = Cell { text: oxutrm_term::CellText::from("Z"), ..Cell::blank() };
+        let sender: oxutrm_sync::Sender<ScreenState> = oxutrm_sync::Sender::new(good.clone());
+        let repair = sender.make_frame(0)?.expect("a fresh sender owes a full state");
+        assert!(rx.on_frame(&repair)?, "the repairing diff must apply");
+        assert_eq!(rx.state().cell(0, 0).text.as_str(), "Z");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_frame_far_beyond_one_datagram_arrives_intact() -> anyhow::Result<()> {
         let (server, client) = crate::testkit::loopback_pair().await?;
         let sink = FrameSink::new(server);
         let mut source = FrameSource::new(client);
 
-        let big = Frame { my_state: 1, from_state: 0, ack_state: 0, flags: 0, payload: noise(400 * 1024) };
-        assert_eq!(sink.send(&big)?, Sent::Stream);
-        assert!(sink.is_busy());
+        let payload = noise(150_000);
+        let f = Frame {
+            my_state: 42,
+            from_state: 0,
+            ack_state: 0,
+            frag_index: 0,
+            frag_count: 1,
+            flags: 0,
+            payload: payload.clone(),
+        };
+        let sent = sink.send(&f)?;
+        assert!(sent > 100, "expected many fragments, got {sent}");
 
-        // A small frame offered while the stream is in flight is dropped, not
-        // sent: the newer state will be diffed afresh once the sink is free.
-        let small = Frame { my_state: 2, from_state: 1, ack_state: 0, flags: 0, payload: noise(10) };
-        assert_eq!(sink.send(&small)?, Sent::Skipped);
-
-        let got = source.recv().await?;
-        assert_eq!(got.my_state, 1);
-
-        // Once drained, the sink frees up and accepts frames again.
-        for _ in 0..200 {
-            if !sink.is_busy() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(!sink.is_busy(), "sink never cleared after the stream drained");
-        assert_eq!(sink.send(&small)?, Sent::Datagram);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.payload, payload);
         Ok(())
     }
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they fail**
+- [ ] **Step 7: Run tests to verify they fail**
 
 Add to `crates/oxutrm-net/src/lib.rs`:
 
@@ -627,192 +1285,116 @@ pub mod xport;
 pub mod testkit;
 ```
 
+Add `oxutrm-sync`, `oxutrm-term` and `oxutrm-proto` to `crates/oxutrm-net/Cargo.toml`
+under `[dev-dependencies]` so the worst-case test can build a real state.
+
 Run: `cargo test --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
 
-Expected: FAIL to compile — `cannot find function choose_channel`, `cannot find type FrameSink`.
+Expected: FAIL to compile — `cannot find type FrameSink`.
 
-- [ ] **Step 5: Write minimal implementation**
+- [ ] **Step 8: Write minimal implementation**
 
 Put this above the test module in `crates/oxutrm-net/src/xport.rs`:
 
 ```rust
 //! Getting a `Frame` from one peer to the other.
 //!
-//! A `Frame` that fits in a QUIC datagram goes in a datagram: unreliable,
-//! unretransmitted, exactly what screen state wants (spec §8.1). A `Frame`
-//! that does not fit — in practice a full repaint — goes on a fresh
-//! unidirectional stream instead. Datagrams are never fragmented: losing one
-//! fragment of a thirty-fragment state would lose the whole state, which is
-//! precisely the property §8.1 exists to avoid.
-//!
-//! Unidirectional streams are reserved for this. Control, scrollback and
-//! clipboard are bidirectional (spec §7.2), so no discriminating header is
-//! needed: a uni stream carries one postcard `Frame` and then FIN.
+//! Screen and input state travel as QUIC datagrams: unreliable and never
+//! retransmitted, which is exactly what §8.1 wants. Anything too large for one
+//! datagram is fragmented by `crate::frag`; unidirectional streams are NOT used
+//! for state. Control, scrollback and clipboard are bidirectional streams and
+//! belong elsewhere (§7.2).
 
+use crate::frag::{fragment, Reassembler};
 use oxutrm_proto::Frame;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-/// Headroom below `max_datagram_size()`, so a frame never lands exactly on a
-/// boundary DPLPMTUD is still probing.
-pub const DATAGRAM_MARGIN: usize = 64;
-
-/// A stream frame larger than this is a bug, not a repaint.
-pub const MAX_STREAM_FRAME: usize = 8 * 1024 * 1024;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Channel {
-    Datagram,
-    Stream,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Sent {
-    Datagram,
-    Stream,
-    /// An oversized transfer was already in flight; this state was dropped and
-    /// will be superseded by a fresher diff.
-    Skipped,
-}
-
-/// `max_datagram` is `quinn::Connection::max_datagram_size()`; `None` means the
-/// peer disabled datagrams, in which case everything goes on a stream.
-pub fn choose_channel(encoded_len: usize, max_datagram: Option<usize>) -> Channel {
-    match max_datagram {
-        Some(max) if encoded_len + DATAGRAM_MARGIN <= max => Channel::Datagram,
-        _ => Channel::Stream,
-    }
-}
-
-/// Sends `Frame`s. Cheap to clone-free share: `send` takes `&self`.
+/// Sends `Frame`s, fragmenting whatever will not fit.
 pub struct FrameSink {
     conn: quinn::Connection,
-    stream_busy: Arc<AtomicBool>,
 }
 
 impl FrameSink {
     pub fn new(conn: quinn::Connection) -> FrameSink {
-        FrameSink { conn, stream_busy: Arc::new(AtomicBool::new(false)) }
+        FrameSink { conn }
     }
 
-    /// True while an oversized frame is still being delivered.
-    pub fn is_busy(&self) -> bool {
-        self.stream_busy.load(Ordering::SeqCst)
-    }
-
-    pub fn send(&self, f: &Frame) -> anyhow::Result<Sent> {
-        // Nothing else goes out while a repaint is in flight: it would either
-        // be superseded on arrival or arrive out of order against a base the
-        // peer is about to leave.
-        if self.is_busy() {
-            return Ok(Sent::Skipped);
+    /// Returns the number of datagrams sent.
+    pub fn send(&self, f: &Frame) -> anyhow::Result<usize> {
+        // `None` means the peer disabled datagrams, which M2's TransportConfig
+        // must not allow; 1200 is QUIC's floor and a safe last resort.
+        let max = self.conn.max_datagram_size().unwrap_or(1200);
+        let parts = fragment(f, max)?;
+        for p in &parts {
+            self.conn.send_datagram(bytes::Bytes::from(p.encode()?))?;
         }
-
-        let bytes = f.encode()?;
-        match choose_channel(bytes.len(), self.conn.max_datagram_size()) {
-            Channel::Datagram => {
-                self.conn.send_datagram(bytes::Bytes::from(bytes))?;
-                Ok(Sent::Datagram)
-            }
-            Channel::Stream => {
-                anyhow::ensure!(
-                    bytes.len() <= MAX_STREAM_FRAME,
-                    "frame of {} bytes exceeds MAX_STREAM_FRAME",
-                    bytes.len()
-                );
-                self.stream_busy.store(true, Ordering::SeqCst);
-                let conn = self.conn.clone();
-                let busy = self.stream_busy.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        let mut s = conn.open_uni().await?;
-                        s.write_all(&bytes).await?;
-                        s.finish()?;
-                        // Resolves once the peer has taken the stream, so the
-                        // sink stays busy for as long as the transfer really
-                        // occupies the link.
-                        let _ = s.stopped().await;
-                        anyhow::Ok(())
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        // A dead connection is the session loop's problem, not
-                        // this task's; it will observe `conn.closed()`.
-                        eprintln!("oxutrm: oversized frame not delivered: {e}");
-                    }
-                    busy.store(false, Ordering::SeqCst);
-                });
-                Ok(Sent::Stream)
-            }
-        }
+        Ok(parts.len())
     }
 }
 
-/// Receives `Frame`s from either channel.
+/// Receives `Frame`s, reassembling fragment sets.
 pub struct FrameSource {
     conn: quinn::Connection,
+    reassembler: Reassembler,
 }
 
 impl FrameSource {
     pub fn new(conn: quinn::Connection) -> FrameSource {
-        FrameSource { conn }
+        FrameSource { conn, reassembler: Reassembler::new() }
     }
 
-    /// The next `Frame`, from whichever channel produces one first.
+    /// Tell the source what the receiver has applied, so fragments of an
+    /// already-superseded state are discarded on arrival (§7.1.1).
+    pub fn set_current_state(&mut self, seq: u64) {
+        self.reassembler.set_current_state(seq);
+    }
+
+    /// The next COMPLETE frame. Incomplete sets never surface: they are
+    /// discarded wholesale, and the peer's next diff carries what they held.
     pub async fn recv(&mut self) -> anyhow::Result<Frame> {
         loop {
-            let bytes = tokio::select! {
-                d = self.conn.read_datagram() => d?.to_vec(),
-                s = self.conn.accept_uni() => {
-                    let mut recv = s?;
-                    recv.read_to_end(MAX_STREAM_FRAME).await?
-                }
-            };
+            let bytes = self.conn.read_datagram().await?;
             match Frame::decode(&bytes) {
-                Ok(f) => return Ok(f),
-                // A malformed frame is a lost frame: the next one diffs from
-                // the same acknowledged base and contains whatever was in it.
-                Err(e) => eprintln!("oxutrm: dropping undecodable frame: {e}"),
+                Ok(f) => {
+                    if let Some(whole) = self.reassembler.accept(&f) {
+                        return Ok(whole);
+                    }
+                }
+                // A malformed datagram is a lost datagram: the next diff comes
+                // from the same acknowledged base and contains what it held.
+                Err(e) => eprintln!("oxutrm: dropping undecodable datagram: {e}"),
             }
         }
     }
 }
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [ ] **Step 9: Run tests to verify they pass**
 
 `cargo test --jobs 4 -p oxutrm-net xport:: -- --test-threads 4`
 
-Expected: PASS, 6 tests, including `an_oversized_frame_arrives_intact_over_a_stream`.
+Expected: PASS, 4 tests, including `a_full_200x60_truecolor_state_arrives_intact`
+and `a_reassembled_but_invalid_state_is_rejected_without_disturbing_the_receiver`.
 
-- [ ] **Step 7: Run the gates**
+- [ ] **Step 10: Run the gates and commit**
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --jobs 4 -- --test-threads 4
-```
-
-Expected: both clean.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/oxutrm-net/src/xport.rs crates/oxutrm-net/src/testkit.rs \
-        crates/oxutrm-net/src/lib.rs crates/oxutrm-net/Cargo.toml
+git add crates/oxutrm-net/src/frag.rs crates/oxutrm-net/src/xport.rs \
+        crates/oxutrm-net/src/testkit.rs crates/oxutrm-net/src/lib.rs \
+        crates/oxutrm-net/Cargo.toml
 git commit -m "$(cat <<'EOF'
-feat(net): frame transport, datagram below the MTU and uni stream above it
+feat(net): fragment diffs across datagrams, reassemble whole states only
 
-A full repaint does not fit in a QUIC datagram. Fragmenting an unreliable
-datagram would make one lost fragment lose the whole state, destroying the
-property in spec 8.1; a unidirectional stream gives exactly the semantics an
-oversized repaint needs. One oversized transfer at a time, so states coalesce
-rather than queue.
+A full ScreenState is well over 10 KB and send_datagram refuses anything past
+max_datagram_size, so the sync engine's own ring-miss recovery could not send.
+Frames now carry frag_index/frag_count; an incomplete set is discarded whole,
+which is what keeps "a lost datagram costs nothing" true.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 EOF
 )"
 ```
-
 ---
 
 ### Task 3: Input bookkeeping on both sides
@@ -822,6 +1404,18 @@ the user types and shrinks from the front when the host's acknowledgement comes
 back. The host must write each byte to the PTY exactly once across that
 shrinking, and neither side may guess: guessing by suffix matching is genuinely
 ambiguous (type `aaaa` and no overlap rule recovers the right split).
+
+On the wire this is already solved. `InputDiff` carries
+`consumed: u64` alongside `appended: Vec<u8>`, and `apply()` is defined as **drop
+`consumed` bytes from the front, THEN append `appended`** — get that order wrong
+and consumed input reaches the PTY twice. What is *not* available is the diff
+itself: `Receiver::on_frame` applies it internally and returns only
+`Result<bool, ApplyError>`, so the host cannot simply write `appended`.
+
+This task therefore reconstructs the same bookkeeping from what a caller can
+see. (If `oxutrm-sync` ever grows an `on_frame_with(&Frame, |d: &S::Diff|)`
+callback, `InputCursor` collapses to `term.write_input(&d.appended)` and should
+be deleted.)
 
 The mechanism, which needs no wire change:
 
@@ -1205,7 +1799,8 @@ EOF
 
 Spec §9.4: "Colours the client cannot show are down-converted **in the client**,
 so the host's state stays full fidelity for a future client that can." The host
-never learns about this; `ScreenState` always carries whatever `vt100` produced.
+never learns about this; `ScreenState` always carries whatever `alacritty_terminal`
+produced.
 
 **Files:**
 - Create: `crates/oxutrm-client/src/color.rs`
@@ -1339,7 +1934,7 @@ Put this above the test module in `crates/oxutrm-client/src/color.rs`:
 ```rust
 //! Colour down-conversion.
 //!
-//! The host's `ScreenState` always carries full fidelity — whatever `vt100`
+//! The host's `ScreenState` always carries full fidelity — whatever the emulator
 //! produced. Reducing it to what the user's real terminal can show happens
 //! here, on the client, so a future client on a better terminal gets the
 //! original (spec §9.4).
@@ -1510,7 +2105,7 @@ Append to the test module in `crates/oxutrm-client/src/color.rs`:
         let mut r = crate::Renderer::new(size, caps(256));
         let mut s = ScreenState::blank(size.rows, size.cols);
         s.cells[0] = Cell {
-            text: "X".to_string(),
+            text: oxutrm_term::CellText::from("X"),
             fg: Color::Rgb(255, 0, 0),
             bg: Color::Rgb(0, 0, 255),
             attrs: oxutrm_term::Attrs::empty(),
@@ -1597,28 +2192,47 @@ EOF
 
 ### Task 5: Terminal capability negotiation, end to end
 
-The client detects what its own terminal can do, sends it in `ClientHello`, and
-the host turns it into the child's `TERM` and `COLORTERM`. When the user moves
-to a different terminal on reattach, `ControlMsg::CapsUpdate` carries the new
-capabilities and the host re-exports them for future children.
+Spec §9.4, and note what it does **not** say. `caps` **never reaches the child
+environment.** The host derives `TERM` and `COLORTERM` **solely from what
+`alacritty_terminal` emulates**; `negotiate_term` takes no argument and has
+nothing client-specific to take. All capability adaptation lives in the client
+(Task 4).
+
+Two reasons, both decisive, and a task that "improves" on this by feeding client
+capabilities into `TERM` is wrong:
+
+- **Fidelity is not recoverable.** A `TERM` narrowed to the current client's
+  intersection makes the *shell* emit degraded output, which is then baked into
+  the authoritative `ScreenState` forever. A better client attaching tomorrow
+  cannot recover what the application never emitted.
+- **`TERM` cannot change under a running shell.** Connect and reattach are one
+  code path (§4.1), so a client with different capabilities can attach to a
+  session whose shell has been running for a week.
+
+`caps` is therefore used for exactly two things: choosing the client's own
+down-conversion strategy, and diagnosis. `term_name` is never propagated
+anywhere.
 
 **Files:**
-- Modify: `crates/oxutrm-term/src/host_term.rs`
+- Modify: `crates/oxutrm-term/src/lib.rs`
 - Create: `crates/oxutrm-host/src/caps.rs`
 - Modify: `crates/oxutrm-host/src/lib.rs`
+- Modify: `crates/oxutrm-host/Cargo.toml`
 
 **Interfaces:**
-- Consumes: `oxutrm_term::detect_caps() -> TerminalCaps` and
-  `oxutrm_term::negotiate_term(caps: &TerminalCaps) -> (String, Option<String>)`
-  (both M1); `oxutrm_term::HostTerm::spawn(shell, args, env, size, scrollback)`;
-  `oxutrm_proto::{TerminalCaps, ControlMsg}`.
+- Consumes: `oxutrm_term::detect_caps() -> TerminalCaps` (M1);
+  `oxutrm_term::negotiate_term() -> (String /*TERM*/, Option<String> /*COLORTERM*/)`
+  — **no arguments**; `oxutrm_term::HostTerm::spawn(shell, args, env, size, scrollback)`;
+  `oxutrm_proto::{TerminalCaps, ControlMsg, PathDescription}`.
 - Produces:
   ```rust
   // crates/oxutrm-host/src/caps.rs
-  /// The environment a session's child shell is started with, given the
-  /// client's capabilities. Never contains key material.
-  pub fn child_env(caps: &oxutrm_proto::TerminalCaps) -> Vec<(String, String)>;
-  /// Serve one `ControlMsg` on the control stream.
+  /// The environment a session's child shell is started with. Takes no client
+  /// capabilities, deliberately (§9.4). Never contains key material.
+  pub fn child_env() -> Vec<(String, String)>;
+
+  /// Serve one `ControlMsg`. `caps` is stored for diagnosis and for nothing
+  /// else: it must never influence the child environment.
   pub fn handle_control(
       msg: &oxutrm_proto::ControlMsg,
       caps: &mut oxutrm_proto::TerminalCaps,
@@ -1627,7 +2241,64 @@ capabilities and the host re-exports them for future children.
   ) -> Option<oxutrm_proto::ControlMsg>;
   ```
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test for `negotiate_term`**
+
+Append to `crates/oxutrm-term/src/lib.rs`:
+
+```rust
+#[cfg(test)]
+mod negotiate_term_tests {
+    use super::*;
+
+    #[test]
+    fn term_describes_the_emulator_and_nothing_else() {
+        let (term, colorterm) = negotiate_term();
+        // alacritty_terminal handles the full 256-colour palette and 24-bit
+        // SGR 38;2/48;2, so both of these are honest.
+        assert_eq!(term, "xterm-256color");
+        assert_eq!(colorterm.as_deref(), Some("truecolor"));
+    }
+
+    /// The signature is the guard rail: if this ever grows a `TerminalCaps`
+    /// argument, spec §9.4 has been violated.
+    #[test]
+    fn negotiate_term_is_deterministic_across_calls() {
+        assert_eq!(negotiate_term(), negotiate_term());
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+`cargo test --jobs 4 -p oxutrm-term negotiate_term_tests -- --test-threads 4`
+
+Expected: FAIL to compile if M1 gave `negotiate_term` a `TerminalCaps` argument,
+or FAIL on the assertions otherwise.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `crates/oxutrm-term/src/lib.rs`, replace whatever `negotiate_term` M1 wrote:
+
+```rust
+/// Derived SOLELY from what `alacritty_terminal` emulates. The client's
+/// capabilities must NOT influence this: the child's `TERM` cannot change when
+/// a differently-capable client reattaches, and down-converting here would
+/// permanently degrade the host's authoritative state (spec §9.4). All
+/// capability adaptation happens in the client, at render time.
+pub fn negotiate_term() -> (String, Option<String>) {
+    // The emulator implements the full 256-colour palette and 24-bit SGR
+    // 38;2 / 48;2, so claiming both is honest rather than hopeful.
+    ("xterm-256color".to_string(), Some("truecolor".to_string()))
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-term negotiate_term_tests -- --test-threads 4`
+
+Expected: PASS, 2 tests.
+
+- [ ] **Step 5: Write the failing test for the host side**
 
 Create `crates/oxutrm-host/src/caps.rs` containing only:
 
@@ -1653,32 +2324,32 @@ mod tests {
     }
 
     #[test]
-    fn a_truecolor_client_gets_colorterm_in_the_child() {
-        let env = child_env(&caps(16_777_216, true));
+    fn the_child_environment_describes_the_emulator() {
+        let env = child_env();
         assert_eq!(get(&env, "TERM"), Some("xterm-256color"));
         assert_eq!(get(&env, "COLORTERM"), Some("truecolor"));
     }
 
+    /// The whole point of §9.4: a 16-colour client must not degrade what the
+    /// shell emits, because a better client may attach tomorrow.
     #[test]
-    fn a_256_colour_client_gets_no_colorterm() {
-        let env = child_env(&caps(256, false));
-        assert_eq!(get(&env, "TERM"), Some("xterm-256color"));
-        assert_eq!(get(&env, "COLORTERM"), None);
+    fn a_poor_client_does_not_change_the_child_environment() {
+        // child_env takes no capabilities at all, so this is true by
+        // construction — the test exists to keep it that way.
+        let before = child_env();
+        let mut stored = caps(16, false);
+        let info = ControlMsg::SessionInfo {
+            session_id: "0".repeat(32),
+            shell: "/bin/sh".to_string(),
+            created_unix: 0,
+        };
+        handle_control(&ControlMsg::CapsUpdate(caps(8, false)), &mut stored, &info, &path());
+        assert_eq!(before, child_env());
     }
 
-    #[test]
-    fn a_16_colour_client_gets_a_16_colour_term() {
-        let env = child_env(&caps(16, false));
-        assert_eq!(get(&env, "TERM"), Some("xterm"));
-        assert_eq!(get(&env, "COLORTERM"), None);
-    }
-
-    /// The client's own $TERM is diagnostic only: it must never reach the
-    /// child, because the child renders into vt100, not into the user's
-    /// terminal.
     #[test]
     fn the_clients_own_term_name_never_reaches_the_child() {
-        let env = child_env(&caps(256, false));
+        let env = child_env();
         assert!(
             env.iter().all(|(_, v)| v != "foot"),
             "the client's terminal name leaked into the child environment"
@@ -1687,45 +2358,14 @@ mod tests {
 
     #[test]
     fn no_environment_variable_carries_key_material() {
-        let env = child_env(&caps(16_777_216, true));
-        for (k, _) in &env {
+        for (k, _) in child_env() {
             let k = k.to_ascii_uppercase();
             assert!(!k.contains("PSK") && !k.contains("KEY") && !k.contains("SECRET"));
         }
     }
 
-    #[test]
-    fn a_caps_update_replaces_the_stored_capabilities() {
-        let mut current = caps(16, false);
-        let info = ControlMsg::SessionInfo {
-            session_id: "0".repeat(32),
-            shell: "/bin/sh".to_string(),
-            created_unix: 0,
-        };
-        let path = PathDescription {
-            rung: Rung::Ipv6Direct,
-            local: "[::1]:443".parse().unwrap(),
-            remote: "[::1]:1".parse().unwrap(),
-            probes_sent: 0,
-            nat_type: NatType::None,
-            rtt_ms: 11,
-            mtu: 1452,
-        };
-        let reply = handle_control(&ControlMsg::CapsUpdate(caps(16_777_216, true)), &mut current, &info, &path);
-        assert!(reply.is_none());
-        assert_eq!(current.colors, 16_777_216);
-        assert!(current.truecolor);
-    }
-
-    #[test]
-    fn a_status_request_is_answered_with_the_current_path() {
-        let mut current = caps(256, false);
-        let info = ControlMsg::SessionInfo {
-            session_id: "a".repeat(32),
-            shell: "/bin/sh".to_string(),
-            created_unix: 7,
-        };
-        let path = PathDescription {
+    fn path() -> PathDescription {
+        PathDescription {
             rung: Rung::StunPunch,
             local: "127.0.0.1:443".parse().unwrap(),
             remote: "127.0.0.1:9".parse().unwrap(),
@@ -1733,8 +2373,37 @@ mod tests {
             nat_type: NatType::EndpointIndependent,
             rtt_ms: 38,
             mtu: 1392,
+        }
+    }
+
+    #[test]
+    fn a_caps_update_replaces_the_stored_capabilities_for_diagnosis() {
+        let mut stored = caps(16, false);
+        let info = ControlMsg::SessionInfo {
+            session_id: "0".repeat(32),
+            shell: "/bin/sh".to_string(),
+            created_unix: 0,
         };
-        match handle_control(&ControlMsg::StatusRequest, &mut current, &info, &path) {
+        let reply = handle_control(
+            &ControlMsg::CapsUpdate(caps(16_777_216, true)),
+            &mut stored,
+            &info,
+            &path(),
+        );
+        assert!(reply.is_none());
+        assert_eq!(stored.colors, 16_777_216);
+        assert!(stored.truecolor);
+    }
+
+    #[test]
+    fn a_status_request_is_answered_with_the_current_path() {
+        let mut stored = caps(256, false);
+        let info = ControlMsg::SessionInfo {
+            session_id: "a".repeat(32),
+            shell: "/bin/sh".to_string(),
+            created_unix: 7,
+        };
+        match handle_control(&ControlMsg::StatusRequest, &mut stored, &info, &path()) {
             Some(ControlMsg::StatusReply(p)) => {
                 assert_eq!(p.rtt_ms, 38);
                 assert_eq!(p.rung, Rung::StunPunch);
@@ -1745,7 +2414,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 6: Run test to verify it fails**
 
 Add `pub mod caps;` to `crates/oxutrm-host/src/lib.rs`, then run:
 
@@ -1753,25 +2422,25 @@ Add `pub mod caps;` to `crates/oxutrm-host/src/lib.rs`, then run:
 
 Expected: FAIL to compile — `cannot find function child_env`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 7: Write minimal implementation**
 
 Put this above the test module in `crates/oxutrm-host/src/caps.rs`:
 
 ```rust
-//! Turning the client's declared capabilities into the child shell's
-//! environment (spec §9.4).
+//! The child shell's environment, and the control stream (spec §9.4).
 //!
-//! Mosh hardcodes `xterm-256color` and hopes. We can do better because the
-//! client re-renders into the user's real terminal and therefore knows what it
-//! can display. `TERM` describes what `vt100` emulates, narrowed by what the
-//! client can show; the client's own `$TERM` is diagnostic only and never
-//! reaches the child.
+//! Mosh hardcodes `xterm-256color` and hopes. oxutrm states honestly what its
+//! own emulator implements — and deliberately does NOT narrow it to the current
+//! client. Narrowing would degrade what the shell emits, which is then baked
+//! into the authoritative `ScreenState` forever, and it would be undefined the
+//! moment a differently-capable client reattaches to a week-old shell.
 
 use oxutrm_proto::{ControlMsg, PathDescription, TerminalCaps};
 
-/// The environment for a session's child shell.
-pub fn child_env(caps: &TerminalCaps) -> Vec<(String, String)> {
-    let (term, colorterm) = oxutrm_term::negotiate_term(caps);
+/// The environment for a session's child shell. Takes no client capabilities,
+/// deliberately.
+pub fn child_env() -> Vec<(String, String)> {
+    let (term, colorterm) = oxutrm_term::negotiate_term();
     let mut env = vec![("TERM".to_string(), term)];
     if let Some(ct) = colorterm {
         env.push(("COLORTERM".to_string(), ct));
@@ -1787,9 +2456,9 @@ pub fn handle_control(
     path: &PathDescription,
 ) -> Option<ControlMsg> {
     match msg {
+        // Stored for diagnosis only. It must never reach the child: see the
+        // module docs and spec §9.4.
         ControlMsg::CapsUpdate(new_caps) => {
-            // The running child keeps the TERM it was started with — changing
-            // it under a live process would be a lie. New children get this.
             *caps = new_caps.clone();
             None
         }
@@ -1800,52 +2469,25 @@ pub fn handle_control(
 }
 ```
 
-M1's `negotiate_term` must satisfy the table the tests assert. If it does not,
-fix it in `crates/oxutrm-term/src/lib.rs` to exactly this:
-
-```rust
-/// The honest intersection of what vt100 emulates and what the client can show.
-pub fn negotiate_term(caps: &TerminalCaps) -> (String, Option<String>) {
-    let term = if caps.colors >= 256 { "xterm-256color" } else { "xterm" };
-    let colorterm = if caps.truecolor && caps.colors >= 16_777_216 {
-        Some("truecolor".to_string())
-    } else {
-        None
-    };
-    (term.to_string(), colorterm)
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 8: Run test to verify it passes**
 
 `cargo test --jobs 4 -p oxutrm-host caps:: -- --test-threads 4`
 
-Expected: PASS, 7 tests.
+Expected: PASS, 6 tests.
 
-- [ ] **Step 5: Write the failing test that the child really sees the environment**
+- [ ] **Step 9: Write the failing test that the child really sees the environment**
 
 Create `crates/oxutrm-host/tests/child_env.rs`:
 
 ```rust
-use oxutrm_proto::{TermSize, TerminalCaps};
+use oxutrm_proto::TermSize;
 use oxutrm_term::HostTerm;
 
-fn caps(colors: u32, truecolor: bool) -> TerminalCaps {
-    TerminalCaps {
-        truecolor,
-        colors,
-        bracketed_paste: true,
-        mouse_sgr: true,
-        osc52: true,
-        term_name: "kitty".to_string(),
-    }
-}
-
-/// Start a shell with the negotiated environment and have it print $TERM and
+/// Start a shell with the derived environment and have it print $TERM and
 /// $COLORTERM back through the PTY.
-fn shell_reports(caps: &TerminalCaps) -> String {
+fn shell_reports() -> String {
     let size = TermSize { cols: 80, rows: 10 };
-    let env = oxutrm_host::caps::child_env(caps);
+    let env = oxutrm_host::caps::child_env();
     let mut term = HostTerm::spawn(
         "/bin/sh",
         &["-c".to_string(), "printf '<%s|%s>' \"$TERM\" \"$COLORTERM\"".to_string()],
@@ -1858,7 +2500,7 @@ fn shell_reports(caps: &TerminalCaps) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         term.poll().expect("poll");
-        let s = term.snapshot(0);
+        let s = term.snapshot(1);
         let text: String = s.cells.iter().map(|c| c.text.as_str()).collect();
         if text.contains('>') {
             return text;
@@ -1869,32 +2511,26 @@ fn shell_reports(caps: &TerminalCaps) -> String {
 }
 
 #[test]
-fn a_truecolor_client_gives_the_child_term_and_colorterm() {
-    let out = shell_reports(&caps(16_777_216, true));
+fn the_child_gets_term_and_colorterm_from_the_emulator() {
+    let out = shell_reports();
     assert!(out.contains("<xterm-256color|truecolor>"), "got {out:?}");
-}
-
-#[test]
-fn a_256_colour_client_gives_the_child_an_empty_colorterm() {
-    let out = shell_reports(&caps(256, false));
-    assert!(out.contains("<xterm-256color|>"), "got {out:?}");
 }
 ```
 
-- [ ] **Step 6: Run test to verify it fails, then passes**
+- [ ] **Step 10: Run test to verify it passes**
 
-`cargo test --jobs 4 -p oxutrm-host --test child_env -- --test-threads 4`
-
-If `oxutrm-host`'s `Cargo.toml` lacks `oxutrm-term` as a dependency, add it:
+If `crates/oxutrm-host/Cargo.toml` lacks `oxutrm-term`, add it:
 
 ```toml
 [dependencies]
 oxutrm-term = { path = "../oxutrm-term" }
 ```
 
-Expected after that: PASS, 2 tests.
+Run: `cargo test --jobs 4 -p oxutrm-host --test child_env -- --test-threads 4`
 
-- [ ] **Step 7: Run the gates and commit**
+Expected: PASS, 1 test.
+
+- [ ] **Step 11: Run the gates and commit**
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -1903,22 +2539,22 @@ git add crates/oxutrm-host/src/caps.rs crates/oxutrm-host/src/lib.rs \
         crates/oxutrm-host/tests/child_env.rs crates/oxutrm-host/Cargo.toml \
         crates/oxutrm-term/src/lib.rs
 git commit -m "$(cat <<'EOF'
-feat(host): negotiate TERM and COLORTERM from the client's real capabilities
+feat(host): derive the child's TERM from the emulator, never from the client
 
-The client's own terminal name stays diagnostic; the child gets the honest
-intersection of what vt100 emulates and what the client can display, and
-CapsUpdate carries a new terminal on reattach.
+Narrowing TERM to a client's capabilities degrades what the shell emits, which
+is then baked into the authoritative state forever, and it is undefined when a
+differently-capable client reattaches. All capability adaptation stays in the
+client. negotiate_term takes no argument.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 EOF
 )"
 ```
-
 ---
 
 ### Task 6: The host session loop
 
-PTY → `vt100` → `Sender<ScreenState>` → QUIC, and QUIC → `Receiver<InputState>`
+PTY → `alacritty_terminal` → `Sender<ScreenState>` → QUIC, and QUIC → `Receiver<InputState>`
 → PTY, paced by Task 1's `Pacer` and sent through Task 2's `FrameSink`.
 
 The PTY master is driven by `tokio::io::unix::AsyncFd`, so the loop sleeps
@@ -1932,7 +2568,8 @@ instead of spinning. That needs the fd, and it needs the fd to be non-blocking.
 
 **Interfaces:**
 - Consumes: `oxutrm_term::{HostTerm, ScreenState}`; `oxutrm_sync::{Sender, Receiver, InputState}`;
-  `oxutrm_net::xport::{FrameSink, FrameSource, Sent}`; `oxutrm_net::pace::Pacer`;
+  `oxutrm_net::xport::{FrameSink, FrameSource}` with
+  `FrameSink::send(&Frame) -> anyhow::Result<usize>`; `oxutrm_net::pace::Pacer`;
   `oxutrm_net::link::link_stats`; `oxutrm_host::InputCursor`; `oxutrm_proto::TermSize`.
   `Sender::<ScreenState>::make_frame(ack_state: u64) -> Result<Option<Frame>, ApplyError>`,
   `Receiver::<InputState>::{on_frame, state, ack, peer_ack}`.
@@ -2104,6 +2741,77 @@ async fn typed_input_reaches_the_shell_and_the_output_comes_back() -> anyhow::Re
     Ok(())
 }
 
+/// A frame the sync engine rejects must cost one frame, not the session.
+/// Tearing down here would be self-defeating: reconnecting cannot help, because
+/// the peer would re-derive the very same diff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unapplicable_frame_does_not_kill_the_session() -> anyhow::Result<()> {
+    let (server_conn, client_conn) = oxutrm_net::testkit::loopback_pair().await?;
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let term = HostTerm::spawn(
+        "/bin/sh",
+        &[],
+        &[("TERM".to_string(), "xterm".to_string()), ("PS1".to_string(), "".to_string())],
+        size(),
+        200,
+    )?;
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+
+    let sink = FrameSink::new(client_conn.clone());
+    let mut source = FrameSource::new(client_conn.clone());
+    let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
+    let mut input_tx: Sender<InputState> =
+        Sender::new(InputState { seq: 0, pending: Vec::new(), size: size() });
+
+    // Garbage where a postcard InputDiff should be. The host must log it and
+    // carry on.
+    sink.send(&Frame {
+        my_state: 900,
+        from_state: 0,
+        ack_state: 0,
+        frag_index: 0,
+        frag_count: 1,
+        flags: 0,
+        payload: vec![0xFF; 64],
+    })?;
+
+    // The session is still alive: real input still reaches the shell.
+    let next = input_tx.current().append(b"printf 'STILL-ALIVE'\n", size());
+    input_tx.update(next);
+    if let Some(f) = input_tx.make_frame(screen_rx.ack())? {
+        sink.send(&f)?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the session died on a bad frame:\n{}",
+            text(screen_rx.state())
+        );
+        assert!(!host.is_finished(), "run_host_session returned instead of dropping the frame");
+        match tokio::time::timeout(Duration::from_millis(500), source.recv()).await {
+            Ok(f) => {
+                let _ = screen_rx.on_frame(&f?);
+            }
+            Err(_) => {
+                if let Some(f) = input_tx.make_frame(screen_rx.ack())? {
+                    sink.send(&f)?;
+                }
+                continue;
+            }
+        }
+        if text(screen_rx.state()).contains("STILL-ALIVE") {
+            break;
+        }
+    }
+
+    client_conn.close(0u32.into(), b"done");
+    let _ = tokio::time::timeout(Duration::from_secs(5), host).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resize_in_the_input_state_resizes_the_pty() -> anyhow::Result<()> {
     let (server_conn, client_conn) = oxutrm_net::testkit::loopback_pair().await?;
@@ -2183,7 +2891,7 @@ Create `crates/oxutrm-host/src/session.rs`:
 //! The host session loop.
 //!
 //! ```text
-//!   PTY --> vt100 --> Sender<ScreenState> --> Frame --> QUIC
+//!   PTY --> alacritty_terminal --> Sender<ScreenState> --> Frame --> QUIC
 //!   PTY <--------------- Receiver<InputState> <-- Frame <-- QUIC
 //! ```
 //!
@@ -2195,7 +2903,7 @@ use crate::input_cursor::InputCursor;
 use anyhow::Context;
 use oxutrm_net::link::link_stats;
 use oxutrm_net::pace::Pacer;
-use oxutrm_net::xport::{FrameSink, FrameSource, Sent};
+use oxutrm_net::xport::{FrameSink, FrameSource};
 use oxutrm_proto::TermSize;
 use oxutrm_sync::{InputState, Receiver, Sender};
 use oxutrm_term::{HostTerm, ScreenState};
@@ -2221,7 +2929,9 @@ pub async fn run_host_session(
     let sink = FrameSink::new(conn.clone());
     let mut source = FrameSource::new(conn.clone());
 
-    let mut screen_tx: Sender<ScreenState> = Sender::new(term.snapshot(0));
+    // `ScreenState.seq` starts at 1 and resets to 1 at every attach; 0 is
+    // reserved as the "full state" sentinel, so it is never a real state.
+    let mut screen_tx: Sender<ScreenState> = Sender::new(term.snapshot(1));
     let mut input_rx: Receiver<InputState> =
         Receiver::new(InputState { seq: 0, pending: Vec::new(), size: initial });
     let mut cursor = InputCursor::new();
@@ -2265,7 +2975,21 @@ pub async fn run_host_session(
                     Err(_) => return Ok(None),
                 };
                 cursor.on_peer_saw(frame.ack_state);
-                if input_rx.on_frame(&frame)? {
+                // A frame the sync engine rejects is a DROPPED frame, not a
+                // dead session. `ScreenState::validate` and the bounds checks
+                // reject wholesale and leave the receiver's state untouched, so
+                // the ack does not advance and the peer's next diff — computed
+                // from that same base — repairs it. Propagating with `?` here
+                // would tear down a connection that is working perfectly.
+                let advanced = match input_rx.on_frame(&frame) {
+                    Ok(advanced) => advanced,
+                    Err(e) => {
+                        eprintln!("oxutrm: dropping unapplicable input frame: {e}");
+                        continue;
+                    }
+                };
+                if advanced {
+                    source.set_current_state(input_rx.ack());
                     let state = input_rx.state().clone();
                     let new_bytes = cursor.take_new(&state.pending).to_vec();
                     if !new_bytes.is_empty() {
@@ -2285,20 +3009,17 @@ pub async fn run_host_session(
                     dirty = true;
                 }
                 let now = Instant::now();
-                if dirty && pacer.may_send(now, rtt) && !sink.is_busy() {
-                    let next = term.snapshot(screen_tx.current().seq);
-                    if next != *screen_tx.current() {
-                        screen_tx.update(next);
-                    }
+                if dirty && pacer.may_send(now, rtt) {
+                    // `poll()` reported a change, and it is damage-driven
+                    // (`Term::damage()` / `reset_damage()`), so there is no
+                    // whole-grid comparison here and there must not be one.
+                    screen_tx.update(term.snapshot(screen_tx.current().seq));
                     if let Some(frame) = screen_tx.make_frame(input_rx.ack())? {
-                        match sink.send(&frame)? {
-                            Sent::Skipped => {}
-                            _ => {
-                                cursor.on_ack_sent(frame.my_state);
-                                pacer.on_sent(now);
-                                dirty = false;
-                            }
-                        }
+                        let sent = sink.send(&frame)?;
+                        debug_assert!(sent >= 1);
+                        cursor.on_ack_sent(frame.my_state);
+                        pacer.on_sent(now);
+                        dirty = false;
                     } else {
                         dirty = false;
                         // Nothing outstanding: the next change goes out at once.
@@ -2321,7 +3042,7 @@ current sequence and comparing keeps the ring free of identical states.
 
 `cargo test --jobs 4 -p oxutrm-host --test session_loop -- --test-threads 4`
 
-Expected: PASS, 2 tests. If `typed_input_reaches_the_shell_and_the_output_comes_back`
+Expected: PASS, 3 tests. If `typed_input_reaches_the_shell_and_the_output_comes_back`
 hangs, the first thing to check is whether `HostTerm::poll` really returns
 without blocking on an empty PTY — `set_nonblocking` must have taken effect.
 
@@ -2334,7 +3055,7 @@ git add crates/oxutrm-term/src/host_term.rs crates/oxutrm-host/src/session.rs \
         crates/oxutrm-host/src/lib.rs crates/oxutrm-host/Cargo.toml \
         crates/oxutrm-host/tests/session_loop.rs
 git commit -m "$(cat <<'EOF'
-feat(host): the session loop, PTY to vt100 to QUIC and back
+feat(host): the session loop, PTY to the emulator to QUIC and back
 
 Sends are paced with clamp(rtt/2, 8ms, 100ms) from quinn's own RTT estimate,
 immediate when the link has been idle, and states coalesce rather than queue.
@@ -2911,3 +3632,2149 @@ EOF
 ```
 
 ---
+
+### Task 9: The status line, the migration announcement and the `Ctrl-]` pane
+
+Spec §10.3: one line on connect, then silence; `Ctrl-]` opens a locally drawn
+pane; a path change announces itself for a few seconds. All three are drawn by
+the client and cost no bandwidth.
+
+The separator in the connect line is two spaces, U+00B7, two spaces. The
+migration line uses single spaces around the U+00B7. These are exact.
+
+Two things the spec is emphatic about and that are easy to get wrong:
+
+- The rung-4 line **names the lost property**: `no UDP path, not detachable`.
+  "Not detachable" (§5.5) is otherwise discovered only by closing the laptop lid.
+- A migration announcement reports **the client's own local addresses**, old and
+  new. The rung and the peer address cannot change within an attach (§5), so
+  naming a rung there would be a lie.
+
+**Files:**
+- Create: `crates/oxutrm-client/src/status.rs`
+- Create: `crates/oxutrm-client/src/pane.rs`
+- Modify: `crates/oxutrm-client/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `oxutrm_proto::{PathDescription, Rung, NatType}`;
+  `oxutrm_net::link::LinkStats`.
+- Produces:
+  ```rust
+  // crates/oxutrm-client/src/status.rs
+  pub fn rung_label(path: &oxutrm_proto::PathDescription) -> String;
+  /// One connect-time line, then silence. Replaces M1's stub.
+  pub fn status_line(path: &oxutrm_proto::PathDescription) -> String;
+  /// Shown for MIGRATION_DWELL after the CLIENT'S OWN local address changes.
+  pub fn migration_line(
+      old_local: std::net::SocketAddr,
+      new_local: std::net::SocketAddr,
+      rtt_ms: u32,
+  ) -> String;
+  pub const MIGRATION_DWELL: std::time::Duration = std::time::Duration::from_secs(3);
+
+  // crates/oxutrm-client/src/pane.rs
+  pub const PANE_WIDTH: usize = 60;
+  pub struct StatusPane {
+      pub path: oxutrm_proto::PathDescription,
+      pub loss_pct: f32,
+      pub bytes_tx: u64,
+      pub bytes_rx: u64,
+      pub migrations: Vec<(u64, String)>,   // (seconds since connect, "old → new")
+      pub session_id: String,
+      pub uptime: std::time::Duration,
+  }
+  pub fn fmt_bytes(n: u64) -> String;
+  pub fn fmt_uptime(d: std::time::Duration) -> String;
+  pub fn status_pane_lines(p: &StatusPane) -> Vec<String>;
+  ```
+
+- [ ] **Step 1: Write the failing test for the status line**
+
+Create `crates/oxutrm-client/src/status.rs` containing only:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxutrm_proto::{NatType, PathDescription, Rung};
+
+    fn path(rung: Rung, remote: &str, rtt_ms: u32, mtu: u16, probes: u32, nat: NatType) -> PathDescription {
+        PathDescription {
+            rung,
+            local: "127.0.0.1:443".parse().unwrap(),
+            remote: remote.parse().unwrap(),
+            probes_sent: probes,
+            nat_type: nat,
+            rtt_ms,
+            mtu,
+        }
+    }
+
+    #[test]
+    fn the_ipv6_direct_line_matches_the_spec() {
+        let p = path(Rung::Ipv6Direct, "[2001:db8::2]:443", 11, 1452, 0, NatType::None);
+        assert_eq!(status_line(&p), "oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452");
+    }
+
+    #[test]
+    fn the_port_mapped_line_matches_the_spec() {
+        let p = path(Rung::PortMapped, "203.0.113.7:443", 38, 1392, 0, NatType::EndpointIndependent);
+        assert_eq!(
+            status_line(&p),
+            "oxutrm  IPv4 punched (port mapped)  ·  38 ms  ·  mtu 1392"
+        );
+    }
+
+    #[test]
+    fn the_birthday_line_reports_the_probe_count_and_the_nat_instead_of_the_mtu() {
+        let p = path(Rung::Birthday, "203.0.113.7:41234", 61, 1392, 312, NatType::Symmetric);
+        assert_eq!(
+            status_line(&p),
+            "oxutrm  IPv4 punched (birthday, 312 probes)  ·  61 ms  ·  symmetric NAT"
+        );
+    }
+
+    /// The rung-4 line must name the lost property: a user who is not told
+    /// "not detachable" discovers it by closing the laptop lid (§5.5).
+    #[test]
+    fn the_ssh_tunnel_line_warns_that_the_session_is_not_detachable() {
+        let p = path(Rung::SshTunnel, "127.0.0.1:41234", 45, 1200, 0, NatType::Unknown);
+        assert_eq!(
+            status_line(&p),
+            "oxutrm  SSH tunnel — no UDP path, not detachable  ·  45 ms      [warning]"
+        );
+        assert!(status_line(&p).contains("not detachable"));
+    }
+
+    #[test]
+    fn the_plain_stun_punch_line_names_the_address_family() {
+        let v4 = path(Rung::StunPunch, "203.0.113.7:443", 22, 1400, 6, NatType::EndpointIndependent);
+        assert_eq!(status_line(&v4), "oxutrm  IPv4 punched  ·  22 ms  ·  mtu 1400");
+        let v6 = path(Rung::StunPunch, "[2001:db8::2]:443", 22, 1400, 6, NatType::EndpointIndependent);
+        assert_eq!(status_line(&v6), "oxutrm  IPv6 punched  ·  22 ms  ·  mtu 1400");
+    }
+
+    /// A migration names the client's OWN local addresses. The rung and the
+    /// peer address are fixed for the attach (§5), so naming a rung would lie.
+    #[test]
+    fn the_migration_line_names_the_old_and_new_local_address() {
+        let old = "10.0.0.7:51000".parse().unwrap();
+        let new = "192.0.2.44:51000".parse().unwrap();
+        assert_eq!(
+            migration_line(old, new, 74),
+            "oxutrm  path migrated → 10.0.0.7:51000 → 192.0.2.44:51000 · 74 ms"
+        );
+    }
+
+    #[test]
+    fn the_connect_separator_is_two_spaces_around_a_middle_dot() {
+        let p = path(Rung::Ipv6Direct, "[2001:db8::2]:443", 11, 1452, 0, NatType::None);
+        assert!(status_line(&p).contains("  \u{b7}  "));
+        // The migration line uses single spaces, deliberately.
+        let old = "10.0.0.7:51000".parse().unwrap();
+        let new = "192.0.2.44:51000".parse().unwrap();
+        assert!(migration_line(old, new, 74).contains(" \u{b7} "));
+        assert!(!migration_line(old, new, 74).contains("  \u{b7}  "));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Add `pub mod status;` and `pub use status::{status_line, migration_line, rung_label};`
+to `crates/oxutrm-client/src/lib.rs`, removing M1's `status_line` stub, then run:
+
+`cargo test --jobs 4 -p oxutrm-client status:: -- --test-threads 4`
+
+Expected: FAIL — either a compile error, or M1's stub produces a different string.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Put this above the test module in `crates/oxutrm-client/src/status.rs`:
+
+```rust
+//! The status display, spec §10.3. One line on connect, then silence.
+//!
+//! The `PathDescription` carries no mapping protocol, so a rung-1 path is
+//! described as "port mapped" rather than naming NAT-PMP, PCP or UPnP.
+
+use oxutrm_proto::{NatType, PathDescription, Rung};
+use std::net::SocketAddr;
+use std::time::Duration;
+
+/// How long a path-change announcement stays on screen.
+pub const MIGRATION_DWELL: Duration = Duration::from_secs(3);
+
+fn family(a: &SocketAddr) -> &'static str {
+    if a.is_ipv6() {
+        "IPv6"
+    } else {
+        "IPv4"
+    }
+}
+
+fn nat_label(n: NatType) -> &'static str {
+    match n {
+        NatType::None => "none",
+        NatType::EndpointIndependent => "endpoint-independent",
+        NatType::AddressDependent => "address-dependent",
+        NatType::Symmetric => "symmetric",
+        NatType::Unknown => "unknown",
+    }
+}
+
+/// How the path is described to the user, in one phrase.
+pub fn rung_label(path: &PathDescription) -> String {
+    match path.rung {
+        Rung::Ipv6Direct => "IPv6 direct".to_string(),
+        Rung::PortMapped => format!("{} punched (port mapped)", family(&path.remote)),
+        Rung::StunPunch => format!("{} punched", family(&path.remote)),
+        Rung::Birthday => format!(
+            "{} punched (birthday, {} probes)",
+            family(&path.remote),
+            path.probes_sent
+        ),
+        Rung::SshTunnel => "SSH tunnel".to_string(),
+    }
+}
+
+/// The one line printed on connect. No silent magic: the user is told what
+/// connection they actually got.
+pub fn status_line(path: &PathDescription) -> String {
+    match path.rung {
+        // Rung 4 cannot daemonize, so the session dies with its SSH (§5.5).
+        // Saying only "SSH tunnel" would leave the user to find that out by
+        // closing the laptop lid.
+        Rung::SshTunnel => format!(
+            "oxutrm  SSH tunnel — no UDP path, not detachable  \u{b7}  {} ms      [warning]",
+            path.rtt_ms
+        ),
+        // Rung 3 was entered because the NAT is symmetric; saying so explains
+        // the probe count better than the MTU would.
+        Rung::Birthday => format!(
+            "oxutrm  {}  \u{b7}  {} ms  \u{b7}  {} NAT",
+            rung_label(path),
+            path.rtt_ms,
+            nat_label(path.nat_type)
+        ),
+        _ => format!(
+            "oxutrm  {}  \u{b7}  {} ms  \u{b7}  mtu {}",
+            rung_label(path),
+            path.rtt_ms,
+            path.mtu
+        ),
+    }
+}
+
+/// Shown for `MIGRATION_DWELL` when the client's OWN local address changes.
+/// Walking from Wi-Fi to mobile should be explained, not mysterious.
+///
+/// This reports local addresses, not a rung: QUIC migration changes only the
+/// endpoint's own address, and the peer address and rung are fixed for the
+/// attach (§5). There is no mechanism to repoint an established connection at a
+/// different peer.
+pub fn migration_line(old_local: SocketAddr, new_local: SocketAddr, rtt_ms: u32) -> String {
+    format!("oxutrm  path migrated → {old_local} → {new_local} \u{b7} {rtt_ms} ms")
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-client status:: -- --test-threads 4`
+
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Write the failing test for the pane**
+
+Create `crates/oxutrm-client/src/pane.rs` containing only:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxutrm_proto::{NatType, PathDescription, Rung};
+    use std::time::Duration;
+
+    fn pane() -> StatusPane {
+        StatusPane {
+            path: PathDescription {
+                rung: Rung::Ipv6Direct,
+                local: "[2001:db8::1]:443".parse().unwrap(),
+                remote: "[2001:db8::2]:51234".parse().unwrap(),
+                probes_sent: 0,
+                nat_type: NatType::None,
+                rtt_ms: 11,
+                mtu: 1452,
+            },
+            loss_pct: 0.4,
+            bytes_tx: 1_258_291,
+            bytes_rx: 348_672,
+            migrations: vec![(742, "IPv4 punched → IPv6 direct".to_string())],
+            session_id: "0a1b2c3d4e5f60718293a4b5c6d7e8f9".to_string(),
+            uptime: Duration::from_secs(3 * 3600 + 14 * 60 + 7),
+        }
+    }
+
+    #[test]
+    fn every_line_is_exactly_the_pane_width() {
+        for l in status_pane_lines(&pane()) {
+            assert_eq!(l.chars().count(), PANE_WIDTH, "wrong width: {l:?}");
+        }
+    }
+
+    #[test]
+    fn the_pane_is_a_closed_box() {
+        let lines = status_pane_lines(&pane());
+        assert!(lines[0].starts_with("┌ oxutrm ─ session 0a1b2c3d4e5f60718293a4b5c6d7e8f9 "));
+        assert!(lines[0].ends_with('┐'));
+        assert!(lines.last().unwrap().starts_with("└ Ctrl-] closes "));
+        assert!(lines.last().unwrap().ends_with('┘'));
+        for l in &lines[1..lines.len() - 1] {
+            assert!(l.starts_with("│ ") && l.ends_with(" │"), "not a body line: {l:?}");
+        }
+    }
+
+    #[test]
+    fn the_pane_reports_everything_spec_10_3_asks_for() {
+        let text = status_pane_lines(&pane()).join("\n");
+        assert!(text.contains("path      IPv6 direct"));
+        assert!(text.contains("local     [2001:db8::1]:443"));
+        assert!(text.contains("remote    [2001:db8::2]:51234"));
+        assert!(text.contains("rtt       11 ms"));
+        assert!(text.contains("loss      0.4 %"));
+        assert!(text.contains("mtu       1452"));
+        assert!(text.contains("nat       none"));
+        assert!(text.contains("sent      1.2 MiB"));
+        assert!(text.contains("received  340.5 KiB"));
+        assert!(text.contains("uptime    3h 14m 07s"));
+        assert!(text.contains("+742s  IPv4 punched → IPv6 direct"));
+    }
+
+    #[test]
+    fn a_session_with_no_migrations_still_renders() {
+        let mut p = pane();
+        p.migrations.clear();
+        let text = status_pane_lines(&p).join("\n");
+        assert!(text.contains("migrations  none"));
+        for l in status_pane_lines(&p) {
+            assert_eq!(l.chars().count(), PANE_WIDTH);
+        }
+    }
+
+    #[test]
+    fn byte_counts_use_binary_units() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KiB");
+        assert_eq!(fmt_bytes(348_672), "340.5 KiB");
+        assert_eq!(fmt_bytes(1_258_291), "1.2 MiB");
+        assert_eq!(fmt_bytes(3_221_225_472), "3.0 GiB");
+    }
+
+    #[test]
+    fn uptime_drops_the_hours_when_there_are_none() {
+        assert_eq!(fmt_uptime(Duration::from_secs(7)), "0m 07s");
+        assert_eq!(fmt_uptime(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(fmt_uptime(Duration::from_secs(3661)), "1h 01m 01s");
+    }
+
+    /// A pathologically long migration label must not break the box.
+    #[test]
+    fn overlong_content_is_truncated_rather_than_widening_the_pane() {
+        let mut p = pane();
+        p.migrations = vec![(1, "x".repeat(200))];
+        for l in status_pane_lines(&p) {
+            assert_eq!(l.chars().count(), PANE_WIDTH, "wrong width: {l:?}");
+        }
+    }
+}
+```
+
+- [ ] **Step 6: Run test to verify it fails**
+
+Add `pub mod pane;` and `pub use pane::{status_pane_lines, StatusPane};` to
+`crates/oxutrm-client/src/lib.rs`, then run:
+
+`cargo test --jobs 4 -p oxutrm-client pane:: -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find type StatusPane`.
+
+- [ ] **Step 7: Write minimal implementation**
+
+Put this above the test module in `crates/oxutrm-client/src/pane.rs`:
+
+```rust
+//! The `Ctrl-]` status pane, spec §10.3. Drawn locally over the current
+//! screen, so it costs nothing on the wire and appears instantly.
+
+use crate::status::rung_label;
+use oxutrm_proto::{NatType, PathDescription};
+use std::time::Duration;
+
+/// Total width, borders included.
+pub const PANE_WIDTH: usize = 60;
+/// Room for text between the borders and their padding spaces.
+const INNER: usize = PANE_WIDTH - 4;
+
+pub struct StatusPane {
+    pub path: PathDescription,
+    pub loss_pct: f32,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
+    /// `(seconds since connect, "old label → new label")`.
+    pub migrations: Vec<(u64, String)>,
+    pub session_id: String,
+    pub uptime: Duration,
+}
+
+pub fn fmt_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if n < 1024 {
+        format!("{n} B")
+    } else if f < K * K {
+        format!("{:.1} KiB", f / K)
+    } else if f < K * K * K {
+        format!("{:.1} MiB", f / (K * K))
+    } else {
+        format!("{:.1} GiB", f / (K * K * K))
+    }
+}
+
+pub fn fmt_uptime(d: Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m {sec:02}s")
+    } else {
+        format!("{m}m {sec:02}s")
+    }
+}
+
+fn nat_label(n: NatType) -> &'static str {
+    match n {
+        NatType::None => "none",
+        NatType::EndpointIndependent => "endpoint-independent",
+        NatType::AddressDependent => "address-dependent",
+        NatType::Symmetric => "symmetric",
+        NatType::Unknown => "unknown",
+    }
+}
+
+/// One body line, padded or truncated to the pane's exact width.
+fn body(text: &str) -> String {
+    let mut t: String = text.chars().take(INNER).collect();
+    let pad = INNER - t.chars().count();
+    t.push_str(&" ".repeat(pad));
+    format!("│ {t} │")
+}
+
+/// A border line: a leading label, then rule characters out to the width.
+fn border(open: char, label: &str, close: char) -> String {
+    let mut s = String::new();
+    s.push(open);
+    s.push(' ');
+    s.push_str(label);
+    s.push(' ');
+    while s.chars().count() < PANE_WIDTH - 1 {
+        s.push('─');
+    }
+    // A very long label would have overrun; truncate back to size.
+    let mut s: String = s.chars().take(PANE_WIDTH - 1).collect();
+    s.push(close);
+    s
+}
+
+pub fn status_pane_lines(p: &StatusPane) -> Vec<String> {
+    let mut out = vec![border('┌', &format!("oxutrm ─ session {}", p.session_id), '┐')];
+    out.push(body(&format!("path      {}", rung_label(&p.path))));
+    out.push(body(&format!("local     {}", p.path.local)));
+    out.push(body(&format!("remote    {}", p.path.remote)));
+    out.push(body(&format!("rtt       {} ms", p.path.rtt_ms)));
+    out.push(body(&format!("loss      {:.1} %", p.loss_pct)));
+    out.push(body(&format!("mtu       {}", p.path.mtu)));
+    out.push(body(&format!("nat       {}", nat_label(p.path.nat_type))));
+    out.push(body(&format!("sent      {}", fmt_bytes(p.bytes_tx))));
+    out.push(body(&format!("received  {}", fmt_bytes(p.bytes_rx))));
+    out.push(body(&format!("uptime    {}", fmt_uptime(p.uptime))));
+    if p.migrations.is_empty() {
+        out.push(body("migrations  none"));
+    } else {
+        out.push(body("migrations"));
+        for (secs, what) in &p.migrations {
+            out.push(body(&format!("  +{secs}s  {what}")));
+        }
+    }
+    out.push(border('└', "Ctrl-] closes", '┘'));
+    out
+}
+```
+
+- [ ] **Step 8: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-client pane:: -- --test-threads 4`
+
+Expected: PASS, 7 tests.
+
+- [ ] **Step 9: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add crates/oxutrm-client/src/status.rs crates/oxutrm-client/src/pane.rs \
+        crates/oxutrm-client/src/lib.rs
+git commit -m "$(cat <<'EOF'
+feat(client): the connect line, the migration announcement and the Ctrl-] pane
+
+Exact spec 10.3 formats, all drawn locally, all costing nothing on the wire.
+The connect line tells the user what connection they actually got, and the
+SSH tunnel says so as a warning rather than silently.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 10: The client session loop
+
+Local input → `Sender<InputState>` → QUIC, and QUIC → `Receiver<ScreenState>`
+→ `Renderer`. `SIGWINCH` drives resize, `Ctrl-]` toggles the pane, and every
+exit path goes through Task 7's guard.
+
+Local stdin is read on a dedicated blocking thread rather than with `AsyncFd`:
+putting `O_NONBLOCK` on fd 0 changes a file description the user's shell shares,
+and a shell that inherits a non-blocking stdin misbehaves after oxutrm exits.
+
+**Files:**
+- Modify: `crates/oxutrm-client/src/session.rs`
+- Modify: `crates/oxutrm-client/src/lib.rs`
+- Modify: `crates/oxutrm-client/Cargo.toml`
+
+**Interfaces:**
+- Consumes: `oxutrm_client::{InputQueue, TerminalGuard, Renderer, terminal_size, status_line, migration_line, StatusPane, status_pane_lines}`;
+  `oxutrm_client::status::MIGRATION_DWELL`; `oxutrm_net::xport::{FrameSink, FrameSource}`
+  with `FrameSink::send(&Frame) -> anyhow::Result<usize>`;
+  `oxutrm_net::link::{link_stats, refresh_path}`; `oxutrm_net::pace::Pacer`;
+  `oxutrm_sync::{Receiver, ScreenState}`; `oxutrm_proto::{PathDescription, TermSize}`.
+- Produces:
+  ```rust
+  // crates/oxutrm-client/src/session.rs
+  /// The byte Ctrl-] produces.
+  pub const ESCAPE_BYTE: u8 = 0x1d;
+  /// Split raw input at the escape byte. Returns (bytes to send, escape presses).
+  pub fn split_escape(input: &[u8]) -> (Vec<u8>, usize);
+
+  /// `endpoint` is the client's own endpoint. It is needed because a
+  /// migration is a change of OUR local address, which only the endpoint
+  /// reports; `Connection::remote_address()` cannot change within an attach.
+  pub async fn run_client_session(
+      conn: quinn::Connection,
+      endpoint: quinn::Endpoint,
+      path: oxutrm_proto::PathDescription,
+      session_id: String,
+      caps: oxutrm_proto::TerminalCaps,
+  ) -> anyhow::Result<()>;
+
+  pub async fn wait_for_terminating_signal();   // from Task 8
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Append a test module to `crates/oxutrm-client/src/session.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_input_passes_through_untouched() {
+        let (out, presses) = split_escape(b"hello");
+        assert_eq!(out, b"hello");
+        assert_eq!(presses, 0);
+    }
+
+    #[test]
+    fn the_escape_byte_is_removed_and_counted() {
+        let (out, presses) = split_escape(b"ab\x1dcd");
+        assert_eq!(out, b"abcd");
+        assert_eq!(presses, 1);
+    }
+
+    #[test]
+    fn repeated_escapes_are_all_counted() {
+        let (out, presses) = split_escape(b"\x1d\x1d");
+        assert_eq!(out, b"");
+        assert_eq!(presses, 2);
+    }
+
+    /// 0x1d inside a longer escape sequence is still 0x1d: the terminal sends
+    /// it only when the user presses Ctrl-], so intercepting it unconditionally
+    /// is correct and matches what the spec asks for.
+    #[test]
+    fn an_escape_at_the_very_start_or_end_is_handled() {
+        assert_eq!(split_escape(b"\x1dx"), (b"x".to_vec(), 1));
+        assert_eq!(split_escape(b"x\x1d"), (b"x".to_vec(), 1));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+`cargo test --jobs 4 -p oxutrm-client session:: -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find function split_escape`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/oxutrm-client/src/session.rs`, above the test module and below
+`wait_for_terminating_signal` from Task 8:
+
+```rust
+//! The client session loop.
+//!
+//! ```text
+//!   keyboard --> Sender<InputState> --> Frame --> QUIC
+//!   Renderer <-- Receiver<ScreenState> <-- Frame <-- QUIC
+//! ```
+
+use crate::pane::{status_pane_lines, StatusPane};
+use crate::status::{migration_line, status_line, MIGRATION_DWELL};
+use crate::{InputQueue, Renderer, TerminalGuard};
+use oxutrm_net::link::{link_stats, refresh_path};
+use oxutrm_net::pace::Pacer;
+use oxutrm_net::xport::{FrameSink, FrameSource};
+use oxutrm_proto::{PathDescription, TerminalCaps, TermSize};
+use oxutrm_sync::Receiver;
+use oxutrm_term::ScreenState;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+/// Ctrl-]. Configurable in a later phase; fixed for now.
+pub const ESCAPE_BYTE: u8 = 0x1d;
+
+/// Strip the escape byte out of raw input and count how many times it appeared.
+pub fn split_escape(input: &[u8]) -> (Vec<u8>, usize) {
+    let presses = input.iter().filter(|&&b| b == ESCAPE_BYTE).count();
+    let out = input.iter().copied().filter(|&b| b != ESCAPE_BYTE).collect();
+    (out, presses)
+}
+
+/// Read stdin on its own thread. `O_NONBLOCK` on fd 0 would outlive us in the
+/// user's shell, so blocking reads on a thread are the safe choice.
+fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+pub async fn run_client_session(
+    conn: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    mut path: PathDescription,
+    session_id: String,
+    caps: TerminalCaps,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut size = crate::terminal_size()?;
+
+    // The one connect-time line, printed before raw mode so it stays on the
+    // main screen and the user still has it after the session ends.
+    println!("{}", status_line(&path));
+
+    let _guard = TerminalGuard::install()?;
+    let mut renderer = Renderer::new(size, caps);
+    let mut out = std::io::stdout();
+
+    let sink = FrameSink::new(conn.clone());
+    let mut source = FrameSource::new(conn.clone());
+    let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size.rows, size.cols));
+    let mut input = InputQueue::new(size);
+    let mut pacer = Pacer::new();
+
+    let mut stdin = spawn_stdin_reader();
+    let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut term_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    let mut pane_open = false;
+    let mut migrations: Vec<(u64, String)> = Vec::new();
+    let mut last_local = endpoint.local_addr()?;
+    let mut announce: Option<(SocketAddr, SocketAddr)> = None;
+    let mut announce_until: Option<Instant> = None;
+    let mut dirty = true;
+
+    loop {
+        let local = endpoint.local_addr()?;
+        let stats = link_stats(&conn, local);
+        refresh_path(&mut path, &stats);
+
+        // We roamed: OUR local address changed and QUIC migrated the
+        // connection onto it. The peer address and the rung cannot change
+        // within an attach (§5), so this is the only migration there is.
+        if local != last_local {
+            migrations.push((
+                started.elapsed().as_secs(),
+                format!("{last_local} → {local}"),
+            ));
+            announce = Some((last_local, local));
+            last_local = local;
+            announce_until = Some(Instant::now() + MIGRATION_DWELL);
+            dirty = true;
+        }
+        if announce_until.is_some_and(|t| Instant::now() >= t) {
+            announce_until = None;
+            announce = None;
+            renderer.invalidate();
+            dirty = true;
+        }
+
+        if dirty {
+            if pane_open {
+                // The pane is drawn over the screen, so the screen underneath
+                // must be repainted when it closes.
+                renderer.render(&mut out, screen_rx.state())?;
+                let lines = status_pane_lines(&StatusPane {
+                    path: path.clone(),
+                    loss_pct: stats.loss_pct,
+                    bytes_tx: stats.bytes_tx,
+                    bytes_rx: stats.bytes_rx,
+                    migrations: migrations.clone(),
+                    session_id: session_id.clone(),
+                    uptime: started.elapsed(),
+                });
+                for (i, l) in lines.iter().enumerate() {
+                    write!(out, "\x1b[{};{}H{}", i + 2, 3, l)?;
+                }
+            } else {
+                renderer.render(&mut out, screen_rx.state())?;
+                if let Some((old, new)) = announce {
+                    write!(
+                        out,
+                        "\x1b[1;1H\x1b[7m{}\x1b[0m",
+                        migration_line(old, new, path.rtt_ms)
+                    )?;
+                }
+            }
+            out.flush()?;
+            dirty = false;
+        }
+
+        let rtt = stats.rtt;
+        let wake = match pacer.next_deadline(rtt) {
+            Some(t) => tokio::time::sleep_until(t.into()),
+            None => tokio::time::sleep(Duration::from_millis(0)),
+        };
+
+        tokio::select! {
+            bytes = stdin.recv() => {
+                let Some(bytes) = bytes else { break };
+                let (to_send, presses) = split_escape(&bytes);
+                if presses % 2 == 1 {
+                    pane_open = !pane_open;
+                    renderer.invalidate();
+                    dirty = true;
+                }
+                if !to_send.is_empty() {
+                    input.push(&to_send, size);
+                    pacer.go_idle();   // a keystroke goes out at once
+                }
+            }
+
+            frame = source.recv() => {
+                let frame = frame?;
+                input.on_host_ack(frame.ack_state);
+                // Same rule as the host: a rejected frame is dropped and the
+                // session continues. The receiver's state is unchanged, so our
+                // ack still names a state the host holds in its ring, and the
+                // host's next diff repairs the screen. Never `?` here.
+                match screen_rx.on_frame(&frame) {
+                    Ok(true) => {
+                        source.set_current_state(screen_rx.ack());
+                        dirty = true;
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("oxutrm: dropping unapplicable screen frame: {e}"),
+                }
+            }
+
+            _ = winch.recv() => {
+                size = crate::terminal_size()?;
+                renderer.resize(size);
+                renderer.invalidate();
+                input.push(b"", size);
+                pacer.go_idle();
+                dirty = true;
+            }
+
+            _ = wake => {
+                let now = Instant::now();
+                if pacer.may_send(now, rtt) {
+                    if let Some(f) = input.sender().make_frame(screen_rx.ack())? {
+                        sink.send(&f)?;
+                        pacer.on_sent(now);
+                    }
+                }
+                // The pane shows live counters, so keep it fresh while open.
+                if pane_open || announce_until.is_some() {
+                    dirty = true;
+                }
+            }
+
+            _ = int.recv() => break,
+            _ = term_sig.recv() => break,
+            _ = hup.recv() => break,
+
+            // The peer went away. Unwinding here drops the guard, which
+            // restores the terminal.
+            _ = conn.closed() => break,
+        }
+    }
+
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-client session:: -- --test-threads 4`
+
+Expected: PASS, 4 tests, and the crate compiles.
+
+- [ ] **Step 5: Add the dependencies the loop needs**
+
+In `crates/oxutrm-client/Cargo.toml`:
+
+```toml
+[dependencies]
+oxutrm-net = { path = "../oxutrm-net" }
+quinn = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "signal"] }
+```
+
+- [ ] **Step 6: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add crates/oxutrm-client/src/session.rs crates/oxutrm-client/src/lib.rs \
+        crates/oxutrm-client/Cargo.toml
+git commit -m "$(cat <<'EOF'
+feat(client): the session loop, keyboard to QUIC to renderer
+
+SIGWINCH resizes, Ctrl-] toggles the locally drawn status pane, a QUIC path
+migration announces itself for three seconds, and every exit path unwinds
+through the terminal guard. stdin is read on a thread so O_NONBLOCK never
+touches the user's fd 0.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 11: Rung 4 — QUIC inside the SSH connection
+
+When no UDP path forms, QUIC runs inside a stream over the SSH connection that
+is already open. Nothing in the QUIC layer changes: the swap happens entirely at
+the socket. A relay binds a loopback UDP socket, hands `quinn` a second loopback
+socket, and shuttles datagrams between that pair and the SSH channel with a
+two-byte length prefix.
+
+MTU: the relay refuses to carry anything larger than `TUNNEL_MAX_PAYLOAD`.
+`quinn` starts at its 1200-byte initial MTU and only raises it after a DPLPMTUD
+probe is acknowledged; probes above the cap are dropped, so no probe validates
+and the connection stays at 1200. That is exactly how path MTU discovery is
+meant to behave, and it needs no change to `quic_client` or `quic_server`.
+
+**A rung-4 session is not detachable, and this task must not fight M3's
+`daemonize`.** Because the transport *is* the SSH connection, the session cannot
+close its inherited SSH descriptors, so §4.3's double-fork is skipped entirely:
+
+- `daemonize()` is **never called** on a rung-4 path. Calling it would close the
+  descriptors the transport is running on and kill the session instantly.
+- `SessionMeta.detachable` is `false`, in `HostHello` and in `meta.json`.
+- The registry entry is pruned when the SSH connection ends — the session dies
+  with its SSH, and closing the laptop lid ends it.
+- `status_line` says `not detachable` (Task 9), because this is the one cost a
+  user would otherwise discover only by closing the lid.
+
+**Files:**
+- Create: `crates/oxutrm-net/src/tunnel.rs`
+- Modify: `crates/oxutrm-net/src/lib.rs`
+- Modify: `src/main.rs`
+
+**Interfaces:**
+- Consumes: `tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}`;
+  M3's SSH child, whose stdin/stdout carried the newline-JSON signalling and
+  becomes the tunnel's byte channel once `Signal::Established { path }` names
+  `Rung::SshTunnel`; `oxutrm_net::{quic_client, quic_server}`;
+  `oxutrm_host::{SessionMeta, daemonize}` — `SessionMeta` carries
+  `pub detachable: bool`, and `daemonize()` must NOT be called on this path.
+- Produces:
+  ```rust
+  // crates/oxutrm-net/src/tunnel.rs
+  /// The largest UDP payload the tunnel will carry. Bigger DPLPMTUD probes are
+  /// dropped, so quinn stays at its 1200-byte initial MTU.
+  pub const TUNNEL_MAX_PAYLOAD: usize = 1400;
+
+  pub struct TunnelEndpoint {
+      /// Hand this to `quic_client` / `quic_server`.
+      pub socket: std::net::UdpSocket,
+      /// Hand this to `quic_client` as the peer address.
+      pub peer: std::net::SocketAddr,
+  }
+
+  pub fn spawn_tunnel<R, W>(reader: R, writer: W) -> anyhow::Result<(TunnelEndpoint, tokio::task::JoinHandle<()>)>
+  where
+      R: tokio::io::AsyncRead + Unpin + Send + 'static,
+      W: tokio::io::AsyncWrite + Unpin + Send + 'static;
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Create `crates/oxutrm-net/src/tunnel.rs` containing only:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xport::{FrameSink, FrameSource};
+    use oxutrm_proto::Frame;
+
+    /// A whole QUIC session inside a byte channel that is not a UDP socket.
+    /// `tokio::io::duplex` stands in for the SSH child's stdin/stdout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quic_runs_inside_a_byte_channel() -> anyhow::Result<()> {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (b_read, b_write) = tokio::io::split(b);
+
+        let (host_ep, _h) = spawn_tunnel(a_read, a_write)?;
+        let (client_ep, _c) = spawn_tunnel(b_read, b_write)?;
+
+        let (cert, key, spki) = crate::generate_cert()?;
+        let host_relay = host_ep.peer;
+        let endpoint = crate::quic_server(host_ep.socket, cert, key).await?;
+        let accepting = tokio::spawn(async move {
+            let inc = endpoint.accept().await.expect("accepted");
+            let conn = inc.await?;
+            anyhow::Ok((conn, endpoint))
+        });
+
+        // The client's relay forwards everything it receives to the far side,
+        // so the address quinn dials is the client's own relay socket.
+        let _ = host_relay;
+        let client = crate::quic_client(client_ep.socket, client_ep.peer, spki).await?;
+        let (server, _keepalive) = accepting.await??;
+
+        let sink = FrameSink::new(server);
+        let mut source = FrameSource::new(client);
+        let f = Frame { my_state: 3, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: vec![9u8; 500] };
+        sink.send(&f)?;
+        let got = source.recv().await?;
+        assert_eq!(got.my_state, 3);
+        assert_eq!(got.payload, f.payload);
+        Ok(())
+    }
+
+    /// Fragmentation and the tunnel compose: a state far larger than one
+    /// datagram is split by `crate::frag`, every piece stays under
+    /// TUNNEL_MAX_PAYLOAD, and it reassembles on the far side.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fragmented_state_survives_the_tunnel() -> anyhow::Result<()> {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (b_read, b_write) = tokio::io::split(b);
+        let (host_ep, _h) = spawn_tunnel(a_read, a_write)?;
+        let (client_ep, _c) = spawn_tunnel(b_read, b_write)?;
+
+        let (cert, key, spki) = crate::generate_cert()?;
+        let endpoint = crate::quic_server(host_ep.socket, cert, key).await?;
+        let accepting = tokio::spawn(async move {
+            let inc = endpoint.accept().await.expect("accepted");
+            let conn = inc.await?;
+            anyhow::Ok((conn, endpoint))
+        });
+        let client = crate::quic_client(client_ep.socket, client_ep.peer, spki).await?;
+        let (server, _keepalive) = accepting.await??;
+
+        assert!(
+            server.max_datagram_size().unwrap_or(0) <= TUNNEL_MAX_PAYLOAD,
+            "the tunnel must not let quinn discover an MTU it cannot carry"
+        );
+
+        let sink = FrameSink::new(server);
+        let mut source = FrameSource::new(client);
+        let payload: Vec<u8> = (0..120_000).map(|i| (i % 251) as u8).collect();
+        let f = Frame { my_state: 5, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: payload.clone() };
+        let sent = sink.send(&f)?;
+        assert!(sent > 90, "expected many fragments through the tunnel, got {sent}");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(30), source.recv()).await??;
+        assert_eq!(got.payload, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_overlong_payload_is_dropped_rather_than_desynchronising_the_stream()
+    -> anyhow::Result<()> {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (_b_read, mut b_write) = tokio::io::split(b);
+        let (ep, _h) = spawn_tunnel(a_read, a_write)?;
+
+        // Frame a payload above the cap by hand and confirm the relay keeps
+        // parsing afterwards, by sending a legal frame straight after it.
+        use tokio::io::AsyncWriteExt;
+        let big = vec![7u8; TUNNEL_MAX_PAYLOAD + 100];
+        b_write.write_all(&(big.len() as u16).to_be_bytes()).await?;
+        b_write.write_all(&big).await?;
+        let small = b"hello";
+        b_write.write_all(&(small.len() as u16).to_be_bytes()).await?;
+        b_write.write_all(small).await?;
+        b_write.flush().await?;
+
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        probe.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let _ = probe;
+
+        // The legal payload reaches the quinn-side socket; the oversized one
+        // does not. Read from the endpoint's socket to confirm.
+        ep.socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut buf = [0u8; 2048];
+        let (n, _) = ep.socket.recv_from(&mut buf)?;
+        assert_eq!(&buf[..n], small, "the relay lost sync after an oversized payload");
+        Ok(())
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Add `pub mod tunnel;` to `crates/oxutrm-net/src/lib.rs`, then run:
+
+`cargo test --jobs 4 -p oxutrm-net tunnel:: -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find function spawn_tunnel`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Put this above the test module in `crates/oxutrm-net/src/tunnel.rs`:
+
+```rust
+//! Rung 4, spec §5.5: when no UDP path forms, QUIC runs inside a stream over
+//! the SSH connection that is already open.
+//!
+//! The swap is entirely at the socket. A relay owns two loopback UDP sockets:
+//! `quic_sock`, which is handed to `quinn`, and `relay_sock`, which `quinn`
+//! sends to. Datagrams arriving on `relay_sock` are length-prefixed onto the
+//! SSH channel; frames arriving from the SSH channel are sent back to
+//! `quic_sock`. `quinn` sees an ordinary UDP socket and an ordinary peer.
+//!
+//! The session works. It is slower, and it dies on an IP change, which is why
+//! the status line announces it as a warning rather than silently.
+
+use anyhow::Context;
+use std::net::{SocketAddr, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// The largest UDP payload the tunnel carries. A DPLPMTUD probe above this is
+/// dropped and therefore never validates, so `quinn` stays at its 1200-byte
+/// initial MTU — which is the correct outcome, reached the standard way.
+pub const TUNNEL_MAX_PAYLOAD: usize = 1400;
+
+pub struct TunnelEndpoint {
+    /// Hand this to `quic_client` or `quic_server`.
+    pub socket: UdpSocket,
+    /// Hand this to `quic_client` as the peer address.
+    pub peer: SocketAddr,
+}
+
+/// Start the relay. `reader` and `writer` are the SSH child's stdout and stdin.
+pub fn spawn_tunnel<R, W>(
+    reader: R,
+    mut writer: W,
+) -> anyhow::Result<(TunnelEndpoint, tokio::task::JoinHandle<()>)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let quic_sock = UdpSocket::bind("127.0.0.1:0").context("bind quic-side socket")?;
+    quic_sock.set_nonblocking(true)?;
+    let quic_addr = quic_sock.local_addr()?;
+
+    let relay_std = UdpSocket::bind("127.0.0.1:0").context("bind relay socket")?;
+    relay_std.set_nonblocking(true)?;
+    let relay_addr = relay_std.local_addr()?;
+    let relay = std::sync::Arc::new(tokio::net::UdpSocket::from_std(relay_std)?);
+
+    // The socket quinn gets back must be blocking-agnostic: quinn sets its own
+    // mode when it adopts it.
+    quic_sock.set_nonblocking(false)?;
+
+    let up = relay.clone();
+    let handle = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                // quinn -> SSH
+                r = up.recv_from(&mut buf) => {
+                    let Ok((n, _from)) = r else { break };
+                    if n > TUNNEL_MAX_PAYLOAD {
+                        // Larger than the tunnel carries: dropping it is what
+                        // makes quinn's MTU probing settle at 1200.
+                        continue;
+                    }
+                    if writer.write_all(&(n as u16).to_be_bytes()).await.is_err() { break }
+                    if writer.write_all(&buf[..n]).await.is_err() { break }
+                    if writer.flush().await.is_err() { break }
+                }
+
+                // SSH -> quinn
+                len = read_frame_len(&mut reader) => {
+                    let Some(len) = len else { break };
+                    let mut payload = vec![0u8; len];
+                    if reader.read_exact(&mut payload).await.is_err() { break }
+                    if len > TUNNEL_MAX_PAYLOAD {
+                        // Consumed, so the stream stays in sync, then discarded.
+                        continue;
+                    }
+                    if up.send_to(&payload, quic_addr).await.is_err() { break }
+                }
+            }
+        }
+    });
+
+    Ok((TunnelEndpoint { socket: quic_sock, peer: relay_addr }, handle))
+}
+
+/// The next payload length, or `None` when the channel ended.
+async fn read_frame_len<R: AsyncRead + Unpin>(reader: &mut R) -> Option<usize> {
+    let mut hdr = [0u8; 2];
+    reader.read_exact(&mut hdr).await.ok()?;
+    Some(u16::from_be_bytes(hdr) as usize)
+}
+```
+
+Note the select arm cancellation: `read_frame_len` reads exactly two bytes and
+is only cancelled at an arm boundary, before any partial read, because
+`recv_from` and `read_exact` never both make progress in one poll. Do **not**
+inline the length read into the arm body — a cancelled partial `read_exact`
+would desynchronise the stream.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-net tunnel:: -- --test-threads 4`
+
+Expected: PASS, 3 tests, including `a_fragmented_state_survives_the_tunnel`.
+
+- [ ] **Step 5: Wire rung 4 into the ladder**
+
+In `src/main.rs`, where M2's ladder reports failure and M3 still holds the SSH
+child, add the fallback. The signalling side sends
+`Signal::Established { path }` with `rung: Rung::SshTunnel` so the peer switches
+its channel too:
+
+```rust
+/// Rung 4: no UDP path formed, so run QUIC inside the SSH connection.
+/// `ssh_stdout` and `ssh_stdin` are the same descriptors that carried the
+/// newline-JSON signalling; from here on they carry length-prefixed datagrams.
+async fn connect_over_ssh_tunnel(
+    ssh_stdout: tokio::process::ChildStdout,
+    ssh_stdin: tokio::process::ChildStdin,
+    expect_spki_sha256: [u8; 32],
+) -> anyhow::Result<(quinn::Connection, std::net::SocketAddr)> {
+    let (endpoint, _relay) = oxutrm_net::tunnel::spawn_tunnel(ssh_stdout, ssh_stdin)?;
+    let local = endpoint.socket.local_addr()?;
+    let conn = oxutrm_net::quic_client(endpoint.socket, endpoint.peer, expect_spki_sha256).await?;
+    Ok((conn, local))
+}
+```
+
+The host mirrors it with `quic_server` on its own `TunnelEndpoint.socket`. The
+`PathDescription` the client shows carries `rung: Rung::SshTunnel`, so
+`status_line` prints the warning form from Task 9.
+
+On the host side, the rung decides whether the session may detach:
+
+```rust
+/// Rung 4 runs the transport over the SSH connection itself, so it can never
+/// close those descriptors and can never daemonize (spec §5.5). Everything
+/// else detaches normally.
+fn finish_bootstrap(rung: Rung, meta: &mut SessionMeta) -> anyhow::Result<()> {
+    meta.detachable = rung != Rung::SshTunnel;
+    if meta.detachable {
+        // §4.3: double fork, setsid, chdir /, close every inherited
+        // descriptor. Only legal once HostHello has been flushed.
+        oxutrm_host::daemonize()?;
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 5b: Write the failing test that rung 4 never daemonizes**
+
+Create `crates/oxutrm-host/tests/detachable.rs`:
+
+```rust
+use oxutrm_proto::{Rung, TermSize};
+use oxutrm_host::SessionMeta;
+
+fn meta() -> SessionMeta {
+    SessionMeta {
+        session_id: "0".repeat(32),
+        pid: std::process::id(),
+        created_unix: 0,
+        shell: "/bin/sh".to_string(),
+        size: TermSize { cols: 80, rows: 24 },
+        detachable: true,
+    }
+}
+
+#[test]
+fn a_udp_session_is_detachable() {
+    for rung in [Rung::Ipv6Direct, Rung::PortMapped, Rung::StunPunch, Rung::Birthday] {
+        let mut m = meta();
+        m.detachable = rung != Rung::SshTunnel;
+        assert!(m.detachable, "{rung:?} must be detachable");
+    }
+}
+
+/// The whole point: a rung-4 session that daemonized would close the SSH
+/// descriptors its own transport is running on.
+#[test]
+fn an_ssh_tunnelled_session_is_not_detachable() {
+    let mut m = meta();
+    m.detachable = Rung::SshTunnel != Rung::SshTunnel;
+    assert!(!m.detachable);
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"detachable\":false"), "meta.json must record it: {json}");
+}
+```
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test detachable -- --test-threads 4`
+
+Expected: FAIL if `SessionMeta` has no `detachable` field, then PASS once M3's
+struct carries it.
+
+- [ ] **Step 6: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add crates/oxutrm-net/src/tunnel.rs crates/oxutrm-net/src/lib.rs src/main.rs \
+        crates/oxutrm-host/tests/detachable.rs
+git commit -m "$(cat <<'EOF'
+feat(net): rung 4, QUIC inside the SSH connection, and not detachable
+
+The swap is entirely at the socket: a loopback relay shuttles length-prefixed
+datagrams over the SSH channel, so quinn sees an ordinary UDP peer. Payloads
+above 1400 bytes are dropped, which is what keeps quinn's MTU probing at 1200.
+Because the transport IS the SSH connection, the session never daemonizes,
+sets detachable=false, and its registry entry dies with its SSH.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 12: Roaming — the session survives a change of local address
+
+QUIC connection migration is the whole reason the transport was chosen. This
+test forcibly rebinds the client's endpoint to a new local address mid-session
+and asserts the session keeps working.
+
+**Scope, and it is a hard boundary.** QUIC migration lets an endpoint change its
+own **local** address and nothing else. There is no mechanism in RFC 9000 and no
+API in `quinn` 0.11 — whose `Connection` exposes `remote_address()` with no
+setter and no path management — to repoint an established connection at a
+different **peer** address. So:
+
+- **Do write** a test that rebinds the client's own socket. That is §1.3's
+  roaming case: the user walks from Wi-Fi to mobile, their address changes, the
+  peer's does not.
+- **Do NOT write** a test that changes the remote address mid-session. It cannot
+  be done, and an attempt would be testing a fiction. A changed peer address
+  requires a fresh attach, which re-runs ICE nomination from scratch (§5).
+
+This is also why ICE nomination completes *before* QUIC starts: the peer address
+must already be final. A better path found after nomination is lost for that
+attach and picked up by the next one.
+
+**Files:**
+- Create: `tests/roaming.rs`
+
+**Interfaces:**
+- Consumes: `quinn::Endpoint::rebind_abstract(&self, socket: std::sync::Arc<dyn quinn::AsyncUdpSocket>) -> std::io::Result<()>`;
+  `oxutrm_net::StunDemuxSocket` with
+  `StunDemuxSocket::new(inner: Arc<tokio::net::UdpSocket>) -> (StunDemuxSocket, tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>)`;
+  `oxutrm_net::xport::{FrameSink, FrameSource}`;
+  `oxutrm_net::{generate_cert, quic_server, quic_client}`; `oxutrm_proto::Frame`.
+
+  `rebind_abstract`, not `rebind`: M2 builds the client endpoint with
+  `Endpoint::new_with_abstract_socket` around a `StunDemuxSocket`, because
+  `quinn` owns the socket's recv loop and STUN keepalives must be peeled off in
+  front of it. Rebinding to a plain `UdpSocket` would drop the demultiplexer and
+  let STUN packets reach `quinn` as garbage.
+- Produces:
+  ```rust
+  // crates/oxutrm-net/src/lib.rs
+  /// The connection, and the endpoint it runs on. `quic_client` keeps its
+  /// contract signature and delegates here.
+  pub async fn quic_client_on(
+      socket: std::net::UdpSocket,
+      peer: std::net::SocketAddr,
+      expect_spki_sha256: [u8; 32],
+  ) -> anyhow::Result<(quinn::Connection, quinn::Endpoint)>;
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/roaming.rs`:
+
+```rust
+use oxutrm_net::xport::{FrameSink, FrameSource};
+use oxutrm_proto::Frame;
+use std::time::{Duration, Instant};
+
+fn frame(n: u64) -> Frame {
+    Frame { my_state: n, from_state: 0, ack_state: 0, frag_index: 0, frag_count: 1, flags: 0, payload: vec![(n % 251) as u8; 200] }
+}
+
+/// The client's socket is rebound to a different local port mid-session. QUIC
+/// must validate the new path and carry on: no reconnect, no lost session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_survives_a_forced_rebind_of_the_client_socket() -> anyhow::Result<()> {
+    let (cert, key, spki) = oxutrm_net::generate_cert()?;
+
+    let server_sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let server_addr = server_sock.local_addr()?;
+    let server_ep = oxutrm_net::quic_server(server_sock, cert, key).await?;
+    let accepting = tokio::spawn(async move {
+        let inc = server_ep.accept().await.expect("accepted");
+        let conn = inc.await?;
+        anyhow::Ok((conn, server_ep))
+    });
+
+    let client_sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let (client_conn, client_ep) =
+        oxutrm_net::quic_client_on(client_sock, server_addr, spki).await?;
+    let (server_conn, _keep) = accepting.await??;
+
+
+    let server_sink = FrameSink::new(server_conn.clone());
+    let mut client_source = FrameSource::new(client_conn.clone());
+    let client_sink = FrameSink::new(client_conn.clone());
+    let mut server_source = FrameSource::new(server_conn.clone());
+
+    // A round trip before the rebind, so we know the path works at all.
+    server_sink.send(&frame(1))?;
+    assert_eq!(client_source.recv().await?.my_state, 1);
+    let before = server_conn.remote_address();
+
+    // Roam: a brand-new LOCAL address, exactly as a Wi-Fi to mobile switch
+    // would produce. The peer address is untouched, and cannot be touched.
+    let fresh = tokio::net::UdpSocket::from_std(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
+    let new_local = fresh.local_addr()?;
+    assert_ne!(new_local, before, "the test must actually change the address");
+    // Rebind through the demultiplexer, not to a bare socket: quinn owns the
+    // recv loop and STUN keepalives must still be peeled off in front of it.
+    let (demux, _stun_rx) = oxutrm_net::StunDemuxSocket::new(std::sync::Arc::new(fresh));
+    client_ep.rebind_abstract(std::sync::Arc::new(demux))?;
+
+    // The client speaks first from the new address; the server validates the
+    // path and migrates.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut n = 2u64;
+    loop {
+        assert!(Instant::now() < deadline, "the session never recovered after the rebind");
+        client_sink.send(&frame(n))?;
+        match tokio::time::timeout(Duration::from_millis(500), server_source.recv()).await {
+            Ok(f) => {
+                let f = f?;
+                assert!(f.my_state >= 2);
+                break;
+            }
+            Err(_) => {
+                n += 1;
+                continue;
+            }
+        }
+    }
+
+    // The server now sees the client at its new address. This is the server's
+    // view of ITS peer changing because the client moved — not the client
+    // repointing at a new peer, which is impossible.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if server_conn.remote_address() == new_local {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server still sees {before}, expected {new_local}"
+        );
+        client_sink.send(&frame(n))?;
+        n += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // And the session still carries traffic in the other direction.
+    server_sink.send(&frame(99))?;
+    let got = tokio::time::timeout(Duration::from_secs(10), client_source.recv()).await??;
+    assert_eq!(got.my_state, 99, "the host->client direction did not survive the migration");
+    Ok(())
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+`cargo test --jobs 4 --test roaming -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find function quic_client_on`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`quinn::Connection` does not expose its `Endpoint`, so the test must be handed
+one. Add a variant that returns both, and keep `quic_client`'s contract
+signature by delegating to it.
+
+In `crates/oxutrm-net/src/lib.rs`:
+
+```rust
+/// The connection, and the endpoint it runs on.
+///
+/// The endpoint is returned rather than dropped because it must outlive the
+/// connection, and because roaming is driven through
+/// `quinn::Endpoint::rebind_abstract`: a client that cannot rebind cannot
+/// follow the user from Wi-Fi to mobile. Note what this does NOT enable —
+/// there is no way to repoint the connection at a different peer address, so
+/// the remote end is fixed for the life of the attach.
+pub async fn quic_client_on(
+    socket: std::net::UdpSocket,
+    peer: std::net::SocketAddr,
+    expect_spki_sha256: [u8; 32],
+) -> anyhow::Result<(quinn::Connection, quinn::Endpoint)> {
+    // Move M2's existing `quic_client` body here verbatim — including the
+    // `StunDemuxSocket` wrapper and `Endpoint::new_with_abstract_socket`, both
+    // of which are required and must not be simplified away — and change only
+    // its final expression to `Ok((conn, endpoint))`.
+    unimplemented!("move M2's quic_client body here; return (conn, endpoint)")
+}
+
+pub async fn quic_client(
+    socket: std::net::UdpSocket,
+    peer: std::net::SocketAddr,
+    expect_spki_sha256: [u8; 32],
+) -> anyhow::Result<quinn::Connection> {
+    let (conn, endpoint) = quic_client_on(socket, peer, expect_spki_sha256).await?;
+    // The endpoint drives the connection; dropping it would kill the session.
+    // Callers that need to roam use `quic_client_on` and keep the handle.
+    std::mem::forget(endpoint);
+    Ok(conn)
+}
+```
+
+Then update `run_client_session`'s call site to use `quic_client_on` and pass
+the endpoint through, since Task 10 needs `endpoint.local_addr()` to notice a
+migration at all.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 --test roaming -- --test-threads 4`
+
+Expected: PASS, 1 test. If the server never sees the new address, check that
+M2's `quic_server` did not set `TransportConfig::max_concurrent_uni_streams(0)`
+or disable migration; `quinn` allows migration by default and it must stay that
+way.
+
+- [ ] **Step 5: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add tests/roaming.rs crates/oxutrm-net/src/lib.rs
+git commit -m "$(cat <<'EOF'
+test: the session survives a forced rebind of the client socket
+
+Roaming is the reason QUIC was chosen. quic_client_on now returns the endpoint
+so it can be rebound, and the test asserts traffic in both directions after the
+server has migrated to the client's new address.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 13: End to end — the client's rendered screen equals the host's state
+
+The whole pipeline, on loopback: a real shell behind a real PTY, a real host
+session loop, a real QUIC connection, a real client renderer. The assertion is
+the strong one: feed the client's emitted ANSI back through a fresh emulator and
+compare the resulting screen against the host's authoritative `ScreenState`,
+cell by cell. That checks the renderer, not just the sync engine.
+
+**Files:**
+- Modify: `crates/oxutrm-term/src/lib.rs`
+- Create: `tests/e2e.rs`
+
+**Interfaces:**
+- Consumes: `oxutrm_host::session::run_host_session`; `oxutrm_client::Renderer`;
+  `oxutrm_net::testkit::loopback_pair`; `oxutrm_net::xport::{FrameSink, FrameSource}`;
+  `oxutrm_sync::{Receiver, Sender, InputState}`; `oxutrm_term::{HostTerm, ScreenState, Cell}`.
+- Produces:
+  ```rust
+  // crates/oxutrm-term/src/lib.rs
+  /// Parse raw terminal output into a ScreenState, with no PTY and no child.
+  /// Used to check what a stream of ANSI actually paints.
+  pub fn parse_to_state(bytes: &[u8], size: oxutrm_proto::TermSize, seq: u64) -> ScreenState;
+  ```
+
+- [ ] **Step 1: Write the failing test for `parse_to_state`**
+
+Append to `crates/oxutrm-term/src/lib.rs`:
+
+```rust
+#[cfg(test)]
+mod parse_to_state_tests {
+    use super::*;
+    use oxutrm_proto::TermSize;
+
+    #[test]
+    fn plain_text_lands_where_it_was_written() {
+        let size = TermSize { cols: 10, rows: 3 };
+        let s = parse_to_state(b"hi", size, 7);
+        assert_eq!(s.seq, 7);
+        assert_eq!(s.rows, 3);
+        assert_eq!(s.cols, 10);
+        assert_eq!(s.cell(0, 0).text, "h");
+        assert_eq!(s.cell(0, 1).text, "i");
+        assert_eq!(s.cell(0, 2).text, " ");
+    }
+
+    #[test]
+    fn cursor_positioning_and_colour_are_honoured() {
+        let size = TermSize { cols: 10, rows: 3 };
+        let s = parse_to_state(b"\x1b[2;3H\x1b[38;5;196mX", size, 0);
+        assert_eq!(s.cell(1, 2).text, "X");
+        assert_eq!(s.cell(1, 2).fg, Color::Idx(196));
+        assert_eq!(s.cursor.row, 1);
+        assert_eq!(s.cursor.col, 3);
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+`cargo test --jobs 4 -p oxutrm-term parse_to_state -- --test-threads 4`
+
+Expected: FAIL to compile — `cannot find function parse_to_state`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/oxutrm-term/src/lib.rs`, next to `detect_caps`:
+
+```rust
+/// Parse raw terminal output into a `ScreenState`, with no PTY and no child.
+///
+/// This is how a test checks what a stream of ANSI actually paints, which is a
+/// stronger statement than checking what the sync engine believes.
+pub fn parse_to_state(bytes: &[u8], size: oxutrm_proto::TermSize, seq: u64) -> ScreenState {
+    let mut term = new_term(size, 0);
+    let mut processor = alacritty_terminal::vte::ansi::Processor::new();
+    processor.advance(&mut term, bytes);
+    // `term_to_state` is the same conversion `HostTerm::snapshot` performs;
+    // if M1 kept it private inside host_term.rs, move it here and have
+    // `snapshot` call it.
+    term_to_state(&term, seq)
+}
+```
+
+If M1's snapshot conversion lives inside `HostTerm::snapshot` rather than in a
+free function, extract it now:
+
+```rust
+/// The single conversion from the emulator's grid to our replicated state.
+pub(crate) fn term_to_state<L: alacritty_terminal::event::EventListener>(
+    term: &alacritty_terminal::term::Term<L>,
+    seq: u64,
+) -> ScreenState {
+    // Move M1's snapshot body here verbatim, replacing `self.term` with `term`,
+    // and have `HostTerm::snapshot` become:
+    //     term_to_state(&self.term, seq)
+    unimplemented!("move M1's snapshot conversion here")
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 -p oxutrm-term -- --test-threads 4`
+
+Expected: PASS, including every M1 golden test — the extraction must not change
+behaviour.
+
+- [ ] **Step 5: Write the failing end-to-end test**
+
+Create `tests/e2e.rs`:
+
+```rust
+use oxutrm_client::Renderer;
+use oxutrm_net::xport::{FrameSink, FrameSource};
+use oxutrm_proto::{TermSize, TerminalCaps};
+use oxutrm_sync::{InputState, Receiver, Sender};
+use oxutrm_term::{HostTerm, ScreenState};
+use std::time::{Duration, Instant};
+
+fn size() -> TermSize {
+    TermSize { cols: 80, rows: 24 }
+}
+
+fn caps() -> TerminalCaps {
+    TerminalCaps {
+        truecolor: true,
+        colors: 16_777_216,
+        bracketed_paste: true,
+        mouse_sgr: true,
+        osc52: true,
+        term_name: "xterm-256color".to_string(),
+    }
+}
+
+fn text(s: &ScreenState) -> String {
+    (0..s.rows)
+        .map(|r| s.row(r).iter().map(|c| c.text.as_str()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A real shell, a real PTY, a real QUIC connection, a real renderer. The
+/// client's emitted ANSI is replayed through a fresh emulator and compared with
+/// the host's authoritative state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clients_painted_screen_equals_the_hosts_state() -> anyhow::Result<()> {
+    let (server_conn, client_conn) = oxutrm_net::testkit::loopback_pair().await?;
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let term = HostTerm::spawn(
+        "/bin/sh",
+        &[],
+        &oxutrm_host::caps::child_env()
+            .into_iter()
+            .chain([("PS1".to_string(), "$ ".to_string())])
+            .collect::<Vec<_>>(),
+        size(),
+        200,
+    )?;
+
+    // The host's authoritative state is read back through a second snapshot at
+    // the end, so keep a handle on the loop's result rather than the term.
+    let host = tokio::spawn(oxutrm_host::session::run_host_session(term, server_conn, local, size()));
+
+    let sink = FrameSink::new(client_conn.clone());
+    let mut source = FrameSource::new(client_conn.clone());
+    let mut screen_rx: Receiver<ScreenState> = Receiver::new(ScreenState::blank(size().rows, size().cols));
+    let mut input_tx: Sender<InputState> =
+        Sender::new(InputState { seq: 0, pending: Vec::new(), size: size() });
+
+    let mut renderer = Renderer::new(size(), caps());
+    let mut painted: Vec<u8> = Vec::new();
+
+    // A scripted session: plain text, a colour, a cursor move, and a marker
+    // that tells the test the shell has finished.
+    let script: &[u8] = b"printf 'plain \\033[38;2;255;0;0mRED\\033[0m \\033[4munder\\033[0m\\n'; \
+                          printf '\\033[5;10Hpositioned\\n'; \
+                          printf 'E2E-DONE\\n'\n";
+    let next = input_tx.current().append(script, size());
+    input_tx.update(next);
+    if let Some(f) = input_tx.make_frame(screen_rx.ack())? {
+        sink.send(&f)?;
+    }
+
+    // Run until the marker appears and the screen then stops changing.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen_marker = false;
+    let mut quiet_since: Option<Instant> = None;
+    loop {
+        assert!(Instant::now() < deadline, "never settled:\n{}", text(screen_rx.state()));
+        match tokio::time::timeout(Duration::from_millis(200), source.recv()).await {
+            Ok(f) => {
+                let f = f?;
+                if screen_rx.on_frame(&f)? {
+                    renderer.render(&mut painted, screen_rx.state())?;
+                    quiet_since = None;
+                }
+                if text(screen_rx.state()).contains("E2E-DONE") {
+                    seen_marker = true;
+                }
+            }
+            Err(_) => {
+                if let Some(f) = input_tx.make_frame(screen_rx.ack())? {
+                    sink.send(&f)?;
+                }
+                if seen_marker {
+                    let q = *quiet_since.get_or_insert_with(Instant::now);
+                    if q.elapsed() >= Duration::from_millis(600) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // What the ANSI the client emitted actually paints.
+    let rendered = oxutrm_term::parse_to_state(&painted, size(), screen_rx.state().seq);
+    let authoritative = screen_rx.state();
+
+    assert_eq!(rendered.rows, authoritative.rows);
+    assert_eq!(rendered.cols, authoritative.cols);
+    for r in 0..authoritative.rows {
+        for c in 0..authoritative.cols {
+            let a = authoritative.cell(r, c);
+            let b = rendered.cell(r, c);
+            assert_eq!(
+                (b.text.as_str(), b.fg, b.bg, b.attrs),
+                (a.text.as_str(), a.fg, a.bg, a.attrs),
+                "cell ({r},{c}) differs\nauthoritative:\n{}\nrendered:\n{}",
+                text(authoritative),
+                text(&rendered)
+            );
+        }
+    }
+    assert_eq!(rendered.cursor, authoritative.cursor, "the cursor was painted in the wrong place");
+
+    client_conn.close(0u32.into(), b"done");
+    let _ = tokio::time::timeout(Duration::from_secs(5), host).await;
+    Ok(())
+}
+```
+
+- [ ] **Step 6: Run test to verify it fails, then passes**
+
+Add to the root `Cargo.toml`:
+
+```toml
+[dev-dependencies]
+oxutrm-host = { path = "crates/oxutrm-host" }
+oxutrm-client = { path = "crates/oxutrm-client" }
+oxutrm-sync = { path = "crates/oxutrm-sync" }
+oxutrm-term = { path = "crates/oxutrm-term" }
+oxutrm-proto = { path = "crates/oxutrm-proto" }
+```
+
+Run: `cargo test --jobs 4 --test e2e -- --test-threads 4`
+
+Expected: FAIL first (missing `parse_to_state` wiring or a renderer mismatch),
+then PASS once the renderer's output really reproduces the state. A mismatch
+here is a genuine renderer bug, not a test artefact — fix the renderer, never
+the assertion.
+
+- [ ] **Step 7: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add tests/e2e.rs crates/oxutrm-term/src/lib.rs crates/oxutrm-term/src/host_term.rs Cargo.toml
+git commit -m "$(cat <<'EOF'
+test: end to end, the client's painted screen equals the host's state
+
+The client's emitted ANSI is replayed through a fresh emulator and compared cell
+by cell against the authoritative ScreenState, so the renderer is under test
+and not just the sync engine.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 14: `README.md` and `--help`
+
+The last thing between "it works" and "someone else can use it".
+
+**Files:**
+- Create: `README.md`
+- Create: `src/help.rs`
+- Modify: `src/main.rs`
+- Create: `tests/help.rs`
+
+**Interfaces:**
+- Consumes: M3's subcommand dispatch in `src/main.rs`.
+- Produces:
+  ```rust
+  // src/help.rs
+  pub const HELP: &str;
+  pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+  pub fn help_text() -> String;
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/help.rs`:
+
+```rust
+use std::process::Command;
+
+fn run(args: &[&str]) -> (String, bool) {
+    let out = Command::new(env!("CARGO_BIN_EXE_oxutrm")).args(args).output().expect("run oxutrm");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (text, out.status.success())
+}
+
+#[test]
+fn help_lists_every_subcommand() {
+    let (text, ok) = run(&["--help"]);
+    assert!(ok, "--help must exit successfully: {text}");
+    for needle in [
+        "oxutrm <ssh-target>",
+        "oxutrm host --serve",
+        "oxutrm host --list",
+        "oxutrm host --attach",
+        "Ctrl-]",
+    ] {
+        assert!(text.contains(needle), "--help is missing {needle:?}:\n{text}");
+    }
+}
+
+#[test]
+fn short_help_and_the_help_subcommand_agree() {
+    let (long, _) = run(&["--help"]);
+    let (short, _) = run(&["-h"]);
+    let (word, _) = run(&["help"]);
+    assert_eq!(long, short);
+    assert_eq!(long, word);
+}
+
+#[test]
+fn an_unknown_subcommand_fails_and_points_at_help() {
+    let (text, ok) = run(&["--frobnicate"]);
+    assert!(!ok, "an unknown option must not exit successfully");
+    assert!(text.contains("--help"), "the error must point at --help:\n{text}");
+}
+
+/// The test-only hook must never be advertised.
+#[test]
+fn help_does_not_mention_the_test_hook() {
+    let (text, _) = run(&["--help"]);
+    assert!(!text.contains("client-test-hook"));
+    assert!(!text.contains("OXUTRM_TEST_HOOK"));
+}
+
+#[test]
+fn version_is_reported() {
+    let (text, ok) = run(&["--version"]);
+    assert!(ok);
+    assert!(text.contains(env!("CARGO_PKG_VERSION")));
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+`cargo test --jobs 4 --test help -- --test-threads 4`
+
+Expected: FAIL — the binary has no `--help`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/help.rs`:
+
+```rust
+//! The `--help` text. Written by hand rather than generated, because oxutrm
+//! parses its own arguments and the help is the only user-facing description
+//! of the three roles the one binary plays.
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub const HELP: &str = "\
+oxutrm — a remote terminal that survives bad networks, changing IP addresses
+and NAT on both ends.
+
+USAGE
+  oxutrm <ssh-target> [command ...]
+      Connect. Drives ssh to start a session on the remote host, then becomes
+      the client. <ssh-target> is anything `ssh` accepts; oxutrm never parses
+      ~/.ssh/config, so if `ssh <target>` works, this works.
+
+  oxutrm host --serve
+      Run the remote half. Spawned over SSH; not normally typed by hand.
+
+  oxutrm host --list
+      List sessions on this machine, pruning any whose process is gone.
+
+  oxutrm host --attach <session-id>
+      Reattach to a running session. Reattaching uses the same code path as
+      the first connect.
+
+OPTIONS
+  -h, --help        Show this help.
+      --version     Show the version.
+
+WHILE CONNECTED
+  Ctrl-]            Open or close the status pane: current path and rung,
+                    round-trip time, loss, bytes each way, migration history,
+                    session id and uptime.
+
+ON CONNECT
+  One line says what connection you got, for example:
+      oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452
+      oxutrm  SSH tunnel — no UDP path, not detachable  ·  45 ms      [warning]
+  The SSH tunnel is slower, it does not survive an IP change, and a session on
+  it CANNOT be detached: it dies with the SSH connection. That is why it is
+  always announced rather than used silently.
+
+DETACHING
+  Closing the client leaves the session running on the remote host, costing no
+  bandwidth while detached. Reattach with `oxutrm <ssh-target>`; use
+  `oxutrm host --list` over ssh to see what is there.
+
+  The one exception is a session running over the SSH tunnel fallback. Its
+  transport IS the SSH connection, so it cannot detach and ends when that
+  connection does. The connect line says `not detachable` when this applies.
+";
+
+pub fn help_text() -> String {
+    format!("oxutrm {VERSION}\n\n{HELP}")
+}
+```
+
+In `src/main.rs`, add `mod help;` and handle the flags before the subcommand
+match:
+
+```rust
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("-h") | Some("--help") | Some("help") => {
+            print!("{}", help::help_text());
+            return Ok(());
+        }
+        Some("--version") | Some("-V") => {
+            println!("oxutrm {}", help::VERSION);
+            return Ok(());
+        }
+        Some(a) if a.starts_with('-') => {
+            eprintln!("oxutrm: unknown option {a:?}\nTry `oxutrm --help`.");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+```
+
+Note that a bare `oxutrm` with no arguments prints the help and exits zero,
+which is why `help_lists_every_subcommand` passes on `--help` alone.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+`cargo test --jobs 4 --test help -- --test-threads 4`
+
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Write the README**
+
+Create `README.md`:
+
+````markdown
+# oxutrm
+
+A remote terminal that survives bad networks, changing IP addresses, and NAT on
+both ends. It replaces the `ssh` + `tmux` habit of "reconnect and hope" with a
+session that simply stays alive.
+
+It is, deliberately, **Mosh rebuilt in Rust with a real terminal emulator on
+both ends**, plus the two things Mosh never solved: NAT traversal and
+scrollback.
+
+## What it does
+
+- **Encrypted UDP transport** (QUIC) that outlives IP changes on either side.
+- **Both endpoints may sit behind NAT.** A five-rung ladder — IPv6 direct,
+  router port mapping, STUN hole punching, a birthday-paradox blast for
+  symmetric NAT, and an SSH tunnel as the last resort.
+- **SSH for session initiation and reattachment.** No new trust root, no new
+  daemon to expose. If you trust `ssh <target>` today, you trust oxutrm.
+- **Real terminal emulation on both ends** (`alacritty_terminal`), so screen state
+  is authoritative on
+  the host.
+- **Detach and reattach.** The remote session outlives the client indefinitely
+  and costs no bandwidth while detached.
+- **Full fidelity**: 24-bit colour, SGR mouse reporting, resize, window title,
+  OSC 52 clipboard. Colour is folded down to what your terminal can actually
+  show, in the client, so the host's state stays intact for a better terminal
+  later.
+- **It tells you what connection you got.** No silent magic.
+
+## Install
+
+```sh
+cargo install --path .
+```
+
+The same binary must be on both machines. It plays three roles depending on how
+it is invoked.
+
+## Use
+
+```sh
+oxutrm myserver              # connect, or reattach
+oxutrm myserver -- htop      # run something other than your shell
+ssh myserver oxutrm host --list
+```
+
+While connected, `Ctrl-]` opens a status pane: path and rung, round-trip time,
+loss, bytes each way, migration history, session id and uptime.
+
+On connect you get exactly one line, then silence:
+
+```
+oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452
+oxutrm  IPv4 punched (birthday, 312 probes)  ·  61 ms  ·  symmetric NAT
+oxutrm  SSH tunnel — no UDP path, not detachable  ·  45 ms      [warning]
+```
+
+If your own address changes while you are connected — walking from Wi-Fi to
+mobile — oxutrm says so for a few seconds rather than leaving it mysterious.
+The remote end of a connection is fixed once it is established, so a session
+follows *you*; if the server's address changes, reconnect.
+
+## How it works
+
+`oxutrm <target>` shells out to `ssh` and starts `oxutrm host --serve` on the
+far end. The SSH channel carries a short JSON handshake: a session id, the
+SHA-256 of the host's self-signed QUIC certificate, a 32-byte pre-shared key,
+and each side's connection candidates. Both sides then punch with authenticated
+STUN checks, and QUIC comes up on the socket that was punched. SSH closes and
+the host detaches.
+
+Screen state is replicated rather than streamed: the host sends the difference
+between what the client is known to have and what is true now. A lost datagram
+therefore costs nothing — the next one diffs from the same acknowledged base and
+contains whatever was lost — and output that outruns the link coalesces instead
+of queueing.
+
+## Security
+
+The trust root is SSH, unchanged. The client pins exactly the certificate
+fingerprint delivered over SSH; the pre-shared key binds the QUIC session to
+that exchange. Keys are fresh for every attach and are never written to disk.
+Public STUN servers learn only that an IP is using STUN, and the server list is
+configurable.
+
+## Requirements
+
+Unix. Windows is out of scope: the PTY layer assumes Unix semantics.
+
+## Not in scope
+
+Graphics protocols (Sixel, Kitty, iTerm2 inline images) — the emulator does not model
+them and claiming support would be a lie. A GUI client. Replacing tmux. Being a
+VPN or a port forwarder.
+````
+
+- [ ] **Step 6: Run the gates and commit**
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --jobs 4 -- --test-threads 4
+git add README.md src/help.rs src/main.rs tests/help.rs
+git commit -m "$(cat <<'EOF'
+docs: README and --help for the three roles the binary plays
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+## Self-review notes
+
+**Spec coverage.** §7.1 framing and §7.1.1 fragmentation: Task 2. §7.2 streams:
+Task 5 (control stream). §9.4 capability negotiation: Task 5, with the
+client-side fold in Task 4. §10.1 two diffs: Tasks 10 and 13. §10.2 input and raw
+mode: Tasks 7, 8, 10. §10.3 status display: Task 9. §10.4 bandwidth adaptation:
+Task 1, applied in Tasks 6 and 10. §5.5 rung 4 including `detachable: false`:
+Task 11. §6's "0-RTT is deliberately not used": stated in the header, no task.
+§12's end-to-end row: Task 13. Roaming (§5, §1.3): Task 12.
+
+**Decisions taken from the spec rather than re-derived.**
+- Fragmentation, not a stream fallback: `Frame` carries `frag_index`/`frag_count`,
+  a state applies only when every fragment arrives, and an incomplete set is
+  discarded wholesale (§7.1.1).
+- `negotiate_term()` takes no argument. Client capabilities never reach the child
+  environment (§9.4).
+- Migration is the client's own **local** address only. No task attempts to
+  repoint a connection at a new peer (§5).
+- 0-RTT is not implemented or tested (§6).
+
+**Things this plan deliberately does not do.** Rung 3's birthday blast is M2's
+ladder work, reached here only through `Rung::Birthday` in the status line.
+Speculative echo, synced scrollback and `tmux -CC` are phases C and D.
+Multi-client attach stays possible (§9.5) because nothing here mutates
+`ScreenState` in a way that assumes one reader, but it is not implemented.
+`Ctrl-]` is spec'd as configurable and is a fixed constant here.
+
+**Type consistency.** `TermSize { cols, rows }` everywhere, never a bare tuple.
+`Frame` is `my_state` / `from_state` / `ack_state` / `frag_index` / `frag_count`
+/ `flags` / `payload`, and `base`/`target` live **only** in `Frame` — the diff
+structs never repeat them. `ScreenState.seq` starts at 1; 0 is the full-state
+sentinel. `ScreenState` has no `icon` field. `FrameSink::send` returns the
+datagram count. `TerminalGuard` replaces `RawGuard`, and Task 7 amends the
+contract to say so. `quic_client` keeps its contract signature; `quic_client_on`
+additionally returns the endpoint, which Tasks 10 and 12 both need.
+
+---
+
+## Contradictions between the two committed documents
+
+Both were re-read at commit `6b7bf6f` before this pass. Three places disagree,
+and in each case the plan follows the source named:
+
+1. **The rung-1 status line.** Spec §10.3 shows `oxutrm  IPv4 punched (UPnP)`,
+   but `PathDescription` (contract) has no field naming the mapping protocol —
+   `Rung::PortMapped` cannot distinguish NAT-PMP from PCP from UPnP-IGD. Task 9
+   renders `IPv4 punched (port mapped)`. **Followed the contract**; matching the
+   spec literally needs `PathDescription` to gain a mapping-protocol field.
+2. **`TerminalCaps`.** Spec §9.4's illustrative struct still shows
+   `colors: u16` (which cannot hold 16 777 216) and a
+   `unicode_width: UnicodeWidthVersion` field. The contract has `colors: u32` and
+   no `unicode_width`. **Followed the contract**; the spec's snippet is stale.
+3. **Late better paths.** Spec §5 line 1 still says "The first validated path
+   wins", and §1.3's table row says roaming is handled by "QUIC connection
+   migration", while §5's own following paragraph and the contract both say a
+   better path found after nomination is lost for that attach. **Followed the
+   later, explicit statement**, which the contract repeats verbatim on
+   `IceAgent`.
+
+One further gap, in neither document: `Receiver::on_frame` does not expose the
+applied diff, so the host cannot write `InputDiff.appended` directly and Task 3
+reconstructs the same bookkeeping. An `on_frame_with` callback would delete that
+whole task.
