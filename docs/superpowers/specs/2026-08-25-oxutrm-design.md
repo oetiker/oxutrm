@@ -21,12 +21,14 @@ scrollback.
 - **Both endpoints may sit behind NAT.**
 - **SSH for session initiation and reattachment** — no new trust root, no new
   daemon to expose.
-- **Real `vt100` emulation on both ends**, so screen state is authoritative on
+- **Real `alacritty_terminal` emulation on both ends**, so screen state is authoritative on
   the host and predictions on the client are correct rather than approximated.
 - **Detach and reattach**: the remote session outlives the client indefinitely.
 - **Working scrollback**, which Mosh cannot provide.
-- **Full fidelity**: 24-bit colour, SGR mouse reporting, resize, window title,
-  OSC 52 clipboard.
+- **Full fidelity**: 24-bit colour, SGR mouse reporting, resize **with reflow**,
+  window title, OSC 52 clipboard, and the full SGR attribute set including
+  strikethrough, blink and hidden. This is meant literally — no attribute in the
+  model is a field the emulator cannot fill.
 - **Bandwidth adaptation** so a poor link degrades gracefully instead of
   falling behind.
 - **`tmux -CC` control mode integration** (phase D), so window switching and the
@@ -35,7 +37,7 @@ scrollback.
 
 ### 1.2 Non-goals
 
-- Graphics protocols (Sixel, Kitty, iTerm2 inline images). `vt100` does not
+- Graphics protocols (Sixel, Kitty, iTerm2 inline images). `alacritty_terminal` does not
   model them; claiming support would be a lie.
 - A GUI client. oxutrm renders into an existing terminal.
 - Replacing tmux. oxutrm integrates with it (phase D) rather than competing.
@@ -51,7 +53,7 @@ scrollback.
 | Congestion control | hand-rolled | QUIC's, already correct |
 | NAT | none — server must be reachable | five-rung ladder, both ends may be NATed |
 | Firewalls | UDP 60000-61000, widely blocked | UDP/443, the one UDP port usually open |
-| Client prediction | heuristic overlay | a second real `vt100`, reconciled |
+| Client prediction | heuristic overlay | a second real `alacritty_terminal`, reconciled |
 | Scrollback | broken | synced, and local scrolling is instant |
 | Reattach | none | same code path as first connect |
 | `TERM` | hardcoded `xterm-256color` | negotiated from the client's real capabilities |
@@ -67,9 +69,9 @@ phases, each with its own plan and working milestone.
 | Phase | Contents | Status |
 |---|---|---|
 | **A — Link** | UDP socket, QUIC, NAT ladder, roaming, SSH bootstrap and signalling, session registry, detach/reattach | **specified here** |
-| **B — Terminal sync** | Host PTY + `vt100`, state-diff engine, client renderer, resize, mouse, colour, OSC | **specified here** |
+| **B — Terminal sync** | Host PTY + `alacritty_terminal`, state-diff engine, client renderer, resize, mouse, colour, OSC | **specified here** |
 | **C — Feel** | Speculative local echo, synced scrollback, bandwidth adaptation | sketched, §14 |
-| **D — tmux** | `tmux -CC` control mode, one `vt100` per pane, local layout and status bar | sketched, §15 |
+| **D — tmux** | `tmux -CC` control mode, one `alacritty_terminal` per pane, local layout and status bar | sketched, §15 |
 
 **A+B together are the first usable deliverable**: a working remote terminal.
 
@@ -82,7 +84,7 @@ One binary, three roles. Exactly one thing to install per machine.
 | Invocation | Runs where | Job |
 |---|---|---|
 | `oxutrm <ssh-target>` | local | wrapper: drives SSH, then becomes the client |
-| `oxutrm host --serve` | remote | spawned over SSH; owns the PTY and authoritative `vt100` |
+| `oxutrm host --serve` | remote | spawned over SSH; owns the PTY and authoritative `alacritty_terminal` |
 | `oxutrm host --list` / `--attach <id>` | remote | session registry queries, spawned over SSH |
 
 oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes the
@@ -584,6 +586,12 @@ struct Cell { text: CompactString, fg: Color, bg: Color, attrs: Attrs }
 marks survive intact. Wide-character continuation cells are represented
 explicitly, not as spaces.
 
+`Attrs` carries **bold, dim, italic, underline, inverse, strikethrough, blink and
+hidden**. All eight are real: `alacritty_terminal` parses SGR 5, 8 and 9 into its
+cell flags, so the last three are values the emulator actually holds rather than
+fields that would always read false. This is what lets §1.1's "full fidelity"
+claim stand without qualification.
+
 ```rust
 struct ScreenDiff {
     resize: Option<(u16, u16)>,
@@ -696,8 +704,8 @@ simultaneous updates in both directions need no arbitration at all.
 ### 9.1 Contents of a session
 
 - a PTY with the user's shell (`rustix-openpty`, as in `ansidrama`),
-- a `HostTerm`: a `vt100::Parser` plus the sidecar scanner of §9.1.1 — together
-  **the single source of truth**,
+- a `HostTerm`: a headless `alacritty_terminal::Term` — **the single source of
+  truth** (§9.1.1),
 - the current `ScreenState` and a ring of the last 32,
 - **zero or one** attached client; detached is a normal state, not an error,
 - creation time, last activity, and the child's status.
@@ -705,49 +713,37 @@ simultaneous updates in both directions need no arbitration at all.
 Per §15, the session holds these terminal states as a **collection**, even though
 in phase A+B it always has exactly one member.
 
-### 9.1.1 `HostTerm` and the sidecar scanner
+### 9.1.1 `HostTerm`
 
-`vt100` renders the grid; it does not report everything `ScreenState` needs.
-Checked against the crate's public API, `Screen` exposes `alternate_screen`,
-`application_cursor`, `application_keypad`, `bracketed_paste`, `hide_cursor`,
-`mouse_protocol_mode`, `mouse_protocol_encoding`, `cursor_position`, `rows`,
-`cell`, `size` and the `contents_*`/`*_formatted` family — but **no title, no
-icon name, no bell counter, no way to read scrollback by index or range, and no
-count of lines scrolled off**. `Cell` exposes `bold`, `dim`, `italic`,
-`underline` and `inverse`, and nothing parses OSC 52.
+`HostTerm` wraps a **headless `alacritty_terminal::Term`**, driven by feeding it
+the PTY's output bytes. It is the only thing that touches that byte stream, and
+it is the single source of truth for the session.
 
-Waiting on a fork to supply all of that would make four `ScreenState` fields and
-the whole of §14 hostage to someone else's release schedule. So `HostTerm` owns
-them itself. It is the only thing that touches the PTY's output byte stream, and
-it does two things with every chunk it reads:
+Nothing is hand-rolled around it. Everything `ScreenState` needs, the crate
+already provides:
 
-1. feeds the bytes to `vt100::Parser` unchanged, and
-2. runs a **sidecar scanner** over the same bytes.
+| `ScreenState` field | Source |
+|---|---|
+| `cells`, `cursor`, `modes` | the `Term` grid and its mode flags |
+| `title`, `icon` | `EventListener` events, raised as the emulator parses `OSC 0/1/2` |
+| `bell` | the `EventListener` bell event, counted monotonically |
+| `scrollback_len` | the crate's own scrollback, which is addressable by line index |
 
-The scanner is a small, independent state machine that extracts exactly what
-`vt100` does not surface:
+OSC 52 likewise arrives as an `EventListener` clipboard event and is forwarded to
+the Clipboard stream (§7.2). `HostTerm` implements the listener; it does not
+re-parse escape sequences that the emulator has already parsed.
 
-| Extracted | From | Feeds |
-|---|---|---|
-| window title | `OSC 0` and `OSC 2` | `ScreenState.title` |
-| icon name | `OSC 0` and `OSC 1` | `ScreenState.icon` |
-| clipboard | `OSC 52` | the Clipboard stream (§7.2) |
-| bell | `BEL` (`0x07`) outside any OSC/DCS string | `ScreenState.bell`, incremented |
+**Scrollback is the crate's, not ours.** `alacritty_terminal` retains scrolled-off
+lines in an addressable buffer, so `ScrollbackReq { from, to }` (§7.2) is answered
+by reading the requested line range directly. `HostTerm` must **not** maintain a
+parallel scrollback ring: a second copy would be a second source of truth, and
+keeping it consistent with the grid across resize and reflow is exactly the kind
+of bug the "single source of truth" property exists to prevent.
 
-It must track string-terminator state properly, since a `BEL` inside an OSC
-string terminates that string and is **not** a bell. `ScreenState.title` and
-`.icon` are the scanner's latest values; `.bell` is its monotonic count.
-
-Scrollback is likewise `HostTerm`'s own: it keeps a **ring of lines scrolled off
-the top**, captured as they leave the grid, together with a monotonic count of
-every line ever scrolled off. That count is `ScreenState.scrollback_len`, and the
-ring is what answers the `ScrollbackReq { from, to }` of §7.2. `vt100`'s
-`scrollback()`/`set_scrollback()` viewport offset is not used for this and cannot
-be: it moves a view, it does not hand back addressable lines.
-
-Any attribute the emulator does not model — strikethrough, blink, hidden — is
-absent from `Attrs` rather than faked, which is the same honesty §1.2 applies to
-graphics protocols.
+**Resize reflows.** `Term::resize` rewraps previously wrapped lines rather than
+truncating them, so a narrowed and then re-widened window recovers its text. The
+host resizes the `Term` and the PTY together and lets the next diff carry the
+result; the client does not attempt to predict a reflow.
 
 ### 9.2 Registry
 
@@ -827,7 +823,7 @@ struct TerminalCaps {
 ```
 
 **`caps` never reaches the child environment.** The host derives `TERM` and
-`COLORTERM` **solely from what `vt100` emulates** — `negotiate_term` takes no
+`COLORTERM` **solely from what `alacritty_terminal` emulates** — `negotiate_term` takes no
 `TerminalCaps` argument and has nothing client-specific to take. All capability
 adaptation lives in the client: colours the client cannot show are down-converted
 there, at render time.
@@ -1016,7 +1012,7 @@ oxutrm/
 └── crates/
     ├── oxutrm-proto/          wire types, postcard, version negotiation
     ├── oxutrm-sync/           state + diff engine — NO I/O AT ALL
-    ├── oxutrm-term/           HostTerm: vt100 + sidecar scanner, ScreenState, PTY, capabilities
+    ├── oxutrm-term/           HostTerm: alacritty_terminal, ScreenState, PTY, capabilities
     ├── oxutrm-net/            candidates, STUN, ICE, NAT-PMP/PCP/UPnP, AsyncUdpSocket demux, quinn
     ├── oxutrm-host/           session registry, daemonize, PTY supervision
     └── oxutrm-client/         renderer, speculation (phase C), input
@@ -1031,7 +1027,7 @@ risky about the protocol is therefore testable in isolation.
 |---|---|---|
 | `quinn` | 0.11 | QUIC transport; `new_with_abstract_socket` (§5.3.1) |
 | `rustls` | 0.23, via `quinn`'s re-export | TLS 1.3, custom pinning verifier (§6.1) |
-| `vt100` | fork `Junyi-99/vt100-rust`, **pinned by commit** `TODO-COMMIT` | terminal emulation, both ends |
+| `alacritty_terminal` | 0.26 | terminal emulation, both ends |
 | `rustix`, `rustix-openpty` | 1 / 0.2 | PTY, termios, process control |
 | `stunclient` | 0.4 | pre-QUIC address discovery **only** (§5.3.1) |
 | `stun_codec` | 0.4 | ICE checks, nomination, keepalive, test STUN server |
@@ -1053,17 +1049,16 @@ sharing a `digest` generation with them must stay on the 0.10-era releases.
 `hkdf` 0.13 and `sha2` 0.11 belong to the next generation and cannot coexist with
 them in one graph.
 
-**`vt100` is pinned by commit hash, not by branch.** A branch name is not a
-reproducible dependency — `deck` can move underneath the build, and this is the
-crate the entire terminal layer's fidelity rests on. The dependency is declared
-as `{ git = "https://github.com/Junyi-99/vt100-rust", rev = "TODO-COMMIT" }`.
+**The emulator is a released crate, not a fork.** `alacritty_terminal` 0.26 is
+published on crates.io and is depended on by version, so there is no branch to
+move underneath the build and no commit to pin. That is a deliberate change from
+an earlier draft, which pinned a fork of `vt100`; §18 records why.
 
-What that fork is relied on for is exactly the grid: cells, attributes, wrapping,
-wide characters, and the mode flags `Screen` already exposes. It is **not**
-relied on for title, icon, bell, OSC 52 or addressable scrollback — `HostTerm`'s
-sidecar scanner (§9.1.1) supplies those from the byte stream, so no `ScreenState`
-field depends on a fork feature landing. The fork is the same one `ansidrama`
-uses, keeping one emulator across both projects.
+It is relied on for the whole of the terminal layer, not merely the grid: cells
+and the full attribute set, wrapping, wide characters, the mode flags, resize
+**with reflow**, addressable scrollback, and the `EventListener` events that
+carry title, icon, bell and OSC 52. No `ScreenState` field depends on anything
+oxutrm has to hand-roll around it (§9.1.1).
 
 ---
 
@@ -1071,7 +1066,7 @@ uses, keeping one emulator across both projects.
 
 Specified in its own document when phase A+B lands. The shape:
 
-**Speculative echo.** The client holds a **second `vt100`**, seeded from the
+**Speculative echo.** The client holds a **second `alacritty_terminal`**, seeded from the
 authoritative screen. Predicted echo bytes are fed into it and drawn
 immediately. Because prediction runs through a *real emulator*, wide characters,
 right-margin wrapping and attribute inheritance are correct — precisely the
@@ -1084,12 +1079,11 @@ rolling hit-rate governs whether to predict at all, so oxutrm stops guessing
 inside `vim` rather than flickering. Unconfirmed cells may be underlined above a
 latency threshold; configurable, off by default on fast links.
 
-**Synced scrollback.** `HostTerm`'s own line ring (§9.1.1) retains N lines —
-`vt100` cannot serve this, since it offers a viewport offset rather than
-addressable lines. `scrollback_len` in `ScreenState` tells the client how much
-history exists; the client fetches ranges over a dedicated stream and caches
-them. Local scrolling is then instant
-and **keeps working while the link is down**.
+**Synced scrollback.** The emulator's own scrollback (§9.1.1) retains N lines and
+is addressable by line index, so no parallel ring is kept. `scrollback_len` in
+`ScreenState` tells the client how much history exists; the client fetches ranges
+over a dedicated stream and caches them. Local scrolling is then instant and
+**keeps working while the link is down**.
 
 **Adaptation** is §10.4, refined with loss-aware frame dropping.
 
@@ -1101,7 +1095,7 @@ Specified in its own document. The shape:
 
 The host runs `tmux -CC`, parses control-mode output (`%output`, `%window-add`,
 `%layout-change`, `%session-changed`, `%begin`/`%end`), and maintains **one
-`vt100` per pane**, each synced as its own `ScreenState`.
+`alacritty_terminal` per pane**, each synced as its own `ScreenState`.
 
 The client then draws pane borders, the layout and the status bar **locally**.
 The payoff is large: window switching and the status clock become
@@ -1119,7 +1113,7 @@ forward-compatibility constraint phase D places on phase A+B.
 
 | # | Deliverable | Proves |
 |---|---|---|
-| **M1** | Loopback terminal: shell → `vt100` → sync engine → renderer, one process, no network | terminal core and sync engine, with the convergence property green |
+| **M1** | Loopback terminal: shell → `alacritty_terminal` → sync engine → renderer, one process, no network | terminal core and sync engine, with the convergence property green |
 | **M2** | QUIC over a punched socket, dummy payload, rungs 0-2, netns tests | NAT traversal actually works |
 | **M3** | SSH bootstrap, signalling, daemonize, registry, detach and reattach | the session model |
 | **M4** | Joined up: a real remote terminal. Rungs 3-4, status display, capability negotiation | **usable daily** |
@@ -1134,7 +1128,7 @@ whose correctness is hardest to recover from later.
 These are named rather than left implicit:
 
 - **Windows support.** Out of scope; the PTY layer assumes Unix.
-- **Graphics protocols.** Out of scope; `vt100` does not model them.
+- **Graphics protocols.** Out of scope; `alacritty_terminal` does not model them.
 - **Multiple simultaneous clients.** Not implemented, but §9.5 keeps it
   possible.
 - **MASQUE / CONNECT-UDP relay (RFC 9298).** The standards-based successor to
@@ -1159,11 +1153,11 @@ resolved above. Recorded here so the changes are auditable.
 | 4 | `InputDiff` could not express prefix removal, so input replayed | §8.3: `consumed: u64` added; `apply` is drop-then-append |
 | 5 | Rung 4 needs SSH alive, but §4.3 closed every SSH descriptor | §4.3, §5.5, §9.2: rung 4 skips daemonization, is not detachable, `SessionMeta.detachable` records it, registry entry dies with its SSH |
 | 6 | 0-RTT is impossible given fresh keys per attach | §6: removed from the table, with the reason stated |
-| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | §9.1.1: `HostTerm` owns a sidecar scanner over the PTY byte stream plus its own line ring; §13.1 pins the fork by commit and scopes what it is relied on for |
+| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | Superseded by the emulator change below: `alacritty_terminal` supplies all of them natively, so §9.1.1 hand-rolls nothing |
 | 8 | ICE had no roles, no tie-break, and one shared key for both directions | §5.3: client is deterministically controlling, only it nominates, credentials derived per direction via HKDF-SHA256 |
 | 9 | `$XDG_RUNTIME_DIR` is destroyed at logout, killing reattach | §9.2: `loginctl ... Linger` is checked, `$HOME/.local/state/oxutrm/` is the fallback, the fallback is announced loudly |
 | 10 | `crab_nat` has no gateway discovery | §5.2: `netdev::get_default_gateway` supplies it; rung 1 is skipped if unavailable |
-| 11 | `TERM` from client caps contradicted client-side down-conversion and reattach | §9.4: `TERM`/`COLORTERM` derive solely from what `vt100` emulates, `negotiate_term` takes no caps, all adaptation is client-side |
+| 11 | `TERM` from client caps contradicted client-side down-conversion and reattach | §9.4: `TERM`/`COLORTERM` derive solely from what the emulator emulates, `negotiate_term` takes no caps, all adaptation is client-side |
 | 12 | Sequence numbers duplicated in `Frame` and in the diffs | §7.1, §8.2, §8.3, §8.4: `base`/`target` removed from both diffs, `Frame` is the sole carrier, `apply` takes them as parameters |
 | 13 | `Run.repeat` was readable two ways | §8.2: `cells` is emitted `repeat + 1` times from `start_col`; `repeat == 0` means once; runs must not overlap |
 | 14 | State numbering across reattach was unspecified; `base == 0` collided with a valid seq | §8.5: `seq` starts at 1, 0 reserved as the full-state sentinel, counters reset per attach, `attach_id` added, the host's first datagram of an attach is a full state |
@@ -1171,5 +1165,28 @@ resolved above. Recorded here so the changes are auditable.
 | 16 | Two STUN probes cannot separate `AddressDependent` from `Symmetric` | §5.3: three probes, with a second port on the same server IP, and an explicit truth table |
 | 17 | The pinning verifier's signature-checking duty was unstated | §6.1: the verifier checks the SPKI hash **and** performs real TLS 1.3 signature verification; `CryptoProvider` installation and TLS-1.3-only noted |
 
-`TODO-COMMIT` in §13.1 is the one deliberate placeholder in this document,
-pending the fork audit.
+### 18.1 Emulator change: `vt100` → `alacritty_terminal`
+
+Made after the seventeen findings above were applied, and recorded separately
+because it supersedes part of finding 7 rather than following from it.
+
+Finding 7 was resolved by having `HostTerm` hand-roll a sidecar scanner and a
+scrollback ring around a pinned fork of `vt100`. An audit of that fork
+(`Junyi-99/vt100-rust` `deck`, commit `4bca1b1ec4efbb73b55f6c229e38268dca836825`)
+then showed the workaround could not carry the whole load:
+
+- it has **no way to read scrollback by line index** and **no scrolled-off line
+  counter**, and synced scrollback (§1.1, §14) is a stated v1 feature;
+- its parser **discards SGR 5, 8 and 9 outright**, so blink, hidden and
+  strikethrough never reach the grid — these were missing values, not missing
+  getters, and no wrapper could recover them.
+
+The emulator is therefore **`alacritty_terminal` 0.26.0 on both ends**. It is a
+released crate rather than a fork, so the commit pin and its placeholder are gone.
+Consequences already applied above: §9.1.1 no longer hand-rolls anything, since
+title, icon, bell and OSC 52 arrive as `EventListener` events and scrollback is
+addressable by line index; §8.2's `Attrs` genuinely carries strikethrough, blink
+and hidden, so §1.1's "full fidelity" is now literal; and resize **reflows**
+wrapped lines rather than truncating them.
+
+This document contains **no placeholders**.
