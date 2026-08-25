@@ -526,6 +526,31 @@ impl<S: SyncState> Receiver<S> {
     pub fn peer_ack(&self) -> u64;
 }
 
+// ---- THE FIRST FRAME OF AN ATTACH — a rule whose absence cost a real bug ----
+//
+// Both ends independently construct an initial state numbered 1, holding
+// COMPLETELY DIFFERENT content: the host's comes from the live emulator, the
+// client's from a blank screen. A sequence number says which GENERATION, never
+// which CONTENT, so nothing notices the collision.
+//
+// R1. The host's first frame of every attach IS a full state — a fresh `Sender`
+//     has `peer_saw == 0`, finds no ring entry for 0, and takes the `full_diff`
+//     branch with `from_state == 0`.
+//
+// R2. **A full state (`from_state == 0`) MUST apply even when `my_state` does
+//     not exceed the seq the receiver currently holds.** This is the half that
+//     was missing. The ordinary staleness test `my_state > state.seq()` rejects
+//     the legitimate first full state at seq 1, after which the client keeps its
+//     invented blank screen and every later diff arrives against a base it never
+//     reached. The session deadlocks until ring eviction accidentally rescues it,
+//     which is why the symptom looked like flakiness.
+//
+// R3. Because the sentinel applies against any held seq, a full state is also
+//     the protocol's universal recovery: whenever the peer's ack has left the
+//     ring, `from_state == 0` re-synchronises unconditionally.
+//
+// Do not "optimise" R2 back into a plain `>` comparison.
+
 /// Trim consumed input after the host acknowledges it.
 impl InputState {
     pub fn append(&self, bytes: &[u8], size: TermSize) -> InputState;
