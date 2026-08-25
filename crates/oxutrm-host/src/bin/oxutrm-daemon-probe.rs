@@ -14,12 +14,45 @@ fn main() {
         .expect("usage: oxutrm-daemon-probe <report-path>");
     let marker = format!("{report}.marker");
 
-    // Stand in for the descriptors ssh leaves behind: opened before
-    // daemonizing and deliberately leaked, so nothing but `daemonize` can
-    // close it. If it survives, the test sees it by name.
-    let held = std::fs::File::create(&marker).expect("create the marker file");
-    let held_fd = held.as_raw_fd();
-    std::mem::forget(held);
+    // Stand in for the descriptors a real `oxutrm host --serve` inherits from
+    // sshd, and deliberately VARIED. A single held descriptor would let a
+    // partial close pass: an implementation that shut fd 3 and stopped, or one
+    // that looped over a guessed range, would look identical to a correct one.
+    //
+    // Everything here is leaked on purpose, so nothing but `daemonize` can
+    // close it.
+    let mut held: Vec<(String, i32)> = Vec::new();
+
+    // Several regular files, so "closed the first one" is not enough.
+    for i in 0..4 {
+        let f = std::fs::File::create(format!("{marker}.{i}")).expect("create a marker file");
+        held.push((format!("file{i}"), f.as_raw_fd()));
+        std::mem::forget(f);
+    }
+
+    // A pipe pair: what sshd actually hands a remote command.
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+        held.push(("pipe-read".to_string(), fds[0]));
+        held.push(("pipe-write".to_string(), fds[1]));
+    }
+
+    // A listening Unix socket, which is the shape of a session socket bound
+    // too early -- one of the four ordering rules daemonize documents.
+    let sock_path = format!("{marker}.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    if let Ok(listener) = std::os::unix::net::UnixListener::bind(&sock_path) {
+        held.push(("unix-listener".to_string(), listener.as_raw_fd()));
+        std::mem::forget(listener);
+    }
+
+    // A HIGH-numbered descriptor. This is the one that catches a bounded loop
+    // such as `for fd in 3..256`: enumeration finds it, a guessed range does
+    // not.
+    let high = unsafe { libc::dup2(held[0].1, 900) };
+    if high >= 0 {
+        held.push(("high-900".to_string(), high));
+    }
 
     oxutrm_host::daemonize().expect("daemonize");
 
@@ -31,7 +64,9 @@ fn main() {
     lines.push(format!("pid={}", std::process::id()));
     lines.push(format!("ppid={}", unsafe { libc::getppid() }));
     lines.push(format!("sid={}", unsafe { libc::getsid(0) }));
-    lines.push(format!("held_fd={held_fd}"));
+    for (name, fd) in &held {
+        lines.push(format!("held={name}:{fd}"));
+    }
     lines.push(format!(
         "cwd={}",
         std::env::current_dir()

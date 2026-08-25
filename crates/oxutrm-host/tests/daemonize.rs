@@ -111,12 +111,57 @@ fn the_daemon_outlives_its_parent_and_keeps_no_inherited_descriptor() {
         "still parented to the test harness"
     );
 
+    // The probe held a varied set open before detaching. Anything less than
+    // all of them surviving-nothing would let a partial close pass.
+    let held: Vec<&str> = report
+        .lines()
+        .filter_map(|l| l.strip_prefix("held="))
+        .collect();
+    assert!(
+        held.len() >= 6,
+        "the probe held too few descriptors to prove anything: {held:?}"
+    );
+    assert!(
+        held.iter().any(|h| h.starts_with("high-900")),
+        "without a high-numbered descriptor, a bounded close loop would pass: {held:?}"
+    );
+
     let targets = fd_targets(&report);
     assert!(
         !targets.is_empty(),
         "the probe reported no descriptors at all, so it checked nothing"
     );
 
+    // The enumeration opens a descriptor of its own to read /proc/self/fd.
+    // Everything else that survived is a genuine leak.
+    let survivors: Vec<&(i32, String)> = targets
+        .iter()
+        .filter(|(_, target)| !target.starts_with("/proc/"))
+        .collect();
+
+    // THE assertion. Not "no pipe survived" -- exactly three descriptors
+    // survived, and each is /dev/null. A close that missed one file, one
+    // socket or one high number fails here; a check for particular targets
+    // would not.
+    assert_eq!(
+        survivors.len(),
+        3,
+        "exactly stdin, stdout and stderr may survive; these did:\n{survivors:#?}\n\nfull report:\n{report}"
+    );
+
+    for std_fd in [0, 1, 2] {
+        let (_, target) = survivors
+            .iter()
+            .find(|(n, _)| *n == std_fd)
+            .unwrap_or_else(|| panic!("fd {std_fd} is missing entirely:\n{report}"));
+        assert_eq!(
+            target, "/dev/null",
+            "fd {std_fd} must be reopened on /dev/null"
+        );
+    }
+
+    // Kept as named checks too, because the message they give when they fail
+    // says what went wrong rather than only that a count was off.
     for (fd, target) in &targets {
         assert!(
             !target.starts_with("pipe:"),
@@ -125,18 +170,11 @@ fn the_daemon_outlives_its_parent_and_keeps_no_inherited_descriptor() {
         );
         assert!(
             !target.contains(".marker"),
-            "fd {fd} still points at the file held before daemonizing ({target})"
+            "fd {fd} still points at something held before daemonizing ({target})"
         );
-    }
-
-    for std_fd in [0, 1, 2] {
-        let (_, target) = targets
-            .iter()
-            .find(|(n, _)| *n == std_fd)
-            .unwrap_or_else(|| panic!("fd {std_fd} is missing entirely:\n{report}"));
-        assert_eq!(
-            target, "/dev/null",
-            "fd {std_fd} must be reopened on /dev/null"
+        assert!(
+            !target.contains(".sock"),
+            "fd {fd} still points at a socket bound before daemonizing ({target})"
         );
     }
 }
