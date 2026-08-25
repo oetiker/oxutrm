@@ -42,10 +42,11 @@
 | `quinn` | `0.11` | net |
 | `rustls` | whatever `quinn` 0.11 re-exports | net |
 | `rcgen` | `0.13` | net (self-signed cert) |
-| `vt100` | git `https://github.com/Junyi-99/vt100-rust`, branch `deck` | term |
+| `vt100` | git `https://github.com/Junyi-99/vt100-rust`, **pinned by commit hash**, not by branch | term |
 | `rustix` | `1` (features `process`, `termios`, `stdio`, `fs`) | term, host, client |
 | `rustix-openpty` | `0.2` | term |
-| `stun_codec` | `0.4` | net |
+| `stun_codec` | `0.4` | net — ALL ICE checks and keepalives |
+| `stunclient` | `0.4` | net — pre-QUIC discovery ONLY; its API has no MESSAGE-INTEGRITY |
 | `bytecodec` | `0.5` | net |
 | `crab_nat` | `0.8` | net |
 | `igd-next` | `0.17` | net |
@@ -60,6 +61,9 @@
 | `rand` | `0.9` | net, host |
 | `sha2` | `0.10` | net |
 | `hmac` | `0.12` | net (STUN MESSAGE-INTEGRITY) |
+| `hkdf` | `0.12` | net (direction-labelled ICE credentials) |
+| `sha1` | `0.10` | net (STUN MESSAGE-INTEGRITY is HMAC-SHA1) |
+| `rtnetlink` or `/proc/net/route` parsing | — | net (`crab_nat` needs the gateway address and ships no discovery) |
 | `base64` | `0.22` | proto |
 | `unicode-width` | `0.2` | term, client |
 | `proptest` | `1` | sync (dev) |
@@ -161,6 +165,10 @@ pub struct Frame {
     pub from_state: u64,
     pub ack_state: u64,
     pub flags: u8,
+    /// 0-based fragment index within this target state.
+    pub frag_index: u16,
+    /// Total fragments for this target state. 1 means unfragmented.
+    pub frag_count: u16,
     pub payload: Vec<u8>,
 }
 
@@ -240,6 +248,8 @@ pub struct Modes {
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ScreenState {
+    /// Starts at 1. Zero is reserved as the "full state" sentinel.
+    /// Resets to 1 at every attach.
     pub seq: u64,
     pub rows: u16,
     pub cols: u16,
@@ -292,8 +302,11 @@ impl HostTerm {
 /// Detect the local terminal's capabilities from the environment.
 pub fn detect_caps() -> TerminalCaps;
 
-/// The honest intersection of what vt100 emulates and what the client can show.
-pub fn negotiate_term(caps: &TerminalCaps) -> (String /*TERM*/, Option<String> /*COLORTERM*/);
+/// Derived SOLELY from what vt100 emulates. The client's capabilities must NOT
+/// influence this: the child's TERM cannot change when a differently-capable
+/// client reattaches, and down-converting here would permanently degrade the
+/// host's state. All capability adaptation happens in the client.
+pub fn negotiate_term() -> (String /*TERM*/, Option<String> /*COLORTERM*/);
 ```
 
 ### `oxutrm-sync`
@@ -318,12 +331,14 @@ pub trait SyncState: Clone {
     fn set_seq(&mut self, seq: u64);
     /// Diff that turns `base` into `self`.
     fn diff_from(&self, base: &Self) -> Self::Diff;
-    fn apply(&mut self, d: &Self::Diff) -> Result<(), ApplyError>;
+    fn apply(&mut self, base: u64, target: u64, d: &Self::Diff) -> Result<(), ApplyError>;
     /// A diff from nothing: used when the peer's ack has left the ring.
     fn full_diff(&self) -> Self::Diff;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// The `cells` sequence is emitted `repeat + 1` times consecutively, starting
+/// at `start_col`. `repeat == 0` therefore means "emit `cells` exactly once".
 pub struct Run { pub start_col: u16, pub repeat: u16, pub cells: Vec<Cell> }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -331,8 +346,7 @@ pub struct RowPatch { pub row: u16, pub runs: Vec<Run> }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenDiff {
-    pub base: u64,
-    pub target: u64,
+    // NOTE: base/target live in `Frame` only. Never duplicate them here.
     pub resize: Option<TermSize>,
     pub rows: Vec<RowPatch>,
     pub cursor: Option<Cursor>,
@@ -348,11 +362,14 @@ pub struct InputState { pub seq: u64, pub pending: Vec<u8>, pub size: TermSize }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputDiff {
-    pub base: u64,
-    pub target: u64,
+    // NOTE: base/target live in `Frame` only. Never duplicate them here.
+    /// Bytes the host has consumed; dropped from the FRONT of `pending`.
+    pub consumed: u64,
     pub appended: Vec<u8>,
     pub size: Option<TermSize>,
 }
+// apply() is defined as: drop `consumed` bytes from the front, THEN append
+// `appended`. Getting this order wrong writes consumed input to the PTY twice.
 
 impl SyncState for ScreenState { type Diff = ScreenDiff; }
 impl SyncState for InputState  { type Diff = InputDiff; }
@@ -423,6 +440,9 @@ impl Drop for PortMapping;             // releases the mapping
 
 /// Query several STUN servers from `socket`; classify the NAT by comparing
 /// the mapped ports they report.
+/// THREE probes, not two: two servers at different IPs, plus a second port on
+/// the FIRST server's IP. Two probes can only separate `EndpointIndependent`
+/// from the rest; they cannot tell `AddressDependent` from `Symmetric`.
 pub async fn stun_discover(
     socket: &tokio::net::UdpSocket,
     cfg: &NetConfig,
@@ -439,6 +459,16 @@ pub enum IceEvent {
 
 /// ICE connectivity checks: STUN Binding Requests with MESSAGE-INTEGRITY
 /// keyed by the shared PSK.
+/// The client is ALWAYS `IceRole::Controlling`, and only the controlling side
+/// nominates — otherwise asymmetric loss makes the two sides nominate different
+/// pairs. Direction-labelled credentials are derived from the shared psk with
+/// HKDF-SHA256, info strings `"oxutrm ice c2h"` and `"oxutrm ice h2c"`, so a
+/// side can tell its own reflected check from a genuine peer check.
+///
+/// Nomination MUST complete BEFORE QUIC starts. QUIC connection migration only
+/// lets a client change its own LOCAL address; there is no protocol mechanism
+/// and no quinn API to repoint an established connection at a different REMOTE
+/// address. A better path found later is lost for that attach.
 pub struct IceAgent { /* private */ }
 impl IceAgent {
     pub fn new(psk: [u8; 32], role: IceRole, cfg: NetConfig) -> IceAgent;
@@ -451,6 +481,21 @@ impl IceAgent {
 /// STUN: top two bits are 00. QUIC: fixed bit (0x40) is set.
 pub fn is_stun(datagram: &[u8]) -> bool;
 
+/// quinn owns the socket's recv loop, so STUN and QUIC CANNOT both call recv
+/// on the same socket — they race and steal each other's packets. This wrapper
+/// peels STUN off the front and passes everything else to quinn. Construct the
+/// endpoint with `Endpoint::new_with_abstract_socket`, never `Endpoint::new`.
+pub struct StunDemuxSocket { /* private */ }
+impl quinn::AsyncUdpSocket for StunDemuxSocket { /* ... */ }
+impl StunDemuxSocket {
+    pub fn new(inner: std::sync::Arc<tokio::net::UdpSocket>) -> (StunDemuxSocket,
+        tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>);
+}
+
+/// The default gateway, needed because `crab_nat` takes the gateway address
+/// and ships no discovery of its own. Read from netlink or /proc/net/route.
+pub fn default_gateway() -> Option<std::net::IpAddr>;
+
 /// Self-signed certificate plus the SHA-256 of its SPKI.
 pub fn generate_cert() -> anyhow::Result<(rustls::pki_types::CertificateDer<'static>,
                                           rustls::pki_types::PrivateKeyDer<'static>,
@@ -462,6 +507,13 @@ pub async fn quic_server(
     key: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> anyhow::Result<quinn::Endpoint>;
 
+/// The pinning verifier checks the SPKI hash AND performs real TLS 1.3
+/// signature verification by delegating to the default provider. Stubbing
+/// `verify_tls12_signature` / `verify_tls13_signature` / `supported_verify_schemes`
+/// to `Ok(())` — the usual copy-paste — throws away proof that the peer holds
+/// the private key and reduces pinning to merely knowing the certificate bytes.
+/// rustls 0.23 also needs an explicit `CryptoProvider` installed before
+/// `QuicClientConfig::try_from` will succeed.
 pub async fn quic_client(
     socket: std::net::UdpSocket,
     peer: std::net::SocketAddr,
@@ -479,9 +531,16 @@ pub struct SessionMeta {
     pub created_unix: u64,
     pub shell: String,
     pub size: TermSize,
+    /// False for a rung-4 (SSH-tunnelled) session: it cannot daemonize,
+    /// so it dies with its SSH connection and cannot be reattached.
+    pub detachable: bool,
 }
 
 /// `$XDG_RUNTIME_DIR/oxutrm/<id>/` — dir 0700, files 0600. Never holds keys.
+/// `/run/user/<uid>` is DESTROYED at logout unless lingering is enabled, which
+/// would make every detached session unreachable. `dir()` therefore checks
+/// `loginctl show-user <uid> --property=Linger` and falls back to
+/// `$HOME/.local/state/oxutrm/`, warning loudly when it does.
 pub struct Registry;
 impl Registry {
     pub fn dir() -> anyhow::Result<std::path::PathBuf>;
