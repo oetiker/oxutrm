@@ -1246,7 +1246,7 @@ resolved above. Recorded here so the changes are auditable.
 | 4 | `InputDiff` could not express prefix removal, so input replayed | §8.3: `consumed: u64` added; `apply` is drop-then-append |
 | 5 | Rung 4 needs SSH alive, but §4.3 closed every SSH descriptor | §4.3, §5.5, §9.2: rung 4 skips daemonization, is not detachable, `SessionMeta.detachable` records it, registry entry dies with its SSH |
 | 6 | 0-RTT is impossible given fresh keys per attach | §6: removed from the table, with the reason stated |
-| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | Superseded by §18.1: `alacritty_terminal` supplies title, bell, OSC 52 and scrollback natively. Icon name is unavailable in either emulator and the field is dropped (§1.2) |
+| 7 | `vt100` 0.16 has no title, icon, bell, OSC 52 or addressable scrollback | Superseded by §18.1: `alacritty_terminal` supplies title, bell, OSC 52 and scrollback natively. Icon name is the exception — `vt100` **did** deliver it and `alacritty_terminal` does not, so the field is dropped as an accepted regression (§1.2, §18.1) |
 | 8 | ICE had no roles, no tie-break, and one shared key for both directions | §5.3: client is deterministically controlling, only it nominates, credentials derived per direction via HKDF-SHA256 |
 | 9 | `$XDG_RUNTIME_DIR` is destroyed at logout, killing reattach | §9.2: `loginctl ... Linger` is checked, `$HOME/.local/state/oxutrm/` is the fallback, the fallback is announced loudly |
 | 10 | `crab_nat` has no gateway discovery | §5.2: `netdev::get_default_gateway` supplies it; rung 1 is skipped if unavailable |
@@ -1289,12 +1289,22 @@ reaching the grid — while the cost of switching is a single capability (below)
 A shared dependency is worth keeping only while it can do the job; this one
 could not, and patching it would have meant carrying a fork of a fork.
 
-**The accepted cost is the icon name.** `OSC 1` is silently discarded — the
-crate's `osc_dispatch` matches only `0` and `2`, with no `1` arm and no handler
-method, confirmed by feeding `ESC ] 1 ; MyIcon BEL` and observing no event.
-Recovering it would require pre-scanning the byte stream, which is the second
-parser this design removed. `ScreenState.icon` is therefore **dropped** (§1.2).
-This is a real loss, recorded rather than worked around.
+**The accepted cost is the icon name, and it is a genuine regression.** This is
+the one capability the switch loses rather than gains, and the comparison is
+exact: the `vt100` fork **did** support `OSC 1`, through
+`Callbacks::set_window_icon_name(&mut self, &mut Screen, icon_name: &[u8])`, with
+`OSC 0` firing both that and `set_window_title`. `alacritty_terminal` drops it —
+`vte`'s `osc_dispatch` matches only `b"0"` and `b"2"`, with no `b"1"` arm and no
+handler method, confirmed by feeding `ESC ] 1 ; MyIcon BEL` and observing zero
+events.
+
+Recovering it would require pre-scanning the PTY byte stream, which is the second
+parser this design removed. oxutrm therefore **accepts the loss** and drops
+`ScreenState.icon` (§1.2).
+
+Stated this plainly on purpose: a future reader weighing a move back to `vt100`
+should be able to see that there is exactly one thing to gain by it, and what
+that thing is.
 
 Four smaller obligations the probe surfaced are specified in §9.1.1: blink is
 parsed but dropped and must be intercepted through a `Handler` newtype;
