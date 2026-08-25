@@ -142,7 +142,10 @@ struct HostHello {
     proto: u32,                  // protocol version, hard failure on mismatch
     session_id: String,          // 128-bit, hex
     attach_id: u64,              // increments per attach; scopes all sync sequence numbers (§8.5)
-    cert_spki_sha256: [u8; 32],  // pins the host's self-signed QUIC certificate
+    cert_spki_sha256: String,    // base64; pins the host's self-signed QUIC
+                                 // certificate. Base64 rather than [u8; 32]
+                                 // because this travels as JSON, where a byte
+                                 // array becomes 32 numbers.
     psk: String,                 // base64, 32 random bytes: root secret for the ICE
                                  // credentials derived in §5.3; never used directly
     candidates: Vec<Candidate>,
@@ -157,7 +160,7 @@ struct ClientHello {
     candidates: Vec<Candidate>,
     nat_type: NatType,
     caps: TerminalCaps,
-    size: (u16, u16),            // cols, rows
+    size: TermSize,              // cols, rows
 }
 
 /// either direction, repeatable until the link is up
@@ -494,12 +497,19 @@ struct Frame {
     my_state: u64,       // the state this datagram describes
     from_state: u64,     // the peer-acknowledged state it is a diff against
     ack_state: u64,      // highest peer state I have applied
+    flags: u8,           // bit 0: payload is zstd-compressed
     frag_index: u16,     // 0-based position in this state's fragment set
     frag_count: u16,     // total fragments for this state; 1 means unfragmented
-    flags: u8,           // bit 0: payload is zstd-compressed
     payload: Vec<u8>,    // a slice of the postcard-encoded ScreenDiff or InputDiff
 }
 ```
+
+**This field order is wire-significant and must not be changed.** `postcard`
+serialises struct fields in declaration order, so reordering them — tidying them
+by size, or alphabetically — silently changes the wire format. Two builds that
+disagree produce a host and client that cannot talk to each other, and the
+failure surfaces as garbage decoding rather than as anything that names the
+cause.
 
 **`Frame` is the sole carrier of the sequence numbers.** The diff structures in
 §8 do not repeat `base` and `target`; there is exactly one place a receiver looks
@@ -545,7 +555,7 @@ Consequences that follow, and are normative:
 | Stream | Type | Contents |
 |---|---|---|
 | Control | bidi, client-opened, long-lived | `SessionInfo`, `CapsUpdate`, `StatusRequest` |
-| Scrollback | bidi, client-opened, per request | `ScrollbackReq { from, to }` → lines → FIN |
+| Scrollback | bidi, client-opened, per request | `ScrollbackReq { from_line, to_line }` → lines → FIN |
 | Clipboard | bidi, per transfer | OSC 52 payloads, both directions |
 | Tmux | bidi, long-lived | phase D only |
 
@@ -595,9 +605,13 @@ struct Cell { text: CompactString, fg: Color, bg: Color, attrs: Attrs }
 marks survive intact. Wide-character continuation cells are represented
 explicitly, not as spaces.
 
-`Attrs` carries **inverse, bold, italic, dim, hidden, strikeout, underline and
-blink**. The first six are native cell flags. **Blink** is the one attribute the
-emulator parses and then discards, so §9.1.1 recovers it explicitly.
+`Attrs` carries **nine** bits: inverse, bold, italic, dim, hidden, strikeout,
+underline, blink, and `WIDE_CONT`. The first six are native cell flags.
+**Blink** is the one attribute the emulator parses and then discards, so §9.1.1
+recovers it explicitly. **`WIDE_CONT`** marks the right-hand half of a
+double-width character (the emulator's `WIDE_CHAR_SPACER`) — this is how the
+explicit continuation cell described above is represented, and it is a bit of
+`Attrs` rather than a separate field.
 
 Three capabilities the emulator offers are deliberately **not** on the wire in
 v1, because each would widen `Cell` for something no caller needs yet: the five
@@ -608,7 +622,7 @@ protocol version — the emulator holds them, `ScreenState` simply does not ask.
 
 ```rust
 struct ScreenDiff {
-    resize: Option<(u16, u16)>,
+    resize: Option<TermSize>,
     rows: Vec<RowPatch>,                 // changed rows only
     cursor: Option<Cursor>,
     modes: Option<Modes>,
@@ -650,13 +664,13 @@ The same machinery, inverted.
 struct InputState {
     seq: u64,
     pending: Vec<u8>,        // user input not yet acknowledged, in order
-    size: (u16, u16),        // latest requested terminal size
+    size: TermSize,          // latest requested terminal size
 }
 
 struct InputDiff {
     consumed: u64,           // bytes to drop from the front of base.pending
     appended: Vec<u8>,       // bytes to append afterwards
-    size: Option<(u16, u16)>,
+    size: Option<TermSize>,
 }
 ```
 
@@ -677,10 +691,14 @@ the remote application expects, so the host writes them straight to the PTY.
 
 ### 8.4 Purity, and the property that matters
 
-`oxutrm-sync` performs **no I/O whatsoever**. Its entire surface is:
+`oxutrm-sync` is **pure**: no sockets, no clocks, no filesystem, no I/O of any
+kind. That is the load-bearing property, and it is what §12's convergence
+property tests rest on.
+
+Its two central operations are:
 
 ```rust
-fn diff(&self, from: &Self) -> Self::Diff;
+fn diff_from(&self, base: &Self) -> Self::Diff;
 fn apply(&mut self, base: u64, target: u64, d: &Self::Diff) -> Result<(), ApplyError>;
 ```
 
@@ -688,6 +706,10 @@ fn apply(&mut self, base: u64, target: u64, d: &Self::Diff) -> Result<(), ApplyE
 owns them (§7.1). `apply` is responsible for checking that `base` matches the
 state it is being applied to and that `target` advances; both are `ApplyError`
 otherwise.
+
+The crate's **full** surface is larger than these two — `SyncState`, `Sender`,
+`Receiver` and `InputState::{append, consume}` — and is specified in the
+interface contract rather than here.
 
 This makes the highest-risk component of the project exhaustively testable
 without sockets. See §12.
@@ -809,7 +831,7 @@ bright variants is a renderer decision, and the crate does none of it.
 line. A scrollback line is therefore just
 `&term.grid()[Point::new(Line(-n), Column(c))]` — O(1), and it does **not** move
 the viewport, so reading history never disturbs what the live screen shows. The
-valid span is `topmost_line()..=bottommost_line()`, and `ScrollbackReq { from, to }`
+valid span is `topmost_line()..=bottommost_line()`, and `ScrollbackReq { from_line, to_line }`
 (§7.2) maps onto it directly.
 
 `HostTerm` must **not** maintain a parallel scrollback ring: a second copy would
@@ -892,8 +914,8 @@ be displayed.
 ```rust
 struct TerminalCaps {
     truecolor: bool,       // COLORTERM=truecolor present
-    colors: u16,           // 8 / 16 / 256 / 16777216
-    unicode_width: UnicodeWidthVersion,
+    colors: u32,           // 8 / 16 / 256 / 16777216 — u32, since 16777216 does
+                           // not fit in a u16
     bracketed_paste: bool,
     mouse_sgr: bool,
     osc52: bool,
@@ -1111,6 +1133,9 @@ risky about the protocol is therefore testable in isolation.
 | `stunclient` | 0.4 | pre-QUIC address discovery **only** (§5.3.1) |
 | `stun_codec` | 0.4 | ICE checks, nomination, keepalive, test STUN server |
 | `hkdf`, `sha2` | 0.12 / 0.10 | directional ICE credentials from the `psk` (§5.3) |
+| `hmac`, `sha1` | 0.12 / 0.10 | STUN `MESSAGE-INTEGRITY`, which is HMAC-SHA1 |
+| `rcgen` | 0.13 | generates the host's self-signed certificate (§6.1) |
+| `thiserror` | 2 | concrete error enums in `oxutrm-proto` and `oxutrm-sync` |
 | `crab_nat` | 0.8 | NAT-PMP and PCP (caller supplies the gateway) |
 | `igd-next` | 0.17 | UPnP-IGD, including its own SSDP discovery |
 | `netdev` | 0.46 | default-gateway lookup for `crab_nat` (§5.2) |
@@ -1122,11 +1147,17 @@ risky about the protocol is therefore testable in isolation.
 | `anyhow` | 1 | error handling, matching house style |
 | `proptest` | 1 | the convergence property |
 
-The RustCrypto versions above are not free choices: STUN `MESSAGE-INTEGRITY` is
-HMAC-SHA1, so `hmac` 0.12 and `sha1` 0.10 are already required, and everything
-sharing a `digest` generation with them must stay on the 0.10-era releases.
-`hkdf` 0.13 and `sha2` 0.11 belong to the next generation and cannot coexist with
-them in one graph.
+**This table is not the authority.** The interface contract's dependency table is
+normative and complete; §13.1 lists the crates that carry design significance and
+defers to the contract on everything else, including exact features. Where the
+two ever appear to disagree, the contract is right. Stating the precedence is the
+only way two documents listing the same thing can stay consistent.
+
+The RustCrypto versions are not free choices: STUN `MESSAGE-INTEGRITY` is
+HMAC-SHA1, so `hmac` 0.12 and `sha1` 0.10 are required, and everything sharing a
+`digest` generation with them must stay on the 0.10-era releases. `hkdf` 0.13 and
+`sha2` 0.11 belong to the next generation and cannot coexist with them in one
+graph.
 
 **The emulator is a released crate, not a fork.** `alacritty_terminal` 0.26.0 is
 published on crates.io and is depended on by version, so there is no branch to
