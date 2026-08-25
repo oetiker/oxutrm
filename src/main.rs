@@ -59,9 +59,25 @@ fn run_host(_args: &[String]) -> Result<()> {
 /// The frames are real: every screen and every keystroke is encoded to bytes,
 /// decoded again, and applied through a `Receiver`. See `src/loopback.rs`.
 fn run_loopback(args: &[String]) -> Result<()> {
+    // Arguments first, and `--help` before anything that needs a terminal:
+    // `oxutrm loopback --help | less` and a CI log must both work, and a help
+    // text that only prints on a tty is a help text nobody can read when they
+    // most need it.
+    match args.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            print!("{LOOPBACK_USAGE}");
+            return Ok(());
+        }
+        Some(other) if other.starts_with('-') => {
+            eprintln!("oxutrm loopback: unknown option {other:?}\nTry `oxutrm loopback --help`.");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+
     let shell = match args.first() {
-        Some(s) if !s.starts_with('-') => s.clone(),
-        _ => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+        Some(s) => s.clone(),
+        None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
     };
 
     let size = terminal_size().context("oxutrm loopback needs a real terminal")?;
@@ -120,6 +136,21 @@ fn run_connect(_args: &[String]) -> Result<()> {
     unimplemented!("oxutrm <ssh-target>: implemented in M3 and M4")
 }
 
+const LOOPBACK_USAGE: &str = "\
+oxutrm loopback — run both halves in one process, with no network in between.
+
+Everything a real session does happens here: a shell on a pty, the terminal
+emulator, the state diff, a Frame encoded to bytes and decoded again, and the
+renderer. Only the transport is missing.
+
+USAGE
+  oxutrm loopback [shell]
+      Run <shell>, or $SHELL, or /bin/sh.
+
+OPTIONS
+  -h, --help        Show this help.
+";
+
 const USAGE: &str = "\
 oxutrm — a remote terminal that survives bad networks, changing IP addresses
 and NAT on both ends.
@@ -168,6 +199,16 @@ mod tests {
         assert!(dispatch(&["--help".to_string()]).is_ok());
         assert!(dispatch(&["-h".to_string()]).is_ok());
         assert!(dispatch(&["help".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn loopback_help_works_without_a_terminal() {
+        // It used to ask the terminal for its size BEFORE parsing arguments,
+        // so `oxutrm loopback --help` failed in a pipe, in CI, and anywhere
+        // else someone would actually be reading it.
+        assert!(LOOPBACK_USAGE.contains("oxutrm loopback [shell]"));
+        assert!(run_loopback(&["--help".to_string()]).is_ok());
+        assert!(run_loopback(&["-h".to_string()]).is_ok());
     }
 
     #[test]

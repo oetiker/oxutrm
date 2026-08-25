@@ -36,20 +36,28 @@
 mod candidates;
 mod config;
 mod demux;
+mod demuxsock;
+mod der;
 mod discover;
 mod ice;
+mod quic;
 mod socketfam;
 mod stunmsg;
 mod stunserver;
+mod tls;
 
 pub use candidates::{ice_priority, is_link_local, local_candidates, local_candidates_filtered};
 pub use config::NetConfig;
 pub use demux::{STUN_HEADER_LEN, STUN_MAGIC_COOKIE, is_stun};
+pub use demuxsock::{StunDemuxSocket, StunRx};
+pub use der::{spki_der, spki_sha256};
 pub use discover::{Probe, classify, stun_discover};
 pub use ice::{IceAgent, IceEvent};
+pub use quic::{ALPN, quic_client, quic_server};
 pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};
 pub use stunmsg::{
     Check, CheckKind, Direction, IceCredentials, IceRole, build_check_request,
     build_check_response, build_nomination, parse_check, random_transaction_id,
 };
 pub use stunserver::{MappingBehaviour, StunResponder};
+pub use tls::{CERT_NAME, PinnedSpki, generate_cert, install_crypto_provider, provider};
