@@ -30,15 +30,19 @@
 pub mod attach;
 pub mod daemon;
 pub mod keys;
+pub mod ladder;
 pub mod registry;
 pub mod signalling;
 pub mod ssh;
+pub mod transport;
 
-pub use daemon::daemonize;
-pub use keys::{Attach, AttachKeys, PSK_LEN, begin_attach};
+pub use daemon::{daemonize, daemonize_session};
+pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
+pub use ladder::{LadderError, LadderPlan, RungResult, RungRunner, nominate, status_line};
 pub use registry::{
     META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot,
     RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, check_socket_path_length,
     choose_registry_root, detachable_for_rung, entry_is_stale, linger_enabled, now_unix, pid_alive,
     process_start_unix, read_root_env, resolve_registry_root,
 };
+pub use transport::{Path, PathError, TUNNEL_MAX_PAYLOAD};

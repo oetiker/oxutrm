@@ -143,3 +143,21 @@ fn reopen_standard_descriptors() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Daemonize a session that has been cleared to detach.
+///
+/// The [`DetachPermit`](crate::DetachPermit) is the point: it can only come
+/// from [`settle_detachability`](crate::settle_detachability), which needs the
+/// nominated rung, so rule 4 above is enforced by the type system rather than
+/// by anyone remembering it. A rung-4 session never gets one, and therefore
+/// cannot reach this function at all.
+///
+/// [`daemonize`] itself stays public because the descriptor probe in
+/// `tests/daemonize.rs` needs to call it without inventing a session.
+pub fn daemonize_session(_permit: crate::DetachPermit) -> anyhow::Result<()> {
+    // Taken by value rather than by reference: a permit is good for one detach,
+    // and the signature is what enforces the ordering. The binding is unused on
+    // purpose -- there is nothing to read from it, because its whole content is
+    // the fact that it exists.
+    daemonize()
+}

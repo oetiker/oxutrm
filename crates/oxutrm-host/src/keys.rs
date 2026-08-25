@@ -132,3 +132,41 @@ pub fn begin_attach(meta: &mut SessionMeta, cert_spki_sha256: [u8; 32]) -> std::
         keys: AttachKeys::fresh(cert_spki_sha256)?,
     })
 }
+
+/// Proof that the rung has been nominated and this session is allowed to
+/// detach.
+///
+/// It cannot be constructed except by [`settle_detachability`], and
+/// [`crate::daemonize_session`] demands one. That is the ordering made
+/// structural rather than remembered: there is no way to write a call that
+/// daemonizes before the rung is known, because there is nothing to pass.
+///
+/// The failure it prevents is not hypothetical. A rung-4 session carries its
+/// QUIC traffic inside the ssh connection, and `daemonize` closes every
+/// inherited descriptor — so a session that detached on the handshake's
+/// optimistic intent would destroy the link it was about to use, and the
+/// symptom would be a session that dies the moment it is left alone.
+#[derive(Debug)]
+pub struct DetachPermit {
+    _private: (),
+}
+
+/// Settle detachability from the nominated rung, and say whether this session
+/// may daemonize.
+///
+/// `Some` for every rung that carries its own UDP socket. `None` for
+/// [`Rung::SshTunnel`], whose session must stay attached to the ssh connection
+/// for its whole life.
+///
+/// Writes the outcome into `meta`, so `--list` reports what is true rather than
+/// what was hoped for at handshake time.
+pub fn settle_detachability(
+    meta: &mut SessionMeta,
+    rung: oxutrm_proto::Rung,
+) -> Option<DetachPermit> {
+    if meta.set_detachable(rung) {
+        Some(DetachPermit { _private: () })
+    } else {
+        None
+    }
+}
