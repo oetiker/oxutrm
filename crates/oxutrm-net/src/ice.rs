@@ -481,6 +481,122 @@ mod tests {
         assert_eq!(hr, ca, "the two sides disagree about the path");
     }
 
+    /// Genuine ONE-DIRECTIONAL loss, which a dead candidate cannot produce.
+    ///
+    /// A relay forwards client -> host intact but drops the first few
+    /// host -> client datagrams. The host therefore validates its inbound
+    /// direction almost immediately while the client's outbound direction
+    /// lags — a pair validated at one end and not the other, which is exactly
+    /// the state one-sided nomination exists to survive. With both sides free
+    /// to nominate they could commit to different pairs here; with only the
+    /// controlling side choosing, they cannot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_directional_loss_still_leaves_both_sides_on_the_same_path() {
+        /// How many host -> client datagrams the relay eats.
+        const DROPS: usize = 6;
+
+        let cs = sock().await;
+        let hs = sock().await;
+        let ca = cs.local_addr().unwrap();
+        let ha = hs.local_addr().unwrap();
+
+        // Client-facing and host-facing halves of the lossy middlebox.
+        let front = sock().await;
+        let back = sock().await;
+        let front_addr = front.local_addr().unwrap();
+        let back_addr = back.local_addr().unwrap();
+
+        let relay = tokio::spawn({
+            let (front, back) = (front.clone(), back.clone());
+            async move {
+                let mut fbuf = vec![0u8; 2048];
+                let mut bbuf = vec![0u8; 2048];
+                let mut client_seen: Option<SocketAddr> = None;
+                let mut dropped = 0usize;
+                loop {
+                    tokio::select! {
+                        r = front.recv_from(&mut fbuf) => {
+                            let Ok((n, from)) = r else { return };
+                            client_seen = Some(from);
+                            // client -> host: always delivered.
+                            let _ = back.send_to(&fbuf[..n], ha).await;
+                        }
+                        r = back.recv_from(&mut bbuf) => {
+                            let Ok((n, _)) = r else { return };
+                            if dropped < DROPS {
+                                dropped += 1;
+                                continue;
+                            }
+                            if let Some(c) = client_seen {
+                                let _ = front.send_to(&bbuf[..n], c).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // A dead candidate as well, so there is a real choice to converge on.
+        let dead = {
+            let d = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let a = d.local_addr().expect("addr");
+            drop(d);
+            a
+        };
+
+        let mut client = IceAgent::new(PSK, IceRole::Controlling, cfg(6000));
+        client.add_local(host_candidate(ca));
+        client.add_remote(host_candidate(front_addr));
+        client.add_remote(host_candidate(dead));
+
+        let mut host = IceAgent::new(PSK, IceRole::Controlled, cfg(6000));
+        host.add_local(host_candidate(ha));
+        host.add_remote(host_candidate(back_addr));
+
+        let c = tokio::spawn(async move {
+            let mut out = Vec::new();
+            for _ in 0..12 {
+                let ev = client.run(cs.clone()).await;
+                let stop = matches!(ev, IceEvent::Nominated { .. } | IceEvent::Failed(_));
+                out.push(ev);
+                if stop {
+                    break;
+                }
+            }
+            out
+        });
+        let h = tokio::spawn(async move {
+            let mut out = Vec::new();
+            for _ in 0..12 {
+                let ev = host.run(hs.clone()).await;
+                let stop = matches!(ev, IceEvent::Nominated { .. } | IceEvent::Failed(_));
+                out.push(ev);
+                if stop {
+                    break;
+                }
+            }
+            out
+        });
+
+        let (cev, hev) = tokio::join!(c, h);
+        relay.abort();
+        let (cev, hev) = (cev.expect("client task"), hev.expect("host task"));
+
+        let (_, cr, _, _) =
+            nominated(&cev).expect("the client never nominated despite a working path");
+        let (_, hr, _, _) =
+            nominated(&hev).expect("the host was never told, so the two sides disagree");
+
+        assert_eq!(
+            cr, front_addr,
+            "the client nominated the dead candidate rather than the lossy but live one"
+        );
+        assert_eq!(
+            hr, back_addr,
+            "the host settled on a path the client is not using"
+        );
+    }
+
     /// The `XOR-MAPPED-ADDRESS` in a response is our own address as the peer
     /// sees it — a reflector is not needed to learn it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
