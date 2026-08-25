@@ -1,0 +1,21 @@
+[package]
+name = "oxutrm-term"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "oxutrm terminal emulation, PTY supervision and screen state"
+
+[dependencies]
+alacritty_terminal.workspace = true
+rustix.workspace = true
+rustix-openpty.workspace = true
+serde.workspace = true
+bitflags.workspace = true
+compact_str.workspace = true
+unicode-width.workspace = true
+anyhow.workspace = true
+oxutrm-proto.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "oxutrm-net"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "oxutrm connectivity: candidates, STUN, NAT traversal and QUIC"
+
+[dependencies]
+quinn.workspace = true
+rcgen.workspace = true
+stun_codec.workspace = true
+stunclient.workspace = true
+bytecodec.workspace = true
+crab_nat.workspace = true
+igd-next.workspace = true
+netdev.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+rand.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+oxutrm-proto.workspace = true
+
+[features]
+# Exposes loopback test harnesses to integration tests in the workspace root
+# without shipping them in a release build.
+testkit = []

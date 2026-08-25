@@ -1,0 +1,24 @@
+[package]
+name = "oxutrm-sync"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "oxutrm state replication and diff engine — no I/O of any kind"
+
+# DELIBERATELY NO I/O DEPENDENCY. No tokio, no quinn, no socket, file, or clock
+# crate may ever be added here. This boundary is load-bearing: it is what makes
+# the highest-risk component of the project — the convergence property under
+# dropped, duplicated and reordered diffs — exhaustively testable with property
+# tests and without a network. A dependency that reaches the outside world
+# silently destroys that, so adding one fails review.
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+oxutrm-proto.workspace = true
+oxutrm-term.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

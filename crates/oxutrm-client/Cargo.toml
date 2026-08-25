@@ -1,0 +1,18 @@
+[package]
+name = "oxutrm-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "oxutrm local half: rendering, input and the terminal guard"
+
+[dependencies]
+rustix.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+unicode-width.workspace = true
+anyhow.workspace = true
+oxutrm-proto.workspace = true
+oxutrm-sync.workspace = true
+oxutrm-term.workspace = true
+oxutrm-net.workspace = true
