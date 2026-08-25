@@ -412,36 +412,47 @@ mod tests {
     }
 
     #[test]
-    fn a_runaway_writer_does_not_accumulate_frames() {
+    fn a_flood_costs_one_frame_per_tick_rather_than_one_per_screen() {
         // The property that makes this design worth its indirection: states
-        // are REPLACED, never queued. `yes` writes far faster than the tick,
-        // and the loop must still emit one frame per tick and no more.
-        let mut lb = loopback("yes oxutrm-runaway 2>/dev/null");
+        // are REPLACED, never queued.
+        //
+        // This used to assert `frames_sent() <= ticks`, which `tick` makes
+        // true by construction - it increments at most one of each per turn -
+        // so it could not go red for any change to any code. The claim it was
+        // reaching for is about VOLUME: each of these lines is a separate
+        // write that moves the screen, and thousands of them must collapse
+        // into a handful of frames. A loop that carried screens one at a time
+        // would need a frame per line, so counting lines against frames is
+        // what makes "replaced, never queued" checkable rather than merely
+        // asserted. Shrink `oxutrm_term`'s READ_BUDGET to a few bytes and this
+        // fails, which the old form did not.
+        const LINES: u64 = 4000;
+        let mut lb = loopback(&format!(
+            "i=0; while [ $i -lt {LINES} ]; do echo flood$i; i=$((i+1)); done; \
+             printf 'FLOOD-OVER\\r\\n'; sleep 30"
+        ));
         let mut out = Vec::new();
 
-        let mut ticks = 0u64;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            lb.tick(&[], &mut out).expect("tick");
-            ticks += 1;
-            std::thread::sleep(TICK);
-        }
+        assert!(
+            drive(&mut lb, &mut out, Duration::from_secs(60), |lb| {
+                text_of(lb.client_screen()).contains("FLOOD-OVER")
+            }),
+            "the flood never finished; the loop fell behind. client screen was {:?}",
+            text_of(lb.client_screen())
+        );
 
+        let frames = lb.frames_sent();
+        assert!(frames >= 1, "no frame ever crossed the loop");
         assert!(
-            ticks > 20,
-            "the test did not run long enough to mean anything"
+            frames * 8 < LINES,
+            "{frames} frames to carry {LINES} lines of output: the loop is \
+             delivering screens one at a time rather than replacing them"
         );
         assert!(
-            lb.frames_sent() <= ticks,
-            "{} frames from {ticks} ticks: output is being queued rather than coalesced",
-            lb.frames_sent()
-        );
-        assert!(
-            text_of(lb.client_screen()).contains("oxutrm-runaway"),
-            "the screen should still be current, not stuck behind a backlog"
+            text_of(lb.client_screen()).contains("FLOOD-OVER"),
+            "the screen should be current, not stuck behind a backlog"
         );
         assert_eq!(lb.client_screen().validate(), Ok(()));
-        // And the two ends agree despite the flood.
         assert_eq!(lb.client_screen().rows, size().rows);
     }
 

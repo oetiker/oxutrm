@@ -7,6 +7,16 @@
 //! lost one costs nothing because the next diff is computed against the same
 //! acknowledged base and contains whatever was lost.
 //!
+//! A peer with datagrams turned off has no channel at all, and that case is
+//! refused rather than quietly redirected onto streams. `max_datagram_size()`
+//! returning `None` is not a missing number to guess at and not a cue to send
+//! everything reliably: it means the peer never advertised
+//! `max_datagram_frame_size`. Streaming every frame instead would turn the
+//! recovery channel into the whole transport, at one frame per pacing
+//! interval, and present a configuration bug as a slow terminal. This is the
+//! one rule that used to live only in an abstraction nothing called; it lives
+//! here now, on the path a frame actually takes.
+//!
 //! A frame that does **not** fit goes on a fresh unidirectional stream,
 //! reliably. It is not split across several datagrams, and that is a decision
 //! rather than an omission. An unreliable state split into F pieces arrives
@@ -23,6 +33,11 @@
 //! the current state. Queueing would deliver a screen the user has already
 //! moved past, and then another, and then another.
 //!
+//! "In flight" has to mean *still being written*, not *was started once*. A
+//! writer that has finished, failed, or been reset stops counting, so a state
+//! that never advances can be offered again after a lost attempt — otherwise
+//! every state gets exactly one try and retry does not exist.
+//!
 //! Resetting has to be explicit: dropping a `quinn::SendStream` calls
 //! `finish()`, which would deliver a **truncated** frame rather than
 //! cancelling it. The receiver would reject that — rejection is not
@@ -37,6 +52,7 @@
 //! disconnecting because one diff failed to apply.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use oxutrm_proto::Frame;
@@ -59,6 +75,9 @@ pub enum SendOutcome {
     Datagram(usize),
     /// It went on a fresh unidirectional stream, superseding any in flight.
     Stream { bytes: usize, superseded: bool },
+    /// The peer never advertised `max_datagram_frame_size`, so nothing can be
+    /// sent on this connection at all. See [`FrameSink::send`].
+    DatagramsDisabled,
     /// It did not go. The next pacing tick will carry the same information.
     Dropped(String),
 }
@@ -69,12 +88,51 @@ pub struct FrameSink {
     /// The stream currently being written, if any. Dropping the sender tells
     /// the writer task to reset rather than finish.
     in_flight: Option<InFlight>,
+    /// Whether the "this peer has datagrams off" warning has been printed.
+    /// Once per sink, not once per frame: the condition is permanent for the
+    /// life of a connection, so repeating it would bury everything else.
+    warned_no_datagrams: bool,
 }
 
 struct InFlight {
     /// Which state it is carrying, so a newer one can supersede it.
     my_state: u64,
     cancel: oneshot::Sender<()>,
+    /// Set by this entry's own writer task when it stops touching its stream.
+    ///
+    /// A flag rather than a channel or a shared `Option`, for two reasons.
+    ///
+    /// [`FrameSink::send`] is sync, non-blocking and infallible outward, so it
+    /// cannot await a completion signal and must not take a lock that a writer
+    /// task holds across an await. An [`AtomicBool`] is readable from `send`
+    /// with one load and no blocking.
+    ///
+    /// And it makes the obvious race unrepresentable. The clear happens in the
+    /// task while the check and the take happen in `send`, so a task that
+    /// reached into `in_flight` could wipe an entry that a newer frame had
+    /// already installed. This flag belongs to exactly one writer, is written
+    /// by nobody else, and is thrown away with the entry that owns it — a
+    /// superseded writer sets a flag that `send` no longer holds.
+    done: Arc<AtomicBool>,
+}
+
+impl InFlight {
+    fn finished(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Marks an [`InFlight`] finished however its writer task leaves: stream
+/// opened or not, written, failed, cancelled, or unwound by a panic.
+///
+/// A plain store at the end of the task would miss the early return when
+/// `open_uni` fails — which is precisely the case that must stay retryable.
+struct DoneOnDrop(Arc<AtomicBool>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl FrameSink {
@@ -82,6 +140,7 @@ impl FrameSink {
         FrameSink {
             conn,
             in_flight: None,
+            warned_no_datagrams: false,
         }
     }
 
@@ -98,27 +157,74 @@ impl FrameSink {
             return SendOutcome::Dropped(format!("frame of {} bytes is absurd", bytes.len()));
         }
 
-        // `max_datagram_size` is None when the peer disabled datagrams, and
-        // shrinks when the path MTU does. Asking every time rather than
-        // caching is what keeps this correct across a migration.
-        if let Some(limit) = self.conn.max_datagram_size() {
-            if bytes.len() <= limit {
-                let n = bytes.len();
-                return match self.conn.send_datagram(bytes.into()) {
-                    Ok(()) => SendOutcome::Datagram(n),
-                    // Full send buffer, or a peer that stopped accepting
-                    // datagrams. Neither is fatal.
-                    Err(e) => SendOutcome::Dropped(format!("datagram: {e}")),
-                };
-            }
+        // `max_datagram_size` shrinks when the path MTU does, so it is asked
+        // for on every frame rather than cached: a limit decided once when the
+        // connection was built would survive a migration that invalidated it,
+        // and every send after that would fail for no visible reason.
+        //
+        // `None` is a different thing entirely, and it is NOT a size to guess
+        // at nor a cue to put everything on a stream. It means the peer never
+        // advertised `max_datagram_frame_size`, so no frame of any size can
+        // travel unreliably on this connection. See the outcome's own note for
+        // why that refuses instead of falling through.
+        let Some(limit) = self.conn.max_datagram_size() else {
+            return self.no_datagrams();
+        };
+
+        if bytes.len() <= limit {
+            let n = bytes.len();
+            return match self.conn.send_datagram(bytes.into()) {
+                Ok(()) => SendOutcome::Datagram(n),
+                // Full send buffer, or a peer that stopped accepting
+                // datagrams. Neither is fatal.
+                Err(e) => SendOutcome::Dropped(format!("datagram: {e}")),
+            };
         }
 
         self.send_on_stream(frame.my_state, bytes)
     }
 
+    /// The peer turned datagrams off, so this connection cannot carry a
+    /// session at all.
+    ///
+    /// Falling through to [`FrameSink::send_on_stream`] would "work" and is
+    /// what makes this worth a comment: every frame, keystrokes included,
+    /// would take a fresh unidirectional stream, one at a time, at one frame
+    /// per pacing interval, with everything offered in between dropped. That
+    /// is a terminal that feels mysteriously broken rather than a
+    /// configuration bug anybody can find — and it silently converts the
+    /// stream path, which exists as a recovery channel for oversized states,
+    /// into the whole transport.
+    ///
+    /// Both ends of oxutrm set both datagram buffer sizes, so reaching here
+    /// means either that config grew a hole (`oxutrm_net::quic` documents how
+    /// easily: omit one of the two lines and datagrams vanish silently) or the
+    /// peer is not oxutrm. Say so once, out loud, and keep returning a
+    /// non-fatal outcome — a send failure still never ends a session.
+    fn no_datagrams(&mut self) -> SendOutcome {
+        if !self.warned_no_datagrams {
+            self.warned_no_datagrams = true;
+            eprintln!(
+                "oxutrm: this peer advertised no QUIC datagram support, so no screen \
+                 state can be sent. Nothing will be displayed until the connection is \
+                 replaced."
+            );
+        }
+        SendOutcome::DatagramsDisabled
+    }
+
     fn send_on_stream(&mut self, my_state: u64, bytes: Vec<u8>) -> SendOutcome {
-        // Supersede whatever is in flight: dropping the cancel sender makes
-        // the writer task reset its stream rather than finish it.
+        // Reap a writer that has already stopped, BEFORE deciding anything.
+        // Without this an entry outlives its task for ever, so a state that
+        // does not advance gets exactly one stream attempt in its whole life —
+        // a failed `open_uni` or a reset would never be retried — and a
+        // long-finished stream gets reported as superseded by the next one.
+        if self.in_flight.as_ref().is_some_and(InFlight::finished) {
+            self.in_flight = None;
+        }
+
+        // Supersede whatever is still genuinely in flight: dropping the cancel
+        // sender makes the writer task reset its stream rather than finish it.
         let superseded = match self.in_flight.take() {
             Some(old) if old.my_state < my_state => {
                 drop(old.cancel);
@@ -136,12 +242,19 @@ impl FrameSink {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let conn = self.conn.clone();
         let n = bytes.len();
+        let done = Arc::new(AtomicBool::new(false));
+        let mark_done = DoneOnDrop(Arc::clone(&done));
 
         tokio::spawn(async move {
+            // Held for the whole task. However this ends — an `open_uni` that
+            // never succeeded, a completed write, a failed one, a reset, or a
+            // runtime that drops the future unpolled — the entry stops
+            // counting as in flight.
+            let _mark_done = mark_done;
             let mut stream = match conn.open_uni().await {
                 Ok(s) => s,
                 // Out of stream credit or a closing connection. The next tick
-                // tries again.
+                // tries again — which it now can.
                 Err(_) => return,
             };
             tokio::select! {
@@ -163,6 +276,7 @@ impl FrameSink {
         self.in_flight = Some(InFlight {
             my_state,
             cancel: cancel_tx,
+            done,
         });
         SendOutcome::Stream {
             bytes: n,
@@ -297,5 +411,242 @@ impl Link {
         self.endpoint.rebind_abstract(demux)?;
         self.socket = socket;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use oxutrm_net::{
+        ALPN, CERT_NAME, PinnedSpki, generate_cert, install_crypto_provider, provider,
+    };
+    use quinn::rustls;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    const BUFFER: usize = 1024 * 1024;
+
+    /// A transport config whose datagram support can be turned off.
+    ///
+    /// It is the RECEIVE buffer that decides what the peer sees: leaving it
+    /// unset is exactly how a peer "disables datagrams", and it is what makes
+    /// the far end's `max_datagram_size()` return `None`. That asymmetry is
+    /// documented in `oxutrm_net::quic` and is the failure this file has to
+    /// cope with.
+    fn transport(datagrams: bool) -> Arc<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        t.datagram_send_buffer_size(BUFFER);
+        t.datagram_receive_buffer_size(datagrams.then_some(BUFFER));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(1024));
+        Arc::new(t)
+    }
+
+    fn server_config(
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        datagrams: bool,
+    ) -> quinn::ServerConfig {
+        install_crypto_provider();
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        cfg.transport_config(transport(datagrams));
+        cfg
+    }
+
+    fn client_config(fingerprint: [u8; 32], datagrams: bool) -> quinn::ClientConfig {
+        install_crypto_provider();
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(fingerprint)))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
+        cfg.transport_config(transport(datagrams));
+        cfg
+    }
+
+    /// A QUIC pair on loopback, with no ICE and no STUN demux in the way.
+    ///
+    /// `peer_datagrams` is what the SERVER advertises, so it decides what the
+    /// returned client-side [`FrameSink`] sees from `max_datagram_size()`.
+    /// The endpoints come back because dropping them closes the connection.
+    async fn pair(peer_datagrams: bool) -> (FrameSink, FrameSource, Vec<quinn::Endpoint>) {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let server_ep =
+            quinn::Endpoint::server(server_config(cert, key, peer_datagrams), addr).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let accepting = {
+            let ep = server_ep.clone();
+            tokio::spawn(async move { ep.accept().await.unwrap().await.unwrap() })
+        };
+
+        let mut client_ep = quinn::Endpoint::client(addr).unwrap();
+        client_ep.set_default_client_config(client_config(fingerprint, true));
+        let client_conn = client_ep
+            .connect(server_addr, CERT_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accepting.await.unwrap();
+
+        (
+            FrameSink::new(client_conn),
+            FrameSource::new(server_conn),
+            vec![client_ep, server_ep],
+        )
+    }
+
+    /// Far larger than any datagram, so channel selection must reach for a
+    /// stream.
+    fn big(my_state: u64) -> Frame {
+        Frame {
+            my_state,
+            from_state: 0,
+            ack_state: 1,
+            flags: 0,
+            payload: vec![0xab; 64 * 1024],
+        }
+    }
+
+    fn small(my_state: u64) -> Frame {
+        Frame {
+            my_state,
+            from_state: my_state.saturating_sub(1),
+            ack_state: 1,
+            flags: 0,
+            payload: vec![0xcd; 32],
+        }
+    }
+
+    /// Wait until a frame comes out the far end, which proves the writer task
+    /// ran to completion: the peer cannot finish `read_to_end` before
+    /// `finish()` was called on the sending side.
+    async fn arrived(source: &mut FrameSource, my_state: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(f) = source.try_recv() {
+                if f.my_state == my_state {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("frame for state {my_state} never arrived");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn size_alone_picks_the_channel_when_datagrams_are_available() {
+        let (mut sink, mut source, _eps) = pair(true).await;
+        let limit = sink
+            .connection()
+            .max_datagram_size()
+            .expect("the peer enabled datagrams");
+
+        match sink.send(&small(1)) {
+            SendOutcome::Datagram(n) => assert!(n <= limit),
+            other => panic!("a small frame did not go in a datagram: {other:?}"),
+        }
+        match sink.send(&big(2)) {
+            SendOutcome::Stream { bytes, .. } => {
+                assert!(
+                    bytes > limit,
+                    "a frame of {bytes} bytes fits the {limit}-byte datagram limit, so the \
+                     stream path was taken for some reason other than size"
+                );
+            }
+            other => panic!("an oversized frame did not go on a stream: {other:?}"),
+        }
+        arrived(&mut source, 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_stream_stops_counting_as_in_flight() {
+        // The retry that defect 1 killed. A state that got exactly one stream
+        // attempt must be offered again once that attempt is over: nothing is
+        // in flight any more, whatever it was carrying.
+        let (mut sink, mut source, _eps) = pair(true).await;
+
+        assert!(matches!(sink.send(&big(7)), SendOutcome::Stream { .. }));
+        arrived(&mut source, 7).await;
+
+        // The SAME state again. Nothing newer exists, so the only reason to
+        // refuse would be an `in_flight` entry that never got cleared.
+        let again = sink.send(&big(7));
+        assert!(
+            matches!(again, SendOutcome::Stream { .. }),
+            "a state whose only stream attempt has already finished can never be \
+             retried: {again:?}"
+        );
+        arrived(&mut source, 7).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superseding_is_reported_only_when_a_live_stream_was_actually_reset() {
+        let (mut sink, mut source, _eps) = pair(true).await;
+
+        assert_eq!(
+            sink.send(&big(1)),
+            SendOutcome::Stream {
+                bytes: big(1).encode().unwrap().len(),
+                superseded: false
+            }
+        );
+        arrived(&mut source, 1).await;
+
+        // State 1's stream is over. State 2 supersedes nothing.
+        match sink.send(&big(2)) {
+            SendOutcome::Stream { superseded, .. } => assert!(
+                !superseded,
+                "a long-finished stream was reported as superseded, so the caller \
+                 cannot tell a real reset from a stale bookkeeping entry"
+            ),
+            other => panic!("expected a stream: {other:?}"),
+        }
+        arrived(&mut source, 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_with_datagrams_disabled_is_refused_rather_than_silently_streamed() {
+        // `max_datagram_size()` is `None` here. That is not a missing number to
+        // guess at and not a cue to put everything on streams: it means no
+        // frame of any size can travel unreliably. Falling through to the
+        // stream path would silently move an entire session onto the recovery
+        // channel, at one frame per pacing interval, and look like a
+        // mysteriously slow terminal rather than the configuration bug it is.
+        let (mut sink, _source, _eps) = pair(false).await;
+        assert!(
+            sink.connection().max_datagram_size().is_none(),
+            "this test needs a peer that disabled datagrams"
+        );
+
+        // A frame that would comfortably fit a datagram.
+        let outcome = sink.send(&small(1));
+        assert_eq!(
+            outcome,
+            SendOutcome::DatagramsDisabled,
+            "a small frame on a datagram-less path came back as {outcome:?}"
+        );
+        // And an oversized one gets the same answer: the path is unusable, not
+        // selectively usable.
+        let outcome = sink.send(&big(2));
+        assert_eq!(
+            outcome,
+            SendOutcome::DatagramsDisabled,
+            "an oversized frame on a datagram-less path came back as {outcome:?}"
+        );
     }
 }

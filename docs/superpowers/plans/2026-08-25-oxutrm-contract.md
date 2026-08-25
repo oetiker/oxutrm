@@ -212,10 +212,36 @@ pub struct Frame {
 //                            ordered. A full state is a recovery mechanism, not
 //                            a latency-critical one, so reliability is right.
 //
+//   no datagrams at all   -> NOTHING is sent, and the sender says so once, out
+//                            loud. `max_datagram_size()` returning `None` means
+//                            the peer never advertised
+//                            `max_datagram_frame_size`; it is not a missing
+//                            number to guess at, and it is not a cue to put
+//                            every frame on a stream.
+//
+// That last line is a behavioural rule, not a definition, and it was added
+// because the code did the opposite: with datagrams off it fell through to the
+// stream path silently, so keystrokes and diffs alike each took a fresh
+// unidirectional stream, one at a time, at one frame per pacing interval, with
+// everything offered in between dropped. That is a terminal that feels
+// mysteriously broken instead of a configuration bug anyone can find, and it
+// converts the recovery channel into the whole transport. Both ends of oxutrm
+// set both datagram buffer sizes, so `None` means the config grew a hole or the
+// peer is not oxutrm — and neither is something to paper over. A refusal is
+// still not fatal: the session survives, as every send failure must.
+//
 // The rule that keeps "never stale, never behind" true on the stream path:
 // if a newer state becomes current while such a stream is still in flight,
 // RESET_STREAM it and open a new stream for the CURRENT state. Never queue.
 // The receiver then gets nothing rather than something out of date.
+//
+// "In flight" means STILL BEING WRITTEN, never "was started once". A writer
+// that finished, failed, or was reset stops counting immediately, so a state
+// that does not advance can be offered again after a lost attempt. Held the
+// other way — as it was — a stream that could not even be opened pinned its
+// state for ever, every state got exactly one attempt in its whole life, and
+// retry did not exist; a long-finished stream was also reported as superseded
+// by the next one, which made the outcome unable to distinguish a real reset.
 //
 // Streams may complete out of order; the receiver applies one only if its
 // `my_state` is newer than what it holds. `Frame`'s sequence numbers already
@@ -541,6 +567,7 @@ impl<S: SyncState> Sender<S> {
     pub fn make_frame(&self, ack_state: u64) -> Result<Option<Frame>, ApplyError>;
 }
 
+/// Keeps a ring of recent states too, so a diff can name a base it has left.
 pub struct Receiver<S: SyncState> { /* private */ }
 
 impl<S: SyncState> Receiver<S> {
@@ -556,6 +583,7 @@ impl<S: SyncState> Receiver<S> {
     pub fn on_frame(&mut self, f: &Frame) -> Result<bool, ApplyError>;
     pub fn state(&self) -> &S;
     /// The sequence number to put in our outgoing `ack_state`.
+    /// ZERO until the peer's first frame has been applied — see R5.
     pub fn ack(&self) -> u64;
     /// The peer's `ack_state` from the last frame we accepted.
     pub fn peer_ack(&self) -> u64;
@@ -585,6 +613,39 @@ impl<S: SyncState> Receiver<S> {
 //     ring, `from_state == 0` re-synchronises unconditionally.
 //
 // Do not "optimise" R2 back into a plain `>` comparison.
+//
+// R4. **A diff applies against whichever state the receiver HELD at
+//     `from_state`, not only against the one it holds now.** The `Receiver`
+//     keeps a ring for the same reason the `Sender` does. The sender diffs
+//     against the newest state the peer ACKNOWLEDGED, and an ack takes a round
+//     trip, so every frame sent inside that window names a base the receiver
+//     has already left. Requiring `from_state == state.seq()` throws all of
+//     them away — and each one carries a state strictly NEWER than the one
+//     being shown. Measured under the runaway-writer flood: 44 of 89 screen
+//     frames dropped at one round trip of ack latency, 63 of 72 at eight, with
+//     the client's screen running 15 generations behind the host. It never
+//     deadlocks, because the sender re-diffs from the same ack, which is
+//     exactly why it was invisible.
+//
+//     The ring is self-pruning: a frame's `from_state` reveals which base the
+//     sender is still working from, and nothing older can be named again.
+//     Steady state is two entries. `STATE_RING` is the cap, for a peer whose
+//     acks are all being lost. A base older than the ring is still a
+//     `BaseMismatch` — refused, never guessed at.
+//
+// R5. **A receiver MUST NOT acknowledge a state it invented.** `ack()` is 0
+//     until the peer's first frame has been applied. This is R1 seen from the
+//     acknowledging side: the receiver's initial state is numbered 1 like
+//     everyone else's, and acknowledging that 1 tells the sender "I hold YOUR
+//     state 1", so the sender diffs against a state the receiver has never
+//     seen and never can. Zero means "I have nothing of yours" — true, and the
+//     one value `make_frame` cannot find in its ring, so it sends the full
+//     state R1 requires. Without R5 the very first frame after an attach is
+//     unapplicable, and the session is rescued only by ring eviction later.
+//
+// R4 and R5 are the same lesson as R2, and it is the lesson of this whole
+// section: a sequence number names a GENERATION, never a piece of content, and
+// it means nothing at all unless both ends agree who AUTHORED that generation.
 
 /// Trim consumed input after the host acknowledges it.
 impl InputState {
@@ -799,6 +860,40 @@ pub struct Detached { /* private */ }
 /// a rung-4 session never obtains one and therefore keeps its pipes for life.
 /// When this returns, ssh sees EOF and exits — the session is now detached.
 pub fn sever_from_ssh(detached: Detached, permit: DetachPermit) -> anyhow::Result<()>;
+
+// There is deliberately no `transport::Path` here. One was written — an enum
+// over "datagram path" and "rung-4 tunnel", exposing a `max_payload() -> usize`
+// so that nobody could write `max_datagram_size().unwrap_or(1200)` — and it
+// acquired no production caller, while the real send site in `src/link.rs` did
+// the very thing it forbade. It was removed rather than wired in, for two
+// reasons beyond its being unused.
+//
+// Its `max_payload` was decided once, when the path was built. On a live QUIC
+// connection that is wrong: the datagram limit shrinks with the path MTU, so a
+// cached one survives a migration that invalidated it. `FrameSink::send` asks
+// the connection per frame instead.
+//
+// And its tunnel half described a wire nothing speaks. `oxutrm_net::ice` never
+// nominates `Rung::SshTunnel`, so rung 4 has no implementation to be abstracted
+// from; its framing and its size limit will be written next to the code that
+// carries them, where the size question gets asked again with a real answer.
+//
+// The rule the type existed to hold now lives in `FrameSink::send`, on the path
+// a frame actually takes, with a test on that path. This is the lesson from the
+// fragmentation removal restated: a rule that lives only in prose or in an
+// abstraction nobody calls is a rule nobody implements.
+
+// When rung 4 IS built, its framing MUST carry both properties the removed code
+// had, because they are the reason it was worth writing and they are easy to
+// omit when rewriting from scratch:
+//   1. An explicit length prefix. The ssh channel is a byte stream with no
+//      message boundaries of its own, so the tunnel must supply them.
+//   2. The length is validated against the maximum BEFORE any allocation, so a
+//      corrupt or hostile prefix cannot ask for four gigabytes. Validate, then
+//      allocate — never the reverse.
+// Recorded here rather than kept as uncalled code, because this project has
+// twice found that an abstraction with no caller drifts away from the rule the
+// live code follows.
 ```
 
 ### `oxutrm-client`

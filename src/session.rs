@@ -63,9 +63,21 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 pub struct Turn {
     pub sent: Option<SendOutcome>,
     pub applied: usize,
-    /// Frames that arrived but could not be applied. A steady stream of these
-    /// means the two ends disagree about the base, which is a deadlock rather
-    /// than a slow link.
+    /// Frames that arrived but could not be applied: the two ends disagree
+    /// about the base.
+    ///
+    /// This should be **zero**, and a steady stream of it is a defect however
+    /// healthy the screen looks. That warning was originally written as "a
+    /// deadlock rather than a slow link", and when the flood test finally made
+    /// it fire, it was neither: the session converged and every test passed,
+    /// while half of every frame the host sent was thrown away and the client
+    /// painted a screen it was holding a newer copy of. Convergence was doing
+    /// the job of hiding it — the sender re-diffs from the same ack, so the
+    /// content always arrives eventually, one round trip later than it should.
+    /// See contract rules R4 and R5.
+    ///
+    /// So: not necessarily a deadlock. Necessarily wasted work, and the waste
+    /// is invisible to any assertion about the screen.
     pub rejected: usize,
     pub exited: Option<i32>,
 }
@@ -707,29 +719,80 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_runaway_writer_coalesces_rather_than_queueing() {
-        // Output far faster than the pacing interval must cost one frame per
-        // interval, not a backlog - and the screen must still end up current.
+        // A flood must cost frames in proportion to TIME, never in proportion
+        // to how much the shell wrote.
+        //
+        // This used to assert `frames <= turns`, which the loop below makes
+        // true by construction - it counts at most one frame per turn - so it
+        // could not go red for any change to any code. What can go red is the
+        // ratio between frames and the output that actually went past, which
+        // `scrollback_len` counts monotonically at the source. A loop that
+        // queued states would need a frame per screen; this one absorbs a
+        // whole read budget of output into a single state and sends that.
+        //
+        // The pacing interval is deliberately NOT the bound asserted here.
+        // Measured under this flood a turn costs ~46 ms, five times the 8 ms
+        // floor, so `due()` is never the thing gating and a bound built on it
+        // would hold for free. Shrink `oxutrm_term`'s READ_BUDGET to a few
+        // bytes and the ratio below fails, which the old form did not.
         let (mut host, mut client) = pair("yes oxutrm-flood\n").await;
         let mut out = Vec::new();
 
         let mut turns = 0u64;
         let mut frames = 0u64;
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut applied = 0u64;
+        let mut rejected = 0u64;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(4);
         while Instant::now() < deadline {
             let t = host.turn().expect("host turn");
             if t.sent.is_some() {
                 frames += 1;
             }
-            client.turn(&[], &mut out).expect("client turn");
+            let ct = client.turn(&[], &mut out).expect("client turn");
+            applied += ct.applied as u64;
+            rejected += ct.rejected as u64;
             turns += 1;
-            tokio::time::sleep(Duration::from_millis(3)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        let elapsed = started.elapsed();
+        // Lines that scrolled off the top: the volume of output, counted as it
+        // happened rather than inferred from the screen.
+        let scrolled = host.screen().scrollback_len;
 
-        eprintln!("{turns} turns, {frames} frames in 4s under a flood");
+        eprintln!(
+            "{turns} turns, {frames} frames, {applied} applied, {rejected} rejected, \
+             {scrolled} lines scrolled in {elapsed:?}"
+        );
         assert!(turns > 40, "only {turns} turns; the test proves little");
+        // Under a flood the sender is always ahead of the acknowledgement, so
+        // every frame it sends names a base the client has already left. That
+        // is the normal condition here, not an edge case — and the client must
+        // apply those frames, because each carries a screen strictly NEWER
+        // than the one it is showing. Rejecting them halves the delivered
+        // frame rate and throws away the freshest screen in the client's own
+        // hand; measured before this was fixed, 44 of 89 frames were dropped
+        // this way, carrying 1196 of 1788 payload bytes.
+        //
+        // Zero, not "few": there is no loss on this loopback link and no
+        // reordering that would make a rejection legitimate.
+        assert_eq!(
+            rejected,
+            0,
+            "{rejected} of {} frames were dropped as unapplicable; the client is \
+             painting a screen it knows to be superseded",
+            applied + rejected
+        );
         assert!(
-            frames <= turns,
-            "{frames} frames from {turns} turns: output is queueing, not coalescing"
+            scrolled > 10_000,
+            "only {scrolled} lines scrolled past in {elapsed:?}; that is not a flood, \
+             so the ratio below would prove nothing"
+        );
+        assert!(
+            frames * 200 < scrolled,
+            "{frames} frames carried {scrolled} scrolled-off lines: fewer than 200 \
+             lines per frame means the loop is delivering screens one at a time \
+             rather than replacing them"
         );
         assert!(
             text(client.screen()).contains("oxutrm-flood"),
@@ -779,14 +842,37 @@ mod tests {
         // first-attach case the stream path exists for, and holding the client
         // back reproduces it deterministically instead of hoping a diff
         // happens to come out large.
+        // SIZE is what must pick the channel, so the test has to know the size
+        // it is being measured against. A bare "a stream was used" flag is
+        // satisfied by any reason at all - most importantly by a peer with
+        // datagrams disabled, where every frame took a stream and no frame was
+        // ever too large for anything. Pin the limit down first.
+        let limit = host
+            .link
+            .sink
+            .connection()
+            .max_datagram_size()
+            .expect("this test is meaningless unless datagrams are actually available");
+
         let fill_by = Instant::now() + Duration::from_secs(30);
-        let mut used_stream = false;
+        // The largest frame observed going out on a stream, against the
+        // datagram limit in force when it went.
+        let mut streamed_over_the_limit: Option<usize> = None;
         while Instant::now() < fill_by {
             let t = host.turn().expect("host turn");
-            if matches!(t.sent, Some(SendOutcome::Stream { .. })) {
-                used_stream = true;
+            if let Some(SendOutcome::Stream { bytes, .. }) = t.sent {
+                let now = host
+                    .link
+                    .sink
+                    .connection()
+                    .max_datagram_size()
+                    .expect("datagrams must not have gone away mid-test");
+                assert_eq!(now, limit, "the datagram limit moved under the test");
+                if bytes > limit {
+                    streamed_over_the_limit = Some(bytes);
+                }
             }
-            if used_stream && text(host.screen()).contains("-59") {
+            if streamed_over_the_limit.is_some() && text(host.screen()).contains("-59") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(3)).await;
@@ -797,12 +883,15 @@ mod tests {
              offered\n--- host ---\n{}",
             text(host.screen())
         );
-        assert!(
-            used_stream,
-            "no frame exceeded a datagram even with a full 200x60 truecolor \
-             screen and no ack to diff against, so the stream path was never \
-             taken and this test proved nothing"
-        );
+        let bytes = streamed_over_the_limit.unwrap_or_else(|| {
+            panic!(
+                "no frame went on a stream BECAUSE it exceeded the {limit}-byte \
+                 datagram limit, even with a full 200x60 truecolor screen and no ack \
+                 to diff against. Either channel selection is not choosing by size, \
+                 or nothing large was ever built"
+            )
+        });
+        assert!(bytes > limit);
 
         // Now let the client in and wait for the screens to agree.
         let converged = drive(
