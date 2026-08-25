@@ -306,7 +306,13 @@ impl ScreenState {
 ///      accessor that clamps with `Point::grid_clamp(&dims, Boundary::Grid)`.
 ///   2. The crate ships NO default palette. `Term::colors()` is an OSC 4/10/11
 ///      OVERRIDE table, all-`None` by default. oxutrm supplies its own 269-entry
-///      table and consults `colors()` only as an override layer.
+///      table and consults `colors()` only as an override layer. Layout, all
+///      ranges half-open: 0..16 named, 16..232 cube (216), 232..256 grayscale
+///      (24), 256 fg, 257 bg, 258 cursor, 259..267 the eight dim variants,
+///      267 bright foreground, 268 dim foreground. Sums to exactly 269.
+///      There is no dim BACKGROUND — `NamedColor` ends
+///      `BrightForeground, DimForeground`.
+///      DIM/BOLD-to-bright promotion is the RENDERER's job, not the crate's.
 ///   3. There is NO monotonic scrolled-off counter; `history_size()` saturates.
 ///      Synthesize `scrollback_len` by accumulating `saturating_sub` of
 ///      `history_size()` across each `advance()`.
