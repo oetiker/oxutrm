@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::Renderer;
-use oxutrm_proto::{ScreenState, TermSize, TerminalCaps};
+use oxutrm_client::{Renderer, status_line};
+use oxutrm_proto::{PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender};
 use oxutrm_term::HostTerm;
 
@@ -240,6 +240,9 @@ pub struct ClientSession {
     link: Link,
     size: TermSize,
     last_send: Option<Instant>,
+    /// The path last announced, so a change can be spotted and silence can be
+    /// the default.
+    announced: Option<PathDescription>,
 }
 
 impl ClientSession {
@@ -257,7 +260,50 @@ impl ClientSession {
             link,
             size,
             last_send: None,
+            announced: None,
         })
+    }
+
+    /// Tell the user what connection they got — once, and then be quiet.
+    ///
+    /// Spec §10.3: oxutrm never does anything clever silently. On connect this
+    /// prints one line. Called again with the same path it prints **nothing**,
+    /// which is what makes the silence a property rather than an accident.
+    /// Called again with a different path it announces the migration briefly,
+    /// because walking from Wi-Fi to mobile should be explained rather than
+    /// mysterious.
+    ///
+    /// Rung 4 reads as a warning, and that is not decoration: a session inside
+    /// the SSH connection cannot daemonize and cannot be reattached, so
+    /// degrading to it silently would remove both properties the project
+    /// exists to provide while looking like success.
+    pub fn announce<W: Write>(&mut self, path: &PathDescription, out: &mut W) -> Result<bool> {
+        let same = self
+            .announced
+            .as_ref()
+            .is_some_and(|old| old.rung == path.rung && old.remote == path.remote);
+        if same {
+            return Ok(false);
+        }
+
+        let line = match &self.announced {
+            None => status_line(path),
+            // A migration, not a fresh connect.
+            Some(_) => format!(
+                "oxutrm  path migrated \u{2192} {}  \u{b7}  {} ms",
+                oxutrm_client::rung_label(path),
+                path.rtt_ms
+            ),
+        };
+        writeln!(out, "{line}").context("announcing the path")?;
+        out.flush().context("flushing the terminal")?;
+
+        // The line was written outside the renderer's model of the screen, so
+        // that model is now wrong by one row. Anything less than a full
+        // repaint would leave the terminal and the model disagreeing.
+        self.renderer.invalidate();
+        self.announced = Some(path.clone());
+        Ok(true)
     }
 
     /// One turn: send `input`, apply what arrived, repaint if it changed.
@@ -354,6 +400,7 @@ impl ClientSession {
 mod tests {
     use super::*;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
+    use oxutrm_proto::{NatType, Rung};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -370,19 +417,35 @@ mod tests {
         TermSize { cols: 40, rows: 10 }
     }
 
+    fn path_of(rung: Rung, rtt_ms: u32, mtu: u16, probes: u32, nat: NatType) -> PathDescription {
+        PathDescription {
+            rung,
+            local: "127.0.0.1:1".parse().unwrap(),
+            remote: "203.0.113.7:443".parse().unwrap(),
+            probes_sent: probes,
+            nat_type: nat,
+            rtt_ms,
+            mtu,
+        }
+    }
+
     async fn udp() -> Arc<tokio::net::UdpSocket> {
         Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
     }
 
     /// A host and a client joined by a real QUIC connection on loopback.
     async fn pair(shell: &str) -> (HostSession, ClientSession) {
+        pair_on("127.0.0.1:0", shell).await
+    }
+
+    async fn pair_on(client_bind: &str, shell: &str) -> (HostSession, ClientSession) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
 
         let host_sock = udp().await;
         let host_addr = host_sock.local_addr().unwrap();
         let (host_ep, _stun) = quic_server(&host_sock, cert, key).await.unwrap();
 
-        let client_sock = udp().await;
+        let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
         let accepting = tokio::spawn(async move {
             let incoming = host_ep.accept().await.expect("an inbound connection");
             let conn = incoming.await.expect("a completed handshake");
@@ -659,11 +722,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_session_survives_the_client_changing_its_own_local_address() {
-        // The ONLY migration QUIC has. There is no mechanism to repoint a
-        // connection at a different REMOTE address, so this deliberately does
-        // not try - a test built on that assumption would invite someone to
-        // "fix" it later by adding something that cannot exist.
-        let (mut host, mut client) = pair("printf 'before-roam\\r\\n'\n").await;
+        // The headline feature: a session that outlives an IP change. This is
+        // the ONLY migration QUIC has - a client may change its own local
+        // address. There is deliberately no test that moves the REMOTE
+        // address: the protocol has no mechanism for it, and a test built on
+        // that assumption would invite someone to "fix" it later by adding
+        // something that cannot exist.
+        //
+        // The move is to a different local IP, not merely a different port.
+        // 127.0.0.0/8 is entirely loopback on Linux, so 127.0.0.2 is a real
+        // second address to migrate onto, and the 4-tuple changes in both
+        // halves rather than one.
+        let (mut host, mut client) = pair_on("127.0.0.1:0", "printf 'before-roam\r\n'\n").await;
         let mut out = Vec::new();
 
         assert!(
@@ -677,19 +747,29 @@ mod tests {
             .await,
             "the session was not up before roaming"
         );
+        let seq_before = client.screen().seq;
 
         let old_addr = client.link.socket.local_addr().unwrap();
-        client.rebind(udp().await).expect("rebind");
-        let new_addr = client.link.socket.local_addr().unwrap();
-        assert_ne!(
-            old_addr, new_addr,
-            "the local address must actually have changed"
-        );
+        assert_eq!(old_addr.ip().to_string(), "127.0.0.1");
 
-        // And the session keeps working across the move.
-        host.term
-            .write_input(b"printf 'after-roam\\r\\n'\n")
-            .unwrap();
+        let moved = Arc::new(tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap());
+        client.rebind(moved).expect("rebind");
+        let new_addr = client.link.socket.local_addr().unwrap();
+
+        assert_ne!(
+            old_addr.ip(),
+            new_addr.ip(),
+            "the local IP must actually have changed"
+        );
+        assert_eq!(new_addr.ip().to_string(), "127.0.0.2");
+
+        // The screen already painted is still correct: migration moves an
+        // address, it does not reset state.
+        assert_eq!(client.screen().seq, seq_before);
+        assert!(text(client.screen()).contains("before-roam"));
+
+        // And new output crosses the new path.
+        host.term.write_input(b"printf 'after-roam\r\n'\n").unwrap();
         assert!(
             drive(
                 &mut host,
@@ -702,6 +782,103 @@ mod tests {
             "the session did not survive the rebind; screen was {:?}",
             text(client.screen())
         );
+
+        // Both halves still agree afterwards.
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            Duration::from_secs(5),
+            |h, c| c.screen().seq == h.screen().seq,
+        )
+        .await;
+        assert_eq!(text(client.screen()), text(host.screen()));
+        assert_eq!(client.screen().validate(), Ok(()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_connect_line_is_printed_once_and_then_there_is_silence() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+
+        let path = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
+        assert!(client.announce(&path, &mut out).expect("announce"));
+        let first = String::from_utf8(out.clone()).unwrap();
+        assert!(first.contains("oxutrm"), "got {first:?}");
+        assert!(first.contains("punched"));
+        assert!(first.contains("38 ms"));
+        assert!(first.contains("mtu 1392"));
+        assert_eq!(first.lines().count(), 1, "exactly one line");
+
+        // Then silence: the same path announced again says nothing at all.
+        out.clear();
+        assert!(!client.announce(&path, &mut out).expect("announce"));
+        assert!(
+            out.is_empty(),
+            "a repeat announcement must be silent, got {out:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_change_announces_itself() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+
+        client
+            .announce(
+                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
+                &mut out,
+            )
+            .expect("first");
+        out.clear();
+
+        // Walking from Wi-Fi to mobile should be explained, not mysterious.
+        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        assert!(client.announce(&better, &mut out).expect("second"));
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.contains("migrated"), "got {line:?}");
+        assert!(line.contains("IPv6 direct"), "got {line:?}");
+        assert!(line.contains("11 ms"), "got {line:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rung_four_reads_as_a_warning() {
+        // A session inside the SSH connection cannot daemonize and cannot be
+        // reattached. Degrading to it silently would remove both properties
+        // the project exists to provide, while looking like success.
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::SshTunnel, 45, 1200, 0, NatType::Unknown),
+                &mut out,
+            )
+            .expect("announce");
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.contains("[warning]"), "got {line:?}");
+        assert!(line.contains("SSH tunnel"), "got {line:?}");
+        assert!(
+            line.contains("not detachable"),
+            "the user must be told what this connection cannot do: {line:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_birthday_path_reports_what_it_cost() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::Birthday, 61, 1200, 312, NatType::Symmetric),
+                &mut out,
+            )
+            .expect("announce");
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.contains("312 probes"),
+            "the cost must be visible: {line:?}"
+        );
+        assert!(line.contains("symmetric NAT"), "got {line:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
