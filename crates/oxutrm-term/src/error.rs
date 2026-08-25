@@ -50,7 +50,12 @@ pub enum ApplyError {
     /// clamped: a clamped cursor produces a state that looks healthy while
     /// the two ends quietly disagree about where the caret is.
     #[error("cursor ({row},{col}) outside {rows}x{cols}")]
-    CursorOutOfBounds { row: u16, col: u16, rows: u16, cols: u16 },
+    CursorOutOfBounds {
+        row: u16,
+        col: u16,
+        rows: u16,
+        cols: u16,
+    },
 
     /// **I3.** Sequence zero is the full-state sentinel — the value a diff
     /// carries to mean "this is not a diff at all". A real state numbered

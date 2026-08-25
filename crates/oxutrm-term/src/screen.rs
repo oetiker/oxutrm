@@ -87,7 +87,12 @@ impl ScreenState {
             rows,
             cols,
             cells: vec![Cell::blank(); rows as usize * cols as usize],
-            cursor: Cursor { row: 0, col: 0, visible: true, shape: CursorShape::Block },
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+                shape: CursorShape::Block,
+            },
             modes: Modes::default(),
             title: String::new(),
             bell: 0,
@@ -190,7 +195,10 @@ impl ScreenState {
         // either swallow bells or, on the way back up, ring once for every
         // bell in the session's history.
         if self.bell < previous.bell {
-            return Err(ApplyError::BellWentBackwards { was: previous.bell, now: self.bell });
+            return Err(ApplyError::BellWentBackwards {
+                was: previous.bell,
+                now: self.bell,
+            });
         }
 
         // I6. Lines that have scrolled off do not come back.

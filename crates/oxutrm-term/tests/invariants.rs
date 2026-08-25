@@ -64,8 +64,14 @@ fn i1_the_row_major_order_is_the_one_every_offset_assumes() {
     assert_eq!(s.cell(2, 3).text, "X");
     assert_eq!(s.row(2).len(), 4);
     assert_eq!(s.row(2)[3].text, "X");
-    // And nothing else moved.
-    assert_eq!(s.cell(3usize.min(2) as u16, 0).text, " ");
+    // And nothing else moved: not the rest of that row, not any other row.
+    assert_eq!(s.cell(2, 0).text, " ");
+    assert_eq!(s.cell(0, 3).text, " ");
+    assert_eq!(
+        s.cells.iter().filter(|c| c.text == "X").count(),
+        1,
+        "exactly one cell was written"
+    );
 }
 
 // ---------------------------------------------------------------- I2
@@ -105,8 +111,11 @@ fn i2_clamping_is_not_an_acceptable_implementation() {
     // This test exists to fail loudly if someone "fixes" the rejection above
     // by clamping with a min(). Clamping produces a state that validates,
     // looks healthy, and is quietly desynchronised from the other end - the
-    // most expensive class of bug this protocol can have. If validate() ever
-    // starts mutating, `before` and `after` diverge and this fails.
+    // most expensive class of bug this protocol can have.
+    //
+    // Three things are asserted, and a clamping implementation fails all of
+    // them: it returns Ok, it reports the clamped coordinates rather than the
+    // ones that were actually wrong, and it mutates the state it was handed.
     let mut s = good();
     s.cursor = Cursor {
         row: 99,
@@ -115,11 +124,20 @@ fn i2_clamping_is_not_an_acceptable_implementation() {
         shape: CursorShape::Block,
     };
     let before = s.cursor;
-    let result = s.validate();
-    assert!(result.is_err(), "an out-of-range cursor must be rejected");
+
+    assert_eq!(
+        s.validate(),
+        Err(ApplyError::CursorOutOfBounds {
+            row: 99,
+            col: 99,
+            rows: 3,
+            cols: 4
+        }),
+        "the error must carry the ORIGINAL out-of-range position, not a repaired one"
+    );
     assert_eq!(
         s.cursor, before,
-        "validate() must not silently repair the cursor"
+        "validate() takes &self and must not repair anything"
     );
     assert_eq!(s.cursor.row, 99, "still out of range: nothing was clamped");
 }
@@ -455,9 +473,22 @@ fn cell_text_encodes_byte_identically_to_a_string() {
         text: CellText,
     }
 
-    for sample in ["", " ", "x", "e\u{0301}", "\u{4f60}", "a rather longer run of text"] {
-        let a = postcard::to_stdvec(&AsString { text: sample.to_owned() }).unwrap();
-        let b = postcard::to_stdvec(&AsCellText { text: sample.into() }).unwrap();
+    for sample in [
+        "",
+        " ",
+        "x",
+        "e\u{0301}",
+        "\u{4f60}",
+        "a rather longer run of text",
+    ] {
+        let a = postcard::to_stdvec(&AsString {
+            text: sample.to_owned(),
+        })
+        .unwrap();
+        let b = postcard::to_stdvec(&AsCellText {
+            text: sample.into(),
+        })
+        .unwrap();
         assert_eq!(a, b, "encoding differs for {sample:?}");
     }
 }
@@ -474,7 +505,11 @@ fn a_screen_state_survives_a_postcard_round_trip() {
         bg: Color::Idx(42),
         attrs: Attrs::BOLD | Attrs::WIDE_CONT,
     };
-    s.modes = Modes { alt_screen: true, mouse: MouseMode::AnyMotion, ..Modes::default() };
+    s.modes = Modes {
+        alt_screen: true,
+        mouse: MouseMode::AnyMotion,
+        ..Modes::default()
+    };
 
     let bytes = postcard::to_stdvec(&s).unwrap();
     let back: ScreenState = postcard::from_bytes(&bytes).unwrap();
