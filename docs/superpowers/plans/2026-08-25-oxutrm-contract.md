@@ -301,7 +301,30 @@ impl ScreenState {
     pub fn blank(rows: u16, cols: u16) -> ScreenState;
     pub fn cell(&self, row: u16, col: u16) -> &Cell;
     pub fn row(&self, row: u16) -> &[Cell];
+
+    /// Checks every invariant below. Called by `Receiver::on_frame` after
+    /// `apply`, and by every constructor. A comment is not a constraint
+    /// anyone checks — this is.
+    pub fn validate(&self) -> Result<(), ApplyError>;
 }
+
+// ---- ScreenState INVARIANTS — enforced, not merely documented ----
+//
+// I1. `cells.len() == rows as usize * cols as usize`, EXACTLY. Row-major.
+//     A diff that would break this is rejected with
+//     `ApplyError::LengthMismatch`, never applied partially.
+// I2. `cursor.row < rows` and `cursor.col < cols`. A diff carrying an
+//     out-of-range cursor is rejected, not clamped: clamping would hide a
+//     real desynchronisation between the two ends.
+// I3. `seq >= 1`. Zero is the full-state sentinel and is never a real state.
+// I4. `title` is set from OSC 0 and OSC 2 ONLY. There is no icon field:
+//     `vte` silently drops OSC 1.
+// I5. `bell` is a MONOTONIC counter, never a flag and never reset. The client
+//     rings once per increment, so a reset would ring the terminal once for
+//     every bell in the session's history.
+// I6. `scrollback_len` counts lines that NEVER travel in a datagram. The lines
+//     themselves are fetched on a stream. It is synthesized by accumulating
+//     `saturating_sub` of `Term::history_size()`, which saturates at capacity.
 
 /// PTY + `alacritty_terminal::term::Term`, fed by a re-exported
 /// `alacritty_terminal::vte::ansi::Processor`. Owns the child process.
@@ -389,6 +412,10 @@ pub enum ApplyError {
     OutOfBounds { row: u16, rows: u16 },
     #[error("decode: {0}")]
     Decode(String),
+    #[error("cells length {len} does not match {rows}x{cols}")]
+    LengthMismatch { len: usize, rows: u16, cols: u16 },
+    #[error("cursor ({row},{col}) outside {rows}x{cols}")]
+    CursorOutOfBounds { row: u16, col: u16, rows: u16, cols: u16 },
 }
 
 /// A replicated value. No I/O, no clocks, no allocation assumptions.
