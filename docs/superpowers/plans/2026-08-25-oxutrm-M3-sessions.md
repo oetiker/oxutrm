@@ -9,13 +9,16 @@ enum carried as newline-delimited JSON over the SSH child's stdin/stdout, with a
 hard protocol-version check and tolerance for SSH banners and motd noise before
 the first message. `oxutrm-host` gains everything a session needs to outlive its
 creator: `daemonize()` (double fork, `setsid`, `chdir("/")`, every inherited
-descriptor closed), a `$XDG_RUNTIME_DIR/oxutrm/<id>/` registry with strict
-permissions and pid-based pruning, a per-session Unix socket, and fresh key
-material generated per attach and never written to disk. `src/main.rs` wires the
+descriptor closed), a registry of `<id>/` directories with strict permissions
+and pid-based pruning — kept somewhere that survives logout, which
+`$XDG_RUNTIME_DIR` does not — a per-session Unix socket, and fresh key material
+generated per attach and never written to disk. One session cannot detach: a
+rung-4 session tunnels its transport through the ssh connection, so it stays in
+the foreground and says so. `src/main.rs` wires the
 three roles together: `oxutrm <ssh-target>`, `oxutrm host --serve`,
 `oxutrm host --list`, `oxutrm host --attach <id>`.
 
-**Tech Stack:** Rust 2021, `tokio` (process, net, time, io-util), `serde_json`
+**Tech Stack:** Rust edition 2024 (MSRV 1.85), `tokio` (process, net, time, io-util), `serde_json`
 for signalling, `libc` for `fork`/`setsid`/`dup2`/`kill`, `rand` 0.9 for key
 material, `base64` 0.22, `thiserror` 2, `anyhow` 1, `tempfile` 3 (dev).
 
@@ -35,7 +38,9 @@ Copied from the contract. Every task's requirements implicitly include these.
   `oxutrm-proto`, `oxutrm-sync`, `oxutrm-term`, `oxutrm-net`, `oxutrm-host`,
   `oxutrm-client`. The checkout directory is `oxuterm` for historical reasons;
   nothing inside it uses that spelling.
-- **Rust edition 2021**, workspace at the repo root, one binary `src/main.rs`.
+- **Rust edition 2024**, workspace at the repo root, one binary `src/main.rs`.
+  `alacritty_terminal` 0.26 is edition 2024 with MSRV 1.85, so that floor applies
+  to the whole build.
 - **Cap all parallelism at 4**: `cargo build --jobs 4`,
   `cargo test --jobs 4 -- --test-threads 4`. The build machine is shared.
 - **Workspace root `Cargo.toml` must contain:**
@@ -50,7 +55,7 @@ Copied from the contract. Every task's requirements implicitly include these.
   (via `thiserror`) inside `oxutrm-sync` and `oxutrm-proto` where callers must
   discriminate.
 - **No key material is ever written to disk**, in any crate, at any time.
-  Task 12 enforces this with a test.
+  Task 15 enforces this with a test.
 - **Every task ends green**: `cargo clippy --all-targets -- -D warnings` and
   `cargo test --jobs 4 -- --test-threads 4` both pass before committing.
 - **Commit messages** end with:
@@ -85,6 +90,35 @@ re-signatured.
    contract lists `rustix` for host; `libc` is used instead because `fork` is
    not in rustix's stable surface, and mixing two process crates for one
    `daemonize()` is worse than picking one.
+
+5. **`Session::publish` takes `&mut self`, returns `()`, and keeps the
+   `RegistryGuard` inside the session.** The contract's
+   `RegistryGuard::register(meta)` is unchanged and still used underneath. The
+   session must hold the guard because `meta.json` records the **current**
+   `attach_id` (contract, spec §9.2), so every attach rewrites it — and because
+   the registry entry's lifetime is exactly the session's.
+
+`SessionEnd::LinkClosed`, `run_session_until`, `link_closed`, `FIRST_SEQ`,
+`FULL_STATE_BASE`, `entry_is_stale`, `process_start_unix` and the
+`RegistryRoot` / `RootEnv` / `choose_registry_root` surface are additions that
+implement contract behaviour the contract states in prose but does not name.
+
+## Contract behaviour this plan implements, with the task that does it
+
+Not deviations — these are committed requirements, listed so a reviewer can find
+each one:
+
+| Requirement | Source | Task |
+|---|---|---|
+| `HostHello.attach_id`, `SessionMeta.attach_id` | contract; spec §4.2, §8.5 | 1, 4, 12 |
+| `HostHello.detachable`, `SessionMeta.detachable` | contract; spec §4.3, §5.5 | 1, 4, 14 |
+| Rung 4 does not daemonize and cannot be reattached | spec §4.3, §5.5, §9.2 | 14, 16 |
+| `Linger` check, `$HOME/.local/state` fallback, loud warning | contract; spec §9.2 | 7 |
+| Stale = pid gone **or** pid reused, checked against creation time | contract; spec §9.2 | 6 |
+| `seq` starts at 1, 0 is the full-state sentinel, reset per attach | spec §8.5 | 12, 13 |
+| First datagram of every attach is a full state | spec §8.5 | 12 (`must_send_full_state`) |
+| No 0-RTT | spec §6 | asserted in the milestone check |
+| Edition 2024, MSRV 1.85 | contract | Global Constraints |
 
 ## Stubs, and what M4 replaces
 
@@ -136,8 +170,9 @@ touching the lifecycle loop.
   that daemonizes and reports its descriptors.
 - `crates/oxutrm-host/src/bin/oxutrm-fake-ssh.rs` — test fixture: a local
   program that behaves like `ssh <target> oxutrm host --serve`, banner included.
-- `crates/oxutrm-host/tests/registry.rs`, `tests/daemonize.rs`,
-  `tests/ssh_bootstrap.rs`, `tests/attach.rs`, `tests/no_keys_on_disk.rs`.
+- `crates/oxutrm-host/tests/registry.rs`, `tests/registry_root.rs`,
+  `tests/daemonize.rs`, `tests/ssh_bootstrap.rs`, `tests/attach.rs`,
+  `tests/tied_session.rs`, `tests/no_keys_on_disk.rs`.
 
 Fixture binaries live under `src/bin/` and not `examples/` because Cargo sets
 `CARGO_BIN_EXE_<name>` for integration tests only for `[[bin]]` targets. All
@@ -166,9 +201,10 @@ tests that launch a fixture must therefore live in `crates/oxutrm-host/tests/`.
 - Produces:
   ```rust
   pub enum Signal {
-      HostHello { proto: u32, session_id: String, cert_spki_sha256: String,
-                  psk: String, candidates: Vec<Candidate>, nat_type: NatType,
-                  bound_port: u16 },
+      HostHello { proto: u32, session_id: String, attach_id: u64,
+                  cert_spki_sha256: String, psk: String,
+                  candidates: Vec<Candidate>, nat_type: NatType,
+                  bound_port: u16, detachable: bool },
       ClientHello { proto: u32, candidates: Vec<Candidate>, nat_type: NatType,
                     caps: TerminalCaps, size: TermSize },
       CandidateUpdate { candidates: Vec<Candidate> },
@@ -233,11 +269,13 @@ mod tests {
             Signal::HostHello {
                 proto: PROTO_VERSION,
                 session_id: "00112233445566778899aabbccddeeff".to_string(),
+                attach_id: 3,
                 cert_spki_sha256: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=".to_string(),
                 psk: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
                 candidates: vec![cand.clone()],
                 nat_type: NatType::EndpointIndependent,
                 bound_port: 443,
+                detachable: true,
             },
             Signal::ClientHello {
                 proto: PROTO_VERSION,
@@ -334,6 +372,24 @@ mod tests {
     }
 
     #[test]
+    fn host_hello_carries_the_attach_generation_and_detachability() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_signal(&mut buf, &every_variant()[0]).expect("write");
+        let text = String::from_utf8(buf.clone()).expect("utf8");
+        assert!(text.contains(r#""attach_id":3"#), "attach_id missing: {text}");
+        assert!(text.contains(r#""detachable":true"#), "detachable missing: {text}");
+
+        let mut r = BufReader::new(buf.as_slice());
+        match read_signal(&mut r).expect("read") {
+            Signal::HostHello { attach_id, detachable, .. } => {
+                assert_eq!(attach_id, 3, "spec 8.5: the generation both ends agree on");
+                assert!(detachable);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn looks_like_signal_ignores_leading_whitespace() {
         assert!(looks_like_signal("  {\"t\":\"Failed\"}"));
         assert!(!looks_like_signal("Welcome to Ubuntu 24.04.1 LTS"));
@@ -370,13 +426,28 @@ pub enum Signal {
         proto: u32,
         /// 32 lowercase hex characters.
         session_id: String,
-        /// base64 of the SHA-256 of the host certificate's SPKI.
+        /// Which attach generation this is. Both `seq` counters reset to 1 at
+        /// every attach, so the two ends must agree on the generation;
+        /// otherwise a host already serving a session cannot tell a second
+        /// `--attach` from the current one. Signalling and `meta.json` only —
+        /// never per-frame, since each attach is a distinct QUIC connection
+        /// and datagrams cannot cross between them (spec §8.5).
+        attach_id: u64,
+        /// base64 of the SHA-256 of the host certificate's SPKI. Base64 rather
+        /// than `[u8; 32]` because this travels as JSON, where a byte array
+        /// becomes 32 numbers.
         cert_spki_sha256: String,
-        /// base64 of 32 CSPRNG bytes. Never written to disk, on either side.
+        /// base64 of 32 CSPRNG bytes: the root secret the ICE credentials are
+        /// derived from. Never written to disk, on either side.
         psk: String,
         candidates: Vec<Candidate>,
         nat_type: NatType,
         bound_port: u16,
+        /// False once the session has fallen back to rung 4 (SSH tunnel): it
+        /// cannot close its SSH descriptors, so it never daemonizes and can
+        /// never be reattached. The client needs this at handshake time to
+        /// render the connect-time warning (spec §4.3, §5.5, §10.3).
+        detachable: bool,
     },
     /// client -> host, first line.
     ClientHello {
@@ -450,7 +521,7 @@ pub use signal::{looks_like_signal, parse_signal_line, read_signal, write_signal
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-proto -- --test-threads 4`
-Expected: PASS, 7 new tests.
+Expected: PASS, 8 new tests.
 
 - [ ] **Step 8: Lint**
 
@@ -497,8 +568,8 @@ Append these tests inside the existing `mod tests` in
         format!(
             concat!(
                 r#"{{"t":"HostHello","proto":{},"session_id":"00112233445566778899aabbccddeeff","#,
-                r#""cert_spki_sha256":"YWJj","psk":"ZGVm","candidates":[],"#,
-                r#""nat_type":"Unknown","bound_port":443}}"#
+                r#""attach_id":1,"cert_spki_sha256":"YWJj","psk":"ZGVm","candidates":[],"#,
+                r#""nat_type":"Unknown","bound_port":443,"detachable":true}}"#
             ),
             PROTO_VERSION + 1
         )
@@ -532,15 +603,13 @@ Append these tests inside the existing `mod tests` in
 
     #[test]
     fn an_older_peer_also_fails() {
-        let line = format!(
-            concat!(
-                r#"{{"t":"ClientHello","proto":0,"candidates":[],"nat_type":"Unknown","#,
-                r#""caps":{{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
-                r#""mouse_sgr":false,"osc52":false,"term_name":"vt100"}},"#,
-                r#""size":{{"cols":80,"rows":24}}}}"#
-            )
+        let line = concat!(
+            r#"{"t":"ClientHello","proto":0,"candidates":[],"nat_type":"Unknown","#,
+            r#""caps":{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
+            r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"},"#,
+            r#""size":{"cols":80,"rows":24}}"#
         );
-        match parse_signal_line(&line) {
+        match parse_signal_line(line) {
             Err(ProtoError::VersionMismatch { peer, ours }) => {
                 assert_eq!(peer, 0);
                 assert_eq!(ours, PROTO_VERSION);
@@ -614,7 +683,7 @@ pub use signal::{
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-proto -- --test-threads 4`
-Expected: PASS, 12 tests in `signal`.
+Expected: PASS, 13 tests in `signal`.
 
 - [ ] **Step 6: Lint and commit**
 
@@ -776,7 +845,7 @@ pub use signal::{
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-proto -- --test-threads 4`
-Expected: PASS, 17 tests in `signal`.
+Expected: PASS, 18 tests in `signal`.
 
 - [ ] **Step 5: Lint and commit**
 
@@ -805,10 +874,15 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   ```rust
   pub struct SessionMeta {
       pub session_id: String,
+      /// The current attach generation, mirrored from `HostHello.attach_id`.
+      pub attach_id: u64,
       pub pid: u32,
       pub created_unix: u64,
       pub shell: String,
       pub size: TermSize,
+      /// False for a rung-4 session, which tunnels QUIC through the ssh
+      /// connection and therefore cannot outlive it (Task 14).
+      pub detachable: bool,
   }                                     // Clone, Debug, Serialize, Deserialize
 
   pub const REGISTRY_SUBDIR: &str = "oxutrm";
@@ -859,7 +933,7 @@ name = "oxutrm-fake-ssh"
 path = "src/bin/oxutrm-fake-ssh.rs"
 ```
 
-The two `[[bin]]` targets are test fixtures, created in Tasks 7 and 8. Add them
+The two `[[bin]]` targets are test fixtures, created in Tasks 8 and 9. Add them
 to the manifest now but create the files in those tasks; until then, comment out
 both `[[bin]]` blocks so the crate builds. Uncomment each as its task creates it.
 
@@ -870,16 +944,21 @@ Add `"crates/oxutrm-host"` to `[workspace.members]` in the root `Cargo.toml`.
 `crates/oxutrm-host/tests/registry.rs`:
 
 ```rust
-use oxutrm_host::{now_unix, pid_alive, Registry, SessionMeta, REGISTRY_SUBDIR};
+use oxutrm_host::{
+    entry_is_stale, now_unix, pid_alive, process_start_unix, Registry, SessionMeta,
+    REGISTRY_SUBDIR,
+};
 use oxutrm_proto::TermSize;
 
 fn meta(id: &str, pid: u32) -> SessionMeta {
     SessionMeta {
         session_id: id.to_string(),
+        attach_id: 1,
         pid,
         created_unix: now_unix(),
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
+        detachable: true,
     }
 }
 
@@ -923,9 +1002,11 @@ fn session_meta_round_trips_through_json() {
     let text = serde_json::to_string(&m).expect("encode");
     let back: SessionMeta = serde_json::from_str(&text).expect("decode");
     assert_eq!(back.session_id, m.session_id);
+    assert_eq!(back.attach_id, m.attach_id);
     assert_eq!(back.pid, m.pid);
     assert_eq!(back.shell, m.shell);
     assert_eq!(back.size, m.size);
+    assert_eq!(back.detachable, m.detachable);
 }
 ```
 
@@ -963,10 +1044,22 @@ pub const SOCK_FILE: &str = "sock";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// The current attach generation, mirrored from `HostHello.attach_id`
+    /// (spec §8.5). Rewritten on every attach, so a host already serving a
+    /// session can tell a second `--attach` from the current one.
+    pub attach_id: u64,
     pub pid: u32,
     pub created_unix: u64,
     pub shell: String,
     pub size: TermSize,
+    /// Can this session outlive the ssh connection that created it?
+    ///
+    /// True for every ordinary session. False for a rung-4 session, whose
+    /// QUIC traffic runs inside a stream on that ssh connection: it cannot
+    /// close those descriptors, so it never daemonizes and dies with ssh
+    /// (Task 14). `--list` shows the difference, because "reattach later"
+    /// is a promise oxutrm must not make falsely.
+    pub detachable: bool,
 }
 
 /// Seconds since the Unix epoch. Saturates rather than panicking on a clock
@@ -994,10 +1087,61 @@ pub fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Slack between a session recording its creation time and its daemonized
+/// process actually starting. Generous on purpose: being wrong in this
+/// direction only means a stale entry survives one more `--list`, while being
+/// wrong the other way deletes a live session's socket.
+pub const PID_REUSE_SLACK_SECS: u64 = 5;
+
+/// Seconds since the epoch at which the process holding `pid` started.
+///
+/// `None` when there is no such process, or when `/proc` cannot answer.
+/// `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot;
+/// `/proc/stat`'s `btime` turns that into wall-clock time. The command name in
+/// field 2 may itself contain spaces and parentheses, so parsing starts after
+/// the **last** `)`.
+pub fn process_start_unix(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = text.rsplit_once(')')?.1;
+    // Fields resume at 3 (state) after the command name, so field 22 is index 19.
+    let ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as u64 } else { 100 };
+    let boot = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(boot + ticks / hz)
+}
+
+/// Is this registry entry dead wood?
+///
+/// Spec §9.2: stale when the pid is gone, or when the pid now belongs to an
+/// unrelated process. The `$HOME` fallback of Task 7 survives reboots, and pids
+/// are recycled, so liveness alone would resurrect long-dead sessions.
+pub fn entry_is_stale(meta: &SessionMeta) -> bool {
+    if !pid_alive(meta.pid) {
+        return true;
+    }
+    match process_start_unix(meta.pid) {
+        // Started well after the entry was written: the pid was recycled.
+        Some(start) => start > meta.created_unix.saturating_add(PID_REUSE_SLACK_SECS),
+        // The pid exists but /proc will not say more. Keep it: deleting a live
+        // session's socket is much worse than listing a dead one.
+        None => false,
+    }
+}
+
 pub struct Registry;
 
 impl Registry {
     /// `$XDG_RUNTIME_DIR/oxutrm`.
+    /// Task 7 replaces this body: `$XDG_RUNTIME_DIR` does not survive
+    /// logout on a systemd host, which would strand a detached session.
+    /// This version exists so Tasks 5 and 6 have something to build on.
     pub fn dir() -> anyhow::Result<PathBuf> {
         let base = match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -1301,7 +1445,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 6: `Registry::list` with pid-based pruning
+### Task 6: `Registry::list` and stale-entry pruning
 
 **Files:**
 - Modify: `crates/oxutrm-host/src/registry.rs`
@@ -1315,11 +1459,26 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
       pub fn list() -> anyhow::Result<Vec<SessionMeta>>;
       pub fn list_in(dir: &std::path::Path) -> anyhow::Result<Vec<SessionMeta>>;
   }
+  /// Seconds since the epoch at which the process holding this pid started.
+  pub fn process_start_unix(pid: u32) -> Option<u64>;
+  /// Slack between a session recording its creation time and its daemonized
+  /// process actually starting.
+  pub const PID_REUSE_SLACK_SECS: u64 = 5;
+  /// Stale when the pid is gone, or when the pid now belongs to an unrelated
+  /// process (spec §9.2).
+  pub fn entry_is_stale(meta: &SessionMeta) -> bool;
   ```
-  Entries are returned oldest first by `created_unix`. An entry whose pid is
-  gone is **removed from disk** and omitted. A directory with no readable
+  Entries are returned oldest first by `created_unix`. A **stale** entry is
+  removed from disk, socket and all, and omitted. A directory with no readable
   `meta.json` is left alone and omitted, because it may belong to a session
   that is mid-registration.
+
+**Why staleness is more than liveness.** Under `$XDG_RUNTIME_DIR` a reboot
+cleared the registry, so a live pid was proof enough. Task 7's `$HOME` fallback
+is a real filesystem that survives reboots, and pids are recycled — after a
+reboot some unrelated process is very likely to hold the recorded number. So an
+entry is stale when the pid is gone **or** when the process now holding it
+started well after the session recorded its creation time.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1333,10 +1492,12 @@ fn plant(root: &std::path::Path, id: &str, pid: u32, created: u64) -> std::path:
     std::fs::create_dir_all(&dir).expect("create entry dir");
     let m = SessionMeta {
         session_id: id.to_string(),
+        attach_id: 1,
         pid,
         created_unix: created,
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
+        detachable: true,
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&m).unwrap()).expect("write meta");
     std::fs::write(dir.join("sock"), b"").expect("write sock");
@@ -1355,8 +1516,10 @@ fn list_returns_live_sessions_oldest_first() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
     std::fs::create_dir_all(&root).expect("root");
-    plant(&root, "22222222222222222222222222222222", std::process::id(), 2_000);
-    plant(&root, "11111111111111111111111111111111", std::process::id(), 1_000);
+    // Creation times must be recent: an entry claiming to predate the process
+    // holding its pid is stale by definition, which is the next test.
+    plant(&root, "22222222222222222222222222222222", std::process::id(), now_unix() - 1);
+    plant(&root, "11111111111111111111111111111111", std::process::id(), now_unix() - 2);
 
     let listed = Registry::list_in(&root).expect("list");
     let ids: Vec<&str> = listed.iter().map(|m| m.session_id.as_str()).collect();
@@ -1375,8 +1538,8 @@ fn list_prunes_entries_whose_process_is_gone() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
     std::fs::create_dir_all(&root).expect("root");
-    let live = plant(&root, "aaaa1111aaaa1111aaaa1111aaaa1111", std::process::id(), 10);
-    let dead = plant(&root, "bbbb2222bbbb2222bbbb2222bbbb2222", dead_pid(), 20);
+    let live = plant(&root, "aaaa1111aaaa1111aaaa1111aaaa1111", std::process::id(), now_unix());
+    let dead = plant(&root, "bbbb2222bbbb2222bbbb2222bbbb2222", dead_pid(), now_unix());
 
     let listed = Registry::list_in(&root).expect("list");
 
@@ -1384,6 +1547,38 @@ fn list_prunes_entries_whose_process_is_gone() {
     assert_eq!(listed[0].session_id, "aaaa1111aaaa1111aaaa1111aaaa1111");
     assert!(live.exists(), "the live entry stays on disk");
     assert!(!dead.exists(), "the dead entry is removed from disk");
+}
+
+/// The reboot case: the directory outlives the machine's uptime, so the pid in
+/// a stale entry is very likely to have been handed to something unrelated.
+#[test]
+fn an_entry_whose_pid_now_belongs_to_another_process_is_stale() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    std::fs::create_dir_all(&root).expect("root");
+    // Our own pid, but recorded as created in 1970: whatever wrote this entry,
+    // it was not this process.
+    let reused = plant(&root, "eeee5555eeee5555eeee5555eeee5555", std::process::id(), 1);
+    let live = plant(&root, "ffff6666ffff6666ffff6666ffff6666", std::process::id(), now_unix());
+
+    let listed = Registry::list_in(&root).expect("list");
+
+    assert_eq!(listed.len(), 1, "a recycled pid is not a live session: {listed:?}");
+    assert_eq!(listed[0].session_id, "ffff6666ffff6666ffff6666ffff6666");
+    assert!(!reused.exists(), "the stale entry and its socket must be removed");
+    assert!(!reused.join("sock").exists());
+    assert!(live.exists());
+}
+
+#[test]
+fn process_start_unix_answers_for_a_living_process() {
+    let start = process_start_unix(std::process::id()).expect("/proc must answer for us");
+    let now = now_unix();
+    assert!(start <= now + 1, "we cannot have started in the future: {start} > {now}");
+    assert!(
+        !entry_is_stale(&meta("aaaabbbbaaaabbbbaaaabbbbaaaabbbb", std::process::id())),
+        "an entry created now by this very process is not stale"
+    );
 }
 
 #[test]
@@ -1425,8 +1620,8 @@ Expected: FAIL — `no function or associated item named list_in found for struc
 Inside `impl Registry` in `crates/oxutrm-host/src/registry.rs`:
 
 ```rust
-    /// Every live session, oldest first. Entries whose process is gone are
-    /// removed from disk as a side effect (spec §9.2).
+    /// Every live session, oldest first. Stale entries are removed from disk
+    /// as a side effect (spec §9.2).
     pub fn list() -> anyhow::Result<Vec<SessionMeta>> {
         Self::list_in(&Self::dir()?)
     }
@@ -1457,10 +1652,12 @@ Inside `impl Registry` in `crates/oxutrm-host/src/registry.rs`:
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if pid_alive(meta.pid) {
-                live.push(meta);
-            } else {
+            if entry_is_stale(&meta) {
+                // Takes the socket with it, which is the point: a stale socket
+                // makes `--attach` hang instead of failing.
                 let _ = std::fs::remove_dir_all(&path);
+            } else {
+                live.push(meta);
             }
         }
         live.sort_by_key(|m| (m.created_unix, m.session_id.clone()));
@@ -1468,24 +1665,463 @@ Inside `impl Registry` in `crates/oxutrm-host/src/registry.rs`:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Export the new names**
+
+In `crates/oxutrm-host/src/lib.rs`, extend the re-export:
+
+```rust
+pub use registry::{
+    entry_is_stale, now_unix, pid_alive, process_start_unix, Registry, RegistryGuard,
+    SessionMeta, META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, SOCK_FILE,
+};
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-host -- --test-threads 4`
-Expected: PASS, 15 tests.
+Expected: PASS, 17 tests.
 
-- [ ] **Step 5: Lint and commit**
+- [ ] **Step 6: Lint and commit**
 
 ```bash
 cargo clippy --all-targets --jobs 4 -- -D warnings
 git add crates/oxutrm-host
-git commit -m "feat(host): Registry::list with pid-based pruning of dead entries
+git commit -m "feat(host): Registry::list with stale-entry pruning
+
+An entry is stale when its pid is gone or has been recycled by an
+unrelated process, checked against the recorded creation time. The
+\$HOME fallback survives reboots, so liveness alone is not enough.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 7: `daemonize()` — the descriptor that must not survive
+### Task 7: A registry root that survives logout
+
+**Files:**
+- Modify: `crates/oxutrm-host/src/registry.rs`
+- Modify: `crates/oxutrm-host/src/lib.rs`
+- Test: `crates/oxutrm-host/tests/registry_root.rs`
+
+**Interfaces:**
+- Consumes: `Registry::dir_at`, `Registry::list_in`, `RegistryGuard::register_in`,
+  `REGISTRY_SUBDIR` (Tasks 4-6).
+- Produces:
+  ```rust
+  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+  pub enum RegistryRootKind { RuntimeDir, StateDir }
+
+  #[derive(Clone, Debug)]
+  pub struct RegistryRoot {
+      pub base: std::path::PathBuf,
+      pub kind: RegistryRootKind,
+      /// Printed to stderr once, before daemonizing. `None` when all is well.
+      pub warning: Option<String>,
+  }
+
+  #[derive(Clone, Debug, Default)]
+  pub struct RootEnv {
+      pub xdg_runtime_dir: Option<std::path::PathBuf>,
+      pub home: Option<std::path::PathBuf>,
+      pub override_dir: Option<std::path::PathBuf>,
+      /// `None` means persistence could not be determined.
+      pub linger: Option<bool>,
+  }
+
+  /// Pure decision function, so every branch is testable without touching
+  /// the process environment.
+  pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot>;
+  pub fn read_root_env() -> RootEnv;
+  pub fn linger_enabled(uid: u32) -> Option<bool>;
+  pub fn resolve_registry_root() -> anyhow::Result<RegistryRoot>;
+  /// `sun_path` is 108 bytes. A long $HOME can overflow it.
+  pub fn check_socket_path_length(path: &std::path::Path) -> anyhow::Result<()>;
+  // Registry::dir() is rewritten on top of resolve_registry_root().
+  ```
+
+**Why this task exists.** On a systemd host `/run/user/<uid>` is destroyed when
+the user's last login session ends. The session process keeps running, but its
+registry directory and its `sock` are gone with it: `--list` shows nothing and
+reattach is impossible. That is exactly the failure oxutrm exists to prevent,
+arriving through the back door. So the registry lives in `$XDG_RUNTIME_DIR`
+**only when that directory is known to persist**, and in
+`$HOME/.local/state/oxutrm` otherwise.
+
+The runtime directory is still preferred where it survives, because a home
+directory may be on NFS, where Unix sockets are unreliable and file locking is
+worse.
+
+**The decision table.** Implement exactly this:
+
+| `$OXUTRM_STATE_DIR` | `$XDG_RUNTIME_DIR` | linger | base | warning |
+|---|---|---|---|---|
+| set | — | — | the override | none |
+| unset | set | `Some(true)` | `$XDG_RUNTIME_DIR` | none |
+| unset | set | `Some(false)` | `$HOME/.local/state` | lingering is off |
+| unset | set | `None` | `$HOME/.local/state` | persistence unverifiable |
+| unset | unset | — | `$HOME/.local/state` | no runtime directory |
+| unset | unset | — | *error* when `$HOME` is also unset | |
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/oxutrm-host/tests/registry_root.rs`:
+
+```rust
+use std::path::PathBuf;
+
+use oxutrm_host::registry::{
+    check_socket_path_length, choose_registry_root, RegistryRootKind, RootEnv,
+};
+use oxutrm_host::{Registry, RegistryGuard, SessionMeta};
+use oxutrm_proto::TermSize;
+
+fn env(xdg: Option<&str>, home: Option<&str>, linger: Option<bool>) -> RootEnv {
+    RootEnv {
+        xdg_runtime_dir: xdg.map(PathBuf::from),
+        home: home.map(PathBuf::from),
+        override_dir: None,
+        linger,
+    }
+}
+
+#[test]
+fn the_runtime_directory_is_used_when_lingering_keeps_it_alive() {
+    let root = choose_registry_root(&env(Some("/run/user/1000"), Some("/home/u"), Some(true)))
+        .expect("choose");
+    assert_eq!(root.base, PathBuf::from("/run/user/1000"));
+    assert_eq!(root.kind, RegistryRootKind::RuntimeDir);
+    assert!(root.warning.is_none(), "nothing to warn about: {:?}", root.warning);
+}
+
+#[test]
+fn without_lingering_the_state_directory_wins_and_says_why() {
+    let root = choose_registry_root(&env(Some("/run/user/1000"), Some("/home/u"), Some(false)))
+        .expect("choose");
+    assert_eq!(root.base, PathBuf::from("/home/u/.local/state"));
+    assert_eq!(root.kind, RegistryRootKind::StateDir);
+    let warning = root.warning.expect("this case must warn");
+    assert!(
+        warning.contains("loginctl enable-linger"),
+        "the warning must name the fix: {warning}"
+    );
+    assert!(
+        warning.contains("logout") || warning.contains("log out"),
+        "the warning must name the danger: {warning}"
+    );
+}
+
+#[test]
+fn an_unverifiable_runtime_directory_is_not_trusted() {
+    let root = choose_registry_root(&env(Some("/run/user/1000"), Some("/home/u"), None))
+        .expect("choose");
+    assert_eq!(root.kind, RegistryRootKind::StateDir, "when in doubt, persist");
+    assert!(root.warning.is_some());
+}
+
+#[test]
+fn a_missing_runtime_directory_falls_back_quietly_but_visibly() {
+    let root = choose_registry_root(&env(None, Some("/home/u"), None)).expect("choose");
+    assert_eq!(root.base, PathBuf::from("/home/u/.local/state"));
+    assert!(root.warning.is_some());
+}
+
+#[test]
+fn an_explicit_override_beats_everything_and_never_warns() {
+    let mut e = env(Some("/run/user/1000"), Some("/home/u"), Some(false));
+    e.override_dir = Some(PathBuf::from("/srv/oxutrm-state"));
+    let root = choose_registry_root(&e).expect("choose");
+    assert_eq!(root.base, PathBuf::from("/srv/oxutrm-state"));
+    assert!(root.warning.is_none(), "the user asked for this explicitly");
+}
+
+#[test]
+fn with_neither_a_runtime_directory_nor_a_home_it_fails_with_advice() {
+    let err = choose_registry_root(&env(None, None, None)).expect_err("nowhere to put it");
+    let text = format!("{err:#}");
+    assert!(text.contains("OXUTRM_STATE_DIR"), "must offer the override: {text}");
+}
+
+#[test]
+fn a_socket_path_too_long_for_sun_path_is_refused_with_advice() {
+    let long = PathBuf::from(format!("/home/{}/.local/state/oxutrm/abc/sock", "x".repeat(120)));
+    let err = check_socket_path_length(&long).expect_err("108 bytes is the limit");
+    let text = format!("{err:#}");
+    assert!(text.contains("OXUTRM_STATE_DIR"), "must offer the override: {text}");
+    check_socket_path_length(std::path::Path::new("/run/user/1000/oxutrm/abc/sock"))
+        .expect("a normal path is fine");
+}
+
+/// The whole point of the task: the runtime directory disappearing at logout
+/// must not take the session with it.
+#[tokio::test]
+async fn a_session_survives_the_runtime_directory_being_destroyed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_runtime = tmp.path().join("run-user-1000");
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_runtime).expect("runtime dir");
+    std::fs::create_dir_all(&fake_home).expect("home");
+
+    // Lingering is off, so the resolver must choose the state directory.
+    let chosen = choose_registry_root(&RootEnv {
+        xdg_runtime_dir: Some(fake_runtime.clone()),
+        home: Some(fake_home.clone()),
+        override_dir: None,
+        linger: Some(false),
+    })
+    .expect("choose");
+    assert_eq!(chosen.kind, RegistryRootKind::StateDir);
+
+    let root = Registry::dir_at(&chosen.base);
+    let meta = SessionMeta {
+        session_id: "1234abcd1234abcd1234abcd1234abcd".to_string(),
+        attach_id: 1,
+        pid: std::process::id(),
+        // Must be recent: an entry older than the process holding its pid is
+        // stale by the rule in Task 6.
+        created_unix: oxutrm_host::now_unix(),
+        shell: "/bin/bash".to_string(),
+        size: TermSize { cols: 80, rows: 24 },
+        detachable: true,
+    };
+    let guard = RegistryGuard::register_in(&root, &meta).expect("register");
+    let sock = guard.socket_path();
+    check_socket_path_length(&sock).expect("short enough");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+
+    // Logout: systemd tears the runtime directory down.
+    std::fs::remove_dir_all(&fake_runtime).expect("simulate logout");
+    assert!(!fake_runtime.exists());
+
+    let listed = Registry::list_in(&root).expect("list");
+    assert_eq!(listed.len(), 1, "the session must still be discoverable");
+    assert_eq!(listed[0].session_id, meta.session_id);
+
+    let connected = tokio::net::UnixStream::connect(&sock).await;
+    assert!(connected.is_ok(), "the socket must still be reachable: {connected:?}");
+    drop(listener);
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test registry_root -- --test-threads 4`
+Expected: FAIL to compile — `cannot find function choose_registry_root`.
+
+This is the first test file to use `#[tokio::test]`, so add the macros to
+`[dev-dependencies]` in `crates/oxutrm-host/Cargo.toml`:
+
+```toml
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+- [ ] **Step 3: Write the implementation**
+
+Append to `crates/oxutrm-host/src/registry.rs`:
+
+```rust
+/// Where the registry lives, and why.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegistryRootKind {
+    /// `$XDG_RUNTIME_DIR`, which is known to survive logout here.
+    RuntimeDir,
+    /// `$HOME/.local/state`, chosen because the runtime directory would not.
+    StateDir,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegistryRoot {
+    pub base: PathBuf,
+    pub kind: RegistryRootKind,
+    /// Printed to stderr once, before daemonizing, where it can still be seen.
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RootEnv {
+    pub xdg_runtime_dir: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    /// `$OXUTRM_STATE_DIR`: an explicit choice, which is never second-guessed.
+    pub override_dir: Option<PathBuf>,
+    /// `None` means persistence could not be determined.
+    pub linger: Option<bool>,
+}
+
+/// `$HOME/.local/state`, per the XDG base directory specification.
+fn state_base(home: &Path) -> PathBuf {
+    home.join(".local").join("state")
+}
+
+/// Decide where sessions are recorded.
+///
+/// `$XDG_RUNTIME_DIR` is preferred, but only when it is known to survive the
+/// user logging out: on systemd hosts `/run/user/<uid>` is destroyed with the
+/// last login session, taking the socket of a still-running session with it.
+/// A home directory may be on NFS, where Unix sockets are unreliable, so the
+/// runtime directory wins wherever it is safe.
+pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
+    if let Some(dir) = &env.override_dir {
+        return Ok(RegistryRoot {
+            base: dir.clone(),
+            kind: RegistryRootKind::StateDir,
+            warning: None,
+        });
+    }
+
+    let fallback = |reason: &str| -> anyhow::Result<RegistryRoot> {
+        let home = env.home.as_ref().ok_or_else(|| {
+            anyhow!(
+                "neither a usable XDG_RUNTIME_DIR nor a HOME, so there is nowhere \
+                 to record sessions. Set OXUTRM_STATE_DIR to a directory that \
+                 survives logout."
+            )
+        })?;
+        Ok(RegistryRoot {
+            base: state_base(home),
+            kind: RegistryRootKind::StateDir,
+            warning: Some(format!(
+                "oxutrm: {reason}, so sessions are recorded in {} instead of \
+                 XDG_RUNTIME_DIR. Sessions will survive, but on a networked home \
+                 directory the session socket may be unreliable. To use the \
+                 runtime directory instead, run `loginctl enable-linger $USER` \
+                 on this host; to choose the location yourself, set \
+                 OXUTRM_STATE_DIR.",
+                state_base(home).join(REGISTRY_SUBDIR).display()
+            )),
+        })
+    };
+
+    match (&env.xdg_runtime_dir, env.linger) {
+        (Some(dir), Some(true)) => Ok(RegistryRoot {
+            base: dir.clone(),
+            kind: RegistryRootKind::RuntimeDir,
+            warning: None,
+        }),
+        (Some(_), Some(false)) => fallback(
+            "lingering is off for this user, so XDG_RUNTIME_DIR is destroyed at logout \
+             and a detached session would become unreachable",
+        ),
+        (Some(_), None) => fallback(
+            "whether XDG_RUNTIME_DIR survives logout could not be determined",
+        ),
+        (None, _) => fallback("XDG_RUNTIME_DIR is not set"),
+    }
+}
+
+/// Ask systemd whether this user's runtime directory outlives their sessions.
+/// `None` when the question cannot be answered — no `loginctl`, no systemd, or
+/// an unexpected answer.
+pub fn linger_enabled(uid: u32) -> Option<bool> {
+    let out = std::process::Command::new("loginctl")
+        .args(["show-user", &uid.to_string(), "--property=Linger"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value = text.trim().strip_prefix("Linger=")?.trim();
+    match value {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+pub fn read_root_env() -> RootEnv {
+    let uid = unsafe { libc::getuid() };
+    RootEnv {
+        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        home: std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        override_dir: std::env::var_os("OXUTRM_STATE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        linger: linger_enabled(uid),
+    }
+}
+
+pub fn resolve_registry_root() -> anyhow::Result<RegistryRoot> {
+    choose_registry_root(&read_root_env())
+}
+
+/// `sockaddr_un::sun_path` holds 108 bytes including the terminating NUL, and
+/// a long home directory can overflow it. Checked before binding, because the
+/// error the kernel gives otherwise says nothing useful.
+pub fn check_socket_path_length(path: &Path) -> anyhow::Result<()> {
+    const SUN_PATH_MAX: usize = 100;
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len > SUN_PATH_MAX {
+        return Err(anyhow!(
+            "the session socket path is {len} bytes, and a Unix socket path cannot \
+             exceed {SUN_PATH_MAX}: {}. Set OXUTRM_STATE_DIR to something shorter.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+```
+
+Replace the body of `Registry::dir()` with the resolver:
+
+```rust
+    /// The registry directory, wherever it has to live to survive logout.
+    /// See `choose_registry_root`.
+    pub fn dir() -> anyhow::Result<PathBuf> {
+        Ok(Self::dir_at(&resolve_registry_root()?.base))
+    }
+```
+
+Extend `crates/oxutrm-host/src/lib.rs`:
+
+```rust
+pub use registry::{
+    check_socket_path_length, choose_registry_root, entry_is_stale, linger_enabled, now_unix,
+    pid_alive, process_start_unix, read_root_env, resolve_registry_root, Registry,
+    RegistryGuard, RegistryRoot, RegistryRootKind, RootEnv, SessionMeta, META_FILE,
+    PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, SOCK_FILE,
+};
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test registry_root -- --test-threads 4`
+Expected: PASS, 8 tests.
+
+- [ ] **Step 5: Check the resolver against this machine**
+
+Run:
+
+```bash
+loginctl show-user "$(id -u)" --property=Linger; echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+```
+
+Read the answer and predict which branch the resolver takes. If `Linger=no`,
+the registry belongs in `$HOME/.local/state/oxutrm`, and Task 16's manual check
+must find it there.
+
+- [ ] **Step 6: Run the whole suite, lint and commit**
+
+```bash
+cargo test --jobs 4 -p oxutrm-host -- --test-threads 4
+cargo clippy --all-targets --jobs 4 -- -D warnings
+git add crates/oxutrm-host
+git commit -m "feat(host): keep the registry somewhere that survives logout
+
+systemd destroys /run/user/<uid> with the last login session, which would
+strand a detached session with no socket and no registry entry. Without
+lingering, sessions are recorded in \$HOME/.local/state/oxutrm instead,
+and the user is told why.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: `daemonize()` — the descriptor that must not survive
 
 **Files:**
 - Create: `crates/oxutrm-host/src/daemon.rs`
@@ -1703,7 +2339,7 @@ fn main() {
     // The descriptor for this file is opened after the enumeration above, so
     // it does not appear in the listing.
     let mut f = std::fs::File::create(&report).expect("create the report");
-    write!(f, "{}\n", lines.join("\n")).expect("write the report");
+    writeln!(f, "{}", lines.join("\n")).expect("write the report");
 }
 ```
 
@@ -1866,7 +2502,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Async signalling over tokio streams, and the fake `ssh`
+### Task 9: Async signalling over tokio streams, and the fake `ssh`
 
 **Files:**
 - Create: `crates/oxutrm-host/src/ndjson.rs`
@@ -1979,8 +2615,9 @@ mod tests {
         rt().block_on(async {
             let line = format!(
                 concat!(
-                    r#"{{"t":"HostHello","proto":{},"session_id":"00","cert_spki_sha256":"YQ==","#,
-                    r#""psk":"Yg==","candidates":[],"nat_type":"Unknown","bound_port":443}}"#
+                    r#"{{"t":"HostHello","proto":{},"session_id":"00","attach_id":1,"#,
+                    r#""cert_spki_sha256":"YQ==","psk":"Yg==","candidates":[],"#,
+                    r#""nat_type":"Unknown","bound_port":443,"detachable":true}}"#
                 ),
                 PROTO_VERSION + 1
             );
@@ -2075,6 +2712,7 @@ Expected: PASS, 5 new tests.
 //! | mode             | behaviour                                          |
 //! |------------------|----------------------------------------------------|
 //! | `ok` (default)   | banner, HostHello, expects ClientHello, Established |
+//! | `tied`           | as `ok`, but `detachable: false` and rung `SshTunnel` |
 //! | `skew`           | banner, HostHello one protocol version ahead        |
 //! | `missing_binary` | banner, "command not found" on stderr, exit 127     |
 //! | `ssh_failed`     | banner, an ssh error on stderr, exit 255            |
@@ -2109,15 +2747,22 @@ fn main() {
     }
 
     let proto = if mode == "skew" { PROTO_VERSION + 1 } else { PROTO_VERSION };
+    // A rung-4 session is the one case that cannot detach (spec §5.5).
+    let detachable = mode != "tied";
     let hello = Signal::HostHello {
         proto,
         session_id: std::env::var("OXUTRM_FAKE_SSH_ID")
             .unwrap_or_else(|_| "00112233445566778899aabbccddeeff".to_string()),
+        attach_id: std::env::var("OXUTRM_FAKE_SSH_ATTACH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
         cert_spki_sha256: "Y2VydGZpbmdlcnByaW50".to_string(),
         psk: std::env::var("OXUTRM_FAKE_SSH_PSK").unwrap_or_else(|_| "cHNrYnl0ZXM=".to_string()),
         candidates: Vec::new(),
         nat_type: NatType::Unknown,
         bound_port: 443,
+        detachable,
     };
     write_signal(&mut out, &hello).expect("write HostHello");
 
@@ -2131,7 +2776,9 @@ fn main() {
 
     let established = Signal::Established {
         path: PathDescription {
-            rung: Rung::SshTunnel,
+            // The invariant the client relies on: SshTunnel means not
+            // detachable, and nothing else does.
+            rung: if detachable { Rung::StunPunch } else { Rung::SshTunnel },
             local: "127.0.0.1:1".parse().unwrap(),
             remote: "127.0.0.1:2".parse().unwrap(),
             probes_sent: 0,
@@ -2166,7 +2813,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 9: The SSH wrapper — spawning, handshaking, and failing usefully
+### Task 10: The SSH wrapper — spawning, handshaking, and failing usefully
 
 **Files:**
 - Create: `crates/oxutrm-host/src/ssh.rs`
@@ -2174,8 +2821,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Test: `crates/oxutrm-host/tests/ssh_bootstrap.rs`
 
 **Interfaces:**
-- Consumes: `read_signal_async`, `write_signal_async` (Task 8); the
-  `oxutrm-fake-ssh` fixture (Task 8); `oxutrm_proto::{Signal, ProtoError,
+- Consumes: `read_signal_async`, `write_signal_async` (Task 9); the
+  `oxutrm-fake-ssh` fixture (Task 9); `oxutrm_proto::{Signal, ProtoError,
   TerminalCaps, TermSize, PathDescription, NatType, Candidate, PROTO_VERSION}`.
 - Produces:
   ```rust
@@ -2212,11 +2859,15 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   #[derive(Clone, Debug)]
   pub struct Bootstrap {
       pub session_id: String,
+      /// The attach generation this client is in (spec §8.5).
+      pub attach_id: u64,
       pub psk_b64: String,
       pub cert_spki_b64: String,
       pub bound_port: u16,
       pub host_candidates: Vec<Candidate>,
       pub host_nat_type: NatType,
+      /// False when the session is tied to this ssh connection (rung 4).
+      pub detachable: bool,
       pub path: PathDescription,
   }
 
@@ -2272,9 +2923,12 @@ fn bootstraps_through_a_login_banner() {
     rt().block_on(async {
         let cmd = fake()
             .with_env("OXUTRM_FAKE_SSH_MODE", "ok")
-            .with_env("OXUTRM_FAKE_SSH_ID", "0123456789abcdef0123456789abcdef");
+            .with_env("OXUTRM_FAKE_SSH_ID", "0123456789abcdef0123456789abcdef")
+            .with_env("OXUTRM_FAKE_SSH_ATTACH", "4");
         let (link, boot) = bootstrap(&cmd, caps(), size()).await.expect("bootstrap");
         assert_eq!(boot.session_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(boot.attach_id, 4, "the generation must reach the client");
+        assert!(boot.detachable);
         assert_eq!(boot.bound_port, 443);
         assert_eq!(boot.path.rtt_ms, 1);
         link.finish().await.expect("clean finish");
@@ -2347,6 +3001,23 @@ fn version_skew_reaches_the_caller_loudly() {
             }
             other => panic!("expected a VersionMismatch, got {other:?}"),
         }
+    });
+}
+
+/// A rung-4 session tells the client at handshake time that it cannot be
+/// reattached, so the status line can say so (spec §10.3).
+#[test]
+fn a_tied_session_announces_that_it_cannot_detach() {
+    rt().block_on(async {
+        let cmd = fake().with_env("OXUTRM_FAKE_SSH_MODE", "tied");
+        let (link, boot) = bootstrap(&cmd, caps(), size()).await.expect("bootstrap");
+        assert!(!boot.detachable, "rung 4 must admit it dies with ssh");
+        assert_eq!(
+            boot.path.rung,
+            oxutrm_proto::Rung::SshTunnel,
+            "not detachable and SshTunnel go together"
+        );
+        link.finish().await.expect("clean finish");
     });
 }
 
@@ -2587,12 +3258,18 @@ impl SignalLink {
 #[derive(Clone, Debug)]
 pub struct Bootstrap {
     pub session_id: String,
+    /// Which attach generation this is (spec §8.5). M4 scopes the sync
+    /// counters to it; M3 only carries it.
+    pub attach_id: u64,
     /// base64. Held in memory only, never written anywhere.
     pub psk_b64: String,
     pub cert_spki_b64: String,
     pub bound_port: u16,
     pub host_candidates: Vec<Candidate>,
     pub host_nat_type: NatType,
+    /// False when the session is tied to this ssh connection (rung 4) and can
+    /// never be reattached. The status line must say so (spec §10.3).
+    pub detachable: bool,
     pub path: PathDescription,
 }
 
@@ -2608,25 +3285,30 @@ pub async fn bootstrap(
     let mut link = SignalLink::spawn(cmd).await?;
 
     let hello = link.recv().await?;
-    let (session_id, cert_spki_b64, psk_b64, host_candidates, host_nat_type, bound_port) =
-        match hello {
-            Signal::HostHello {
-                session_id,
-                cert_spki_sha256,
-                psk,
-                candidates,
-                nat_type,
-                bound_port,
-                ..
-            } => (session_id, cert_spki_sha256, psk, candidates, nat_type, bound_port),
-            Signal::Failed { reason } => return Err(SshError::Refused { reason }),
-            other => {
-                return Err(SshError::Unexpected {
-                    expected: "HostHello",
-                    got: format!("{other:?}"),
-                })
-            }
-        };
+    let hello = match hello {
+        Signal::HostHello { .. } => hello,
+        Signal::Failed { reason } => return Err(SshError::Refused { reason }),
+        other => {
+            return Err(SshError::Unexpected {
+                expected: "HostHello",
+                got: format!("{other:?}"),
+            })
+        }
+    };
+    let Signal::HostHello {
+        session_id,
+        attach_id,
+        cert_spki_sha256: cert_spki_b64,
+        psk: psk_b64,
+        candidates: host_candidates,
+        nat_type: host_nat_type,
+        bound_port,
+        detachable,
+        ..
+    } = hello
+    else {
+        unreachable!("matched HostHello above")
+    };
 
     link.send(&Signal::ClientHello {
         proto: PROTO_VERSION,
@@ -2645,11 +3327,13 @@ pub async fn bootstrap(
                     link,
                     Bootstrap {
                         session_id,
+                        attach_id,
                         psk_b64,
                         cert_spki_b64,
                         bound_port,
                         host_candidates,
                         host_nat_type,
+                        detachable,
                         path,
                     },
                 ))
@@ -2679,7 +3363,7 @@ pub use ssh::{bootstrap, Bootstrap, SignalLink, SshCommand, SshError};
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-host --test ssh_bootstrap -- --test-threads 4`
-Expected: PASS, 7 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Lint and commit**
 
@@ -2696,7 +3380,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 10: Key material, fresh per attach, never on disk
+### Task 11: Key material, fresh per attach, never on disk
 
 **Files:**
 - Create: `crates/oxutrm-host/src/keys.rs`
@@ -2908,7 +3592,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 11: The `Session` and its lifecycle
+### Task 12: The `Session` and its lifecycle
 
 **Files:**
 - Create: `crates/oxutrm-host/src/session.rs`
@@ -2917,7 +3601,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `SessionMeta`, `RegistryGuard`, `now_unix` (Tasks 4-6);
-  `KeyMaterial`, `new_session_id` (Task 10);
+  `KeyMaterial`, `new_session_id` (Task 11);
   `oxutrm_proto::{Signal, TermSize, NatType, PathDescription, Rung, PROTO_VERSION}`.
 - Produces:
   ```rust
@@ -2940,24 +3624,46 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
       pub size: TermSize,
       /// `None` means never, which is the default (spec §9.3).
       pub idle_timeout: Option<std::time::Duration>,
+      /// False only for a rung-4 session, which cannot detach (Task 14).
+      pub detachable: bool,
   }
   impl Default for SessionConfig;
   pub fn default_shell() -> String;
 
+  /// Sequence numbers restart at 1 on both sides at every attach.
+  pub const FIRST_SEQ: u64 = 1;
+  /// 0 is the full-state sentinel, so it is never a live sequence number.
+  pub const FULL_STATE_BASE: u64 = 0;
+
   #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-  pub enum SessionEnd { ShellExited(i32), IdleTimeout }
+  pub enum SessionEnd { ShellExited(i32), IdleTimeout, LinkClosed }
 
   pub struct Session { /* private */ }
   impl Session {
       pub fn create(cfg: SessionConfig, shell: Box<dyn ShellHandle>) -> Session;
       pub fn id(&self) -> &str;
       pub fn meta(&self) -> &SessionMeta;
-      pub fn attach_count(&self) -> u64;
+      /// The current attach generation; 0 before the first attach.
+      pub fn attach_id(&self) -> u64;
       pub fn set_size(&mut self, size: TermSize);
       pub fn refresh_pid(&mut self);
-      pub fn publish(&self, root: &std::path::Path) -> anyhow::Result<RegistryGuard>;
+      /// Registers the session and **keeps** the guard, so the registry entry
+      /// lives exactly as long as the session and `meta.json` can be rewritten
+      /// when `attach_id` changes.
+      pub fn publish(&mut self, root: &std::path::Path) -> anyhow::Result<()>;
+      pub fn registry_dir(&self) -> Option<&std::path::Path>;
+      pub fn socket_path(&self) -> Option<std::path::PathBuf>;
+      pub fn meta_path(&self) -> Option<std::path::PathBuf>;
       pub fn begin_attach(&mut self) -> KeyMaterial;
       pub fn host_hello(&self, keys: &KeyMaterial) -> Signal;
+      pub fn out_seq(&self) -> u64;
+      pub fn in_seq(&self) -> u64;
+      pub fn set_in_seq(&mut self, seq: u64);
+      pub fn next_out_seq(&mut self) -> u64;
+      pub fn must_send_full_state(&self) -> bool;
+      pub fn note_full_state_sent(&mut self);
+      /// Restart both counters at `FIRST_SEQ`. Called by `begin_attach`.
+      pub fn reset_sync(&mut self);
       pub fn note_activity(&mut self, now: std::time::Instant);
       pub fn poll_end(&mut self, now: std::time::Instant) -> Option<SessionEnd>;
   }
@@ -2978,6 +3684,7 @@ mod tests {
             shell: "/bin/bash".to_string(),
             size: TermSize { cols: 80, rows: 24 },
             idle_timeout: None,
+            detachable: true,
         }
     }
 
@@ -2988,7 +3695,50 @@ mod tests {
         assert_eq!(s.meta().pid, std::process::id());
         assert_eq!(s.meta().shell, "/bin/bash");
         assert_eq!(s.meta().size, TermSize { cols: 80, rows: 24 });
-        assert_eq!(s.attach_count(), 0);
+        assert_eq!(s.attach_id(), 0, "0 means never attached");
+        assert!(s.meta().detachable, "an ordinary session outlives its ssh");
+    }
+
+    #[test]
+    fn a_new_session_starts_at_sequence_one_owing_a_full_state() {
+        let s = Session::create(cfg(), Box::new(StubShell::running()));
+        assert_eq!(s.out_seq(), FIRST_SEQ, "0 is the full-state sentinel");
+        assert_eq!(s.in_seq(), FULL_STATE_BASE);
+        assert!(s.must_send_full_state());
+    }
+
+    #[test]
+    fn every_attach_restarts_the_sequence_numbers() {
+        let mut s = Session::create(cfg(), Box::new(StubShell::running()));
+        let _first = s.begin_attach();
+        assert_eq!(s.next_out_seq(), 1);
+        assert_eq!(s.next_out_seq(), 2);
+        s.note_full_state_sent();
+        s.set_in_seq(17);
+        assert!(!s.must_send_full_state());
+
+        // Reattaching brings a client that has seen nothing at all.
+        let _second = s.begin_attach();
+        assert_eq!(
+            s.out_seq(),
+            FIRST_SEQ,
+            "the counters must restart, or the host diffs against a state the \
+             new client never held"
+        );
+        assert_eq!(s.in_seq(), FULL_STATE_BASE);
+        assert!(
+            s.must_send_full_state(),
+            "the first datagram of every attach is a full state"
+        );
+    }
+
+    #[test]
+    fn reset_sync_is_idempotent() {
+        let mut s = Session::create(cfg(), Box::new(StubShell::running()));
+        s.reset_sync();
+        s.reset_sync();
+        assert_eq!(s.out_seq(), FIRST_SEQ);
+        assert!(s.must_send_full_state());
     }
 
     #[test]
@@ -3062,7 +3812,7 @@ mod tests {
             "spec 11: a stolen psk from an earlier attach must not reattach"
         );
         assert_ne!(first.cert_spki_sha256(), second.cert_spki_sha256());
-        assert_eq!(s.attach_count(), 2);
+        assert_eq!(s.attach_id(), 2, "spec §8.5: the generation counts up");
     }
 
     #[test]
@@ -3070,11 +3820,15 @@ mod tests {
         let mut s = Session::create(cfg(), Box::new(StubShell::running()));
         let keys = s.begin_attach();
         match s.host_hello(&keys) {
-            Signal::HostHello { proto, session_id, psk, cert_spki_sha256, .. } => {
+            Signal::HostHello {
+                proto, session_id, attach_id, psk, cert_spki_sha256, detachable, ..
+            } => {
                 assert_eq!(proto, PROTO_VERSION);
                 assert_eq!(session_id, s.id());
+                assert_eq!(attach_id, 1, "the first attach is generation 1");
                 assert_eq!(psk, keys.psk_b64());
                 assert_eq!(cert_spki_sha256, keys.cert_spki_b64());
+                assert!(detachable);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -3084,12 +3838,42 @@ mod tests {
     fn publishing_writes_the_registry_entry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = crate::Registry::dir_at(tmp.path());
-        let s = Session::create(cfg(), Box::new(StubShell::running()));
-        let guard = s.publish(&root).expect("publish");
-        assert_eq!(guard.dir(), root.join(s.id()));
+        let mut s = Session::create(cfg(), Box::new(StubShell::running()));
+        s.publish(&root).expect("publish");
+        assert_eq!(s.registry_dir().expect("published"), root.join(s.id()));
         let listed = crate::Registry::list_in(&root).expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, s.id());
+        assert_eq!(listed[0].attach_id, 0, "not attached yet");
+    }
+
+    #[test]
+    fn attaching_rewrites_the_generation_on_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = crate::Registry::dir_at(tmp.path());
+        let mut s = Session::create(cfg(), Box::new(StubShell::running()));
+        s.publish(&root).expect("publish");
+
+        let _first = s.begin_attach();
+        assert_eq!(crate::Registry::list_in(&root).expect("list")[0].attach_id, 1);
+        let _second = s.begin_attach();
+        assert_eq!(
+            crate::Registry::list_in(&root).expect("list")[0].attach_id,
+            2,
+            "meta.json records the CURRENT generation, not the first one"
+        );
+    }
+
+    #[test]
+    fn dropping_a_published_session_removes_its_registry_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = crate::Registry::dir_at(tmp.path());
+        let dir = {
+            let mut s = Session::create(cfg(), Box::new(StubShell::running()));
+            s.publish(&root).expect("publish");
+            s.registry_dir().expect("published").to_path_buf()
+        };
+        assert!(!dir.exists(), "the guard belongs to the session now");
     }
 
     #[test]
@@ -3098,7 +3882,7 @@ mod tests {
         let root = crate::Registry::dir_at(tmp.path());
         let mut s = Session::create(cfg(), Box::new(StubShell::running()));
         s.set_size(TermSize { cols: 200, rows: 60 });
-        let _guard = s.publish(&root).expect("publish");
+        s.publish(&root).expect("publish");
         let listed = crate::Registry::list_in(&root).expect("list");
         assert_eq!(listed[0].size, TermSize { cols: 200, rows: 60 });
     }
@@ -3168,6 +3952,9 @@ pub struct SessionConfig {
     /// `None` means never. That is the default, and it is the point of the
     /// product: staying detached for a week must cost nothing (spec §9.3).
     pub idle_timeout: Option<Duration>,
+    /// False only for a rung-4 session, which tunnels QUIC through the ssh
+    /// connection and therefore cannot close those descriptors (Task 14).
+    pub detachable: bool,
 }
 
 impl Default for SessionConfig {
@@ -3176,9 +3963,16 @@ impl Default for SessionConfig {
             shell: default_shell(),
             size: TermSize { cols: 80, rows: 24 },
             idle_timeout: None,
+            detachable: true,
         }
     }
 }
+
+/// Sequence numbers restart at 1 on both sides at every attach.
+pub const FIRST_SEQ: u64 = 1;
+/// 0 is reserved as the full-state sentinel: a diff with `base == 0` is a
+/// full state, so 0 is never a live sequence number.
+pub const FULL_STATE_BASE: u64 = 0;
 
 pub fn default_shell() -> String {
     match std::env::var("SHELL") {
@@ -3191,6 +3985,9 @@ pub fn default_shell() -> String {
 pub enum SessionEnd {
     ShellExited(i32),
     IdleTimeout,
+    /// The ssh connection this session is tied to went away. Only a rung-4
+    /// session can end this way; a detached session has no such tie (Task 14).
+    LinkClosed,
 }
 
 pub struct Session {
@@ -3198,7 +3995,16 @@ pub struct Session {
     cfg: SessionConfig,
     shell: Box<dyn ShellHandle>,
     last_activity: Instant,
-    attaches: u64,
+    /// Kept for the session's whole life: dropping it removes the registry
+    /// entry, and holding it is what lets `attach_id` be rewritten on attach.
+    registry: Option<RegistryGuard>,
+    /// The sequence number of the next screen state this session will send.
+    out_seq: u64,
+    /// The highest input sequence number applied from the current client.
+    in_seq: u64,
+    /// Cleared by every attach: the first datagram of an attach is always a
+    /// full state, because the new client has seen nothing.
+    sent_full_state: bool,
 }
 
 impl Session {
@@ -3209,13 +4015,20 @@ impl Session {
             created_unix: now_unix(),
             shell: cfg.shell.clone(),
             size: cfg.size,
+            // The first `begin_attach` makes this 1; spec §8.5 numbers attach
+            // generations from 1, so 0 means "never attached".
+            attach_id: 0,
+            detachable: cfg.detachable,
         };
         Session {
             meta,
             cfg,
             shell,
             last_activity: Instant::now(),
-            attaches: 0,
+            registry: None,
+            out_seq: FIRST_SEQ,
+            in_seq: FULL_STATE_BASE,
+            sent_full_state: false,
         }
     }
 
@@ -3227,12 +4040,14 @@ impl Session {
         &self.meta
     }
 
-    pub fn attach_count(&self) -> u64 {
-        self.attaches
+    /// The current attach generation (spec §8.5). 0 before the first attach.
+    pub fn attach_id(&self) -> u64 {
+        self.meta.attach_id
     }
 
     pub fn set_size(&mut self, size: TermSize) {
         self.meta.size = size;
+        self.sync_meta();
     }
 
     /// After `daemonize()` the pid has changed twice. `--list` prunes on this
@@ -3241,15 +4056,86 @@ impl Session {
         self.meta.pid = std::process::id();
     }
 
-    pub fn publish(&self, root: &Path) -> anyhow::Result<RegistryGuard> {
-        RegistryGuard::register_in(root, &self.meta)
+    /// Register in the registry and keep the guard for the session's life.
+    pub fn publish(&mut self, root: &Path) -> anyhow::Result<()> {
+        self.registry = Some(RegistryGuard::register_in(root, &self.meta)?);
+        Ok(())
+    }
+
+    pub fn registry_dir(&self) -> Option<&Path> {
+        self.registry.as_ref().map(|g| g.dir())
+    }
+
+    pub fn socket_path(&self) -> Option<std::path::PathBuf> {
+        self.registry.as_ref().map(|g| g.socket_path())
+    }
+
+    pub fn meta_path(&self) -> Option<std::path::PathBuf> {
+        self.registry.as_ref().map(|g| g.meta_path())
+    }
+
+    /// Rewrite `meta.json` after `attach_id` or the size changes. Best effort:
+    /// after daemonizing there is nowhere to report a failure, and a stale
+    /// `attach_id` on disk is not worth ending a live session over.
+    fn sync_meta(&self) {
+        if let Some(guard) = &self.registry {
+            let _ = guard.update(&self.meta);
+        }
     }
 
     /// Fresh key material for one attach (spec §11: fresh keys per attach).
+    ///
+    /// Also restarts the sequence numbers. A reattaching client is a *new*
+    /// peer that has seen nothing, so continuing the old counters would have
+    /// the host diff against a state the client never held.
+    ///
+    /// Fresh keys per attach also rule out QUIC 0-RTT resumption: a new
+    /// certificate on every attach means there is no usable resumption ticket. That is the
+    /// deliberate trade, not an oversight — do not add a 0-RTT path here.
     pub fn begin_attach(&mut self) -> KeyMaterial {
-        self.attaches += 1;
+        // Spec §8.5: the host bumps the generation so both ends agree which
+        // one they are in, and `meta.json` records the current value so a
+        // second `--attach` can be told from the one already being served.
+        self.meta.attach_id += 1;
         self.last_activity = Instant::now();
+        self.reset_sync();
+        self.sync_meta();
         KeyMaterial::fresh()
+    }
+
+    /// Restart both counters at `FIRST_SEQ` and require a full state next.
+    pub fn reset_sync(&mut self) {
+        self.out_seq = FIRST_SEQ;
+        self.in_seq = FULL_STATE_BASE;
+        self.sent_full_state = false;
+    }
+
+    pub fn out_seq(&self) -> u64 {
+        self.out_seq
+    }
+
+    pub fn in_seq(&self) -> u64 {
+        self.in_seq
+    }
+
+    pub fn set_in_seq(&mut self, seq: u64) {
+        self.in_seq = seq;
+    }
+
+    /// Take the current outgoing sequence number and move on.
+    pub fn next_out_seq(&mut self) -> u64 {
+        let seq = self.out_seq;
+        self.out_seq = self.out_seq.saturating_add(1);
+        seq
+    }
+
+    /// True until this attach has been sent one full state.
+    pub fn must_send_full_state(&self) -> bool {
+        !self.sent_full_state
+    }
+
+    pub fn note_full_state_sent(&mut self) {
+        self.sent_full_state = true;
     }
 
     /// The first line of the signalling exchange.
@@ -3260,11 +4146,13 @@ impl Session {
         Signal::HostHello {
             proto: PROTO_VERSION,
             session_id: self.meta.session_id.clone(),
+            attach_id: self.meta.attach_id,
             cert_spki_sha256: keys.cert_spki_b64(),
             psk: keys.psk_b64(),
             candidates: Vec::new(),
             nat_type: NatType::Unknown,
             bound_port: 0,
+            detachable: self.meta.detachable,
         }
     }
 
@@ -3294,14 +4182,15 @@ Add to `crates/oxutrm-host/src/lib.rs`:
 ```rust
 pub mod session;
 pub use session::{
-    default_shell, Session, SessionConfig, SessionEnd, ShellHandle, StubShell,
+    default_shell, Session, SessionConfig, SessionEnd, ShellHandle, StubShell, FIRST_SEQ,
+    FULL_STATE_BASE,
 };
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-host -- --test-threads 4`
-Expected: PASS, 10 new tests.
+Expected: PASS, 13 new tests.
 
 - [ ] **Step 5: Lint and commit**
 
@@ -3315,7 +4204,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 12: The session socket — serving attaches and relaying into them
+### Task 13: The session socket — serving attaches and relaying into them
 
 **Files:**
 - Modify: `crates/oxutrm-host/src/session.rs`
@@ -3323,8 +4212,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Test: `crates/oxutrm-host/tests/attach.rs`
 
 **Interfaces:**
-- Consumes: `Session`, `SessionEnd`, `SessionConfig`, `StubShell` (Task 11);
-  `read_signal_async`, `write_signal_async` (Task 8); `KeyMaterial` (Task 10).
+- Consumes: `Session`, `SessionEnd`, `SessionConfig`, `StubShell` (Task 12);
+  `read_signal_async`, `write_signal_async` (Task 9); `KeyMaterial` (Task 11).
 - Produces:
   ```rust
   /// Serve one attaching client: fresh keys, HostHello out, ClientHello in,
@@ -3337,6 +4226,13 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   pub async fn run_session(
       session: Session, listener: tokio::net::UnixListener,
   ) -> anyhow::Result<SessionEnd>;
+
+  /// The same loop, plus a shutdown future. A rung-4 session passes the death
+  /// of its ssh connection here; a detached session passes `pending()`.
+  pub async fn run_session_until<F>(
+      session: Session, listener: tokio::net::UnixListener, shutdown: F,
+  ) -> anyhow::Result<SessionEnd>
+  where F: std::future::Future<Output = ()> + Send;
 
   /// The `--attach` side: connect to a live session's socket and pump bytes
   /// between it and the SSH pipes, flushing every chunk.
@@ -3357,7 +4253,10 @@ session — do the parsing.
 ```rust
 use std::time::Duration;
 
-use oxutrm_host::session::{relay_attach, run_session, SessionConfig, SessionEnd, StubShell};
+use oxutrm_host::session::{
+    relay_attach, run_session, run_session_until, serve_attach, SessionConfig, SessionEnd,
+    StubShell, FIRST_SEQ,
+};
 use oxutrm_host::{read_signal_async, write_signal_async, Registry, Session};
 use oxutrm_proto::{NatType, Signal, TermSize, TerminalCaps, PROTO_VERSION};
 use tokio::io::BufReader;
@@ -3409,9 +4308,9 @@ async fn attach_once(sock: &std::path::Path) -> String {
 async fn reattaching_generates_fresh_key_material_every_time() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
-    let session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
-    let guard = session.publish(&root).expect("publish");
-    let sock = guard.socket_path();
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let sock = session.socket_path().expect("published");
     let listener = UnixListener::bind(&sock).expect("bind");
 
     let runner = tokio::spawn(run_session(session, listener));
@@ -3431,11 +4330,10 @@ async fn reattaching_generates_fresh_key_material_every_time() {
 async fn the_session_ends_when_the_shell_exits() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
-    let mut cfg = SessionConfig::default();
-    cfg.idle_timeout = None;
-    let session = Session::create(cfg, Box::new(StubShell::exited(7)));
-    let guard = session.publish(&root).expect("publish");
-    let listener = UnixListener::bind(guard.socket_path()).expect("bind");
+    let cfg = SessionConfig { idle_timeout: None, ..SessionConfig::default() };
+    let mut session = Session::create(cfg, Box::new(StubShell::exited(7)));
+    session.publish(&root).expect("publish");
+    let listener = UnixListener::bind(session.socket_path().expect("published")).expect("bind");
 
     let end = tokio::time::timeout(Duration::from_secs(5), run_session(session, listener))
         .await
@@ -3448,11 +4346,13 @@ async fn the_session_ends_when_the_shell_exits() {
 async fn an_idle_session_times_out_when_configured_to() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
-    let mut cfg = SessionConfig::default();
-    cfg.idle_timeout = Some(Duration::from_millis(200));
-    let session = Session::create(cfg, Box::new(StubShell::running()));
-    let guard = session.publish(&root).expect("publish");
-    let listener = UnixListener::bind(guard.socket_path()).expect("bind");
+    let cfg = SessionConfig {
+        idle_timeout: Some(Duration::from_millis(200)),
+        ..SessionConfig::default()
+    };
+    let mut session = Session::create(cfg, Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let listener = UnixListener::bind(session.socket_path().expect("published")).expect("bind");
 
     let end = tokio::time::timeout(Duration::from_secs(5), run_session(session, listener))
         .await
@@ -3465,9 +4365,9 @@ async fn an_idle_session_times_out_when_configured_to() {
 async fn the_relay_carries_a_whole_handshake_between_pipes_and_the_socket() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
-    let session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
-    let guard = session.publish(&root).expect("publish");
-    let sock = guard.socket_path();
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let sock = session.socket_path().expect("published");
     let listener = UnixListener::bind(&sock).expect("bind");
     let runner = tokio::spawn(run_session(session, listener));
 
@@ -3479,9 +4379,9 @@ async fn the_relay_carries_a_whole_handshake_between_pipes_and_the_socket() {
         relay_attach(&sock_for_relay, relay_input, relay_output).await
     });
 
+    // The client writes into one duplex and reads from the other, because the
+    // relay carries each direction separately.
     let (cr, mut cw) = tokio::io::split(client_side);
-    let mut cr = BufReader::new(cr);
-    // The relay only carries bytes, so the client reads from the other duplex.
     drop(cr);
     let mut down = BufReader::new(client_reads);
 
@@ -3498,6 +4398,75 @@ async fn the_relay_carries_a_whole_handshake_between_pipes_and_the_socket() {
 
     relay.abort();
     runner.abort();
+}
+
+/// Correction from review: `seq` restarts at 1 on both sides at every attach,
+/// and 0 stays reserved as the full-state sentinel. A reattaching client has
+/// seen nothing, so the host must not continue the previous attach's counters.
+#[tokio::test]
+async fn a_second_attach_over_the_socket_restarts_the_sequence_numbers() {
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+
+    for round in 0..2 {
+        let (host_side, client_side) = UnixStream::pair().expect("socketpair");
+        let client = tokio::spawn(async move {
+            let (r, mut w) = client_side.into_split();
+            let mut r = BufReader::new(r);
+            let hello = read_signal_async(&mut r, false).await.expect("HostHello");
+            write_signal_async(&mut w, &client_hello()).await.expect("ClientHello");
+            let _ = read_signal_async(&mut r, false).await.expect("Established");
+            hello
+        });
+        serve_attach(&mut session, host_side).await.expect("serve the attach");
+        let hello = client.await.expect("client task");
+        assert!(matches!(hello, Signal::HostHello { .. }));
+
+        assert_eq!(
+            session.out_seq(),
+            FIRST_SEQ,
+            "round {round}: the outgoing counter must restart at 1"
+        );
+        assert_eq!(session.in_seq(), 0, "round {round}: 0 is the sentinel");
+        assert!(
+            session.must_send_full_state(),
+            "round {round}: the first datagram of an attach is a full state"
+        );
+
+        // Pretend this attach then ran for a while, so the next round has
+        // something to reset.
+        session.next_out_seq();
+        session.next_out_seq();
+        session.note_full_state_sent();
+        session.set_in_seq(99);
+    }
+}
+
+/// A rung-4 session ends when its ssh connection does (Task 14).
+#[tokio::test]
+async fn a_shutdown_signal_ends_the_loop_as_link_closed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let listener = UnixListener::bind(session.socket_path().expect("published")).expect("bind");
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(async move {
+        run_session_until(session, listener, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send(()).expect("signal shutdown");
+
+    let end = tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the loop must return promptly")
+        .expect("join")
+        .expect("run_session_until");
+    assert_eq!(end, SessionEnd::LinkClosed);
 }
 
 #[tokio::test]
@@ -3517,9 +4486,8 @@ async fn attaching_to_a_dead_session_fails_with_a_useful_message() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --jobs 4 -p oxutrm-host --test attach -- --test-threads 4`
-Expected: FAIL to compile — `cannot find function run_session`. Add
-`tokio = { version = "1", features = ["macros", "rt-multi-thread"] }` to
-`[dev-dependencies]` so `#[tokio::test]` is available.
+Expected: FAIL to compile — `cannot find function run_session`. The
+`#[tokio::test]` dev-dependency was added in Task 7.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -3555,8 +4523,17 @@ pub async fn serve_attach(session: &mut Session, stream: UnixStream) -> anyhow::
         other => anyhow::bail!("expected a ClientHello, got {other:?}"),
     }
 
+    // M3 has no ladder, so this rung is a stand-in. It still honours the one
+    // invariant that matters: `SshTunnel` means not detachable and vice versa
+    // (spec §4.3, §5.5), so the client's warning is never wrong. M4 reports
+    // the rung ICE actually nominated.
+    let rung = if session.meta().detachable {
+        Rung::StunPunch
+    } else {
+        Rung::SshTunnel
+    };
     let path = PathDescription {
-        rung: Rung::SshTunnel,
+        rung,
         local: "127.0.0.1:0".parse().expect("literal address"),
         remote: "127.0.0.1:0".parse().expect("literal address"),
         probes_sent: 0,
@@ -3582,11 +4559,27 @@ const LIFECYCLE_TICK: Duration = Duration::from_millis(100);
 /// Attaches are served one at a time. §9.5 keeps multiple simultaneous clients
 /// possible in the state model, but M3 does not implement them.
 pub async fn run_session(
-    mut session: Session,
+    session: Session,
     listener: UnixListener,
 ) -> anyhow::Result<SessionEnd> {
+    // A detached session has nothing left to be shut down by: that is the
+    // whole point of daemonizing.
+    run_session_until(session, listener, std::future::pending()).await
+}
+
+/// The lifecycle loop, with a shutdown future for sessions that are tied to
+/// something outside themselves (Task 14).
+pub async fn run_session_until<F>(
+    mut session: Session,
+    listener: UnixListener,
+    shutdown: F,
+) -> anyhow::Result<SessionEnd>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
     let mut tick = tokio::time::interval(LIFECYCLE_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -3601,6 +4594,7 @@ pub async fn run_session(
                     return Ok(end);
                 }
             }
+            _ = &mut shutdown => return Ok(SessionEnd::LinkClosed),
         }
     }
 }
@@ -3658,15 +4652,15 @@ Extend the re-export in `crates/oxutrm-host/src/lib.rs`:
 
 ```rust
 pub use session::{
-    default_shell, relay_attach, run_session, serve_attach, Session, SessionConfig, SessionEnd,
-    ShellHandle, StubShell,
+    default_shell, relay_attach, run_session, run_session_until, serve_attach, Session,
+    SessionConfig, SessionEnd, ShellHandle, StubShell, FIRST_SEQ, FULL_STATE_BASE,
 };
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --jobs 4 -p oxutrm-host --test attach -- --test-threads 4`
-Expected: PASS, 5 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Run the whole suite, lint and commit**
 
@@ -3683,3 +4677,1045 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
+
+### Task 14: Sessions that cannot detach (rung 4)
+
+**Files:**
+- Modify: `crates/oxutrm-host/src/session.rs`
+- Modify: `crates/oxutrm-host/src/lib.rs`
+- Test: `crates/oxutrm-host/tests/tied_session.rs`
+
+**Interfaces:**
+- Consumes: `Session`, `SessionConfig`, `SessionEnd::LinkClosed`,
+  `run_session_until`, `StubShell` (Tasks 12-13); `RegistryGuard`,
+  `Registry::list_in` (Tasks 5-6).
+- Produces:
+  ```rust
+  /// Resolves when the ssh connection carrying a rung-4 session goes away:
+  /// its end of the pipe closes and reading returns end of file.
+  pub async fn link_closed<R>(r: R)
+  where R: tokio::io::AsyncRead + Unpin;
+  ```
+  plus the rule, enforced by `SessionConfig::detachable` and
+  `SessionMeta::detachable`, that a non-detachable session never calls
+  `daemonize()`.
+
+**The contradiction this resolves.** Spec §4.3 says close *every* inherited SSH
+descriptor before daemonizing. Spec §5.5 says a rung-4 session runs QUIC inside
+a stream on that same SSH connection for the session's life. Both cannot hold:
+a rung-4 session that daemonized would sever its own transport at the moment it
+detached. The resolution, which overrides §4.3 for this one case:
+
+- a rung-4 session **does not daemonize**;
+- it is **not detach-capable**, and says so in `SessionMeta::detachable`, because
+  "reattach later" is a promise oxutrm must not make falsely;
+- it runs in the foreground for as long as its SSH connection lives;
+- its registry entry is **removed when that connection dies** — by
+  `RegistryGuard`'s `Drop` on the clean path, and by `Registry::list`'s pid
+  pruning on the unclean one, when SIGHUP kills the process before it can
+  unwind.
+
+M3 has no rungs at all, so nothing selects rung 4 yet. This task builds the
+mechanism and the honesty; M4 chooses it when no UDP path forms.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/oxutrm-host/tests/tied_session.rs`:
+
+```rust
+use std::time::Duration;
+
+use oxutrm_host::session::{link_closed, run_session_until, SessionConfig, SessionEnd, StubShell};
+use oxutrm_host::{Registry, Session};
+
+#[tokio::test]
+async fn a_tied_session_is_marked_as_not_detachable() {
+    let cfg = SessionConfig { detachable: false, ..SessionConfig::default() };
+    let mut session = Session::create(cfg, Box::new(StubShell::running()));
+    assert!(
+        !session.meta().detachable,
+        "a rung-4 session must admit it cannot be reattached later"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    session.publish(&root).expect("publish");
+    let listed = Registry::list_in(&root).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert!(
+        !listed[0].detachable,
+        "--list must be able to tell the user this one dies with ssh"
+    );
+}
+
+#[tokio::test]
+async fn the_registry_entry_goes_when_the_ssh_connection_does() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    let cfg = SessionConfig { detachable: false, ..SessionConfig::default() };
+    let mut session = Session::create(cfg, Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let dir = session.registry_dir().expect("published").to_path_buf();
+    let listener = tokio::net::UnixListener::bind(session.socket_path().expect("published")).expect("bind");
+
+    // Stand in for the ssh channel: while the write half lives, so does the
+    // connection.
+    let (ssh_side, session_side) = tokio::io::duplex(1024);
+
+    let runner = tokio::spawn(async move {
+        // The session owns its registry guard, so returning from here drops
+        // both — exactly as `serve` does when it returns.
+        run_session_until(session, listener, link_closed(session_side)).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(dir.exists(), "the session is live, so its entry is on disk");
+
+    // ssh goes away.
+    drop(ssh_side);
+
+    let end = tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the session must notice promptly")
+        .expect("join")
+        .expect("run_session_until");
+    assert_eq!(end, SessionEnd::LinkClosed);
+    assert!(!dir.exists(), "the entry must not outlive the connection");
+    assert!(Registry::list_in(&root).expect("list").is_empty());
+}
+
+#[tokio::test]
+async fn traffic_on_the_link_is_not_mistaken_for_it_closing() {
+    let (mut ssh_side, session_side) = tokio::io::duplex(1024);
+    let watcher = tokio::spawn(link_closed(session_side));
+
+    use tokio::io::AsyncWriteExt;
+    ssh_side.write_all(b"rung 4 carries real traffic here\n").await.expect("write");
+    ssh_side.flush().await.expect("flush");
+
+    // Still open: the watcher must not have resolved.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!watcher.is_finished(), "bytes are not a hangup");
+
+    drop(ssh_side);
+    tokio::time::timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("must resolve at end of file")
+        .expect("join");
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test tied_session -- --test-threads 4`
+Expected: FAIL to compile — `cannot find function link_closed`.
+
+- [ ] **Step 3: Write the implementation**
+
+Append to `crates/oxutrm-host/src/session.rs`:
+
+```rust
+/// Resolves when the ssh connection carrying a rung-4 session goes away.
+///
+/// A rung-4 session tunnels QUIC through a stream on the ssh connection
+/// (spec §5.5), so it can neither daemonize nor outlive that connection: it
+/// would sever its own transport. Instead it watches the channel, and ends
+/// when the far end closes it.
+///
+/// Bytes arriving are traffic, not a hangup. M3 has no rung 4 to feed, so it
+/// discards them; M4 hands this stream to the tunnelled transport instead.
+pub async fn link_closed<R>(mut r: R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 1024];
+    loop {
+        match r.read(&mut buf).await {
+            // End of file, or a broken pipe: either way, ssh is gone.
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
+        }
+    }
+}
+```
+
+Extend the re-export in `crates/oxutrm-host/src/lib.rs`:
+
+```rust
+pub use session::{
+    default_shell, link_closed, relay_attach, run_session, run_session_until, serve_attach,
+    Session, SessionConfig, SessionEnd, ShellHandle, StubShell, FIRST_SEQ, FULL_STATE_BASE,
+};
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test tied_session -- --test-threads 4`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Run the whole suite, lint and commit**
+
+```bash
+cargo test --jobs 4 -p oxutrm-host -- --test-threads 4
+cargo clippy --all-targets --jobs 4 -- -D warnings
+git add crates/oxutrm-host
+git commit -m "feat(host): rung-4 sessions run tied to ssh and never daemonize
+
+A session whose QUIC runs inside the ssh connection cannot close those
+descriptors. It stays in the foreground, is marked detachable=false, and
+its registry entry goes when the connection does.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 15: Prove that no key material reaches the disk
+
+**Files:**
+- Test: `crates/oxutrm-host/tests/no_keys_on_disk.rs`
+- Modify: only if the test fails — the fix belongs wherever the leak is.
+
+**Interfaces:**
+- Consumes: `Session`, `SessionConfig`, `StubShell`, `run_session` (Tasks 12-13);
+  `Registry` (Task 4); `read_signal_async`, `write_signal_async` (Task 9).
+- Produces: no new API. This task produces a **guard**: the spec's flat claim in
+  §9.2 and §11 — "no key material is ever written to the registry, or to disk at
+  all" — becomes a test that fails if anybody ever writes one there.
+
+**How it works:** create a session, attach twice, capture both psks from the
+`HostHello` messages, then walk every file under the registry root and search
+each one for the psk in all three shapes it could plausibly be written: the raw
+32 bytes, the base64 text, and lowercase hex. The same check runs over
+`meta.json` explicitly, because that is the file most likely to grow a field
+somebody thinks is harmless.
+
+- [ ] **Step 1: Write the test**
+
+`crates/oxutrm-host/tests/no_keys_on_disk.rs`:
+
+```rust
+use base64::Engine;
+use oxutrm_host::session::{run_session, SessionConfig, StubShell};
+use oxutrm_host::{read_signal_async, write_signal_async, Registry, Session};
+use oxutrm_proto::{NatType, Signal, TermSize, TerminalCaps, PROTO_VERSION};
+use tokio::io::BufReader;
+use tokio::net::{UnixListener, UnixStream};
+
+fn client_hello() -> Signal {
+    Signal::ClientHello {
+        proto: PROTO_VERSION,
+        candidates: Vec::new(),
+        nat_type: NatType::Unknown,
+        caps: TerminalCaps {
+            truecolor: true,
+            colors: 16_777_216,
+            bracketed_paste: true,
+            mouse_sgr: true,
+            osc52: true,
+            term_name: "xterm-256color".to_string(),
+        },
+        size: TermSize { cols: 80, rows: 24 },
+    }
+}
+
+/// One full attach. Returns the base64 psk the session offered.
+async fn attach(sock: &std::path::Path) -> String {
+    let stream = UnixStream::connect(sock).await.expect("connect");
+    let (r, mut w) = stream.into_split();
+    let mut r = BufReader::new(r);
+    let psk = match read_signal_async(&mut r, false).await.expect("HostHello") {
+        Signal::HostHello { psk, .. } => psk,
+        other => panic!("expected HostHello, got {other:?}"),
+    };
+    write_signal_async(&mut w, &client_hello()).await.expect("ClientHello");
+    let _ = read_signal_async(&mut r, false).await.expect("Established");
+    psk
+}
+
+/// Every regular file under `dir`, recursively.
+fn every_file(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            every_file(&path, out);
+        } else if meta.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn no_psk_ever_appears_anywhere_under_the_registry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+    let sock = session.socket_path().expect("published");
+    let listener = UnixListener::bind(&sock).expect("bind");
+    let runner = tokio::spawn(run_session(session, listener));
+
+    let psks = vec![attach(&sock).await, attach(&sock).await];
+    assert_ne!(psks[0], psks[1], "the fixture is wrong if the psks match");
+
+    // Give anything that might flush a file after the handshake its chance.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut files = Vec::new();
+    every_file(&root, &mut files);
+    assert!(!files.is_empty(), "the registry has no files; the test proves nothing");
+    assert!(
+        files.iter().any(|p| p.ends_with("meta.json")),
+        "meta.json must be among the files searched: {files:?}"
+    );
+
+    for psk_b64 in &psks {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(psk_b64)
+            .expect("the psk is base64");
+        assert_eq!(raw.len(), 32, "spec 4.2: 32 bytes");
+        let hex = hex_of(&raw);
+
+        for path in &files {
+            let bytes = std::fs::read(path).expect("read a registry file");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(psk_b64.as_str()),
+                "{} contains the psk in base64",
+                path.display()
+            );
+            assert!(
+                !text.to_lowercase().contains(&hex),
+                "{} contains the psk in hex",
+                path.display()
+            );
+            assert!(
+                !bytes.windows(raw.len()).any(|w| w == raw.as_slice()),
+                "{} contains the raw psk bytes",
+                path.display()
+            );
+        }
+    }
+
+    runner.abort();
+}
+
+#[tokio::test]
+async fn meta_json_holds_only_the_documented_fields() {
+    // A second line of defence: a key cannot leak into meta.json through a
+    // field nobody noticed, because there is no field nobody noticed.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Registry::dir_at(tmp.path());
+    let mut session = Session::create(SessionConfig::default(), Box::new(StubShell::running()));
+    session.publish(&root).expect("publish");
+
+    let text = std::fs::read_to_string(session.meta_path().expect("published")).expect("read meta.json");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("meta.json is json");
+    let object = value.as_object().expect("meta.json is an object");
+    let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "attach_id",
+            "created_unix",
+            "detachable",
+            "pid",
+            "session_id",
+            "shell",
+            "size"
+        ],
+        "spec §9.2 fixes the contents of meta.json; a new field needs a new review"
+    );
+}
+```
+
+- [ ] **Step 2: Run the test**
+
+Run: `cargo test --jobs 4 -p oxutrm-host --test no_keys_on_disk -- --test-threads 4`
+Expected: PASS, 2 tests.
+
+If either fails, **the leak is the bug** — find whatever wrote the key and stop
+it writing. Do not weaken the search, do not exclude a file, do not relax the
+field list.
+
+- [ ] **Step 3: Lint and commit**
+
+```bash
+cargo clippy --all-targets --jobs 4 -- -D warnings
+git add crates/oxutrm-host
+git commit -m "test(host): assert no key material ever reaches the registry
+
+Walks every file under the registry and searches for the psk raw, base64
+and hex encoded, for two successive attaches.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 16: The binary — three roles, one dispatch
+
+**Files:**
+- Modify: `src/main.rs`
+- Modify: `Cargo.toml` (the binary depends on `oxutrm-host` and `oxutrm-proto`)
+- Test: `tests/cli.rs`
+
+**Interfaces:**
+- Consumes: everything above —
+  `oxutrm_host::{bootstrap, daemonize, relay_attach, run_session, Registry,
+  Session, SessionConfig, SshCommand, StubShell}`,
+  `oxutrm_proto::{read_signal, write_signal, Signal, TermSize, TerminalCaps,
+  PROTO_VERSION}`.
+- Produces: the command-line surface.
+  ```
+  oxutrm <ssh-target>              # wrapper: create a session and report the path
+  oxutrm host --serve              # remote: create a session, detach, serve it
+  oxutrm host --serve --idle-timeout <seconds|never>
+  oxutrm host --list               # remote: one line per live session
+  oxutrm host --attach <id>        # remote: relay signalling into a live session
+  ```
+
+**Ordering rules `host --serve` must obey**, each of which is a bug if broken:
+
+1. Handshake on stdin/stdout with **blocking** `std::io`, before any runtime
+   exists. `daemonize()` forks, and `fork` copies only the calling thread; a
+   tokio runtime built beforehand wakes in the child with no workers.
+2. `daemonize()` only after `HostHello` and `Established` are flushed — it
+   closes those pipes.
+3. `refresh_pid()` then `publish()` **after** daemonizing, so `meta.json` holds
+   the pid `--list` will prune on.
+4. Bind the Unix socket after daemonizing, because daemonizing closes every
+   descriptor above 2.
+5. Build the tokio runtime last.
+6. `--no-detach` skips rules 2 and 3 entirely: a tied session keeps its ssh
+   descriptors, keeps its own pid, and ends when the connection does (Task 14).
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/cli.rs` at the repository root:
+
+```rust
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_oxutrm")
+}
+
+fn client_hello_line() -> String {
+    let caps = oxutrm_proto::TerminalCaps {
+        truecolor: true,
+        colors: 16_777_216,
+        bracketed_paste: true,
+        mouse_sgr: true,
+        osc52: true,
+        term_name: "xterm-256color".to_string(),
+    };
+    let hello = oxutrm_proto::Signal::ClientHello {
+        proto: oxutrm_proto::PROTO_VERSION,
+        candidates: Vec::new(),
+        nat_type: oxutrm_proto::NatType::Unknown,
+        caps,
+        size: oxutrm_proto::TermSize { cols: 90, rows: 30 },
+    };
+    let mut buf = Vec::new();
+    oxutrm_proto::write_signal(&mut buf, &hello).expect("encode");
+    String::from_utf8(buf).expect("utf8")
+}
+
+/// Run one `oxutrm host --serve`, complete the handshake, and return the
+/// session id it reported. The process is daemonized by the time this returns.
+fn serve_once(state_dir: &std::path::Path) -> String {
+    let mut child = Command::new(bin())
+        .args(["host", "--serve", "--idle-timeout", "30"])
+        // OXUTRM_STATE_DIR is the explicit override, so the test does not
+        // depend on whether lingering happens to be on for this user.
+        .env("OXUTRM_STATE_DIR", state_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn host --serve");
+
+    let mut out = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stdin = child.stdin.take().expect("stdin");
+
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read HostHello");
+    let id = match oxutrm_proto::parse_signal_line(&line).expect("HostHello") {
+        oxutrm_proto::Signal::HostHello { session_id, .. } => session_id,
+        other => panic!("expected HostHello, got {other:?}"),
+    };
+
+    stdin.write_all(client_hello_line().as_bytes()).expect("write ClientHello");
+    stdin.flush().expect("flush");
+
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read Established");
+    assert!(
+        matches!(
+            oxutrm_proto::parse_signal_line(&line).expect("Established"),
+            oxutrm_proto::Signal::Established { .. }
+        ),
+        "expected Established, got {line}"
+    );
+
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "the serve process must exit 0 after detaching");
+    id
+}
+
+fn list(state_dir: &std::path::Path) -> String {
+    let out = Command::new(bin())
+        .args(["host", "--list"])
+        .env("OXUTRM_STATE_DIR", state_dir)
+        .output()
+        .expect("run host --list");
+    assert!(out.status.success(), "list failed: {out:?}");
+    String::from_utf8(out.stdout).expect("utf8")
+}
+
+fn wait_for_socket(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the session never bound {}", path.display());
+}
+
+#[test]
+fn list_is_empty_when_nothing_is_running() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert_eq!(list(tmp.path()).trim(), "");
+}
+
+#[test]
+fn a_session_survives_the_process_ssh_waited_on_and_can_be_reattached() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let id = serve_once(tmp.path());
+    let root = tmp.path().join("oxutrm");
+    let sock = root.join(&id).join("sock");
+    wait_for_socket(&sock);
+
+    let listed = list(tmp.path());
+    assert!(listed.contains(&id), "the live session must be listed: {listed:?}");
+    assert!(
+        listed.contains("detachable"),
+        "--list must say whether a session survives ssh: {listed:?}"
+    );
+
+    // Reattach through the CLI and check the psk differs from the first one.
+    let mut child = Command::new(bin())
+        .args(["host", "--attach", &id])
+        .env("OXUTRM_STATE_DIR", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn host --attach");
+    let mut out = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stdin = child.stdin.take().expect("stdin");
+
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read HostHello");
+    let (attached_id, psk) = match oxutrm_proto::parse_signal_line(&line).expect("HostHello") {
+        oxutrm_proto::Signal::HostHello { session_id, psk, .. } => (session_id, psk),
+        other => panic!("expected HostHello, got {other:?}"),
+    };
+    assert_eq!(attached_id, id, "reattach must reach the same session");
+    assert!(!psk.is_empty());
+
+    stdin.write_all(client_hello_line().as_bytes()).expect("write ClientHello");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read Established");
+    assert!(line.contains("Established"), "{line}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Clean up the daemonized session so the test leaves nothing behind.
+    let meta = std::fs::read_to_string(root.join(&id).join("meta.json")).expect("meta");
+    let meta: serde_json::Value = serde_json::from_str(&meta).expect("json");
+    let pid = meta["pid"].as_u64().expect("pid") as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+}
+
+/// A rung-4 session never daemonizes: it stays in the foreground for as long
+/// as its ssh connection lives, and takes its registry entry with it.
+#[test]
+fn a_tied_session_stays_in_the_foreground_and_ends_with_its_pipes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(bin())
+        .args(["host", "--serve", "--no-detach"])
+        .env("OXUTRM_STATE_DIR", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn host --serve --no-detach");
+
+    let mut out = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stdin = child.stdin.take().expect("stdin");
+
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read HostHello");
+    let id = match oxutrm_proto::parse_signal_line(&line).expect("HostHello") {
+        oxutrm_proto::Signal::HostHello { session_id, .. } => session_id,
+        other => panic!("expected HostHello, got {other:?}"),
+    };
+    stdin.write_all(client_hello_line().as_bytes()).expect("write ClientHello");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read Established");
+    assert!(line.contains("Established"), "{line}");
+
+    let sock = tmp.path().join("oxutrm").join(&id).join("sock");
+    wait_for_socket(&sock);
+
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "a tied session must NOT daemonize: the process stays in the foreground"
+    );
+    let listed = list(tmp.path());
+    assert!(
+        listed.contains("tied to ssh"),
+        "--list must not promise reattachment it cannot keep: {listed:?}"
+    );
+
+    // Spec §9.2: a session recorded as not detachable cannot be attached to.
+    let refused = Command::new(bin())
+        .args(["host", "--attach", &id])
+        .env("OXUTRM_STATE_DIR", tmp.path())
+        .output()
+        .expect("run host --attach");
+    assert!(!refused.status.success(), "a tied session must refuse an attach");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("cannot be reattached"),
+        "the refusal must explain itself: {stderr}"
+    );
+
+    // ssh goes away.
+    drop(stdin);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "a closed link is a clean end, got {status:?}");
+    assert_eq!(
+        list(tmp.path()).trim(),
+        "",
+        "the entry must not outlive the connection"
+    );
+}
+
+#[test]
+fn attaching_to_an_unknown_id_fails_with_a_message_naming_list() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(bin())
+        .args(["host", "--attach", "ffffffffffffffffffffffffffffffff"])
+        .env("OXUTRM_STATE_DIR", tmp.path())
+        .output()
+        .expect("run host --attach");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--list"), "unhelpful error: {stderr}");
+}
+
+#[test]
+fn an_unknown_host_flag_is_rejected_rather_than_ignored() {
+    let out = Command::new(bin())
+        .args(["host", "--frobnicate"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--frobnicate"), "{stderr}");
+}
+```
+
+Add to the root `Cargo.toml`:
+
+```toml
+[dependencies]
+oxutrm-host = { path = "crates/oxutrm-host" }
+oxutrm-proto = { path = "crates/oxutrm-proto" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+libc = "0.2"
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test --jobs 4 --test cli -- --test-threads 4`
+Expected: FAIL — `host --serve` is not a subcommand yet, so `serve_once` panics
+reading the HostHello.
+
+- [ ] **Step 3: Write the implementation**
+
+In `src/main.rs`, keep whatever subcommand arms M1 added and add the `host` arm.
+Any first argument that is not a known subcommand is an ssh target.
+
+```rust
+use std::io::Write;
+
+use anyhow::{bail, Context, Result};
+use oxutrm_host::session::{
+    link_closed, relay_attach, run_session, run_session_until, SessionConfig, StubShell,
+};
+use oxutrm_host::{
+    bootstrap, check_socket_path_length, daemonize, resolve_registry_root, Registry, Session,
+    SshCommand,
+};
+use oxutrm_proto::{read_signal, write_signal, PathDescription, Signal, TermSize, TerminalCaps};
+
+const USAGE: &str = "\
+oxutrm — a remote terminal that survives bad networks
+
+  oxutrm <ssh-target>                     start or reattach a session
+  oxutrm host --serve                     (remote) create a session and detach
+  oxutrm host --serve --idle-timeout N    end the session after N idle seconds
+  oxutrm host --serve --no-detach         (remote) stay tied to this ssh
+                                          connection: needed when the transport
+                                          runs inside it, and the session then
+                                          cannot be reattached later
+  oxutrm host --list                      (remote) list live sessions
+  oxutrm host --attach <id>               (remote) reattach to a live session
+
+The `host` forms are what oxutrm runs over ssh for you. You do not normally
+type them yourself.
+";
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.first().map(String::as_str) {
+        None | Some("-h") | Some("--help") => {
+            print!("{USAGE}");
+            return;
+        }
+        Some("host") => host_main(&args[1..]),
+        Some(target) => wrapper_main(target),
+    };
+    if let Err(e) = result {
+        eprintln!("oxutrm: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// The local half: drive ssh, then report what we got.
+///
+/// M4 continues from here into the QUIC client. M3 stops once the link is
+/// reported, because there is no transport to hand it to yet.
+fn wrapper_main(target: &str) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+    runtime.block_on(async {
+        let cmd = SshCommand::serve(target);
+        // M4 replaces these with oxutrm_term::detect_caps() and the real
+        // terminal size from oxutrm_client::terminal_size().
+        let caps = TerminalCaps {
+            truecolor: std::env::var("COLORTERM").map(|v| v.contains("truecolor")).unwrap_or(false),
+            colors: 256,
+            bracketed_paste: true,
+            mouse_sgr: true,
+            osc52: true,
+            term_name: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        };
+        let size = TermSize { cols: 80, rows: 24 };
+        let (link, boot) = bootstrap(&cmd, caps, size).await?;
+        println!("oxutrm  session {}  ·  {}", boot.session_id, describe(&boot.path));
+        link.finish().await?;
+        Ok(())
+    })
+}
+
+/// One line about the path we got. M4 replaces this with
+/// `oxutrm_client::status_line`, which knows about every rung.
+fn describe(path: &PathDescription) -> String {
+    format!("{:?}  ·  {} ms  ·  mtu {}", path.rung, path.rtt_ms, path.mtu)
+}
+
+fn host_main(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("--serve") => serve(&args[1..]),
+        Some("--list") => list(),
+        Some("--attach") => {
+            let id = args.get(1).context("`host --attach` needs a session id")?;
+            attach(id)
+        }
+        Some(other) => bail!("unknown option {other} for `oxutrm host`\n\n{USAGE}"),
+        None => bail!("`oxutrm host` needs one of --serve, --list, --attach\n\n{USAGE}"),
+    }
+}
+
+fn parse_idle_timeout(args: &[String]) -> Result<Option<std::time::Duration>> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--idle-timeout" {
+            let value = args.get(i + 1).context("--idle-timeout needs a value")?;
+            if value == "never" {
+                return Ok(None);
+            }
+            let secs: u64 = value
+                .parse()
+                .with_context(|| format!("--idle-timeout wants seconds or `never`, got {value}"))?;
+            return Ok(Some(std::time::Duration::from_secs(secs)));
+        }
+        i += 1;
+    }
+    // Spec 9.3: the default is never.
+    Ok(None)
+}
+
+fn serve(args: &[String]) -> Result<()> {
+    // A rung-4 session tunnels its transport through this very ssh connection,
+    // so it can neither daemonize nor outlive it (Task 14).
+    let detachable = !args.iter().any(|a| a == "--no-detach");
+    let cfg = SessionConfig {
+        idle_timeout: parse_idle_timeout(args)?,
+        detachable,
+        ..SessionConfig::default()
+    };
+
+    // Where sessions are recorded depends on whether the runtime directory
+    // survives logout. Warn before detaching, while stderr still travels back
+    // through ssh to the user.
+    let root = resolve_registry_root()?;
+    if let Some(warning) = &root.warning {
+        eprintln!("{warning}");
+    }
+    let dir = Registry::dir_at(&root.base);
+
+    let mut session = Session::create(cfg, Box::new(StubShell::running()));
+
+    // Checked before the handshake, because after daemonizing there is nobody
+    // left to tell.
+    check_socket_path_length(&Registry::socket_path_in(&dir, session.id()))?;
+
+    // 1. Handshake on the ssh pipes with blocking io, before any thread exists.
+    //    `daemonize` forks, and fork copies only the calling thread.
+    {
+        let keys = session.begin_attach();
+        let mut stdout = std::io::stdout();
+        write_signal(&mut stdout, &session.host_hello(&keys)).context("sending HostHello")?;
+        stdout.flush().context("flushing HostHello")?;
+
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        match read_signal(&mut input).context("reading ClientHello")? {
+            Signal::ClientHello { size, .. } => session.set_size(size),
+            other => bail!("expected a ClientHello, got {other:?}"),
+        }
+
+        let path = PathDescription {
+            rung: oxutrm_proto::Rung::SshTunnel,
+            local: "127.0.0.1:0".parse().expect("literal"),
+            remote: "127.0.0.1:0".parse().expect("literal"),
+            probes_sent: 0,
+            nat_type: oxutrm_proto::NatType::Unknown,
+            rtt_ms: 0,
+            mtu: 1200,
+        };
+        write_signal(&mut stdout, &Signal::Established { path }).context("sending Established")?;
+        stdout.flush().context("flushing Established")?;
+        // `keys` is dropped here, zeroing the psk.
+    }
+
+    // 2. Detach, unless the transport is inside this ssh connection.
+    //    Everything above this line spoke on descriptors that are about to be
+    //    closed.
+    if detachable {
+        daemonize().context("detaching from ssh")?;
+        // 3. The pid changed twice; the registry must hold the new one.
+        session.refresh_pid();
+    }
+    session.publish(&dir).context("publishing the session")?;
+
+    // 4. Bind after detaching: daemonize closes every descriptor above 2.
+    let socket_path = session.socket_path().expect("published");
+
+    // 5. The runtime comes last, because forking with threads does not work.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+    runtime.block_on(async move {
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .with_context(|| format!("binding {}", socket_path.display()))?;
+        if detachable {
+            run_session(session, listener).await
+        } else {
+            // stdin is still the ssh channel here, precisely because this
+            // branch did not daemonize. When ssh goes, so does the session.
+            run_session_until(session, listener, link_closed(tokio::io::stdin())).await
+        }
+    })?;
+
+    // The session — and with it the registry guard it owns — is dropped by the
+    // block above, which removes the registry entry.
+    Ok(())
+}
+
+fn list() -> Result<()> {
+    for meta in Registry::list()? {
+        println!(
+            "{}  pid {}  {}  {}x{}  {}",
+            meta.session_id,
+            meta.pid,
+            meta.shell,
+            meta.size.cols,
+            meta.size.rows,
+            // Never promise a reattach that cannot be honoured.
+            if meta.detachable { "detachable" } else { "tied to ssh" }
+        );
+    }
+    Ok(())
+}
+
+fn attach(id: &str) -> Result<()> {
+    // Spec §9.2: a session recorded as `detachable: false` is listed as such
+    // and cannot be attached to. Refuse here rather than letting the relay
+    // connect to a socket whose session is about to die with its own ssh.
+    let meta = Registry::list()?
+        .into_iter()
+        .find(|m| m.session_id == id)
+        .with_context(|| {
+            format!("no live session {id} — `oxutrm host --list` shows what is running")
+        })?;
+    if !meta.detachable {
+        bail!(
+            "session {id} is tied to its own ssh connection (rung 4) and cannot be \
+             reattached. It ends when that connection does. Start a new session instead."
+        );
+    }
+    let sock = Registry::socket_path(id)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+    runtime.block_on(async move {
+        relay_attach(&sock, tokio::io::stdin(), tokio::io::stdout()).await
+    })
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test --jobs 4 --test cli -- --test-threads 4`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Try it by hand against localhost**
+
+Run, with a working `ssh localhost`:
+
+```bash
+cargo build --jobs 4
+PATH="$PWD/target/debug:$PATH" ./target/debug/oxutrm localhost
+ssh localhost "$PWD/target/debug/oxutrm host --list"
+```
+
+Where the registry landed depends on Task 7's decision. With lingering off,
+expect a warning on the first command and the session recorded under
+`$HOME/.local/state/oxutrm/`; with lingering on, `/run/user/$(id -u)/oxutrm/`
+and no warning.
+
+Expected: the first command prints one `oxutrm  session <id>  ·  StunPunch …`
+line and returns; the second lists that session, still alive after the first
+command's ssh connection closed. That is the whole milestone in two commands.
+
+- [ ] **Step 6: Run the whole suite, lint and commit**
+
+```bash
+cargo test --jobs 4 -- --test-threads 4
+cargo clippy --all-targets --jobs 4 -- -D warnings
+git add Cargo.toml src/main.rs tests/cli.rs
+git commit -m "feat: wire the three roles into one binary
+
+oxutrm <target> creates a session over ssh; host --serve detaches and
+keeps it; host --list and host --attach find it again.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Milestone check
+
+After Task 16 the following must all be true. Verify each before declaring M3
+done.
+
+- [ ] `cargo test --jobs 4 -- --test-threads 4` is green across the workspace.
+- [ ] `cargo clippy --all-targets --jobs 4 -- -D warnings` is silent.
+- [ ] `tests/daemonize.rs` proves no inherited descriptor survives detaching.
+- [ ] `tests/no_keys_on_disk.rs` proves no psk reaches the registry.
+- [ ] `tests/attach.rs` proves the second attach's psk differs from the first's.
+- [ ] `tests/ssh_bootstrap.rs` proves a login banner does not break the
+      bootstrap, and that a missing remote binary, a missing local `ssh` and an
+      `ssh` failure are three distinct errors.
+- [ ] A version-skewed peer fails loudly, in the parser, in both readers, and
+      through the wrapper.
+- [ ] A session created over `ssh localhost` is still listed after that ssh
+      connection has closed.
+- [ ] `tests/registry_root.rs` proves a session stays discoverable after the
+      runtime directory is destroyed, and that the fallback warning names
+      `loginctl enable-linger`.
+- [ ] `tests/tied_session.rs` and the `--no-detach` CLI test prove a rung-4
+      session never daemonizes, is listed as `tied to ssh`, and takes its
+      registry entry with it when the connection closes.
+- [ ] A second attach restarts the sequence numbers at 1 and owes a full
+      state, proved both as a unit test and over the session socket.
+- [ ] Nothing anywhere enables QUIC 0-RTT. Spec §6 states it is deliberately
+      not used: a fresh certificate and psk per attach mean no usable resumption
+      ticket ever exists, so there is nothing here for a later reader to "fix".
+- [ ] `HostHello` and `meta.json` both carry `attach_id`, and it increments on
+      every attach — including the copy on disk, so a second `--attach` can be
+      told from the one already being served.
+- [ ] `--list` prunes an entry whose pid has been recycled, not merely one whose
+      pid is gone.
+- [ ] `oxutrm host --attach` refuses a session recorded as `detachable: false`,
+      with a message that explains why.
+
+## What M4 picks up from here
+
+- `serve_attach` and `bootstrap` both stop at `Established` with a stub
+  `PathDescription`. M4 inserts the ICE ladder between the hellos and that
+  message, exchanging `CandidateUpdate` on the link both sides keep open.
+- `KeyMaterial::fresh()` stops inventing a certificate fingerprint and takes the
+  real one from `oxutrm_net::generate_cert()`.
+- `StubShell` is replaced by an implementation over `oxutrm_term::HostTerm`.
+- `Session` holds one terminal today. Spec §15 requires it to become a
+  collection before phase D; M4 is the right moment, while it still has exactly
+  one member.
+- `Session::begin_attach` resets `out_seq`, `in_seq` and `sent_full_state`. M4
+  resets the `oxutrm-sync` `Sender` and `Receiver` at that same call, and sends
+  a full state as the first datagram of every attach.
+- Rung 4 selects `SessionConfig::detachable = false` and the `--no-detach` path.
+  Every other rung detaches. M4 must also refuse to *offer* reattachment for a
+  session whose `SessionMeta::detachable` is false.
+- **0-RTT stays off.** Fresh certificate and psk per attach (spec §11) leave no
+  usable resumption ticket. Spec §6 lists 0-RTT as a QUIC benefit; that line does
+  not survive §11, and nobody should "fix" it later.
