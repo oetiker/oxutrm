@@ -33,6 +33,7 @@
 //! would let a stranger advance our state machine and would make oxutrm usable
 //! as a reflector.
 
+mod birthday;
 mod candidates;
 mod config;
 mod demux;
@@ -40,12 +41,14 @@ mod demuxsock;
 mod der;
 mod discover;
 mod ice;
+mod mapping;
 mod quic;
 mod socketfam;
 mod stunmsg;
 mod stunserver;
 mod tls;
 
+pub use birthday::{BirthdayResult, birthday_blast, guessed_ports};
 pub use candidates::{ice_priority, is_link_local, local_candidates, local_candidates_filtered};
 pub use config::NetConfig;
 pub use demux::{STUN_HEADER_LEN, STUN_MAGIC_COOKIE, is_stun};
@@ -53,6 +56,7 @@ pub use demuxsock::{StunDemuxSocket, StunRx};
 pub use der::{spki_der, spki_sha256};
 pub use discover::{Probe, classify, stun_discover};
 pub use ice::{IceAgent, IceEvent};
+pub use mapping::{PortMapping, default_gateway};
 pub use quic::{ALPN, quic_client, quic_server};
 pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};
 pub use stunmsg::{

@@ -13,7 +13,8 @@ stun_codec.workspace = true
 stunclient.workspace = true
 bytecodec.workspace = true
 crab_nat.workspace = true
-igd-next.workspace = true
+# `aio_tokio` for the async gateway API; the crate is sync-only by default.
+igd-next = { workspace = true, features = ["aio_tokio"] }
 # `net` gives us IPV6_V6ONLY, which std does not expose.
 rustix = { workspace = true, features = ["net"] }
 netdev.workspace = true
