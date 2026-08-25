@@ -144,6 +144,11 @@ impl<S: SyncState> Sender<S> {
 pub struct Receiver<S: SyncState> {
     state: S,
     peer_ack: u64,
+    /// Whether anything from the peer has been applied yet.
+    ///
+    /// Narrows the initial-collision exception in `on_frame` to the one frame
+    /// it exists for.
+    applied_any: bool,
 }
 
 impl<S: SyncState> Receiver<S> {
@@ -151,6 +156,7 @@ impl<S: SyncState> Receiver<S> {
         Receiver {
             state: initial,
             peer_ack: 0,
+            applied_any: false,
         }
     }
 
@@ -185,7 +191,32 @@ impl<S: SyncState> Receiver<S> {
         // sender had already dropped.
         self.peer_ack = self.peer_ack.max(f.ack_state);
 
-        if f.my_state <= self.state.seq() {
+        // Staleness, with one deliberate exception.
+        //
+        // A DIFF must strictly advance the sequence number, or it is a
+        // duplicate and applying it twice would be wrong.
+        //
+        // A FULL STATE (`from_state == 0`) may apply at the number we already
+        // hold, and must. Both ends independently construct an initial state
+        // numbered 1 — the host from the live emulator, the client from a
+        // blank screen — holding completely different content, and a sequence
+        // number says which generation, never which content. Rejecting the
+        // attach's first full state because its number merely EQUALS ours
+        // leaves the client on its own invented screen, and every later diff
+        // then arrives with a base the client never reached.
+        //
+        // Still bounded: a full state older than what we hold is dropped, so a
+        // late one cannot claw the screen backwards.
+        // The exception is exactly as wide as the collision and no wider: it
+        // applies only before anything from the peer has been applied. A
+        // duplicate full state arriving later is a duplicate like any other,
+        // and re-applying it would repaint the screen for nothing.
+        let stale = if f.from_state == 0 && !self.applied_any {
+            f.my_state < self.state.seq()
+        } else {
+            f.my_state <= self.state.seq()
+        };
+        if stale {
             return Ok(false);
         }
 
@@ -205,6 +236,7 @@ impl<S: SyncState> Receiver<S> {
         next.validate()?;
 
         self.state = next;
+        self.applied_any = true;
         self.peer_ack = self.peer_ack.max(f.ack_state);
         Ok(true)
     }
@@ -390,27 +422,104 @@ mod tests {
     /// against an older base than it needs to, and the ring never drains.
     /// Nothing on the happy path shows this, because stale frames appear only
     /// under reordering and loss.
+    /// The sequence-number collision, and the rule that closes it.
+    ///
+    /// Both ends independently construct an initial state numbered 1 — the
+    /// host from the live emulator, the client from a blank screen — holding
+    /// COMPLETELY DIFFERENT content. A sequence number says which generation,
+    /// never which content, so nothing in the protocol notices.
+    ///
+    /// The host's first frame of an attach is a full state (`from_state == 0`)
+    /// precisely so the client's invented state cannot matter. It must
+    /// therefore be applied even though its `my_state` does not EXCEED what the
+    /// receiver holds, because the number it does not exceed was invented
+    /// locally and names a different screen.
+    #[test]
+    fn the_first_full_state_applies_even_though_its_seq_does_not_advance() {
+        let mut host_screen = screen();
+        host_screen.cells[0] = oxutrm_proto::Cell {
+            text: oxutrm_proto::CellText::from("H"),
+            ..oxutrm_proto::Cell::blank()
+        };
+        assert_eq!(host_screen.seq, 1, "the host starts at 1");
+
+        let tx: Sender<ScreenState> = Sender::new(host_screen.clone());
+        // A fresh sender owes a full state: it has heard no ack, so there is
+        // nothing in its ring to diff against.
+        let mut tx = tx;
+        let f = tx
+            .make_frame(0)
+            .expect("make_frame")
+            .expect("a fresh sender owes the peer everything");
+        assert_eq!(
+            f.from_state, 0,
+            "the first frame of an attach must be a full state"
+        );
+        assert_eq!(f.my_state, 1);
+
+        // The client's own blank, also numbered 1, and a different screen.
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+        assert_eq!(rx.state().seq, 1);
+        assert_ne!(rx.state().cells, host_screen.cells);
+
+        assert!(
+            rx.on_frame(&f)
+                .expect("a full state must never be an error"),
+            "the first full state was dropped as stale, so the client kept its \
+             own invented screen and every later diff will mismatch its base"
+        );
+        assert_eq!(rx.state().cells, host_screen.cells);
+    }
+
+    /// The rule is narrow on purpose: only a FULL state may apply without
+    /// advancing the sequence number. A diff at the same number is a genuine
+    /// duplicate and must still be ignored.
+    #[test]
+    fn a_diff_at_the_same_sequence_number_is_still_stale() {
+        let mut tx: Sender<ScreenState> = Sender::new(screen());
+        tx.update(screen());
+        let f = tx.make_frame(0).expect("make_frame").expect("frame");
+
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+        assert!(rx.on_frame(&f).expect("apply"));
+        let seq = rx.state().seq;
+
+        // The same frame again, but rewritten to look like a diff.
+        let mut dup = f.clone();
+        dup.from_state = 1;
+        assert!(
+            !rx.on_frame(&dup).expect("a duplicate is never an error"),
+            "a duplicate diff was applied a second time"
+        );
+        assert_eq!(rx.state().seq, seq);
+    }
+
     #[test]
     fn a_stale_frame_still_advances_the_peers_ack() {
         let mut tx = Sender::new(screen());
-        tx.update(screen());
-        let fresh = tx.make_frame(10).expect("make_frame").expect("frame");
-
         let mut rx = Receiver::new(screen());
-        assert!(
-            rx.on_frame(&fresh).expect("apply"),
-            "the first frame applies"
-        );
+
+        // Sync first, so what follows is a genuine DIFF rather than a full
+        // state — a full state at the same number legitimately applies.
+        let hello = tx.make_frame(1).expect("make_frame").expect("full state");
+        assert_eq!(hello.from_state, 0);
+        rx.on_frame(&hello).expect("apply");
+        tx.on_ack(rx.ack());
+
+        tx.update(screen());
+        let diff = tx.make_frame(10).expect("make_frame").expect("a diff");
+        assert_ne!(diff.from_state, 0, "this must be a diff to test staleness");
+        assert!(rx.on_frame(&diff).expect("apply"), "the diff applies once");
         assert_eq!(rx.peer_ack(), 10);
 
-        // The very same frame again — a duplicate, which the network produces
+        // The very same diff again — a duplicate, which the network produces
         // on its own — but the peer has since acknowledged more of our state.
-        let mut duplicate = fresh.clone();
+        let mut duplicate = diff.clone();
         duplicate.ack_state = 42;
         assert!(
             !rx.on_frame(&duplicate)
                 .expect("a duplicate is never an error"),
-            "a duplicate must not advance the state"
+            "a duplicate diff must not advance the state"
         );
         assert_eq!(
             rx.peer_ack(),
