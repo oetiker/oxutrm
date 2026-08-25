@@ -68,6 +68,7 @@
 | `netdev` | `0.46` | net — default-gateway discovery (`crab_nat` needs the gateway and ships no discovery). Chosen over `/proc/net/route`, which is Linux-only, because §1.2 scopes the project to Unix. |
 | `base64` | `0.22` | proto |
 | `unicode-width` | `0.2` | term, client |
+| `compact_str` | `0.10` | term — `CellText`, inline for <=24 bytes |
 | `proptest` | `1` | sync (dev) |
 | `insta` | `1` | term (dev, snapshots) |
 
@@ -146,6 +147,11 @@ pub enum Signal {
         candidates: Vec<Candidate>,
         nat_type: NatType,
         bound_port: u16,
+        /// False once the session has fallen back to rung 4 (SSH tunnel): it
+        /// cannot close its SSH descriptors, so it never daemonizes and can
+        /// never be reattached. The client needs this at handshake to render
+        /// the connect-time warning.
+        detachable: bool,
     },
     ClientHello {
         proto: u32,
@@ -168,6 +174,9 @@ pub fn read_signal<R: std::io::BufRead>(r: &mut R) -> Result<Signal, ProtoError>
 pub const FLAG_ZSTD: u8 = 0x01;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// FIELD ORDER IS WIRE-SIGNIFICANT. postcard serialises in declaration order,
+/// so reordering these silently breaks interoperability with no useful error.
+/// Do not tidy this struct.
 pub struct Frame {
     pub my_state: u64,
     pub from_state: u64,
@@ -241,8 +250,15 @@ bitflags::bitflags! {
     }
 }
 
+/// Inline for up to 24 bytes, so a cell holding one ASCII char — or one char
+/// plus a combining mark — allocates NOTHING. This matters because the design
+/// keeps a ring of 32 states: with `String` an 80x24 session would hold roughly
+/// 61,000 live heap allocations. Wire encoding is identical (both serialise as
+/// a str), so this alias can be swapped in one line without a protocol change.
+pub type CellText = compact_str::CompactString;
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct Cell { pub text: String, pub fg: Color, pub bg: Color, pub attrs: Attrs }
+pub struct Cell { pub text: CellText, pub fg: Color, pub bg: Color, pub attrs: Attrs }
 impl Default for Cell;                 // " ", Default, Default, empty
 impl Cell { pub fn blank() -> Cell; }
 
@@ -578,6 +594,8 @@ pub async fn quic_client(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// The current attach generation, mirrored from `HostHello.attach_id`.
+    pub attach_id: u64,
     pub pid: u32,
     pub created_unix: u64,
     pub shell: String,
