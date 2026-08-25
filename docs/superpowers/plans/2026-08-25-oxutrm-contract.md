@@ -42,7 +42,7 @@
 | `quinn` | `0.11` | net |
 | `rustls` | whatever `quinn` 0.11 re-exports | net |
 | `rcgen` | `0.13` | net (self-signed cert) |
-| `vt100` | git `https://github.com/Junyi-99/vt100-rust`, **pinned by commit hash**, not by branch | term |
+| `alacritty_terminal` | `0.26` | term — the emulator, on BOTH ends |
 | `rustix` | `1` (features `process`, `termios`, `stdio`, `fs`) | term, host, client |
 | `rustix-openpty` | `0.2` | term |
 | `stun_codec` | `0.4` | net — ALL ICE checks and keepalives |
@@ -65,7 +65,7 @@
 | `sha1` | `0.10` | net (STUN MESSAGE-INTEGRITY is HMAC-SHA1) |
 | `rtnetlink` or `/proc/net/route` parsing | — | net (`crab_nat` needs the gateway address and ships no discovery) |
 | `base64` | `0.22` | proto |
-| `unicode-width` | `0.2` | term, client |
+| `unicode-width` | `0.2` | client |
 | `proptest` | `1` | sync (dev) |
 | `insta` | `1` | term (dev, snapshots) |
 
@@ -133,6 +133,12 @@ pub enum Signal {
     HostHello {
         proto: u32,
         session_id: String,             // hex
+        /// Which attach generation this is. Both `seq` counters reset to 1 at
+        /// every attach, so the two ends must agree on the generation;
+        /// otherwise a host already serving a session cannot tell a second
+        /// `--attach` from the current one. Signalling and meta.json only —
+        /// never per-frame, since each attach is a distinct QUIC connection.
+        attach_id: u64,
         cert_spki_sha256: String,       // base64
         psk: String,                    // base64, 32 bytes
         candidates: Vec<Candidate>,
@@ -268,7 +274,10 @@ impl ScreenState {
     pub fn row(&self, row: u16) -> &[Cell];
 }
 
-/// PTY + vt100 parser. Owns the child process.
+/// PTY + `alacritty_terminal` `Term`. Owns the child process.
+/// Title, bell and OSC 52 arrive through alacritty's `EventListener`.
+/// Scrollback is the crate's own, read by (negative) line index — do NOT
+/// hand-roll a scrollback ring. `Term::resize` genuinely reflows.
 pub struct HostTerm { /* private */ }
 
 impl HostTerm {
@@ -302,7 +311,8 @@ impl HostTerm {
 /// Detect the local terminal's capabilities from the environment.
 pub fn detect_caps() -> TerminalCaps;
 
-/// Derived SOLELY from what vt100 emulates. The client's capabilities must NOT
+/// Derived SOLELY from what `alacritty_terminal` emulates. The client's
+/// capabilities must NOT
 /// influence this: the child's TERM cannot change when a differently-capable
 /// client reattaches, and down-converting here would permanently degrade the
 /// host's state. All capability adaptation happens in the client.
@@ -544,7 +554,10 @@ pub struct SessionMeta {
 pub struct Registry;
 impl Registry {
     pub fn dir() -> anyhow::Result<std::path::PathBuf>;
-    /// Prunes entries whose pid is gone.
+    /// Prunes stale entries. The `$HOME` fallback is a real filesystem, not a
+    /// tmpfs, so a reboot no longer clears them: an entry is stale when the pid
+    /// is gone OR the pid now belongs to an unrelated process, checked against
+    /// the recorded creation time.
     pub fn list() -> anyhow::Result<Vec<SessionMeta>>;
     pub fn socket_path(id: &str) -> anyhow::Result<std::path::PathBuf>;
 }
