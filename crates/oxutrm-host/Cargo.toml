@@ -6,15 +6,34 @@ rust-version.workspace = true
 license.workspace = true
 description = "oxutrm remote half: session registry, daemonizing and PTY supervision"
 
+# Deliberately narrow. The registry and `daemonize` need the wire vocabulary
+# and libc and nothing else, so this crate does not ride on oxutrm-term,
+# oxutrm-sync or oxutrm-net while those are still being written. The later
+# milestones that supervise a PTY and speak QUIC add them back when they are
+# actually used; an unused dependency here would only couple this crate's
+# build to work it does not depend on.
 [dependencies]
-rustix.workspace = true
-tokio.workspace = true
-quinn.workspace = true
+anyhow.workspace = true
+# `param` is added on top of the workspace feature set for
+# `clock_ticks_per_second`, which turns /proc's clock ticks into seconds.
+rustix = { workspace = true, features = ["param"] }
+# Only `daemonize` uses this, for `fork` — which rustix cannot wrap safely,
+# because what is sound after a fork depends on what the process was doing
+# before it.
+libc.workspace = true
+oxutrm-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rand.workspace = true
-anyhow.workspace = true
-oxutrm-proto.workspace = true
-oxutrm-sync.workspace = true
-oxutrm-term.workspace = true
-oxutrm-net.workspace = true
+
+[dev-dependencies]
+# Declared here rather than in [workspace.dependencies] so that adding it does
+# not touch the root manifest, which other crates are being written against.
+tempfile = "3"
+tokio = { workspace = true }
+
+# A test fixture, not part of the product: it daemonizes and then reports what
+# survived, so tests/daemonize.rs can assert against a real detached process
+# rather than a mock. Uncommented once the file exists.
+# [[bin]]
+# name = "oxutrm-daemon-probe"
+# path = "src/bin/oxutrm-daemon-probe.rs"
