@@ -15,7 +15,15 @@ bitflags.workspace = true
 compact_str.workspace = true
 unicode-width.workspace = true
 anyhow.workspace = true
+# `ApplyError` is defined here rather than in oxutrm-sync: sync already depends
+# on this crate for ScreenState, and ScreenState::validate has to return the
+# error, which would be a dependency cycle. oxutrm-sync re-exports it, so
+# `oxutrm_sync::ApplyError` — the contract's spelling — still resolves.
+thiserror.workspace = true
 oxutrm-proto.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# Only to prove the claim that `CellText` encodes byte-identically to a
+# `String`. The crate itself never encodes anything.
+postcard.workspace = true
