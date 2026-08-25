@@ -482,8 +482,9 @@ that somehow obtained the certificate but not the PSK cannot complete ICE.
 > **order** are normative there. This section explains why it carries what it
 > carries.
 
-Every datagram carries three sequence numbers, its position in a fragment set,
-a flags byte, and a payload.
+Every datagram carries three sequence numbers, a flags byte, and a payload —
+and nothing else. There are **no fragment fields**; §7.1.1 explains what replaced
+them.
 
 The **three sequence numbers** are the whole of the sync protocol's bookkeeping,
 and each answers a different question. `my_state` names the state this datagram
@@ -494,10 +495,8 @@ what lets the peer trim its own ring and its own unacknowledged input. Because
 every datagram carries all three, a lost one costs nothing: the next datagram
 re-states the same relationship (§8.1).
 
-**`frag_index` and `frag_count`** place the datagram in its state's fragment set;
-`frag_count == 1` means unfragmented (§7.1.1). Bit 0 of **`flags`** marks a
-zstd-compressed payload, and the payload itself is a slice of the postcard-encoded
-`ScreenDiff` or `InputDiff`.
+Bit 0 of **`flags`** marks a zstd-compressed payload, and the payload itself is
+the postcard-encoded `ScreenDiff` or `InputDiff` — whole, never a slice of one.
 
 **`Frame`'s field order is wire-significant and must not be changed.** `postcard`
 serialises struct fields in declaration order, so reordering them — tidying them
@@ -511,40 +510,56 @@ the order is recorded.
 §8 do not repeat `base` and `target`; there is exactly one place a receiver looks
 for them, so the two can never disagree.
 
-Compression is applied to the whole encoded diff before fragmentation, only when
-it actually shrinks the payload, and the threshold is measured, not assumed. The
-`flags` byte is identical across every fragment of one state.
+Compression is applied to the whole encoded diff, only when it actually shrinks
+the payload, and the threshold is measured, not assumed. Because a frame is never
+split, the compressed size is also what decides which channel carries it
+(§7.1.1).
 
-### 7.1.1 Fragmentation
+### 7.1.1 Choosing a channel by size
 
 A diff is not guaranteed to fit in a datagram. `Connection::max_datagram_size()`
 is on the order of 1200 bytes after overhead, while a full `ScreenState` for
 80×24 with truecolor cells encodes to well over 10 KB — and the full state is
 exactly what §8.2's ring-miss recovery has to send. QUIC datagrams are never
-fragmented by the transport and `send_datagram` rejects an oversized payload with
-`SendDatagramError::TooLarge`, so oxutrm fragments them itself.
+fragmented by the transport, and `send_datagram` rejects an oversized payload
+with `SendDatagramError::TooLarge`.
 
-The encoded diff is split into `frag_count` pieces that each fit
-`max_datagram_size()`, and every piece is sent as its own datagram carrying the
-same `my_state` and `from_state`.
+**A `Frame` is never split.** The size decides which channel carries it:
 
-**A state is applied only when all of its fragments have arrived.** An incomplete
-set is **discarded wholesale** — never partially applied, never held waiting for
-a retransmission, because there are no retransmissions. This is what preserves
-§8.1: the receiver's acknowledged state is unchanged by a lost fragment, so the
-sender's next diff is computed against that same base and therefore *contains*
-everything the dropped set was carrying. Losing one fragment costs exactly one
-send interval, and nothing else.
+- **It fits `max_datagram_size()`** → it goes as a QUIC datagram. Unreliable,
+  unordered, never retransmitted, which is what §8.1 rests on.
+- **It does not fit** → it goes on a **fresh unidirectional QUIC stream**,
+  reliably and in order.
 
-Consequences that follow, and are normative:
+**At most one stream is in flight.** If a newer state becomes current while one
+is still being written, the old stream is **`RESET_STREAM`ed** and a new one
+opened for the current state. Never queued — resetting is what preserves "never
+send stale data" and "cannot fall behind" together. A stream that is superseded
+delivers *nothing*, which is strictly better than delivering something the
+receiver has already moved past.
 
-- The receiver holds at most one incomplete fragment set per peer. A fragment
-  naming a `my_state` newer than the set in progress **replaces** it; the older
-  partial set is dropped immediately rather than being kept in hope.
-- Fragments of a state older than the receiver's current state are discarded on
-  arrival.
-- `frag_count` is bounded by configuration. A diff that would exceed the bound is
-  a bug in diff generation, not a condition to handle at runtime.
+`max_datagram_size()` returning `None` means the peer **disabled** datagrams, not
+that the size is unknown. Everything then goes by stream. Substituting a
+constant — the tempting `unwrap_or(1200)` — is wrong twice over: it invents a
+size where none works, and it exceeds what the rung-4 tunnel accepts, whose limit
+is smaller than a datagram's. The size limit is therefore a property of the
+active path, asked of it, never a literal at the call site.
+
+**Why this preserves §8.1.** A lost datagram still costs nothing: the next diff
+is computed against the same acknowledged base and therefore contains whatever
+the lost one carried. A reset stream costs the same nothing, for the same reason
+— the receiver's acknowledged state never moved, so the next diff re-derives from
+it. Neither case needs a retransmission, and neither can deliver a partial state.
+
+**Why not fragmentation.** An earlier version of this section split an oversized
+diff across several datagrams. The arithmetic defeats it. With no retransmission,
+a state split into *F* fragments arrives only if **all** *F* arrive, so delivery
+is `(1-p)^F`. A 200×60 truecolor full state is about **125 fragments**: 28% at 1%
+loss, and 0.16% at 5%. And the message most likely to be that large is the
+ring-miss full state — the one the protocol is *obliged* to send after exactly
+the burst of loss that makes fragmentation fail. The mechanism most needed after
+loss would have been the one least able to survive it. §18.2 records the
+reversal.
 
 ### 7.2 Streams
 
@@ -571,9 +586,9 @@ supplies the parts Mosh had to build.
 
 - **A lost datagram costs nothing.** The next one diffs from the same
   acknowledged base and therefore *contains* whatever was lost. There is no
-  retransmission of screen state, ever. A lost *fragment* costs the same nothing,
-  for the same reason, provided the incomplete set is discarded rather than
-  partially applied (§7.1.1).
+  retransmission of screen state, ever. A **superseded stream** costs the same
+  nothing, for the same reason: it is reset rather than finished, so it delivers
+  nothing at all, and the receiver's acknowledged state never moved (§7.1.1).
 - **It cannot fall behind.** If output outruns the link, states are simply
   replaced rather than queued; the next datagram is current by construction. A
   runaway `yes` produces one frame, not a backlog.
@@ -1109,7 +1124,7 @@ Testing effort is matched to where the risk actually is.
 
 | Layer | Method | What it proves |
 |---|---|---|
-| `oxutrm-sync` (happy path) | **property tests** (`proptest`) | **the one that matters**: for any sequence of terminal output and any subset of resulting diffs — or individual **fragments** (§7.1.1) — dropped, duplicated or reordered, the client state converges to the host state |
+| `oxutrm-sync` (happy path) | **property tests** (`proptest`) | **the one that matters**: for any sequence of terminal output and any subset of resulting diffs dropped, duplicated or reordered — whether they travelled as **datagrams** or as **streams reset mid-write** (§7.1.1) — the client state converges to the host state |
 | `oxutrm-sync` (reject path) | **fault injection**: diffs deliberately built to violate each §8.6 invariant | that rejection is real — the state is unchanged **and** the acknowledgement has not advanced |
 | `oxutrm-term` | golden tests over recorded `.ansi` fixtures, snapshotting `ScreenState` | emulation fidelity, wide characters, wrapping, attributes |
 | `oxutrm-proto` | round-trip and version-skew tests | wire compatibility, loud failure on mismatch |
@@ -1328,7 +1343,7 @@ forward-compatibility constraint phase D places on phase A+B.
 | **M1** | Loopback terminal: shell → `alacritty_terminal` → sync engine → renderer, one process, no network | terminal core and sync engine, with the convergence property green |
 | **M2** | QUIC over a punched socket, dummy payload, **rungs 0-3**, certificate pinning, netns tests | NAT traversal actually works |
 | **M3** | SSH bootstrap, signalling, daemonize, registry, detach and reattach | the session model |
-| **M4** | Joined up: a real remote terminal. **Rung 4**, fragmentation, roaming, status display, colour down-conversion | **usable daily** |
+| **M4** | Joined up: a real remote terminal. **Rung 4**, size-based channel selection, roaming, status display, colour down-conversion | **usable daily** |
 
 M1 is deliberately first: it needs no network, and it de-risks the component
 whose correctness is hardest to recover from later.
@@ -1336,10 +1351,10 @@ whose correctness is hardest to recover from later.
 Two placements are worth stating because the obvious guess is wrong. **Rung 3
 belongs to M2, not M4** — the birthday blast is a NAT-traversal technique and it
 is tested by the same namespace harness as rungs 0-2, so splitting it off would
-mean building that harness twice. **Fragmentation (§7.1.1) belongs to M4**, even
-though `frag_index` and `frag_count` exist in `Frame` from M1: M1 is a single
-process with no datagram size limit to exceed, so there is nothing to fragment
-until a real link exists.
+mean building that harness twice. **Size-based channel selection (§7.1.1) belongs to
+M4**: M1 is a single process with no datagram size limit to exceed, so there is
+no channel to choose between until a real link exists. `Frame` carries no
+fragment fields in any milestone.
 
 ---
 
@@ -1369,7 +1384,7 @@ resolved above. Recorded here so the changes are auditable.
 |---|---|---|
 | 1 | `stunclient` and `quinn` both `recv` on one socket and race | §5.3.1: an `AsyncUdpSocket` wrapper is the sole reader and demultiplexes STUN by the first two bits; `stunclient` is pre-QUIC discovery only; checks are built on `stun_codec`; `grease_quic_bit` off |
 | 2 | QUIC migration cannot repoint an established connection at a new peer address | §5: ICE nomination completes before QUIC starts, the peer address is fixed for the attach, late better paths are lost until the next one; §10.3's migration notice is now about the client's own local address |
-| 3 | Diffs exceeding `max_datagram_size()` were undeliverable | §7.1: `Frame` gains `frag_index`/`frag_count`; §7.1.1: a state applies only when all fragments arrive, incomplete sets are discarded wholesale |
+| 3 | Diffs exceeding `max_datagram_size()` were undeliverable | **REVISED — see §18.2.** Originally: §7.1 gained `frag_index`/`frag_count` and §7.1.1 specified fragment sets applied only when complete. The arithmetic defeats that: with no retransmission a state of *F* fragments arrives only if all *F* do, and the ring-miss full state is both the largest message and the one sent after exactly the loss that breaks it. Now resolved by size-based channel selection — datagram if it fits, otherwise a fresh unidirectional stream, superseded rather than queued |
 | 4 | `InputDiff` could not express prefix removal, so input replayed | §8.3: `consumed: u64` added; `apply` is drop-then-append |
 | 5 | Rung 4 needs SSH alive, but §4.3 closed every SSH descriptor | §4.3, §5.5, §9.2: rung 4 skips daemonization, is not detachable, `SessionMeta.detachable` records it, registry entry dies with its SSH |
 | 6 | 0-RTT is impossible given fresh keys per attach | §6: removed from the table, with the reason stated |
@@ -1438,5 +1453,48 @@ parsed but dropped and must be intercepted through a `Handler` newtype;
 `history_size()` saturates and cannot serve `scrollback_len`; `Index<Point>` is
 unchecked in release and every access must clamp; and the crate ships no colour
 palette, only an override table.
+
+### 18.2 Fragmentation removed, and this document's late correction
+
+Recorded separately because it **reverses** part of finding 3 rather than
+following from it, and because the reversal reached this document late.
+
+**What was specified.** Finding 3 resolved oversized diffs by fragmenting them:
+`Frame` gained `frag_index` and `frag_count`, and §7.1.1 defined fragment sets
+that applied only when complete.
+
+**Why it was removed.** The arithmetic does not work. There is no retransmission
+of screen state — that is the point of §8.1 — so a state split into *F* fragments
+arrives only if **all** *F* arrive, and delivery is `(1-p)^F`. A 200×60 truecolor
+full state is about 125 fragments: **28%** delivery at 1% loss, **0.16%** at 5%.
+
+The fatal part is *which* message is that large. §8.2's ring-miss recovery is
+**obliged** to send a full state precisely when the client's acknowledgement has
+fallen out of the ring — which is what a burst of loss causes. So the mechanism
+would have been least able to survive exactly the conditions that made it
+necessary. A scheme that works until it is needed is worse than one that never
+existed, because it is trusted.
+
+**What replaced it.** Size-based channel selection (§7.1.1): a `Frame` that fits
+goes as a datagram, a larger one goes on a fresh unidirectional stream, and an
+in-flight stream is superseded rather than queued. A stream is reliable, so the
+`(1-p)^F` problem does not arise; resetting a superseded one means it delivers
+nothing rather than something stale, which is what keeps §8.1 intact.
+
+**Why this entry exists at all.** The decision was taken at contract commit
+`4edd2f2`, and the contract and the code were updated together — `Frame` has
+carried five fields and no fragment machinery ever since. **This document was
+not**, and for a while it went on describing a mechanism the code deliberately
+did not have. §12 was the sharpest edge: it told an implementer to write a
+property test dropping individual fragments, which could not be written at all.
+
+That is the divergence class the "spec explains, contract defines" split exists
+to prevent, and the split did not prevent it, because a pointer to the contract
+does not stop prose beside it from going stale. The rule the split implies, and
+which was not followed here, is that **removing a mechanism means sweeping every
+document that describes it in the same change** — not only the one that defines
+it normatively.
+
+---
 
 This document contains **no placeholders**.
