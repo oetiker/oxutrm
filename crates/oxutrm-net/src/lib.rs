@@ -37,12 +37,19 @@ mod candidates;
 mod config;
 mod demux;
 mod discover;
+mod ice;
 mod socketfam;
+mod stunmsg;
 mod stunserver;
 
 pub use candidates::{ice_priority, is_link_local, local_candidates, local_candidates_filtered};
 pub use config::NetConfig;
 pub use demux::{STUN_HEADER_LEN, STUN_MAGIC_COOKIE, is_stun};
 pub use discover::{Probe, classify, stun_discover};
+pub use ice::{IceAgent, IceEvent};
 pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};
+pub use stunmsg::{
+    Check, CheckKind, Direction, IceCredentials, IceRole, build_check_request,
+    build_check_response, build_nomination, parse_check, random_transaction_id,
+};
 pub use stunserver::{MappingBehaviour, StunResponder};

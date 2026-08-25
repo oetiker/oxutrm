@@ -17,6 +17,7 @@ igd-next.workspace = true
 # `net` gives us IPV6_V6ONLY, which std does not expose.
 rustix = { workspace = true, features = ["net"] }
 netdev.workspace = true
+base64.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 rand.workspace = true
