@@ -12,7 +12,14 @@
 //! oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes the
 //! user has already made `ssh <target>` work, by whatever means.
 
-use anyhow::Result;
+mod loopback;
+
+use std::io::{Read as _, Write as _};
+
+use anyhow::{Context as _, Result};
+
+use oxutrm_client::{RawGuard, terminal_size};
+use oxutrm_term::detect_caps;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,8 +55,62 @@ fn run_host(_args: &[String]) -> Result<()> {
 /// Both halves in one process over a channel, with no network in between.
 /// This is the milestone-1 deliverable and stays useful afterwards as the
 /// fastest way to exercise the terminal core.
-fn run_loopback(_args: &[String]) -> Result<()> {
-    unimplemented!("oxutrm loopback: implemented in M1")
+///
+/// The frames are real: every screen and every keystroke is encoded to bytes,
+/// decoded again, and applied through a `Receiver`. See `src/loopback.rs`.
+fn run_loopback(args: &[String]) -> Result<()> {
+    let shell = match args.first() {
+        Some(s) if !s.starts_with('-') => s.clone(),
+        _ => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+    };
+
+    let size = terminal_size().context("oxutrm loopback needs a real terminal")?;
+    let caps = detect_caps();
+
+    // Raw mode for the whole session. The guard restores the terminal on every
+    // exit path there is - normal return, `?`, panic and signal - because a
+    // terminal left in raw mode with the alternate screen on is a terminal the
+    // user has to blindly type `reset` into.
+    let _raw = RawGuard::enter().context("putting the terminal into raw mode")?;
+
+    let mut session = loopback::Loopback::new(&shell, &[], &[], size, 10_000, caps)?;
+
+    let mut stdin = std::io::stdin();
+    set_nonblocking(rustix::stdio::stdin())?;
+    let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 8192];
+
+    let code = loop {
+        // The window size is polled rather than driven by SIGWINCH. A handler
+        // would need `unsafe` and an async-signal-safe body for something an
+        // ioctl answers exactly, 125 times a second, for nothing.
+        if let Ok(now) = terminal_size() {
+            session.resize(now)?;
+        }
+
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => 0,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => return Err(anyhow::Error::new(e).context("reading the keyboard")),
+        };
+
+        let tick = session.tick(&buf[..n], &mut stdout)?;
+        if let Some(code) = tick.exited {
+            break code;
+        }
+        std::thread::sleep(loopback::TICK);
+    };
+
+    // Drop the guard before writing anything a human should read.
+    drop(_raw);
+    let _ = writeln!(stdout, "\r\noxutrm: the shell exited ({code}).");
+    std::process::exit(code);
+}
+
+fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> Result<()> {
+    rustix::io::ioctl_fionbio(fd, true).context("making the keyboard non-blocking")?;
+    Ok(())
 }
 
 /// The default path: drive `ssh` to start or find a session on the far end,

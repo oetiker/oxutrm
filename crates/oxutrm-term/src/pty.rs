@@ -139,6 +139,12 @@ impl Pty {
         }
     }
 
+    /// The child's process id.
+    #[cfg(test)]
+    pub fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The size the kernel currently believes the PTY is.
     ///
     /// Only the tests ask today; it is how they check that a resize actually
@@ -151,6 +157,34 @@ impl Pty {
             cols: ws.ws_col,
             rows: ws.ws_row,
         })
+    }
+}
+
+impl Drop for Pty {
+    /// Kill the child.
+    ///
+    /// `std::process::Child` deliberately does **not** do this: dropping it
+    /// just stops waiting. For a shell on a PTY that is the wrong default -
+    /// an abandoned session leaves a process holding a descriptor nobody
+    /// reads, forever. A test that spawns `yes` and returns would leak a core
+    /// until the machine is rebooted.
+    ///
+    /// SIGHUP first, because that is what a hangup on a real terminal sends
+    /// and a shell knows how to clean up after it; SIGKILL only if it is still
+    /// there. `try_wait` is then required, or the child becomes a zombie.
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let pid = rustix::process::Pid::from_raw(self.child.id() as i32);
+        if let Some(pid) = pid {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::HUP);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        let _ = self.child.wait();
     }
 }
 

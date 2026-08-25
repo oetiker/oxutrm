@@ -18,8 +18,21 @@ use crate::listener::EventSink;
 use crate::palette::{PALETTE_LEN, palette, to_proto_color};
 use crate::pty::Pty;
 
-/// How much is read from the PTY in one go.
+/// How much is read from the PTY in one `read`.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// The most one [`HostTerm::poll`] will drain before returning.
+///
+/// **Without this the loop does not terminate.** `poll` drains until the PTY
+/// is empty, and a child that writes faster than we read - `yes`, a `find /`,
+/// a cat of a huge file - keeps it non-empty indefinitely. The caller never
+/// gets control back, so no frame is ever emitted and the screen freezes:
+/// precisely the "falls behind" failure the whole design exists to prevent,
+/// arriving through the one path that bypasses it.
+///
+/// 64 KiB per call at an 8 ms tick is 8 MB/s, far more than any terminal
+/// produces meaningfully, and it bounds the work per turn either way.
+const READ_BUDGET: usize = 64 * 1024;
 
 /// PTY + emulator. Owns the child process.
 pub struct HostTerm {
@@ -116,12 +129,21 @@ impl HostTerm {
     pub fn poll(&mut self) -> anyhow::Result<bool> {
         let mut buf = vec![0u8; READ_CHUNK];
         let mut changed = false;
+        let mut drained = 0usize;
 
         loop {
+            // Bounded on purpose: see READ_BUDGET. Whatever is left stays in
+            // the PTY buffer and is picked up next turn, which is exactly the
+            // coalescing behaviour - the emulator has already applied
+            // everything read so far, so the snapshot is current either way.
+            if drained >= READ_BUDGET {
+                break;
+            }
             let n = self.pty.read_ready(&mut buf)?;
             if n == 0 {
                 break;
             }
+            drained += n;
             {
                 // The tap counts scrolled-off lines as they happen. Measuring
                 // `history_size()` growth afterwards does NOT work: it
@@ -251,6 +273,13 @@ impl HostTerm {
     /// The size the emulator is currently at.
     pub fn size(&self) -> TermSize {
         self.size
+    }
+
+    /// The child's process id. Only the tests ask, to prove the child really
+    /// is killed when the terminal is dropped.
+    #[cfg(test)]
+    pub fn child_pid(&self) -> u32 {
+        self.pty.child_pid()
     }
 
     fn modes(&self) -> Modes {
@@ -792,6 +821,68 @@ mod tests {
             assert!(Instant::now() < deadline, "the child never exited");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn poll_returns_even_when_the_child_never_stops_writing() {
+        // The bug this guards is not subtle in effect: `poll` used to drain
+        // until the PTY was empty, and `yes` keeps it non-empty forever, so
+        // the call never returned. No frame is emitted, the screen freezes,
+        // and it looks like a hang rather than a fall-behind.
+        let mut t = sh("yes oxutrm-flood", size());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_output = false;
+
+        while Instant::now() < deadline {
+            let started = Instant::now();
+            t.poll().expect("poll");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "poll took {:?} against an endless writer",
+                started.elapsed()
+            );
+            if t.snapshot(1).cells.iter().any(|c| c.text == "x") {
+                saw_output = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(saw_output, "the emulator never processed any of the flood");
+
+        // And it stays bounded once the flood is in full flow, which is when
+        // the old implementation would never have returned at all.
+        for turn in 0..20 {
+            let started = Instant::now();
+            t.poll().expect("poll");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "poll took {:?} on turn {turn}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_the_terminal_kills_the_child() {
+        // std's Child does not kill on drop. Without an explicit kill, every
+        // abandoned session leaves a shell holding a pty nobody reads.
+        let t = sh("yes oxutrm-orphan", size());
+        let pid = t.child_pid();
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the child should be running"
+        );
+        drop(t);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the child {pid} outlived the HostTerm that owned it");
     }
 
     #[test]

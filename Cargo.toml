@@ -100,6 +100,15 @@ oxutrm-term.workspace = true
 oxutrm-net.workspace = true
 oxutrm-host.workspace = true
 oxutrm-client.workspace = true
+# Only for making the keyboard non-blocking; the terminal itself belongs to
+# oxutrm-client's RawGuard.
+rustix.workspace = true
+
+[dev-dependencies]
+# The loopback test replays the ANSI the renderer emitted through a real
+# emulator and compares it with the host's screen. That is a stronger claim
+# than "the two states match", which the sync tests already prove.
+alacritty_terminal.workspace = true
 
 # This workspace grows large test binaries and shares a target directory with
 # other projects. Line tables are enough for a backtrace; full debug info is

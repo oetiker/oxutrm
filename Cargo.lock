@@ -1111,6 +1111,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "oxutrm"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "oxutrm-client",
  "oxutrm-host",
@@ -1118,6 +1119,7 @@ dependencies = [
  "oxutrm-proto",
  "oxutrm-sync",
  "oxutrm-term",
+ "rustix",
  "tokio",
 ]
 
@@ -1135,15 +1137,14 @@ name = "oxutrm-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "oxutrm-net",
+ "base64",
+ "libc",
  "oxutrm-proto",
- "oxutrm-sync",
- "oxutrm-term",
- "quinn",
  "rand 0.9.5",
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1152,6 +1153,7 @@ name = "oxutrm-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytecodec",
  "bytes",
  "crab_nat",
