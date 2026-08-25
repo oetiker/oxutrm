@@ -14,7 +14,9 @@
   `oxutrm-proto`, `oxutrm-sync`, `oxutrm-term`, `oxutrm-net`, `oxutrm-host`,
   `oxutrm-client`. The checkout directory is `oxuterm` for historical reasons;
   nothing inside it uses that spelling.
-- **Rust edition 2021**, workspace at the repo root, one binary `src/main.rs`.
+- **Rust edition 2024**, workspace at the repo root, one binary `src/main.rs`.
+  `alacritty_terminal` 0.26 is edition 2024 with MSRV 1.85, so that floor applies to
+  the whole build; there is nothing to gain from staying on 2021.
 - **Cap all parallelism at 4**: `cargo build --jobs 4`,
   `cargo test --jobs 4 -- --test-threads 4`. The build machine is shared.
 - **Workspace root `Cargo.toml` must contain:**
@@ -42,7 +44,7 @@
 | `quinn` | `0.11` | net |
 | `rustls` | whatever `quinn` 0.11 re-exports | net |
 | `rcgen` | `0.13` | net (self-signed cert) |
-| `vt100` | patched fork of `Junyi-99/vt100-rust` @ `4bca1b1ec4efbb73b55f6c229e38268dca836825`, vendored at `vendor/vt100/` and wired in with a root `[patch]` entry | term — the emulator, on BOTH ends |
+| `alacritty_terminal` | `0.26`, `default-features = false` (serde is a default we do not need). Edition 2024, **MSRV 1.85**, Apache-2.0. Re-exports `vte`. | term — the emulator, on BOTH ends |
 | `rustix` | `1` (features `process`, `termios`, `stdio`, `fs`) | term, host, client |
 | `rustix-openpty` | `0.2` | term |
 | `stun_codec` | `0.4` | net — ALL ICE checks and keepalives |
@@ -224,8 +226,18 @@ bitflags::bitflags! {
         const STRIKE    = 0b0010_0000;
         const DIM       = 0b0100_0000;
         const HIDDEN    = 0b1000_0000;
-        /// Right-hand half of a double-width character.
+        /// Right-hand half of a double-width character (`Flags::WIDE_CHAR_SPACER`).
         const WIDE_CONT = 0b0001_0000_0000;
+        // BLINK is NOT a native alacritty flag: vte parses SGR 5/6/25 but
+        // `Term::terminal_attribute` drops them. It is recovered by a newtype
+        // wrapping `Term` that implements `vte::ansi::Handler`, forwards every
+        // method, and intercepts those three into a parallel blink plane keyed
+        // by `term.grid().cursor.point`. STRIKE and HIDDEN ARE native.
+        //
+        // v1 maps all five alacritty underline variants (UNDERLINE,
+        // DOUBLE_UNDERLINE, UNDERCURL, DOTTED_UNDERLINE, DASHED_UNDERLINE) onto
+        // UNDERLINE. Styles and per-cell underline colour (SGR 58/59) are
+        // available for a later milestone.
     }
 }
 
@@ -263,7 +275,8 @@ pub struct ScreenState {
     pub cursor: Cursor,
     pub modes: Modes,
     pub title: String,
-    pub icon: String,
+    // NOTE: no `icon`. OSC 1 is SILENTLY DROPPED by vte — there is no `b"1"`
+    // arm in osc_dispatch and no Handler method. Verified empirically.
     pub bell: u32,
     pub scrollback_len: u64,
 }
@@ -274,23 +287,32 @@ impl ScreenState {
     pub fn row(&self, row: u16) -> &[Cell];
 }
 
-/// PTY + patched `vt100::Parser`. Owns the child process.
+/// PTY + `alacritty_terminal::term::Term`, fed by a re-exported
+/// `alacritty_terminal::vte::ansi::Processor`. Owns the child process.
 ///
-/// Title, icon, bell and OSC 52 arrive through the crate's `Callbacks` trait —
-/// `HostTerm` implements a `Callbacks` struct and reads it back via
-/// `Parser::callbacks()`. There is NO sidecar byte scanner. Note the crate does
-/// NOT base64-decode OSC 52 payloads; the caller does.
-/// Construct with `Parser::new_with_callbacks(rows, cols, scrollback_len, cb)`.
+/// Feed bytes with `processor.advance(&mut term, bytes)` — `Term` IS the vte
+/// `Handler`. Title, bell and OSC 52 arrive as `Event`s through an
+/// `EventListener`, whose single method takes `&self`, so the listener needs
+/// interior mutability. OSC 52 payloads arrive ALREADY base64-decoded; set
+/// `Config::osc52 = Osc52::CopyPaste` to receive paste requests.
 ///
-/// Scrollback comes from the PATCH (a monotonic scrolled-off counter plus an
-/// indexed accessor); do NOT hand-roll a ring. `Attrs::BLINK`, `STRIKE` and
-/// `HIDDEN` likewise exist only because of the patch.
+/// Scrollback is native and O(1): negative `Line` indices reach history.
+/// Do NOT hand-roll a ring. `Term::resize` genuinely REFLOWS the primary grid
+/// (never the alternate one) and is lossless in both directions.
 ///
-/// `Screen::set_size` TRUNCATES: it clears every row's `wrapped` flag, pads or
-/// cuts each row, and drops bottom rows without pushing them to scrollback.
-/// This matches xterm and tmux. Reflow is out of scope — never claim it.
-/// `Callbacks::resize` is only the notification of a `CSI 8;rows;cols t`
-/// request; the handler must call `Screen::set_size` itself.
+/// THREE hard obligations, each easy to miss:
+///   1. `Index<Point>` has only a `debug_assert` — out of range PANICS in debug
+///      and reads garbage in release. Route EVERY access through one checked
+///      accessor that clamps with `Point::grid_clamp(&dims, Boundary::Grid)`.
+///   2. The crate ships NO default palette. `Term::colors()` is an OSC 4/10/11
+///      OVERRIDE table, all-`None` by default. oxutrm supplies its own 269-entry
+///      table and consults `colors()` only as an override layer.
+///   3. There is NO monotonic scrolled-off counter; `history_size()` saturates.
+///      Synthesize `scrollback_len` by accumulating `saturating_sub` of
+///      `history_size()` across each `advance()`.
+///
+/// Use `Term::damage()` / `reset_damage()` for per-line dirty ranges instead of
+/// comparing whole grids — it answers exactly the question the diff engine asks.
 pub struct HostTerm { /* private */ }
 
 impl HostTerm {
@@ -324,7 +346,7 @@ impl HostTerm {
 /// Detect the local terminal's capabilities from the environment.
 pub fn detect_caps() -> TerminalCaps;
 
-/// Derived SOLELY from what the patched `vt100` emulates. The client's
+/// Derived SOLELY from what `alacritty_terminal` emulates. The client's
 /// capabilities must NOT
 /// influence this: the child's TERM cannot change when a differently-capable
 /// client reattaches, and down-converting here would permanently degrade the
@@ -375,7 +397,6 @@ pub struct ScreenDiff {
     pub cursor: Option<Cursor>,
     pub modes: Option<Modes>,
     pub title: Option<String>,
-    pub icon: Option<String>,
     pub bell: Option<u32>,
     pub scrollback_len: Option<u64>,
 }
