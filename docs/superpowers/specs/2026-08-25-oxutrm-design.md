@@ -598,8 +598,16 @@ struct ScreenState {
     scrollback_len: u64,       // total lines ever scrolled off; lines travel on a stream
 }
 
-struct Cell { text: CompactString, fg: Color, bg: Color, attrs: Attrs }
+struct Cell { text: CellText, fg: Color, bg: Color, attrs: Attrs }
 ```
+
+`CellText` is the contract's alias for `compact_str::CompactString`, which stores
+up to 24 bytes inline. Nearly every cell — one ASCII character, or one character
+plus a combining mark — therefore allocates nothing at all. This matters more
+than a per-cell figure suggests, because §8.2's ring of 32 states multiplies it:
+a plain `String` would mean roughly 61,000 live heap allocations for an 80×24
+session. The wire encoding is identical either way, and the indirection through
+the alias is what keeps the choice reversible in one line.
 
 `text` is a small string rather than a `char` so grapheme clusters and combining
 marks survive intact. Wide-character continuation cells are represented
@@ -1142,7 +1150,7 @@ risky about the protocol is therefore testable in isolation.
 | `tokio` | 1 | async runtime (`quinn` requires one) |
 | `postcard`, `serde` | 1 / 1 | wire encoding |
 | `serde_json` | 1 | SSH signalling |
-| `compact_str` | 0.10 | `Cell.text` (§8.2) |
+| `compact_str` | 0.10 | `CellText`, the type behind `Cell.text`; inline for ≤24 bytes (§8.2) |
 | `zstd` | 0.13 | opportunistic payload compression |
 | `anyhow` | 1 | error handling, matching house style |
 | `proptest` | 1 | the convergence property |
