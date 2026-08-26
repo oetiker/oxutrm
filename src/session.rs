@@ -326,12 +326,15 @@ impl HostSession {
     /// A code outside `u32` cannot come from a shell; `child_exited` invents
     /// `-1` for a child it can no longer wait on, and that becomes 255, the
     /// same thing every shell reports for "something went wrong out here".
+    ///
+    /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
+    /// decoration. See its own note.
     pub fn close(&self, code: i32) {
         let code = u32::try_from(code).unwrap_or(255);
         self.link
             .sink
             .connection()
-            .close(quinn::VarInt::from_u32(code), b"the shell exited");
+            .close(quinn::VarInt::from_u32(code), SHELL_EXITED);
     }
 
     pub fn screen(&self) -> &ScreenState {
@@ -374,18 +377,43 @@ async fn keys_readable<K: AsRawFd>(
     }
 }
 
+/// The one application close on a session connection that means "the shell
+/// exited, and the error code beside me is its status".
+///
+/// `ApplicationClosed` on its own says nothing: it is what *every* deliberate
+/// close looks like, from anywhere, and the error code beside it is whatever
+/// that closer chose. A reattach superseding an old attach, `accept_one`
+/// tearing down a second inbound connection, a clean detach — all three are
+/// application closes, and all three would have made the old client print
+/// `exit 0` at somebody whose shell is still running on the far end. That is
+/// not a cosmetic wrong answer: it is a user being told their work finished.
+///
+/// QUIC already carries a reason phrase, so distinguishing them costs nothing
+/// on the wire. This is the only phrase [`exit_code`] accepts, and
+/// [`HostSession::close`] is the only place that sends it.
+pub const SHELL_EXITED: &[u8] = b"the shell exited";
+
 /// Why the session ended, as an exit status.
 ///
 /// The shell's exit code has no field in the protocol and needs none: the host
 /// closes the QUIC connection with it as the application error code, so it
 /// rides the mechanism that ends the session. Anything else closed the link —
-/// a timeout, a reset, a host that was killed — and that is an error rather
-/// than a status, because no shell said it.
+/// a timeout, a reset, a host that was killed, or an application close that
+/// was not [`SHELL_EXITED`] — and that is an error rather than a status,
+/// because no shell said it.
 fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
     match reason {
-        quinn::ConnectionError::ApplicationClosed(closed) => {
+        quinn::ConnectionError::ApplicationClosed(closed)
+            if closed.reason.as_ref() == SHELL_EXITED =>
+        {
             Ok(i32::try_from(closed.error_code.into_inner()).unwrap_or(255))
         }
+        // An application close from somewhere that is not a shell finishing.
+        // Saying so beats inventing a status the user would believe.
+        quinn::ConnectionError::ApplicationClosed(closed) => Err(anyhow::anyhow!(
+            "the host closed the session without the shell exiting: {}",
+            String::from_utf8_lossy(&closed.reason)
+        )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
         )),
@@ -698,6 +726,19 @@ impl ClientSession {
                 r = keys_readable(&mut keys) => match r {
                     Ok(mut guard) => match guard.try_io(|k| k.get_mut().read(&mut buf)) {
                         Ok(Ok(n)) => Wake::Keys(n),
+                        // A signal arrived mid-read. Nothing was lost and
+                        // nothing is wrong; the next lap reads again.
+                        //
+                        // Measured rather than assumed, because the guard is
+                        // worth having either way: every signal handler this
+                        // process installs sets SA_RESTART — tokio's, through
+                        // `signal_hook_registry`, and `RawGuard`'s own — and
+                        // the descriptor is non-blocking besides, so oxutrm's
+                        // own signals cannot produce this. A handler installed
+                        // by anything else in the process still can, and the
+                        // cost of being wrong is a killed remote shell against
+                        // one match arm.
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => Wake::Nothing,
                         Ok(Err(e)) => return Err(e).context("reading the keyboard"),
                         // Readiness that evaporated; `try_io` has already
                         // cleared it, so the next lap will wait properly.
@@ -1874,22 +1915,43 @@ mod tests {
         );
     }
 
+    fn application_close(code: u32, reason: &'static [u8]) -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: reason.into(),
+        })
+    }
+
     #[test]
-    fn only_an_application_close_is_an_exit_status() {
+    fn only_the_hosts_own_close_is_an_exit_status() {
         // A host that was killed and a path that went away end the session
         // too. Reporting either as "the shell exited 0" would be a lie the
         // user acts on, so the status has to come from the shell or not at
         // all.
-        let closed = quinn::ApplicationClose {
-            error_code: quinn::VarInt::from_u32(42),
-            reason: Default::default(),
-        };
-        assert_eq!(
-            exit_code(&quinn::ConnectionError::ApplicationClosed(closed)).unwrap(),
-            42
-        );
+        assert_eq!(exit_code(&application_close(42, SHELL_EXITED)).unwrap(), 42);
         assert!(exit_code(&quinn::ConnectionError::TimedOut).is_err());
         assert!(exit_code(&quinn::ConnectionError::LocallyClosed).is_err());
+
+        // And `ApplicationClosed` alone is not enough, which is the part that
+        // was wrong. Every deliberate close in the system looks like this and
+        // carries whatever error code its closer chose: a reattach superseding
+        // an old attach, `accept_one` tearing down a second inbound
+        // connection, a clean detach. Each one used to print
+        // "exit 0" at a user whose shell is still running on the far end.
+        for reason in [
+            b"superseded by a newer attach".as_slice(),
+            b"only one connection is served".as_slice(),
+            b"detached".as_slice(),
+            b"".as_slice(),
+        ] {
+            let got = exit_code(&application_close(0, reason));
+            assert!(
+                got.is_err(),
+                "an application close reading {:?} was reported to the user as \
+                 `exit 0`, so a live shell looks like a finished one",
+                String::from_utf8_lossy(reason)
+            );
+        }
     }
 
     /// This THREAD's CPU time, in milliseconds.
