@@ -175,6 +175,19 @@ pub struct Receiver<S: SyncState> {
     /// Narrows the initial-collision exception in `on_frame` to the one frame
     /// it exists for.
     applied_any: bool,
+    /// Applied frames that carried a real diff (`from_state != 0`).
+    diffs_applied: u64,
+    /// Applied frames that carried a whole screen.
+    ///
+    /// Counted because a full state is the protocol's RESCUE, and a rescue that
+    /// is silently doing all the work looks exactly like health. When the
+    /// sender's ring cannot reach the peer's acknowledged base it falls back to
+    /// a full state, which applies unconditionally — so a session in which base
+    /// drift is completely broken still converges, rejects nothing, and passes
+    /// any test that only counts rejections. Nothing counted this before, and
+    /// that is why the defect this ring fixes went unnoticed until it was
+    /// measured. A gate that cannot tell the two regimes apart is not a gate.
+    full_states_applied: u64,
 }
 
 impl<S: SyncState> Receiver<S> {
@@ -185,7 +198,20 @@ impl<S: SyncState> Receiver<S> {
             ring,
             peer_ack: 0,
             applied_any: false,
+            diffs_applied: 0,
+            full_states_applied: 0,
         }
+    }
+
+    /// Applied frames that carried a diff, and applied frames that carried a
+    /// whole screen, in that order.
+    ///
+    /// For diagnostics and for tests that must tell a healthy session from one
+    /// converging entirely on the full-state rescue. The two look identical
+    /// from the outside: both reject nothing and both paint the right screen.
+    #[must_use]
+    pub fn applied_kinds(&self) -> (u64, u64) {
+        (self.diffs_applied, self.full_states_applied)
     }
 
     /// Apply one frame. `true` when the state advanced.
@@ -268,6 +294,11 @@ impl<S: SyncState> Receiver<S> {
             Some(base) if f.from_state != 0 => base.clone(),
             _ => self.state().clone(),
         };
+        if f.from_state == 0 {
+            self.full_states_applied = self.full_states_applied.saturating_add(1);
+        } else {
+            self.diffs_applied = self.diffs_applied.saturating_add(1);
+        }
         next.apply(f.from_state, f.my_state, &diff)?;
         // AFTER apply, never before: the question is whether the RESULT is a
         // legal state, and the state we already hold is legal by induction.
@@ -307,11 +338,31 @@ impl<S: SyncState> Receiver<S> {
         self.ring.push_back(next);
         // A cap as well as the pruning: a peer whose acks are all being lost
         // keeps naming one ancient base, so the pruning alone never fires.
-        while self.ring.len() > STATE_RING {
+        //
+        // **The cap and `STATE_RING` are coupled, and the margin is one entry.**
+        // `Sender::update` pushes exactly ONE state per call and caps at
+        // `STATE_RING`, so a sender naming base `B` still holds it, which means
+        // its current sequence is at most `B + STATE_RING - 1`. We therefore
+        // hold `B` plus at most `STATE_RING - 1` newer entries — exactly
+        // `STATE_RING` — and popping the front, which is `B` itself, would
+        // evict the very base the sender is working from.
+        //
+        // The `+ 1` is that margin, and it is deliberate rather than a
+        // fencepost. Without it the arithmetic is exact and any change to
+        // either side — a sender that pushed two states in a turn, a sender
+        // ring made deeper than this cap — evicts the base and reinstates the
+        // base-drift defect INVISIBLY, because in that regime the sender's ring
+        // is also near exhaustion, every frame degrades to a full state, and a
+        // full state applies unconditionally. The bug would be masked by its
+        // own consequence.
+        while self.ring.len() > STATE_RING + 1 {
             self.ring.pop_front();
         }
         self.applied_any = true;
-        self.peer_ack = self.peer_ack.max(f.ack_state);
+        // `peer_ack` is already advanced at the top of `on_frame`, before any
+        // early return, and `max` is idempotent — so this second assignment is
+        // dead. Do not "restore" it: the one at the top carries the reasoning
+        // about reordered acknowledgements and is the load-bearing copy.
         Ok(true)
     }
 
