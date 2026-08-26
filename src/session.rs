@@ -661,7 +661,7 @@ impl ClientSession {
 mod tests {
     use super::*;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
-    use oxutrm_proto::{NatType, Rung, SpkiSha256};
+    use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -701,10 +701,15 @@ mod tests {
 
     async fn pair_on(client_bind: &str, shell: &str) -> (HostSession, ClientSession) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        // The client now has an identity of its own, and the host has to be
+        // told about it before it can listen at all.
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
 
         let host_sock = udp().await;
         let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _stun) = quic_server(&host_sock, cert, key).await.unwrap();
+        let (host_ep, _stun) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+            .await
+            .unwrap();
 
         let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
         let accepting = tokio::spawn(async move {
@@ -713,10 +718,15 @@ mod tests {
             (conn, host_ep)
         });
 
-        let (client_conn, client_ep, _cstun) =
-            quic_client(&client_sock, host_addr, SpkiSha256::new(fingerprint))
-                .await
-                .unwrap();
+        let (client_conn, client_ep, _cstun) = quic_client(
+            &client_sock,
+            host_addr,
+            HostSpki::new(fingerprint),
+            client_cert,
+            client_key,
+        )
+        .await
+        .unwrap();
         let (host_conn, host_ep) = accepting.await.unwrap();
 
         let host = HostSession::spawn(
@@ -1070,17 +1080,26 @@ mod tests {
             rows: 60,
         };
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
         let host_sock = udp().await;
         let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _s) = quic_server(&host_sock, cert, key).await.unwrap();
+        let (host_ep, _s) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+            .await
+            .unwrap();
         let client_sock = udp().await;
         let accepting = tokio::spawn(async move {
             let inc = host_ep.accept().await.unwrap();
             (inc.await.unwrap(), host_ep)
         });
-        let (cc, ce, _cs) = quic_client(&client_sock, host_addr, SpkiSha256::new(fingerprint))
-            .await
-            .unwrap();
+        let (cc, ce, _cs) = quic_client(
+            &client_sock,
+            host_addr,
+            HostSpki::new(fingerprint),
+            client_cert,
+            client_key,
+        )
+        .await
+        .unwrap();
         let (hc, he) = accepting.await.unwrap();
 
         let mut host =

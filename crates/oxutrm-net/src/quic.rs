@@ -15,13 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use oxutrm_proto::SpkiSha256;
+use oxutrm_proto::{ClientSpki, HostSpki};
 use quinn::rustls;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::demuxsock::{StunDemuxSocket, StunRx};
 use crate::socketfam::to_socket_family;
-use crate::tls::{CERT_NAME, PinnedSpki, install_crypto_provider, provider};
+use crate::tls::{CERT_NAME, PinnedClientSpki, PinnedSpki, install_crypto_provider, provider};
 
 /// Honest ALPN.
 ///
@@ -56,12 +56,17 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 fn server_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+    expect_client_spki: ClientSpki,
 ) -> anyhow::Result<quinn::ServerConfig> {
     install_crypto_provider();
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("selecting TLS 1.3")?
-        .with_no_client_auth()
+        // The line this file shipped with was `.with_no_client_auth()`, and
+        // the builder's shape is why it survived so long: it is the *default*
+        // way to get past `WantsVerifier`, it reads like boilerplate, and
+        // nothing downstream of it fails.
+        .with_client_cert_verifier(Arc::new(PinnedClientSpki::new(expect_client_spki)))
         .with_single_cert(vec![cert], key)
         .context("installing the session certificate")?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -73,7 +78,11 @@ fn server_config(
     Ok(cfg)
 }
 
-fn client_config(expect_spki_sha256: SpkiSha256) -> anyhow::Result<quinn::ClientConfig> {
+fn client_config(
+    expect_host_spki: HostSpki,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> anyhow::Result<quinn::ClientConfig> {
     // Its own step, and not optional: without a process-default provider
     // `QuicClientConfig::try_from` below fails with an error that says nothing
     // about providers.
@@ -83,8 +92,13 @@ fn client_config(expect_spki_sha256: SpkiSha256) -> anyhow::Result<quinn::Client
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("selecting TLS 1.3")?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(*expect_spki_sha256.as_bytes())))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(expect_host_spki)))
+        // Required, not offered: the host's verifier is mandatory, so a client
+        // built without a certificate cannot complete a handshake at all.
+        // There is no `Option` here for the same reason there is none on the
+        // host side — a client with nothing to present is not a configuration.
+        .with_client_auth_cert(vec![cert], key)
+        .context("installing the client's session certificate")?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
@@ -113,24 +127,48 @@ fn endpoint_over(
     Ok((endpoint, stun_rx))
 }
 
-/// Listen on a socket the ladder has already punched.
+/// Listen on a socket the ladder has already punched, accepting exactly one
+/// client certificate: `expect_client_spki`, and nothing else.
 ///
 /// The caller keeps `socket` for sending ICE keepalives, and receives the
 /// peeled-off STUN on the returned [`StunRx`].
+///
+/// # The fingerprint is by value, required, and has no setter
+///
+/// Not `Option<ClientSpki>`, not `Endpoint::set_client_pin(..)` afterwards.
+/// rustls' `ServerConfig` is immutable once the endpoint exists, so the wrong
+/// ordering — listen first, pin later — is not something a caller can express
+/// badly; it is something there is no method to write. That is the
+/// `Detached`/`DetachPermit` idiom from `oxutrm-host`'s `keys.rs` applied to a
+/// transport, and it matters here because the window between "listening" and
+/// "pinned" is precisely the window in which an unauthenticated peer reaches
+/// `Command::new(shell)`.
+///
+/// The ordering this demands already exists in the plan: `ClientHello` is read
+/// at R7 and the endpoint is built at R9, two steps later.
 pub async fn quic_server(
     socket: &Arc<tokio::net::UdpSocket>,
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+    expect_client_spki: ClientSpki,
 ) -> anyhow::Result<(quinn::Endpoint, StunRx)> {
-    endpoint_over(socket, Some(server_config(cert, key)?))
+    endpoint_over(socket, Some(server_config(cert, key, expect_client_spki)?))
 }
 
-/// Connect to `peer`, trusting exactly `expect_spki_sha256` and nothing else.
+/// Connect to `peer`, trusting exactly `expect_host_spki` and nothing else,
+/// and presenting `cert` so the host can do the same in return.
 ///
-/// The fingerprint arrives as the wire crate's [`SpkiSha256`] rather than a
-/// bare `[u8; 32]`, and that is the whole point: it is the same 32 bytes the
-/// host put in `HostHello`, carried in a type that a `Psk` — also 32 bytes,
-/// also on that message — cannot be mistaken for.
+/// The fingerprint arrives as [`HostSpki`] rather than a bare `[u8; 32]`, and
+/// that is the whole point. There are now two fingerprints on every attach and
+/// both are in scope on both sides: the one the client pins, and the one the
+/// client *presents*. They are the same size and the same shape, a swap here
+/// would make the client pin itself, and there is no conversion between the
+/// two types that would let one happen.
+///
+/// `cert`/`key` are a throwaway pair from [`crate::generate_cert`], minted
+/// fresh per attach and never written to disk — the same call the host makes
+/// for its own identity. The client's fingerprint travels to the host in
+/// `ClientHello`.
 ///
 /// The endpoint comes back alongside the connection because `quinn` drives the
 /// socket from it and M4 needs the same handle for `Endpoint::rebind` when the
@@ -138,10 +176,12 @@ pub async fn quic_server(
 pub async fn quic_client(
     socket: &Arc<tokio::net::UdpSocket>,
     peer: SocketAddr,
-    expect_spki_sha256: SpkiSha256,
+    expect_host_spki: HostSpki,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
 ) -> anyhow::Result<(quinn::Connection, quinn::Endpoint, StunRx)> {
     let (mut endpoint, stun_rx) = endpoint_over(socket, None)?;
-    endpoint.set_default_client_config(client_config(expect_spki_sha256)?);
+    endpoint.set_default_client_config(client_config(expect_host_spki, cert, key)?);
 
     let local = endpoint
         .local_addr()
@@ -165,6 +205,23 @@ mod tests {
 
     async fn socket() -> Arc<UdpSocket> {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
+    }
+
+    /// A client identity: its certificate, its key, and the fingerprint the
+    /// host has to be told about before it can listen.
+    struct ClientId {
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        spki: ClientSpki,
+    }
+
+    fn client_id() -> ClientId {
+        let (cert, key, fp) = generate_cert().unwrap();
+        ClientId {
+            cert,
+            key,
+            spki: ClientSpki::new(fp),
+        }
     }
 
     /// A server that accepts one connection and echoes whatever it is given,
@@ -200,16 +257,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_datagram_goes_round_trip() {
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key).await.unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) =
-            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
-                .await
-                .unwrap();
+        let (conn, _ep, _stun) = quic_client(
+            &client_sock,
+            server_addr,
+            HostSpki::new(fingerprint),
+            me.cert,
+            me.key,
+        )
+        .await
+        .unwrap();
 
         assert!(
             conn.max_datagram_size().is_some(),
@@ -234,16 +297,22 @@ mod tests {
         // A 50,000-line scrollback fetch must never delay a keystroke, so
         // both channels have to exist on one connection.
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key).await.unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) =
-            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
-                .await
-                .unwrap();
+        let (conn, _ep, _stun) = quic_client(
+            &client_sock,
+            server_addr,
+            HostSpki::new(fingerprint),
+            me.cert,
+            me.key,
+        )
+        .await
+        .unwrap();
 
         let payload = vec![0xABu8; 64 * 1024];
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -272,10 +341,11 @@ mod tests {
     async fn a_client_pinned_to_a_different_certificate_is_refused() {
         let (cert, key, _fp) = generate_cert().unwrap();
         let (_other_cert, _other_key, other_fp) = generate_cert().unwrap();
+        let me = client_id();
 
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key).await.unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = tokio::spawn(async move {
             if let Some(incoming) = endpoint.accept().await {
                 let _ = incoming.await;
@@ -285,7 +355,13 @@ mod tests {
         let client_sock = socket().await;
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            quic_client(&client_sock, server_addr, SpkiSha256::new(other_fp)),
+            quic_client(
+                &client_sock,
+                server_addr,
+                HostSpki::new(other_fp),
+                me.cert,
+                me.key,
+            ),
         )
         .await
         .expect("must not hang");
@@ -297,17 +373,172 @@ mod tests {
         server.abort();
     }
 
+    /// The other direction, and the one this crate shipped without.
+    ///
+    /// **Asserted on the HOST side, deliberately.** In TLS 1.3 the client
+    /// finishes its own handshake before the server has verified the client
+    /// certificate, and quinn reports `Connected` as soon as rustls stops
+    /// handshaking — so `quic_client(..).await` here very likely resolves
+    /// `Ok` and the connection dies a moment later. An `is_err()` on the
+    /// client would be a coin flip dressed up as an assertion. The host's
+    /// `incoming.await` is where the refusal is deterministic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_certificate_the_host_did_not_pin_is_refused_by_the_host() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let expected = client_id();
+        let stranger = client_id();
+        assert_ne!(expected.spki.as_bytes(), stranger.spki.as_bytes());
+
+        let server_sock = socket().await;
+        let server_addr = server_sock.local_addr().unwrap();
+        // Pinned to `expected`, and the stranger is the one who calls.
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, expected.spki)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.expect("an inbound connection");
+            incoming.await
+        });
+
+        let client_sock = socket().await;
+        // Whatever this resolves to is not the evidence; see the doc comment.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(15),
+            quic_client(
+                &client_sock,
+                server_addr,
+                HostSpki::new(fingerprint),
+                stranger.cert,
+                stranger.key,
+            ),
+        )
+        .await;
+
+        let accepted = tokio::time::timeout(Duration::from_secs(15), server)
+            .await
+            .expect("the host must not hang")
+            .expect("the accept task must not panic");
+        let shown = format!("{accepted:?}");
+        assert!(
+            accepted.is_err(),
+            "an unpinned client completed the handshake, which is one step from a shell: {shown}"
+        );
+    }
+
+    /// The control for the test above. Without it, a `quic_server` that
+    /// refused *everything* — a mis-wired pin, an ALPN typo, a broken
+    /// certificate — would look exactly as green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_client_the_host_did_pin_is_accepted_by_the_host() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let expected = client_id();
+        let pinned = expected.spki;
+
+        let server_sock = socket().await;
+        let server_addr = server_sock.local_addr().unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, pinned).await.unwrap();
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.expect("an inbound connection");
+            incoming.await
+        });
+
+        let client_sock = socket().await;
+        let (conn, _ep, _stun) = tokio::time::timeout(
+            Duration::from_secs(15),
+            quic_client(
+                &client_sock,
+                server_addr,
+                HostSpki::new(fingerprint),
+                expected.cert,
+                expected.key,
+            ),
+        )
+        .await
+        .expect("must not hang")
+        .expect("the pinned client must connect");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(15), server)
+            .await
+            .expect("the host must not hang")
+            .expect("the accept task must not panic");
+        assert!(
+            accepted.is_ok(),
+            "the pinned client was refused: {accepted:?}"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// A client built the way this file's `client_config` used to build one:
+    /// no certificate at all.
+    ///
+    /// This is what `client_auth_mandatory()` is for. With it `false` — a
+    /// one-word change that overrides a rustls default and would read like a
+    /// decision — this peer would be let in, and every other test in the
+    /// workspace would still pass, because a well-behaved client presents its
+    /// certificate whether or not it was required to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_presents_no_certificate_at_all_is_refused_by_the_host() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let expected = client_id();
+
+        let server_sock = socket().await;
+        let server_addr = server_sock.local_addr().unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, expected.spki)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.expect("an inbound connection");
+            incoming.await
+        });
+
+        // Built by hand rather than through `quic_client`, because
+        // `quic_client` structurally cannot produce this any more — which is
+        // the point, and also the reason the anonymous client has to be
+        // written out here to be tested against.
+        install_crypto_provider();
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(HostSpki::new(fingerprint))))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
+        cfg.transport_config(transport_config());
+
+        let client_sock = socket().await;
+        let (mut client_ep, _stun) = endpoint_over(&client_sock, None).unwrap();
+        client_ep.set_default_client_config(cfg);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(15),
+            client_ep.connect(server_addr, CERT_NAME).unwrap(),
+        )
+        .await;
+
+        let accepted = tokio::time::timeout(Duration::from_secs(15), server)
+            .await
+            .expect("the host must not hang")
+            .expect("the accept task must not panic");
+        assert!(
+            accepted.is_err(),
+            "an anonymous client completed the handshake: {accepted:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn quic_survives_stun_arriving_on_the_same_socket_throughout() {
         // The reason StunDemuxSocket exists, end to end: a handshake, a stream
         // and a datagram while STUN keeps landing on both sockets.
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
         let client_sock = socket().await;
         let client_addr = client_sock.local_addr().unwrap();
 
-        let (endpoint, mut server_stun) = quic_server(&server_sock, cert, key).await.unwrap();
+        let (endpoint, mut server_stun) =
+            quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let noise = tokio::spawn(async move {
@@ -324,7 +555,13 @@ mod tests {
 
         let (conn, _ep, _client_stun) = tokio::time::timeout(
             Duration::from_secs(20),
-            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint)),
+            quic_client(
+                &client_sock,
+                server_addr,
+                HostSpki::new(fingerprint),
+                me.cert,
+                me.key,
+            ),
         )
         .await
         .expect("the handshake must not be starved by the STUN traffic")
@@ -360,16 +597,22 @@ mod tests {
     async fn the_alpn_is_the_honest_one() {
         assert_eq!(ALPN, b"oxutrm/1");
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key).await.unwrap();
+        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) =
-            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
-                .await
-                .unwrap();
+        let (conn, _ep, _stun) = quic_client(
+            &client_sock,
+            server_addr,
+            HostSpki::new(fingerprint),
+            me.cert,
+            me.key,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             conn.handshake_data()
                 .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())

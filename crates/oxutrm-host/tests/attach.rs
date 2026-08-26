@@ -8,7 +8,9 @@ use std::path::Path;
 
 use oxutrm_host::attach::{AttachError, connect_to_session, format_session_list, relay_signals};
 use oxutrm_host::{Registry, RegistryGuard, SessionMeta, begin_attach, now_unix};
-use oxutrm_proto::{NatType, PROTO_VERSION, Psk, Rung, Signal, SpkiSha256, TermSize, TerminalCaps};
+use oxutrm_proto::{
+    ClientSpki, HostSpki, NatType, PROTO_VERSION, Psk, Rung, Signal, TermSize, TerminalCaps,
+};
 use tokio::io::BufReader;
 
 fn meta(id: &str, pid: u32) -> SessionMeta {
@@ -38,6 +40,10 @@ fn wire_form(psk: &Psk) -> String {
 fn client_hello() -> Signal {
     Signal::ClientHello {
         proto: PROTO_VERSION,
+        // The fingerprint of the client's throwaway certificate. The host
+        // pins this in its QUIC `ClientCertVerifier`, so a `ClientHello`
+        // without it is a client the host has nothing to authenticate.
+        cert_spki_sha256: ClientSpki::new([0x11; 32]),
         candidates: vec![],
         nat_type: NatType::Unknown,
         caps: TerminalCaps {
@@ -187,10 +193,10 @@ fn every_attach_mints_a_new_psk_and_bumps_the_generation() {
     let mut m = meta("9999aaaa9999aaaa9999aaaa9999aaaa", 1);
     assert_eq!(m.attach_id, 1);
 
-    let first = begin_attach(&mut m, SpkiSha256::new([7u8; 32])).expect("first attach");
+    let first = begin_attach(&mut m, HostSpki::new([7u8; 32])).expect("first attach");
     assert_eq!(first.attach_id, 2, "the generation moves on every attach");
 
-    let second = begin_attach(&mut m, SpkiSha256::new([9u8; 32])).expect("second attach");
+    let second = begin_attach(&mut m, HostSpki::new([9u8; 32])).expect("second attach");
     assert_eq!(second.attach_id, 3);
 
     assert_ne!(
@@ -209,7 +215,7 @@ fn every_attach_mints_a_new_psk_and_bumps_the_generation() {
 #[test]
 fn a_psk_is_thirty_two_bytes_and_is_not_all_zeroes() {
     let mut m = meta("bbbbccccbbbbccccbbbbccccbbbbcccc", 1);
-    let attach = begin_attach(&mut m, SpkiSha256::new([0u8; 32])).expect("attach");
+    let attach = begin_attach(&mut m, HostSpki::new([0u8; 32])).expect("attach");
     assert_eq!(attach.keys.psk().as_bytes().len(), 32);
     assert!(
         attach.keys.psk().as_bytes().iter().any(|b| *b != 0),
@@ -222,7 +228,7 @@ fn debug_never_prints_key_material() {
     // A derived Debug would put the PSK into the first error that formatted a
     // struct containing one.
     let mut m = meta("ddddeeeeddddeeeeddddeeeeddddeeee", 1);
-    let attach = begin_attach(&mut m, SpkiSha256::new([0xab; 32])).expect("attach");
+    let attach = begin_attach(&mut m, HostSpki::new([0xab; 32])).expect("attach");
     let text = format!("{:?}", attach);
     assert!(text.contains("redacted"), "{text}");
     let leaked = wire_form(attach.keys.psk());
@@ -245,7 +251,7 @@ fn debug_never_prints_key_material() {
 fn the_minted_key_material_survives_the_wire_unchanged() {
     let mut m = meta("aaaa1111aaaa1111aaaa1111aaaa1111", 1);
     let fingerprint = [0x5au8; 32];
-    let attach = begin_attach(&mut m, SpkiSha256::new(fingerprint)).expect("attach");
+    let attach = begin_attach(&mut m, HostSpki::new(fingerprint)).expect("attach");
     let minted_psk = *attach.keys.psk().as_bytes();
 
     let hello = Signal::HostHello {

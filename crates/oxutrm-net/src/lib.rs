@@ -64,4 +64,6 @@ pub use stunmsg::{
     build_check_response, build_nomination, parse_check, random_transaction_id,
 };
 pub use stunserver::{MappingBehaviour, StunResponder};
-pub use tls::{CERT_NAME, PinnedSpki, generate_cert, install_crypto_provider, provider};
+pub use tls::{
+    CERT_NAME, PinnedClientSpki, PinnedSpki, generate_cert, install_crypto_provider, provider,
+};

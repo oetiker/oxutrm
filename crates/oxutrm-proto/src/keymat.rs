@@ -275,9 +275,179 @@ impl<'de> Deserialize<'de> for SpkiSha256 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The two roles a fingerprint can be in
+// ---------------------------------------------------------------------------
+
+/// Both ends of an oxutrm attach present a certificate, so from the moment
+/// client authentication exists there are **two** SPKI fingerprints in scope on
+/// **both** sides at once:
+///
+/// * the host mints its own with `generate_cert()` and reads the client's out
+///   of `ClientHello`;
+/// * the client mints its own with `generate_cert()` and reads the host's out
+///   of `HostHello`.
+///
+/// Both are `[u8; 32]`, both are a SHA-256 of a SubjectPublicKeyInfo, and
+/// nothing in the value distinguishes them. Handing the wrong one to a verifier
+/// type-checked perfectly, and the failure it produces is not symmetric: a
+/// client that pins its own certificate simply cannot connect, but **a host
+/// that pins its own certificate is one copy-paste away from pinning a value
+/// every peer already has**. The verifier is the last thing between an inbound
+/// UDP datagram and `Command::new(shell)`; it is not a place to rely on
+/// argument order.
+///
+/// So the role is in the type. [`HostSpki`] and [`ClientSpki`] are the same 32
+/// bytes and the same base64 on the wire — they delegate their `serde` to
+/// [`SpkiSha256`], which stays the one and only encoding site — but there is
+/// **no conversion between them, in either direction, and none from
+/// [`SpkiSha256`]**. The only way to name a role is to state it where it is
+/// actually known: at `generate_cert()`, or at the wire field.
+///
+/// That absence is the enforcement, and it is machine-checked by the
+/// `compile_fail` doctests on each type rather than left to review. Each one is
+/// paired with a doctest that *must* compile, because a `compile_fail` block
+/// passes just as happily on a typo as on the error it was written for.
+macro_rules! role_fingerprint {
+    ($name:ident, $role:literal, $mine:literal, $theirs:literal) => {
+        #[doc = concat!("The **", $role, "'s** certificate fingerprint.")]
+        ///
+        /// `SpkiSha256` plus the answer to "whose?", and the answer is not
+        /// convertible. Passing the other role where this one belongs does not
+        /// compile:
+        ///
+        /// ```compile_fail
+        #[doc = concat!("use oxutrm_proto::{", $mine, ", ", $theirs, "};")]
+        #[doc = concat!("fn wants_it(_: ", $mine, ") {}")]
+        #[doc = concat!("wants_it(", $theirs, "::new([0u8; 32]));")]
+        /// ```
+        ///
+        /// The right role does, which is what keeps the check above honest:
+        ///
+        /// ```
+        #[doc = concat!("use oxutrm_proto::", $mine, ";")]
+        #[doc = concat!("fn wants_it(_: ", $mine, ") {}")]
+        #[doc = concat!("wants_it(", $mine, "::new([0u8; 32]));")]
+        /// ```
+        ///
+        /// Nor is the bare encoding type accepted — the swap that would
+        /// otherwise survive a refactor left half-done:
+        ///
+        /// ```compile_fail
+        #[doc = concat!("use oxutrm_proto::{", $mine, ", SpkiSha256};")]
+        #[doc = concat!("fn wants_it(_: ", $mine, ") {}")]
+        /// wants_it(SpkiSha256::new([0u8; 32]));
+        /// ```
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub struct $name(SpkiSha256);
+
+        impl $name {
+            #[must_use]
+            pub const fn new(bytes: [u8; WIRE_KEY_LEN]) -> $name {
+                $name(SpkiSha256::new(bytes))
+            }
+
+            #[must_use]
+            pub fn as_bytes(&self) -> &[u8; WIRE_KEY_LEN] {
+                self.0.as_bytes()
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            /// Names the role. Two pins now run on every attach and they fail
+            /// identically otherwise; a log that cannot say which fingerprint
+            /// was pinned cannot diagnose the one bug this type exists to
+            /// prevent.
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($name), "({:?})"), self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            /// Delegated, so there is still exactly one encode site in the
+            /// tree. The role is a Rust-side distinction: on the wire both are
+            /// the same 44 characters under the same field name, and they must
+            /// be, because the two messages are read by two different peers.
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize(s)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<$name, D::Error> {
+                SpkiSha256::deserialize(d).map($name)
+            }
+        }
+    };
+}
+
+role_fingerprint!(HostSpki, "host", "HostSpki", "ClientSpki");
+role_fingerprint!(ClientSpki, "client", "ClientSpki", "HostSpki");
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The role is a Rust-side distinction and must be *only* that: the two
+    /// messages carry the same field name and the same encoding, because a
+    /// host reading a `ClientHello` and a client reading a `HostHello` are
+    /// running the same decoder.
+    #[test]
+    fn the_two_roles_are_the_same_forty_four_characters_on_the_wire() {
+        let bytes = [0x3cu8; WIRE_KEY_LEN];
+        let host = serde_json::to_string(&HostSpki::new(bytes)).expect("encode");
+        let client = serde_json::to_string(&ClientSpki::new(bytes)).expect("encode");
+        assert_eq!(host, client);
+        assert_eq!(
+            host,
+            serde_json::to_string(&SpkiSha256::new(bytes)).expect("encode"),
+            "the roles must not invent a second encoding"
+        );
+    }
+
+    #[test]
+    fn each_role_round_trips_and_keeps_its_bytes() {
+        let bytes = [0x77u8; WIRE_KEY_LEN];
+        let host: HostSpki =
+            serde_json::from_str(&serde_json::to_string(&HostSpki::new(bytes)).unwrap())
+                .expect("decode");
+        assert_eq!(host.as_bytes(), &bytes);
+        let client: ClientSpki =
+            serde_json::from_str(&serde_json::to_string(&ClientSpki::new(bytes)).unwrap())
+                .expect("decode");
+        assert_eq!(client.as_bytes(), &bytes);
+    }
+
+    /// The roles inherit the length rules rather than re-implementing them.
+    /// 31 and 33 bytes are also 44 characters, so this is the assertion that
+    /// would catch a role type that grew its own decoder.
+    #[test]
+    fn a_role_rejects_everything_that_is_not_thirty_two_bytes() {
+        for n in [0usize, 31, 33, 64] {
+            let json = format!("\"{}\"", B64.encode(vec![0x11u8; n]));
+            assert!(
+                serde_json::from_str::<HostSpki>(&json).is_err(),
+                "{n} bytes was accepted as a HostSpki"
+            );
+            assert!(
+                serde_json::from_str::<ClientSpki>(&json).is_err(),
+                "{n} bytes was accepted as a ClientSpki"
+            );
+        }
+    }
+
+    /// Both roles print, and each says whose fingerprint it is.
+    #[test]
+    fn debug_names_the_role_and_still_prints_the_digest() {
+        let encoded = B64.encode([0x2bu8; WIRE_KEY_LEN]);
+        let host = format!("{:?}", HostSpki::new([0x2b; WIRE_KEY_LEN]));
+        let client = format!("{:?}", ClientSpki::new([0x2b; WIRE_KEY_LEN]));
+        assert!(host.starts_with("HostSpki("), "{host}");
+        assert!(client.starts_with("ClientSpki("), "{client}");
+        assert!(host.contains(&encoded), "{host}");
+        assert!(client.contains(&encoded), "{client}");
+        assert_ne!(host, client, "the role must be readable in a log");
+    }
 
     #[test]
     fn a_psk_round_trips_through_json_as_forty_four_characters() {
