@@ -39,7 +39,7 @@ impl GridSize {
     /// a clamped size means the two ends silently disagree about how big the
     /// screen is. A refused one is visible.
     pub fn new(size: TermSize, history: usize) -> Result<GridSize, ApplyError> {
-        // FAULT INJECTION
+        size.check_bounds()?;
         Ok(GridSize {
             screen_lines: size.rows as usize,
             columns: size.cols as usize,
@@ -99,6 +99,42 @@ mod tests {
         assert_eq!(g.last_column(), Column(79));
         assert_eq!(g.bottommost_line(), Line(23));
         assert_eq!(g.topmost_line(), Line(-1_000));
+    }
+
+    /// The test whose absence let a `// FAULT INJECTION` marker ship in place
+    /// of the check itself, in the very commit that added I7. `GridSize::new`
+    /// was made fallible, given a doc comment naming it the choke point, and
+    /// its caller updated to `.expect(...)` — and the body checked nothing.
+    /// Nothing failed, because nothing here ever asked it to refuse.
+    ///
+    /// This is the host-facing direction of I7: a hostile CLIENT sends the
+    /// size, and `history` multiplies whatever it asks for.
+    #[test]
+    fn an_over_cap_size_is_refused_rather_than_allocated() {
+        for (rows, cols, why) in [
+            (u16::MAX, u16::MAX, "the unbounded resize bomb itself"),
+            (2_049, 1, "rows alone past MAX_SCREEN_DIM"),
+            (1, 2_049, "cols alone past MAX_SCREEN_DIM"),
+            (1_024, 1_024, "each dimension legal, the product is not"),
+        ] {
+            let err = GridSize::new(TermSize { cols, rows }, 1_000)
+                .expect_err(&format!("{rows}x{cols} must be refused: {why}"));
+            assert!(
+                matches!(err, ApplyError::ScreenTooLarge { .. }),
+                "{rows}x{cols} ({why}) gave {err:?}, not ScreenTooLarge"
+            );
+        }
+    }
+
+    /// `history` is not part of I7's arithmetic, so a legal size stays legal
+    /// however deep the scrollback. Pinned because the obvious over-correction
+    /// is to fold `history` into the cell count and start refusing ordinary
+    /// terminals.
+    #[test]
+    fn a_legal_size_survives_a_deep_history() {
+        let g = GridSize::new(TermSize { cols: 400, rows: 120 }, 100_000)
+            .expect("a 4K display at a 6px font, with deep scrollback");
+        assert_eq!(g.total_lines(), 100_120);
     }
 
     #[test]
