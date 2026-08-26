@@ -336,9 +336,17 @@ mod tests {
             bell: None,
             scrollback_len: None,
         };
-        let err = s.apply(1, 2, &d).expect_err("a screen that large must be refused");
+        let err = s
+            .apply(1, 2, &d)
+            .expect_err("a screen that large must be refused");
         assert!(
-            matches!(err, ApplyError::ScreenTooLarge { rows: 1024, cols: 1024 }),
+            matches!(
+                err,
+                ApplyError::ScreenTooLarge {
+                    rows: 1024,
+                    cols: 1024
+                }
+            ),
             "expected ScreenTooLarge, got {err:?}"
         );
         assert_eq!(
