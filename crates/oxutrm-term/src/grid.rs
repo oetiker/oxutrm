@@ -132,8 +132,14 @@ mod tests {
     /// terminals.
     #[test]
     fn a_legal_size_survives_a_deep_history() {
-        let g = GridSize::new(TermSize { cols: 400, rows: 120 }, 100_000)
-            .expect("a 4K display at a 6px font, with deep scrollback");
+        let g = GridSize::new(
+            TermSize {
+                cols: 400,
+                rows: 120,
+            },
+            100_000,
+        )
+        .expect("a 4K display at a 6px font, with deep scrollback");
         assert_eq!(g.total_lines(), 100_120);
     }
 
