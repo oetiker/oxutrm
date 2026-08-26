@@ -294,11 +294,6 @@ impl<S: SyncState> Receiver<S> {
             Some(base) if f.from_state != 0 => base.clone(),
             _ => self.state().clone(),
         };
-        if f.from_state == 0 {
-            self.full_states_applied = self.full_states_applied.saturating_add(1);
-        } else {
-            self.diffs_applied = self.diffs_applied.saturating_add(1);
-        }
         next.apply(f.from_state, f.my_state, &diff)?;
         // AFTER apply, never before: the question is whether the RESULT is a
         // legal state, and the state we already hold is legal by induction.
@@ -323,6 +318,20 @@ impl<S: SyncState> Receiver<S> {
         // Checking against the base instead would let a bell counter go
         // backwards relative to a state we already hold.
         next.validate_transition(self.state())?;
+
+        // Counted HERE, after both checks, and not one line earlier. These are
+        // APPLIED frames, which is what the doc comment promises and what the
+        // counter is for: a receiver that refused every diff and converged
+        // purely on the full-state rescue must report zero diffs, or the
+        // instrument built to detect the rescue is fooled by the rescue. Both
+        // `?` above are ordinary refusals — a base we cannot produce, a result
+        // that breaks I5 or I6 — and neither ends the session, so counting the
+        // ATTEMPT reads as health on a link where the diff path is dead.
+        if f.from_state == 0 {
+            self.full_states_applied = self.full_states_applied.saturating_add(1);
+        } else {
+            self.diffs_applied = self.diffs_applied.saturating_add(1);
+        }
 
         // Everything we held before the peer's first frame we invented
         // ourselves. Those sequence numbers name our screens, never the
@@ -868,5 +877,84 @@ mod tests {
         // advanced its ack after refusing a frame would tell the sender it
         // holds a state it does not.
         assert_eq!(rx.ack(), before);
+    }
+
+    /// A frame the receiver REFUSED must not be counted as one it applied.
+    ///
+    /// `applied_kinds` exists for one job: telling a healthy session apart from
+    /// one converging entirely on the full-state rescue. The two are otherwise
+    /// indistinguishable — both paint the right screen, and a receiver whose
+    /// diff path is completely broken still converges, because a full state
+    /// applies unconditionally. The diff count is the only witness.
+    ///
+    /// Counting the ATTEMPT rather than the APPLICATION destroys exactly that.
+    /// A receiver that refused every single diff and reached the right screen
+    /// purely on rescues would report a healthy diff count, and the instrument
+    /// built to detect the rescue would be fooled by the rescue. Under a
+    /// lossless link the two figures agree, which is why nothing noticed: the
+    /// only caller is a flood gate that runs with `rejected == 0`.
+    #[test]
+    fn a_diff_refused_by_apply_is_not_counted_as_applied() {
+        let mut tx: Sender<ScreenState> = Sender::new(screen());
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+        let hello = tx.make_frame(rx.ack()).expect("mf").expect("full state");
+        assert_eq!(hello.from_state, 0);
+        rx.on_frame(&hello).expect("the attach applies");
+        assert_eq!(rx.applied_kinds(), (0, 1), "one rescue, no diffs yet");
+
+        // Names a base the receiver has never held and never will.
+        let stale_base = Frame {
+            my_state: rx.state().seq + 1,
+            from_state: 99,
+            ack_state: 0,
+            flags: 0,
+            payload: postcard::to_stdvec(&screen().diff_from(&screen())).expect("encode"),
+        };
+        assert!(matches!(
+            rx.on_frame(&stale_base),
+            Err(ApplyError::BaseMismatch { base: 99, .. })
+        ));
+        assert_eq!(
+            rx.applied_kinds(),
+            (0, 1),
+            "a diff refused by `apply` was counted as applied"
+        );
+    }
+
+    /// The same, for the refusal that happens AFTER the diff applied cleanly.
+    ///
+    /// This one gets further: `apply` succeeded and the frame was turned back
+    /// only because the RESULT was an illegal state. The counter sat before
+    /// both checks, so both regimes were miscounted.
+    #[test]
+    fn a_diff_refused_by_validate_transition_is_not_counted_as_applied() {
+        let mut rung = screen();
+        rung.bell = 5;
+        let mut tx: Sender<ScreenState> = Sender::new(rung);
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+
+        let hello = tx.make_frame(rx.ack()).expect("mf").expect("full state");
+        rx.on_frame(&hello).expect("the attach applies");
+        tx.on_ack(rx.ack());
+        assert_eq!(rx.state().bell, 5);
+        assert_eq!(rx.applied_kinds(), (0, 1));
+
+        // I5: the bell is a monotonic counter. Walking it backwards is a
+        // rejection with a reason, not an error that ends the session.
+        let mut silent = screen();
+        silent.bell = 0;
+        tx.update(silent);
+        let f = tx.make_frame(rx.ack()).expect("mf").expect("frame");
+        assert_ne!(f.from_state, 0, "this must be a diff, not another rescue");
+        assert!(matches!(
+            rx.on_frame(&f),
+            Err(ApplyError::BellWentBackwards { was: 5, now: 0 })
+        ));
+        assert_eq!(
+            rx.applied_kinds(),
+            (0, 1),
+            "a diff refused by `validate_transition` was counted as applied"
+        );
+        assert_eq!(rx.state().bell, 5, "the refusal must change nothing");
     }
 }

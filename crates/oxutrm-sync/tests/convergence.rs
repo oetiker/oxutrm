@@ -458,17 +458,16 @@ proptest! {
         prop_assert_eq!(rx.ack(), tx.current().seq());
 
         // The receiver's own instrument must agree with what this test watched
-        // happen. It is a `>=` and not an `==`, and that is a finding rather
-        // than a fudge: `Receiver::on_frame` increments these counters BEFORE
-        // `apply` and `validate_transition` can refuse the frame, so a refused
-        // diff is counted as an applied one. Under zero loss the two are the
-        // same number, which is why nothing noticed; a base mismatch is exactly
-        // the case that separates them, and this dimension produces those. The
-        // deterministic test below runs a lossless link and can therefore
-        // assert the exact figures.
+        // happen, EXACTLY. This was a `>=` while `Receiver::on_frame`
+        // incremented the counters before `apply` and `validate_transition`
+        // could refuse a frame, which made a refused diff count as an applied
+        // one. It counts applications now, so the bound is an equality — and it
+        // must stay one: a `>=` here cannot tell a healthy diff path from one
+        // that refuses everything and is rescued by full states, which is the
+        // single thing this counter exists to expose.
         let (diffs, fulls) = rx.applied_kinds();
         prop_assert!(
-            diffs >= applied_diffs && fulls >= applied_fulls,
+            diffs == applied_diffs && fulls == applied_fulls,
             "applied_kinds() reported ({diffs}, {fulls}) but {applied_diffs} diffs and \
              {applied_fulls} full states actually applied"
         );
@@ -695,10 +694,7 @@ fn a_lagging_acknowledgement_is_answered_with_diffs_and_not_with_rescues() {
         "the drift should settle at one less than the ack latency"
     );
 
-    // How convergence was reached, not merely that it was. Exact, because
-    // nothing was refused on this link — under loss `applied_kinds` counts a
-    // refused frame as an applied one, which is why the proptest above can only
-    // assert a bound.
+    // How convergence was reached, not merely that it was.
     let (diffs, fulls) = rx.applied_kinds();
     assert_eq!(
         (diffs, fulls),

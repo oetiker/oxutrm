@@ -106,9 +106,12 @@ oxutrm-term.workspace = true
 oxutrm-net.workspace = true
 oxutrm-host.workspace = true
 oxutrm-client.workspace = true
-# Only for making the keyboard non-blocking; the terminal itself belongs to
-# oxutrm-client's RawGuard.
-rustix.workspace = true
+# `fs` and `event` are for the keyboard: it is opened as its own file
+# description on the controlling terminal rather than by making fd 0
+# non-blocking, because fd 0's description belongs to the user's shell. `pty`
+# is used only by the tests, which need a real terminal to observe that.
+# The terminal itself belongs to oxutrm-client's RawGuard.
+rustix = { workspace = true, features = ["event", "pty"] }
 # src/link.rs adapts a Frame onto a QUIC connection - datagram if it fits, a
 # fresh unidirectional stream if not. It lives here rather than in oxutrm-net
 # because it is transport POLICY for the session loops, not connectivity, and

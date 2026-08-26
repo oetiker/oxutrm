@@ -32,7 +32,7 @@ pub mod renderer;
 pub mod status;
 
 pub use color::down_convert;
-pub use guard::RawGuard;
+pub use guard::{RawGuard, TERMINAL_RESTORE};
 pub use renderer::Renderer;
 pub use status::{rung_label, status_line};
 
