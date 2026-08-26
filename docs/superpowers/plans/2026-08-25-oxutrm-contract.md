@@ -477,8 +477,39 @@ impl ScreenState {
 //
 //     32 bytes is a ceiling, not a policy: the longest thing a cell
 //     legitimately holds is a base character plus its combining marks, which
-//     `HostTerm` builds from `cell.zerowidth()`. 512 is comfortably past any
-//     real window title.
+//     `HostTerm` builds from `cell.zerowidth()`. Measured against real scripts,
+//     the widest cluster found is 15 bytes — a Tibetan stack, a Hebrew word
+//     with nikud and cantillation, a Devanagari cluster with four marks — so 32
+//     is a 2x margin, pinned by a test so a regression reads as a lost margin
+//     rather than as a mystery. It IS a deliberate cut below what Unicode
+//     permits: UAX #15's Stream-Safe Text Format tolerates 30 non-starters
+//     after a base, which would need 94 bytes. No script needs that, and the
+//     cut is what the host-side fit below exists to make safe. 512 is
+//     comfortably past any real window title.
+//
+//     **The host MAINTAINS I8; it does not merely check it.** This is the site
+//     that is easy to forget and the reasoning is not what it first appears:
+//     `alacritty_terminal` puts NO cap on `Cell::zerowidth()` —
+//     `push_zerowidth` is an unbounded `Vec::push` — so a program printing
+//     combining marks in a loop grows one cell without limit. That is ugly
+//     output, not an attack, and an honest host would then ship a state its own
+//     peer must refuse, freezing the session for reasons no log explains. So
+//     the host TRUNCATES while building the cell rather than asserting on the
+//     finished one: filtering a megabyte of marks down to 32 bytes still costs
+//     the megabyte if you assemble it first. The title is fitted where the
+//     `ScreenState` is built, so every path in the crate inherits it.
+//
+//     Truncation at the source is NOT the "stripping" this invariant forbids,
+//     and the distinction is the whole point. The host is fitting text it
+//     AUTHORED, before any sequence number names it; the client is refusing
+//     text a PEER sent. One buys liveness for honest hosts, the other buys
+//     safety for the user, and a hostile host simply would not run the first.
+//     Never move the host's fit to the client side.
+//
+//     The diff's TITLE is checked at the TOP of `ScreenState::apply`, not where
+//     it is assigned. The assignment sits below the row loop, so checking there
+//     would leave a half-painted screen behind on a refusal, and `ApplyError`
+//     promises that nothing was applied. One line of ordering keeps that true.
 //
 //     I8 does NOT cover exit-time restoration, and that hole is still open. A
 //     hostile host can set `alt_screen`, mouse reporting and a hidden cursor,

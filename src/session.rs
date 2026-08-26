@@ -418,6 +418,13 @@ impl ClientSession {
         self.screen_rx.state()
     }
 
+    /// Applied screen frames that carried a diff, and those that carried a
+    /// whole screen. See `Receiver::applied_kinds`.
+    #[must_use]
+    pub fn applied_kinds(&self) -> (u64, u64) {
+        self.screen_rx.applied_kinds()
+    }
+
     pub fn size(&self) -> TermSize {
         self.size
     }
@@ -760,8 +767,10 @@ mod tests {
         // happened rather than inferred from the screen.
         let scrolled = host.screen().scrollback_len;
 
+        let (diffs, full_states) = client.applied_kinds();
         eprintln!(
             "{turns} turns, {frames} frames, {applied} applied, {rejected} rejected, \
+             {diffs} diffs, {full_states} full states, \
              {scrolled} lines scrolled in {elapsed:?}"
         );
         assert!(turns > 40, "only {turns} turns; the test proves little");
@@ -782,6 +791,28 @@ mod tests {
             "{rejected} of {} frames were dropped as unapplicable; the client is \
              painting a screen it knows to be superseded",
             applied + rejected
+        );
+
+        // `rejected == 0` alone does NOT prove the diff path works, and this is
+        // the assertion that says so.
+        //
+        // A full state carries `from_state == 0` and applies unconditionally,
+        // so a session whose base handling is completely broken also rejects
+        // nothing: the sender's ring runs dry, every frame degrades to a whole
+        // screen, and the screen still converges. That regime satisfies the
+        // assertion above exactly as a healthy one does. It is the same
+        // accidental rescue that hid the base-drift defect until somebody
+        // measured it, and a gate that cannot tell the two apart is not a gate.
+        //
+        // On this loopback link the sender's ring is never under pressure, so
+        // the full-state fallback should be the FIRST frame and essentially
+        // nothing else.
+        assert!(
+            diffs > full_states * 4,
+            "{diffs} diffs against {full_states} full states: the client is \
+             converging on the full-state rescue rather than on diffs, which \
+             costs a round trip and the whole bandwidth saving, and which \
+             `rejected == 0` cannot see"
         );
         assert!(
             scrolled > 10_000,
