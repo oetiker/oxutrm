@@ -25,6 +25,7 @@ mod loopback;
 mod session;
 
 use std::io::{Read as _, Write as _};
+use std::os::fd::BorrowedFd;
 
 use anyhow::{Context as _, Result};
 
@@ -146,8 +147,7 @@ fn run_loopback(args: &[String]) -> Result<()> {
 
     let mut session = loopback::Loopback::new(&shell, &[], &[], size, 10_000, caps)?;
 
-    let mut stdin = std::io::stdin();
-    set_nonblocking(rustix::stdio::stdin())?;
+    let mut keyboard = Keyboard::open(rustix::stdio::stdin())?;
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
 
@@ -159,12 +159,7 @@ fn run_loopback(args: &[String]) -> Result<()> {
             session.resize(now)?;
         }
 
-        let n = match stdin.read(&mut buf) {
-            Ok(0) => 0,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-            Err(e) => return Err(anyhow::Error::new(e).context("reading the keyboard")),
-        };
+        let n = keyboard.read(&mut buf).context("reading the keyboard")?;
 
         let tick = session.tick(&buf[..n], &mut stdout)?;
         if let Some(code) = tick.exited {
@@ -179,10 +174,105 @@ fn run_loopback(args: &[String]) -> Result<()> {
     std::process::exit(code);
 }
 
-fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> Result<()> {
-    rustix::io::ioctl_fionbio(fd, true).context("making the keyboard non-blocking")?;
-    Ok(())
+/// The controlling terminal, reachable by name from any process that has one.
+const CONTROLLING_TERMINAL: &str = "/dev/tty";
+
+/// The keyboard, read without blocking and **without touching the descriptor
+/// the user gave us**.
+///
+/// `O_NONBLOCK` is a property of the open FILE DESCRIPTION, not of the
+/// descriptor that names it. The description behind fd 0 was created by
+/// whoever started us — interactively, the user's shell — and `dup` shares it
+/// rather than copying it. So the obvious implementation, `ioctl_fionbio(fd 0,
+/// true)`, does not configure oxutrm's keyboard: it reconfigures the SHELL's
+/// standard input, for the rest of that shell's life. The next program to read
+/// a line gets a spurious `EAGAIN` and reports an error on an empty prompt.
+///
+/// Restoring it afterwards is not good enough and the difference is not
+/// theoretical. The change would have to be undone on every exit path, and
+/// `kill -9` is an exit path no guard can reach, so a `SIGKILL`ed session would
+/// still leave the shell broken. The state is therefore never created.
+///
+/// Instead the terminal is opened **again**. `/dev/tty` is the same device and
+/// the same input queue, but `open` mints a NEW file description, so the
+/// `O_NONBLOCK` on it is ours alone and dies with the process. No keystroke is
+/// lost, and there is nothing to restore anywhere.
+struct Keyboard {
+    file: std::fs::File,
+    /// True when `file` is our own description and carries our own
+    /// `O_NONBLOCK`. False on the fallback below, where it merely duplicates
+    /// the caller's descriptor and therefore SHARES a description we must not
+    /// modify — see [`Keyboard::read`].
+    private: bool,
 }
+
+impl Keyboard {
+    fn open(user: BorrowedFd<'_>) -> Result<Keyboard> {
+        Keyboard::open_via(CONTROLLING_TERMINAL, user)
+    }
+
+    /// `tty` is a parameter only so the tests can name a pty of their own.
+    /// `/dev/tty` inside a test binary means the developer's real terminal,
+    /// which a test has no business opening, let alone reading.
+    fn open_via<P: rustix::path::Arg>(tty: P, user: BorrowedFd<'_>) -> Result<Keyboard> {
+        use rustix::fs::{Mode, OFlags};
+
+        match rustix::fs::open(
+            tty,
+            OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(Keyboard {
+                file: fd.into(),
+                private: true,
+            }),
+            // `RawGuard::enter` has already established that fd 0 is a
+            // terminal, so reaching here means there is no CONTROLLING
+            // terminal to open by name — a session started by a supervisor
+            // that handed us a pty without making it our own. Falling back to
+            // a duplicate is correct; making that duplicate non-blocking would
+            // not be, because it shares the description we are protecting.
+            Err(_) => Ok(Keyboard {
+                file: user
+                    .try_clone_to_owned()
+                    .context("duplicate the keyboard")?
+                    .into(),
+                private: false,
+            }),
+        }
+    }
+
+    /// Whatever has been typed, or nothing at all. Never blocks.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // On the fallback the description belongs to the caller, so instead of
+        // setting a flag on it we ask whether a read would block. `poll` with
+        // a zero timeout answers that and changes no state anywhere — the
+        // point of the whole exercise.
+        if !self.private {
+            let mut fds = [rustix::event::PollFd::new(
+                &self.file,
+                rustix::event::PollFlags::IN,
+            )];
+            let ready = rustix::event::poll(&mut fds, Some(&IMMEDIATELY))?;
+            if ready == 0 {
+                return Ok(0);
+            }
+        }
+        match self.file.read(buf) {
+            Ok(n) => Ok(n),
+            // The private path's own `O_NONBLOCK`, which is the normal case on
+            // a quiet terminal.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// A zero `poll` timeout: answer now, wait for nothing.
+const IMMEDIATELY: rustix::event::Timespec = rustix::event::Timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+};
 
 /// The default path: drive `ssh` to start or find a session on the far end,
 /// exchange candidates over that channel, bring up QUIC, then become the
@@ -295,5 +385,168 @@ mod tests {
     #[test]
     fn the_version_flag_is_accepted() {
         assert!(dispatch(&["--version".to_string()]).is_ok());
+    }
+
+    // ---- the keyboard, and the user's shell it must not damage --------------
+    //
+    // `O_NONBLOCK` is a property of the open FILE DESCRIPTION, not of the
+    // descriptor. The description behind fd 0 belongs to whatever started us -
+    // interactively, the user's shell - and `dup` does not copy it, it shares
+    // it. So setting the flag on fd 0 is a change to the SHELL's stdin that
+    // outlives oxutrm, survives every exit path including `kill -9`, and makes
+    // the next program that reads a line see a spurious EAGAIN.
+    //
+    // These tests turn that sharing into the instrument: a `dup` of the
+    // descriptor handed to `Keyboard::open` sees exactly what the user's shell
+    // would see. A pty stands in for the terminal, and the path `open_via` is
+    // told to open is a parameter, because `/dev/tty` in a test binary means
+    // the developer's own terminal and nothing else.
+
+    use std::ffi::CString;
+    use std::os::fd::{AsFd as _, OwnedFd};
+
+    /// A pty master, plus the path of its slave.
+    fn open_pty() -> (OwnedFd, CString) {
+        use rustix::pty::OpenptFlags;
+        let master =
+            rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty");
+        rustix::pty::grantpt(&master).expect("grantpt");
+        rustix::pty::unlockpt(&master).expect("unlockpt");
+        let name = rustix::pty::ptsname(&master, Vec::new()).expect("ptsname");
+        (master, name)
+    }
+
+    fn flags(fd: BorrowedFd<'_>) -> rustix::fs::OFlags {
+        rustix::fs::fcntl_getfl(fd).expect("fcntl F_GETFL")
+    }
+
+    /// The whole bug in one assertion, on the path that is meant to work.
+    #[test]
+    fn opening_the_keyboard_never_touches_the_users_file_description() {
+        let (user, slave) = open_pty();
+        // A duplicate SHARES the description, which is why the damage escaped
+        // the process in the first place - and is what lets this observe it.
+        let shell_would_see = user.try_clone().expect("dup for observation");
+        let before = flags(shell_would_see.as_fd());
+
+        let keyboard = Keyboard::open_via(slave.as_c_str(), user.as_fd())
+            .expect("open the keyboard on the pty");
+        assert_eq!(
+            flags(shell_would_see.as_fd()),
+            before,
+            "opening the keyboard changed the user's own stdin"
+        );
+        assert!(
+            keyboard.private,
+            "a terminal that opened must give a PRIVATE description"
+        );
+
+        drop(keyboard);
+        assert_eq!(
+            flags(shell_would_see.as_fd()),
+            before,
+            "the user's stdin was left changed after oxutrm let go of it"
+        );
+    }
+
+    /// The same promise on the fallback, where there is no private description
+    /// to be had. It is the harder half: a `dup` shares the caller's
+    /// description, so the fallback must reach non-blocking behaviour WITHOUT
+    /// setting a flag - otherwise the fix holds only where `/dev/tty` opens,
+    /// and the one place it does not is a supervised session, where a broken
+    /// shell is hardest to notice.
+    #[test]
+    fn the_fallback_keyboard_does_not_touch_it_either() {
+        let (user, _slave) = open_pty();
+        let shell_would_see = user.try_clone().expect("dup for observation");
+        let before = flags(shell_would_see.as_fd());
+
+        let keyboard = Keyboard::open_via(c"/nonexistent/dev/tty", user.as_fd())
+            .expect("the fallback must not fail");
+        assert!(!keyboard.private, "this must be the fallback path");
+        assert_eq!(
+            flags(shell_would_see.as_fd()),
+            before,
+            "the fallback changed the user's own stdin"
+        );
+
+        drop(keyboard);
+        assert_eq!(flags(shell_would_see.as_fd()), before);
+    }
+
+    /// Deleting the non-blocking read would pass both tests above and hang the
+    /// session on the first quiet tick, so it is asserted separately: an idle
+    /// keyboard reports nothing typed, promptly, on BOTH paths.
+    #[test]
+    fn an_idle_keyboard_reports_nothing_typed_rather_than_blocking() {
+        for private in [true, false] {
+            let (master, slave) = open_pty();
+            // Keep the slave open, or reading the master is EIO rather than
+            // "nothing to read".
+            let _slave_open = rustix::fs::open(
+                slave.as_c_str(),
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open the pty slave");
+
+            let mut keyboard = if private {
+                Keyboard::open_via(slave.as_c_str(), master.as_fd()).expect("open on the slave")
+            } else {
+                Keyboard::open_via(c"/nonexistent/dev/tty", master.as_fd()).expect("fallback")
+            };
+            assert_eq!(keyboard.private, private, "wrong path under test");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                let _ = tx.send(keyboard.read(&mut buf));
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!("private={private}: reading an idle keyboard blocked the session")
+                });
+            assert_eq!(
+                got.expect("reading an idle keyboard is not an error"),
+                0,
+                "private={private}"
+            );
+        }
+    }
+
+    /// The call site, machine-checked.
+    ///
+    /// The tests above prove the mechanism; this one proves `run_loopback`
+    /// still uses it. Nothing in this file may make standard input
+    /// non-blocking again - the whole defect was one such call, and it read as
+    /// obviously correct for as long as it shipped.
+    #[test]
+    fn nothing_in_this_binary_changes_the_flags_on_standard_input() {
+        const SOURCE: &str = include_str!("main.rs");
+        // Comments are excluded so that the prose above is free to name the
+        // call it is warning about; the needles are spelled in halves so this
+        // list is not itself a match.
+        let code: String = SOURCE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            concat!("ioctl_", "fionbio"),
+            concat!("fcntl_", "setfl"),
+            concat!("set_", "nonblocking"),
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "`{forbidden}` is back in src/main.rs. Anything that sets a file \
+                 status flag here lands on the description behind fd 0, which \
+                 belongs to the user's shell and outlives this process."
+            );
+        }
+        assert!(
+            code.contains("Keyboard::open(rustix::stdio::stdin())"),
+            "run_loopback no longer takes the keyboard through `Keyboard`"
+        );
     }
 }
