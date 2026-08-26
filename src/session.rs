@@ -58,6 +58,14 @@ use crate::link::{Link, SendOutcome};
 /// that an idle session costs nothing.
 const IDLE_POLL: Duration = Duration::from_millis(4);
 
+/// How long [`ClientSession::drain`] will keep taking frames off a closed
+/// link before handing the user their prompt back.
+///
+/// The work it bounds is local — decode, apply, paint — so this is never
+/// reached in practice. It exists so that a reader task which somehow outlives
+/// its connection cannot hold a person's terminal hostage.
+const FINAL_DRAIN: Duration = Duration::from_secs(2);
+
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
 #[derive(Clone, Debug, Default)]
@@ -206,19 +214,43 @@ impl HostSession {
         Ok(())
     }
 
+    /// The frame the current state owes the peer, if any, and the bookkeeping
+    /// that says it has been offered.
+    ///
+    /// Split out from [`HostSession::offer_frame`] so the two ways of putting
+    /// it on the wire — paced and unreliable, or final and reliable — differ
+    /// only in the sending, never in what is sent.
+    fn next_frame(&mut self) -> Option<Frame> {
+        self.screen_tx.on_ack(self.input_rx.peer_ack());
+        match self.screen_tx.make_frame(self.input_rx.ack()) {
+            Ok(Some(f)) => {
+                self.last_send = Some(Instant::now());
+                Some(f)
+            }
+            // Nothing to send, or a diff that could not be built. Neither ends
+            // the session.
+            Ok(None) | Err(_) => None,
+        }
+    }
+
     fn offer_frame(&mut self) -> Option<SendOutcome> {
         if !self.due() {
             return None;
         }
-        self.screen_tx.on_ack(self.input_rx.peer_ack());
-        let frame = match self.screen_tx.make_frame(self.input_rx.ack()) {
-            Ok(Some(f)) => f,
-            // Nothing to send, or a diff that could not be built. Neither ends
-            // the session.
-            Ok(None) | Err(_) => return None,
-        };
-        self.last_send = Some(Instant::now());
+        let frame = self.next_frame()?;
         Some(self.link.sink.send(&frame))
+    }
+
+    /// [`HostSession::offer_frame`], on a stream that is finished and
+    /// acknowledged before this returns.
+    ///
+    /// For the last frame of a session only. See [`crate::link::FrameSink::send_final`].
+    async fn offer_frame_reliably(&mut self) -> Option<SendOutcome> {
+        if !self.due() {
+            return None;
+        }
+        let frame = self.next_frame()?;
+        Some(self.link.sink.send_final(&frame).await)
     }
 
     fn due(&self) -> bool {
@@ -244,11 +276,43 @@ impl HostSession {
         loop {
             let turn = self.turn()?;
             if let Some(code) = turn.exited {
-                self.close(code);
+                self.finish(code).await;
                 return Ok(code);
             }
             tokio::time::sleep(IDLE_POLL).await;
         }
+    }
+
+    /// The last screen, and only then the close. `ls; exit` lives or dies here.
+    ///
+    /// Three separate things were losing it, and all three had to go:
+    ///
+    /// **The shell's last write and its exit are two events.** `turn` polls
+    /// the pty and *then* reaps the child, so a shell that printed and exited
+    /// in the same breath leaves its output in the pty buffer, unread, on the
+    /// very turn that reports the exit. One more poll collects it.
+    ///
+    /// **Pacing has nothing left to defer to.** `offer_frame` is gated by
+    /// `due()`, which at an 8 ms interval against a 4 ms poll is false on
+    /// roughly half the turns. Normally that costs one interval; here it costs
+    /// the screen, because there is no next interval. Clearing `last_send` is
+    /// what makes the final offer unconditional.
+    ///
+    /// **`close` discards whatever is still in flight.** A datagram, or a
+    /// stream whose writer task has not yet reached `open_uni`. So the final
+    /// frame goes on a stream that is finished and *acknowledged* before the
+    /// close is sent.
+    ///
+    /// Infallible on purpose: nothing here is worth reporting instead of the
+    /// status of a shell that has already exited.
+    pub async fn finish(&mut self, code: i32) {
+        if self.term.poll().unwrap_or(false) {
+            let snapshot = self.term.snapshot(1);
+            self.screen_tx.update(snapshot);
+        }
+        self.last_send = None;
+        self.offer_frame_reliably().await;
+        self.close(code);
     }
 
     /// Tell the client the shell is gone, and with what status.
@@ -437,6 +501,25 @@ impl ClientSession {
         }
 
         // ---- inbound: the screen -------------------------------------------
+        self.take_frames(first, out, &mut turn)?;
+
+        // ---- outbound: keystrokes and the size we want ---------------------
+        turn.sent = self.offer_frame();
+        Ok(turn)
+    }
+
+    /// Apply everything waiting on the link and repaint if anything landed.
+    ///
+    /// The inbound half of [`ClientSession::turn_with`], on its own so the
+    /// end of a session can run it without the outbound half: once the
+    /// connection is closed there is nobody left to offer a frame to, and
+    /// asking a dead link to send one would only produce noise.
+    fn take_frames<W: Write>(
+        &mut self,
+        first: Option<Frame>,
+        out: &mut W,
+        turn: &mut Turn,
+    ) -> Result<()> {
         let mut painted = false;
         let mut next = first;
         while let Some(frame) = next.take().or_else(|| self.link.source.try_recv()) {
@@ -462,9 +545,39 @@ impl ClientSession {
                 .context("painting the terminal")?;
             out.flush().context("flushing the terminal")?;
         }
+        Ok(())
+    }
 
-        // ---- outbound: keystrokes and the size we want ---------------------
-        turn.sent = self.offer_frame();
+    /// Paint everything the host managed to deliver before it closed.
+    ///
+    /// The frames this collects are **not in flight**. They have arrived, been
+    /// decoded, and are sitting in an mpsc channel; nothing on the network can
+    /// lose them any more, and only returning early can. `tokio::select!`
+    /// picks at random among ready arms, so once `conn.closed()` has fired,
+    /// every queued frame had roughly even odds per lap of never being
+    /// painted — which is to say the last screen of a session was a coin toss
+    /// even when the host had delivered it perfectly.
+    ///
+    /// This terminates rather than hanging: a closed connection retires the
+    /// datagram reader and the stream acceptor, and quinn deliberately lets
+    /// already-received streams be drained from a closed connection ("which
+    /// are necessarily finite"), so every sender is eventually dropped and
+    /// `recv` yields `None`. The timeout is belt and braces on the one path
+    /// where the user's own terminal is what is being held up.
+    async fn drain<W: Write>(&mut self, out: &mut W) -> Result<Turn> {
+        let mut turn = Turn::default();
+        let drained = tokio::time::timeout(FINAL_DRAIN, async {
+            while let Some(frame) = self.link.source.recv().await {
+                self.take_frames(Some(frame), out, &mut turn)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        // A timeout is not an error — the user is still owed their shell's
+        // status. A failure to paint is, and is not swallowed by the wrapper.
+        if let Ok(result) = drained {
+            result?;
+        }
         Ok(turn)
     }
 
@@ -610,7 +723,13 @@ impl ClientSession {
                 Wake::Due => {
                     self.turn(&[], out)?;
                 }
-                Wake::Closed(reason) => return exit_code(&reason),
+                // The link is gone, but what already arrived over it is not.
+                // Paint it before answering, or `ls; exit` shows the user
+                // nothing at all.
+                Wake::Closed(reason) => {
+                    self.drain(out).await?;
+                    return exit_code(&reason);
+                }
             }
 
             // The next WAKE-UP, which is a different thing from `due()`, and
@@ -1497,18 +1616,29 @@ mod tests {
         );
     }
 
+    /// `ls; exit` — the single most user-visible thing this project can get
+    /// wrong.
+    ///
+    /// This test used to say `printf ...; sleep 1; exit 0`, with a comment
+    /// calling the sleep load-bearing "because closing a QUIC connection
+    /// discards whatever is still in flight". The comment was right that
+    /// something was rescuing the test and wrong about what: the sleep was not
+    /// working around a property of QUIC, it was working around three defects
+    /// in this file, and it is a rescue no real user has. A shell that prints
+    /// and exits in the same breath is not an edge case — it is what every
+    /// last command of every session does.
+    ///
+    /// Measured before the fix, with the sleep removed and nothing else
+    /// changed: 30 runs, 30 failures, screen entirely blank. Not flaky —
+    /// reliably red. The sleep stays out so this can fail again.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_paints_what_the_host_sent() {
         let (mut host, mut client) = pair("").await;
         let (keys, mut typing) = keyboard();
         let host_loop = tokio::spawn(async move { host.run().await });
 
-        // The `sleep` is load-bearing rather than padding: closing a QUIC
-        // connection discards whatever is still in flight, so a shell that
-        // printed and exited in the same breath could legitimately take its
-        // last screen with it and this would be a race, not a test.
         typing
-            .write_all(b"printf 'marker-here\\r\\n'\nsleep 1\nexit 0\n")
+            .write_all(b"printf 'marker-here\\r\\n'\nexit 0\n")
             .expect("type");
 
         let mut out = Vec::new();
@@ -1525,6 +1655,58 @@ mod tests {
         );
         assert!(!out.is_empty(), "the renderer was never asked to paint");
         let _ = host_loop.await;
+    }
+
+    /// The client's half of the same bug, on its own.
+    ///
+    /// `run_paints_what_the_host_sent` above cannot show this one: on loopback
+    /// the host now waits for its final frame to be acknowledged, which gives
+    /// the client's loop time to wake on the frame and paint it long before
+    /// the close lands. Measured — with the client's drain removed and the
+    /// host's fix in place, that test passed 20 out of 20.
+    ///
+    /// So the drain is exercised where it is decidable instead: the whole
+    /// session happens with the client's loop never running, so every frame
+    /// the host delivered is decoded and sitting in an mpsc channel at the
+    /// moment the connection closes. Those frames are not in flight and
+    /// nothing on the network can lose them — only returning without looking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frames_already_taken_off_a_closed_link_are_still_painted() {
+        let (mut host, mut client) = pair("printf 'last-word\\r\\n'\nexit 3\n").await;
+
+        // The host runs to completion by hand. The client is never driven, so
+        // it acknowledges nothing and paints nothing.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut exited = None;
+        while Instant::now() < deadline {
+            if let Some(code) = host.turn().expect("host turn").exited {
+                exited = Some(code);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let code = exited.expect("the shell never exited");
+        assert_eq!(code, 3);
+        host.finish(code).await;
+
+        // The connection is closed before a single frame has been looked at.
+        let mut out = Vec::new();
+        let turn = client
+            .drain(&mut out)
+            .await
+            .expect("draining a closed link");
+        assert!(
+            turn.applied > 0,
+            "nothing was taken off the link after it closed, so a session that \
+             ends the moment it produces output shows the user nothing"
+        );
+        assert!(
+            text(client.screen()).contains("last-word"),
+            "the shell's last output was dropped along with the connection; \
+             screen was {:?}",
+            text(client.screen())
+        );
+        assert!(!out.is_empty(), "the drained frames were never painted");
     }
 
     #[cfg(target_os = "linux")]

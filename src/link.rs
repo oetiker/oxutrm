@@ -68,6 +68,14 @@ const SUPERSEDED: u32 = 1;
 /// wrong upstream — a 200x60 truecolor full state is well under a megabyte.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
+/// How long [`FrameSink::send_final`] waits for the peer to acknowledge the
+/// last frame of a session before giving up on it.
+///
+/// Generous, because this is the screen the user is left looking at, and paid
+/// only once, at the very end. Bounded, because a host that hangs for ever
+/// waiting on a client that is already gone is worse than a lost last screen.
+const FINAL_ACK_WAIT: Duration = Duration::from_secs(2);
+
 /// Why a frame did not go out. None of these end a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -281,6 +289,69 @@ impl FrameSink {
         SendOutcome::Stream {
             bytes: n,
             superseded,
+        }
+    }
+
+    /// Send one frame and do not come back until the peer has it.
+    ///
+    /// The whole file above says a send failure costs one pacing interval,
+    /// because the next interval re-diffs from the same base and carries
+    /// whatever was lost. That argument has exactly one hole in it, and this
+    /// is the method for the moment it opens: **there is no next interval.**
+    /// When the shell has exited, the frame being offered is the last one the
+    /// session will ever produce, and the close that follows it discards
+    /// anything still in flight — a datagram outright, and a stream whose
+    /// writer task has not yet reached `open_uni`.
+    ///
+    /// So this ignores size and takes the stream path unconditionally, writes
+    /// inline rather than in a spawned task the close could outrun, calls
+    /// `finish()`, and then waits on [`quinn::SendStream::stopped`], which
+    /// resolves once the peer has **acknowledged every byte**. Only after that
+    /// is closing the connection safe.
+    ///
+    /// It is still infallible outward: a peer that has already gone is not an
+    /// error to report to a shell that has already exited.
+    pub async fn send_final(&mut self, frame: &Frame) -> SendOutcome {
+        let bytes = match frame.encode() {
+            Ok(b) => b,
+            Err(e) => return SendOutcome::Dropped(format!("encoding a frame: {e}")),
+        };
+        if bytes.len() > MAX_FRAME {
+            return SendOutcome::Dropped(format!("frame of {} bytes is absurd", bytes.len()));
+        }
+        let n = bytes.len();
+
+        // Anything still being written is carrying an older state than this
+        // one by construction — this frame was minted from the newest state
+        // there is. Dropping the entry resets that stream exactly as an
+        // ordinary supersede would, rather than leaving it to race the close.
+        let superseded = self.in_flight.take().is_some_and(|old| !old.finished());
+
+        let mut stream = match self.conn.open_uni().await {
+            Ok(s) => s,
+            Err(e) => return SendOutcome::Dropped(format!("opening the final stream: {e}")),
+        };
+        if let Err(e) = stream.write_all(&bytes).await {
+            return SendOutcome::Dropped(format!("writing the final frame: {e}"));
+        }
+        // `finish` only promises that no more data is coming; it does not wait
+        // for what was already written. `stopped` is the part that makes the
+        // close safe.
+        if let Err(e) = stream.finish() {
+            return SendOutcome::Dropped(format!("finishing the final stream: {e}"));
+        }
+        match tokio::time::timeout(FINAL_ACK_WAIT, stream.stopped()).await {
+            Ok(_) => SendOutcome::Stream {
+                bytes: n,
+                superseded,
+            },
+            // A peer that has stopped acknowledging is a peer that is already
+            // gone. Bounded rather than open-ended because the alternative is
+            // a host process that never exits — and the user is owed their
+            // shell's status even when the last screen could not be delivered.
+            Err(_) => {
+                SendOutcome::Dropped("the peer never acknowledged the final frame".to_owned())
+            }
         }
     }
 
