@@ -30,6 +30,31 @@ root binary, which already depends on both. `ladder` keeps the policy
 
 Everything else in §5's build order is sound. Step 0 (split `daemonize`) is
 DONE. Steps 2 and 3 stand as written.
+
+**§8 STEPS L5, L8 AND L9 ARE OUT OF DATE ON THE KEY MATERIAL.**
+
+Written when `HostHello.psk` and `HostHello.cert_spki_sha256` were both
+`String`, holding base64 that nothing anywhere decoded. L9 shows
+`quic_client(&sock, remote, cert_spki_sha256)`, handing that `String` straight
+to a function that takes `[u8; 32]` — it could not have compiled, and it
+described a seam that was open in the code as well: there was no base64 decode
+call in the tree at all, product or test.
+
+Both fields are now distinct newtypes over `[u8; 32]` in `oxutrm-proto`:
+`Psk` and `SpkiSha256`. base64 lives in their `Serialize`/`Deserialize` and
+nowhere else, so the wire form and the in-memory form cannot drift apart, and
+the two values cannot be swapped for each other — they are the same size, and
+while both were `String` the swap type-checked. So:
+
+  * **L5** yields a `Psk` and an `SpkiSha256`, already decoded and already
+    length-checked. A `HostHello` whose key material is not exactly 32 bytes
+    does not deserialize, so it never reaches this step.
+  * **L8** takes the `Psk`: `IceAgent::new(&psk, IceRole::Controlling, cfg)`,
+    which the step as written does not mention at all. Same value, same type,
+    for `birthday_blast(&psk, ..)` on rung 3.
+  * **L9** takes the `SpkiSha256` unchanged:
+    `quic_client(&sock, remote, cert_spki_sha256)` — the same line, now with a
+    type behind it that means what the step always intended.
 -->
 
 # Wiring `oxutrm <ssh-target>` — a design

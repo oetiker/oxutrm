@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxutrm_proto::{Candidate, CandidateKind, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Psk, Rung};
 
 use crate::{
     CheckKind, IceCredentials, IceRole, NetConfig, build_check_request, build_check_response,
@@ -101,9 +101,9 @@ pub struct IceAgent {
 }
 
 impl IceAgent {
-    pub fn new(psk: [u8; 32], role: IceRole, cfg: NetConfig) -> IceAgent {
+    pub fn new(psk: &Psk, role: IceRole, cfg: NetConfig) -> IceAgent {
         IceAgent {
-            creds: IceCredentials::derive(&psk),
+            creds: IceCredentials::derive(psk.as_bytes()),
             role,
             cfg,
             locals: Vec::new(),
@@ -365,7 +365,7 @@ mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
-    const PSK: [u8; 32] = [0x5A; 32];
+    const PSK: Psk = Psk::new([0x5A; 32]);
 
     fn cfg(budget_ms: u64) -> NetConfig {
         NetConfig {
@@ -395,14 +395,14 @@ mod tests {
         let ca = cs.local_addr().unwrap();
         let ha = hs.local_addr().unwrap();
 
-        let mut client = IceAgent::new(PSK, IceRole::Controlling, cfg(4000));
+        let mut client = IceAgent::new(&PSK, IceRole::Controlling, cfg(4000));
         client.add_local(host_candidate(ca));
         client.add_remote(host_candidate(ha));
         for extra in client_extra_remotes {
             client.add_remote(host_candidate(extra));
         }
 
-        let mut host = IceAgent::new(PSK, IceRole::Controlled, cfg(4000));
+        let mut host = IceAgent::new(&PSK, IceRole::Controlled, cfg(4000));
         host.add_local(host_candidate(ha));
         host.add_remote(host_candidate(ca));
 
@@ -544,12 +544,12 @@ mod tests {
             a
         };
 
-        let mut client = IceAgent::new(PSK, IceRole::Controlling, cfg(6000));
+        let mut client = IceAgent::new(&PSK, IceRole::Controlling, cfg(6000));
         client.add_local(host_candidate(ca));
         client.add_remote(host_candidate(front_addr));
         client.add_remote(host_candidate(dead));
 
-        let mut host = IceAgent::new(PSK, IceRole::Controlled, cfg(6000));
+        let mut host = IceAgent::new(&PSK, IceRole::Controlled, cfg(6000));
         host.add_local(host_candidate(ha));
         host.add_remote(host_candidate(back_addr));
 
@@ -608,9 +608,9 @@ mod tests {
 
         // The client is told nothing about its own address, so the only way
         // it can learn one is from the peer's answer.
-        let mut client = IceAgent::new(PSK, IceRole::Controlling, cfg(4000));
+        let mut client = IceAgent::new(&PSK, IceRole::Controlling, cfg(4000));
         client.add_remote(host_candidate(ha));
-        let mut host = IceAgent::new(PSK, IceRole::Controlled, cfg(4000));
+        let mut host = IceAgent::new(&PSK, IceRole::Controlled, cfg(4000));
         host.add_remote(host_candidate(ca));
 
         let h = tokio::spawn(async move {
@@ -648,7 +648,7 @@ mod tests {
         let va = victim.local_addr().unwrap();
         let attacker = sock().await;
 
-        let mut agent = IceAgent::new(PSK, IceRole::Controlling, cfg(600));
+        let mut agent = IceAgent::new(&PSK, IceRole::Controlling, cfg(600));
         agent.add_local(host_candidate(va));
         agent.add_remote(host_candidate(attacker.local_addr().unwrap()));
 
@@ -690,7 +690,7 @@ mod tests {
         let va = victim.local_addr().unwrap();
         let mirror = sock().await;
 
-        let mut agent = IceAgent::new(PSK, IceRole::Controlling, cfg(600));
+        let mut agent = IceAgent::new(&PSK, IceRole::Controlling, cfg(600));
         agent.add_local(host_candidate(va));
         agent.add_remote(host_candidate(mirror.local_addr().unwrap()));
 
@@ -723,7 +723,7 @@ mod tests {
             drop(d);
             a
         };
-        let mut agent = IceAgent::new(PSK, IceRole::Controlling, cfg(400));
+        let mut agent = IceAgent::new(&PSK, IceRole::Controlling, cfg(400));
         agent.add_local(host_candidate(s.local_addr().unwrap()));
         agent.add_remote(host_candidate(dead));
 
@@ -742,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn an_agent_with_no_remote_candidates_fails_immediately() {
         let s = sock().await;
-        let mut agent = IceAgent::new(PSK, IceRole::Controlling, cfg(5000));
+        let mut agent = IceAgent::new(&PSK, IceRole::Controlling, cfg(5000));
         let ev = tokio::time::timeout(Duration::from_millis(500), agent.run(s))
             .await
             .expect("must not wait out the budget with nothing to check");
@@ -751,8 +751,8 @@ mod tests {
 
     #[test]
     fn the_client_is_always_controlling_and_the_roles_do_not_collide() {
-        let c = IceAgent::new(PSK, IceRole::Controlling, cfg(1000));
-        let h = IceAgent::new(PSK, IceRole::Controlled, cfg(1000));
+        let c = IceAgent::new(&PSK, IceRole::Controlling, cfg(1000));
+        let h = IceAgent::new(&PSK, IceRole::Controlled, cfg(1000));
         assert_eq!(c.role(), IceRole::Controlling);
         assert_eq!(h.role(), IceRole::Controlled);
         assert_ne!(
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn duplicate_candidates_are_merged_rather_than_probed_twice() {
-        let mut a = IceAgent::new(PSK, IceRole::Controlling, cfg(1000));
+        let mut a = IceAgent::new(&PSK, IceRole::Controlling, cfg(1000));
         let addr: SocketAddr = "203.0.113.9:443".parse().unwrap();
         a.add_remote(host_candidate(addr));
         a.add_remote(host_candidate(addr));
@@ -790,10 +790,10 @@ mod tests {
         let ca = cs.local_addr().unwrap();
         let ha = hs.local_addr().unwrap();
 
-        let mut client = IceAgent::new(PSK, IceRole::Controlling, cfg(4000));
+        let mut client = IceAgent::new(&PSK, IceRole::Controlling, cfg(4000));
         client.add_local(host_candidate(ca));
         client.add_remote(host_candidate(ha));
-        let mut host = IceAgent::new(PSK, IceRole::Controlled, cfg(4000));
+        let mut host = IceAgent::new(&PSK, IceRole::Controlled, cfg(4000));
         host.add_local(host_candidate(ha));
         host.add_remote(host_candidate(ca));
 

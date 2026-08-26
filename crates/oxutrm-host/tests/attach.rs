@@ -8,7 +8,7 @@ use std::path::Path;
 
 use oxutrm_host::attach::{AttachError, connect_to_session, format_session_list, relay_signals};
 use oxutrm_host::{Registry, RegistryGuard, SessionMeta, begin_attach, now_unix};
-use oxutrm_proto::{NatType, PROTO_VERSION, Rung, Signal, TermSize, TerminalCaps};
+use oxutrm_proto::{NatType, PROTO_VERSION, Psk, Rung, Signal, SpkiSha256, TermSize, TerminalCaps};
 use tokio::io::BufReader;
 
 fn meta(id: &str, pid: u32) -> SessionMeta {
@@ -21,6 +21,18 @@ fn meta(id: &str, pid: u32) -> SessionMeta {
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
     }
+}
+
+/// A `Psk` as it appears on the wire, without the JSON quotes.
+///
+/// There is no `AttachKeys::psk_base64()` any more: encoding lives in `Psk`'s
+/// `Serialize` and nowhere else, so a test that wants the encoded form asks
+/// the one encoder for it rather than being handed a second one.
+fn wire_form(psk: &Psk) -> String {
+    serde_json::to_string(psk)
+        .expect("a Psk always encodes")
+        .trim_matches('"')
+        .to_string()
 }
 
 fn client_hello() -> Signal {
@@ -175,10 +187,10 @@ fn every_attach_mints_a_new_psk_and_bumps_the_generation() {
     let mut m = meta("9999aaaa9999aaaa9999aaaa9999aaaa", 1);
     assert_eq!(m.attach_id, 1);
 
-    let first = begin_attach(&mut m, [7u8; 32]).expect("first attach");
+    let first = begin_attach(&mut m, SpkiSha256::new([7u8; 32])).expect("first attach");
     assert_eq!(first.attach_id, 2, "the generation moves on every attach");
 
-    let second = begin_attach(&mut m, [9u8; 32]).expect("second attach");
+    let second = begin_attach(&mut m, SpkiSha256::new([9u8; 32])).expect("second attach");
     assert_eq!(second.attach_id, 3);
 
     assert_ne!(
@@ -186,17 +198,21 @@ fn every_attach_mints_a_new_psk_and_bumps_the_generation() {
         second.keys.psk(),
         "a PSK captured from an earlier attach must not be able to reattach"
     );
-    assert_ne!(first.keys.psk_base64(), second.keys.psk_base64());
+    assert_ne!(
+        wire_form(first.keys.psk()),
+        wire_form(second.keys.psk()),
+        "and they differ on the wire as well as in memory"
+    );
     assert_eq!(m.attach_id, 3, "and the session records the generation");
 }
 
 #[test]
 fn a_psk_is_thirty_two_bytes_and_is_not_all_zeroes() {
     let mut m = meta("bbbbccccbbbbccccbbbbccccbbbbcccc", 1);
-    let attach = begin_attach(&mut m, [0u8; 32]).expect("attach");
-    assert_eq!(attach.keys.psk().len(), 32);
+    let attach = begin_attach(&mut m, SpkiSha256::new([0u8; 32])).expect("attach");
+    assert_eq!(attach.keys.psk().as_bytes().len(), 32);
     assert!(
-        attach.keys.psk().iter().any(|b| *b != 0),
+        attach.keys.psk().as_bytes().iter().any(|b| *b != 0),
         "the CSPRNG produced nothing"
     );
 }
@@ -206,11 +222,68 @@ fn debug_never_prints_key_material() {
     // A derived Debug would put the PSK into the first error that formatted a
     // struct containing one.
     let mut m = meta("ddddeeeeddddeeeeddddeeeeddddeeee", 1);
-    let attach = begin_attach(&mut m, [0xab; 32]).expect("attach");
+    let attach = begin_attach(&mut m, SpkiSha256::new([0xab; 32])).expect("attach");
     let text = format!("{:?}", attach);
     assert!(text.contains("redacted"), "{text}");
-    let leaked = attach.keys.psk_base64();
+    let leaked = wire_form(attach.keys.psk());
     assert!(!text.contains(&leaked), "the PSK reached a Debug string");
+    // And through the wire type too, which now carries its own redaction and
+    // is what a formatted `Signal` would reach for.
+    let shown = format!("{:?}", attach.keys.psk());
+    assert!(!shown.contains(&leaked), "the PSK reached Psk's Debug");
+}
+
+/// The seam: what the host MINTS must be what the client RECOVERS.
+///
+/// Both halves are minted here as raw bytes, travel as base64 text, and are
+/// consumed at the far end as raw bytes again — and until this test existed
+/// nothing in the tree ever closed that loop. Every other test checks one side
+/// of it: `AttachKeys` proves the bytes are fresh, `signal.rs` proves the JSON
+/// round-trips. Neither notices that the two ends never agreed on what the
+/// field means.
+#[test]
+fn the_minted_key_material_survives_the_wire_unchanged() {
+    let mut m = meta("aaaa1111aaaa1111aaaa1111aaaa1111", 1);
+    let fingerprint = [0x5au8; 32];
+    let attach = begin_attach(&mut m, SpkiSha256::new(fingerprint)).expect("attach");
+    let minted_psk = *attach.keys.psk().as_bytes();
+
+    let hello = Signal::HostHello {
+        proto: PROTO_VERSION,
+        session_id: m.session_id.clone(),
+        attach_id: attach.attach_id,
+        cert_spki_sha256: attach.keys.cert_spki_sha256(),
+        psk: attach.keys.psk().clone(),
+        candidates: vec![],
+        nat_type: NatType::Unknown,
+        bound_port: 443,
+        detachable: true,
+    };
+
+    let mut wire: Vec<u8> = Vec::new();
+    oxutrm_proto::write_signal(&mut wire, &hello).expect("write");
+
+    let mut r = std::io::BufReader::new(wire.as_slice());
+    match oxutrm_proto::read_signal(&mut r).expect("read") {
+        Signal::HostHello {
+            psk,
+            cert_spki_sha256,
+            ..
+        } => {
+            assert_eq!(
+                psk.as_bytes(),
+                &minted_psk,
+                "the PSK that came off the wire is not the PSK that was minted"
+            );
+            assert_eq!(
+                cert_spki_sha256.as_bytes(),
+                &fingerprint,
+                "the fingerprint that came off the wire is not the one the \
+                 certificate has"
+            );
+        }
+        other => panic!("expected HostHello, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

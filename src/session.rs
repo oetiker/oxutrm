@@ -434,7 +434,7 @@ impl ClientSession {
 mod tests {
     use super::*;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
-    use oxutrm_proto::{NatType, Rung};
+    use oxutrm_proto::{NatType, Rung, SpkiSha256};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -486,9 +486,10 @@ mod tests {
             (conn, host_ep)
         });
 
-        let (client_conn, client_ep, _cstun) = quic_client(&client_sock, host_addr, fingerprint)
-            .await
-            .unwrap();
+        let (client_conn, client_ep, _cstun) =
+            quic_client(&client_sock, host_addr, SpkiSha256::new(fingerprint))
+                .await
+                .unwrap();
         let (host_conn, host_ep) = accepting.await.unwrap();
 
         let host = HostSession::spawn(
@@ -850,7 +851,7 @@ mod tests {
             let inc = host_ep.accept().await.unwrap();
             (inc.await.unwrap(), host_ep)
         });
-        let (cc, ce, _cs) = quic_client(&client_sock, host_addr, fingerprint)
+        let (cc, ce, _cs) = quic_client(&client_sock, host_addr, SpkiSha256::new(fingerprint))
             .await
             .unwrap();
         let (hc, he) = accepting.await.unwrap();

@@ -20,8 +20,8 @@
 use std::io::{BufRead, Write};
 
 use oxutrm_proto::{
-    Candidate, CandidateKind, NatType, PROTO_VERSION, PathDescription, Rung, Signal, TermSize,
-    write_signal,
+    Candidate, CandidateKind, NatType, PROTO_VERSION, PathDescription, Psk, Rung, Signal,
+    SpkiSha256, TermSize, write_signal,
 };
 
 /// What a real login prints before the command's own output.
@@ -156,13 +156,27 @@ fn host_hello(attach_id: u64, proto: u32) -> Signal {
     // Distinct per attach, because that is the property under test. Real key
     // material comes from the OS CSPRNG; this fixture only has to be different
     // each time in a way a test can check.
-    let psk = format!("ZmFrZS1wc2stZm9yLWF0dGFjaC17{attach_id}}}LXNvbWVwYWRkaW5n");
+    //
+    // These used to be `format!`ed base64 strings, and they were not base64:
+    // the interpolation put a literal `}` in the middle of both. Nothing
+    // noticed, because nothing decoded them. They are bytes now, and there is
+    // one encoder, so a fixture that is not a legal 32-byte value cannot be
+    // written by accident.
+    let seed = attach_id.to_le_bytes();
+    let mut psk = [0u8; 32];
+    let mut fingerprint = [0u8; 32];
+    for (i, b) in psk.iter_mut().enumerate() {
+        *b = seed[i % seed.len()] ^ (i as u8);
+    }
+    for (i, b) in fingerprint.iter_mut().enumerate() {
+        *b = seed[i % seed.len()] ^ (i as u8) ^ 0xa5;
+    }
     Signal::HostHello {
         proto,
         session_id: "00112233445566778899aabbccddeeff".to_string(),
         attach_id,
-        cert_spki_sha256: format!("ZmFrZS1jZXJ0LWZvci1hdHRhY2gte{attach_id}}}LXBhZGRpbmc="),
-        psk,
+        cert_spki_sha256: SpkiSha256::new(fingerprint),
+        psk: Psk::new(psk),
         candidates: vec![Candidate {
             addr: "192.0.2.7:443".parse().expect("literal address"),
             kind: CandidateKind::ServerReflexive,

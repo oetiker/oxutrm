@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
             };
             println!("peer addr={remote}");
 
-            let mut agent = IceAgent::new(psk, ice_role, NetConfig::default());
+            let mut agent = IceAgent::new(&psk, ice_role, NetConfig::default());
             agent.add_local(oxutrm_proto::Candidate {
                 addr: local,
                 kind: oxutrm_proto::CandidateKind::Host,
@@ -193,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 birthday_budget: std::time::Duration::from_secs(8),
                 ..NetConfig::default()
             };
-            match oxutrm_net::birthday_blast(psk, IceRole::Controlling, base, &cfg).await? {
+            match oxutrm_net::birthday_blast(&psk, IceRole::Controlling, base, &cfg).await? {
                 Some(r) => println!("blast found remote={} probes={}", r.remote, r.probes),
                 None => {
                     println!("blast none");
@@ -228,11 +228,14 @@ async fn read_published(path: &str) -> anyhow::Result<SocketAddr> {
     anyhow::bail!("the peer never published an address to {path}")
 }
 
-fn psk_from(hex: &str) -> anyhow::Result<[u8; 32]> {
+/// Still hex, and deliberately so: this is a netns fixture driven from a shell
+/// command line, where hex is what a human types. The wire form is base64 and
+/// lives in `Psk`'s serde impl; this is not that path.
+fn psk_from(hex: &str) -> anyhow::Result<oxutrm_proto::Psk> {
     anyhow::ensure!(hex.len() == 64, "a psk is 64 hex characters");
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
         *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).context("psk is not hex")?;
     }
-    Ok(out)
+    Ok(oxutrm_proto::Psk::new(out))
 }
