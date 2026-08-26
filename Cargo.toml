@@ -42,6 +42,12 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
     "process",
+    # SIGWINCH, for the client's event loop. `process` does NOT imply this:
+    # both pull in `signal-hook-registry`, which is what makes the omission
+    # look harmless, but only `signal` builds `tokio::signal`. Without it the
+    # client would be back to asking the terminal its size 250 times a second
+    # for an answer that changes twice a day.
+    "signal",
 ] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

@@ -38,14 +38,15 @@
 //! under it because a different client reattached, and down-converting on the
 //! host would permanently degrade the state for every future client.
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Renderer, status_line};
-use oxutrm_proto::{PathDescription, ScreenState, TermSize, TerminalCaps};
+use oxutrm_client::{Renderer, status_line, terminal_size};
+use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender};
 use oxutrm_term::HostTerm;
 
@@ -243,14 +244,87 @@ impl HostSession {
         loop {
             let turn = self.turn()?;
             if let Some(code) = turn.exited {
+                self.close(code);
                 return Ok(code);
             }
             tokio::time::sleep(IDLE_POLL).await;
         }
     }
 
+    /// Tell the client the shell is gone, and with what status.
+    ///
+    /// The exit code has no field in the protocol and needs none. QUIC's own
+    /// close carries an application error code, so the status travels on the
+    /// mechanism that *is* the end of the session rather than in a frame that
+    /// would have to arrive first — and a frame is exactly what cannot be
+    /// relied on here, since the close discards whatever is still in flight.
+    ///
+    /// A code outside `u32` cannot come from a shell; `child_exited` invents
+    /// `-1` for a child it can no longer wait on, and that becomes 255, the
+    /// same thing every shell reports for "something went wrong out here".
+    pub fn close(&self, code: i32) {
+        let code = u32::try_from(code).unwrap_or(255);
+        self.link
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(code), b"the shell exited");
+    }
+
     pub fn screen(&self) -> &ScreenState {
         self.screen_tx.current()
+    }
+}
+
+/// What woke [`ClientSession::run_on`].
+///
+/// Waking and acting are separate steps, and that is structural rather than
+/// stylistic. `tokio::select!` keeps every arm's future alive while the
+/// winning arm's body runs, so an arm body that reached for `self` would hold
+/// a second borrow of a session another arm's future has already borrowed, and
+/// the loop would not compile. Every arm therefore produces one of these and
+/// touches nothing else; the whole session is borrowed afterwards, once.
+enum Wake {
+    /// Keystrokes — or zero of them, which is end of file on the keyboard.
+    Keys(usize),
+    Frame(Frame),
+    Winch,
+    /// The pacing deadline came round.
+    Due,
+    Closed(quinn::ConnectionError),
+    /// A readiness that turned out to be nothing. Costs one lap.
+    Nothing,
+}
+
+/// Readiness on the keyboard, or never again once it has reached end of file.
+///
+/// `None` does not mean "not ready yet"; it means the arm is retired. Written
+/// as a function rather than a `select!` precondition so the borrow of `keys`
+/// is exactly the returned guard, and the loop can drop the keyboard in the
+/// same breath as reading its last byte.
+async fn keys_readable<K: AsRawFd>(
+    keys: &mut Option<tokio::io::unix::AsyncFd<K>>,
+) -> std::io::Result<tokio::io::unix::AsyncFdReadyMutGuard<'_, K>> {
+    match keys {
+        Some(k) => k.readable_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Why the session ended, as an exit status.
+///
+/// The shell's exit code has no field in the protocol and needs none: the host
+/// closes the QUIC connection with it as the application error code, so it
+/// rides the mechanism that ends the session. Anything else closed the link —
+/// a timeout, a reset, a host that was killed — and that is an error rather
+/// than a status, because no shell said it.
+fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
+    match reason {
+        quinn::ConnectionError::ApplicationClosed(closed) => {
+            Ok(i32::try_from(closed.error_code.into_inner()).unwrap_or(255))
+        }
+        other => Err(anyhow::anyhow!(
+            "the link to the host ended without the shell exiting: {other}"
+        )),
     }
 }
 
@@ -330,6 +404,28 @@ impl ClientSession {
 
     /// One turn: send `input`, apply what arrived, repaint if it changed.
     pub fn turn<W: Write>(&mut self, input: &[u8], out: &mut W) -> Result<Turn> {
+        self.turn_with(input, None, out)
+    }
+
+    /// [`ClientSession::turn`], plus a frame the caller has already taken off
+    /// the link.
+    ///
+    /// [`ClientSession::run`] learns that a frame is ready by awaiting one,
+    /// and awaiting one consumes it. Handing it back here is what lets the
+    /// drain loop below see it in order with the rest.
+    ///
+    /// A parameter rather than a one-slot pushback buffer on [`FrameSource`],
+    /// deliberately. That slot would be mutable transport state which exactly
+    /// one caller in the tree could use correctly — the shape this project has
+    /// twice recorded as a mistake, because the rule for using it lives
+    /// nowhere the compiler can see. Here the frame is simply owned by whoever
+    /// is holding it, and there is nowhere for it to be stranded.
+    pub fn turn_with<W: Write>(
+        &mut self,
+        input: &[u8],
+        first: Option<Frame>,
+        out: &mut W,
+    ) -> Result<Turn> {
         let mut turn = Turn::default();
 
         if !input.is_empty() {
@@ -342,7 +438,8 @@ impl ClientSession {
 
         // ---- inbound: the screen -------------------------------------------
         let mut painted = false;
-        while let Some(frame) = self.link.source.try_recv() {
+        let mut next = first;
+        while let Some(frame) = next.take().or_else(|| self.link.source.try_recv()) {
             // Streams can complete out of order. `on_frame` answers that from
             // the frame's own sequence numbers: an older one is Ok(false).
             match self.screen_rx.on_frame(&frame) {
@@ -404,6 +501,136 @@ impl ClientSession {
         let next = self.input_tx.current().append(&[], size);
         self.input_tx.update(next);
         self.last_send = None;
+    }
+
+    /// Drive the session until the shell exits or the link closes.
+    ///
+    /// The caller owns raw mode. [`oxutrm_client::RawGuard`] is entered before
+    /// this and dropped after it, so `run` touches the terminal's bytes and
+    /// never its settings.
+    pub async fn run<W: Write>(&mut self, out: &mut W) -> Result<i32> {
+        // `/dev/tty`, and NOT a duplicate of fd 0. That is not a detail.
+        //
+        // `AsyncFd` requires the descriptor to be non-blocking, and
+        // `O_NONBLOCK` lives on the open file DESCRIPTION, which a `dup`
+        // shares with the original. Making our copy non-blocking would
+        // therefore make the user's shell's stdin non-blocking too, for the
+        // rest of that shell's life, with nothing left to restore it —
+        // `RawGuard` restores termios, which is a different thing entirely.
+        // Opening the terminal afresh gives a description of our own to
+        // spoil. It is the same terminal and the same input queue, so not a
+        // keystroke is lost.
+        let tty = std::fs::File::options()
+            .read(true)
+            .open("/dev/tty")
+            .context("opening the terminal to read the keyboard")?;
+        self.run_on(tty, out).await
+    }
+
+    /// [`ClientSession::run`], reading keystrokes from `keys`.
+    ///
+    /// The split exists so the loop can be tested, and it is the same reason
+    /// [`oxutrm_client::RawGuard`] has `enter_on`: a test binary has no
+    /// controlling terminal, `AsyncFd` cannot watch a regular file — `epoll`
+    /// refuses one outright — and a loop that can only run against a real
+    /// terminal is a loop with no tests at all. A socket pair is pollable and
+    /// behaves like a keyboard in every way this code can tell.
+    pub async fn run_on<K, W>(&mut self, keys: K, out: &mut W) -> Result<i32>
+    where
+        K: AsFd + AsRawFd + Read,
+        W: Write,
+    {
+        // Done here rather than asked of the caller: a blocking descriptor
+        // makes `try_io` below block the whole runtime on a keystroke that
+        // never comes, and that is not a mistake to leave available.
+        rustix::io::ioctl_fionbio(keys.as_fd(), true)
+            .context("making the keyboard non-blocking")?;
+        let mut keys = Some(
+            tokio::io::unix::AsyncFd::with_interest(keys, tokio::io::Interest::READABLE)
+                .context("watching the keyboard")?,
+        );
+
+        // Cloned OUT of the session, so the arm that waits for the link to
+        // close borrows a local instead of `self`. See `Wake`.
+        let conn = self.link.sink.connection().clone();
+        let mut winch =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                .context("watching for window size changes")?;
+
+        let mut buf = [0u8; 8192];
+        // Now, so the first lap sends immediately: an attach owes the host a
+        // frame before anything has happened, because that frame is what
+        // carries our ack of zero (R5).
+        let mut deadline = tokio::time::Instant::now();
+
+        loop {
+            let wake = tokio::select! {
+                r = keys_readable(&mut keys) => match r {
+                    Ok(mut guard) => match guard.try_io(|k| k.get_mut().read(&mut buf)) {
+                        Ok(Ok(n)) => Wake::Keys(n),
+                        Ok(Err(e)) => return Err(e).context("reading the keyboard"),
+                        // Readiness that evaporated; `try_io` has already
+                        // cleared it, so the next lap will wait properly.
+                        Err(_) => Wake::Nothing,
+                    },
+                    Err(e) => return Err(e).context("waiting on the keyboard"),
+                },
+                Some(frame) = self.link.source.recv() => Wake::Frame(frame),
+                Some(()) = winch.recv() => Wake::Winch,
+                () = tokio::time::sleep_until(deadline) => Wake::Due,
+                reason = conn.closed() => Wake::Closed(reason),
+            };
+
+            // Every borrow of `self` starts HERE, after the select expression
+            // has ended and dropped the futures above.
+            match wake {
+                Wake::Nothing => continue,
+                // End of file on the keyboard. The session lives on: output
+                // still arrives and the screen still paints. A terminal that
+                // went away is not a reason to kill a remote shell — surviving
+                // exactly that is what this project is for.
+                //
+                // Retiring the arm is not tidiness either. A descriptor at end
+                // of file is readable FOR EVER, so an arm left watching one
+                // spins as fast as the runtime can go.
+                Wake::Keys(0) => {
+                    keys = None;
+                    continue;
+                }
+                Wake::Keys(n) => {
+                    self.turn(&buf[..n], out)?;
+                }
+                Wake::Frame(frame) => {
+                    self.turn_with(&[], Some(frame), out)?;
+                }
+                Wake::Winch => {
+                    self.resize(terminal_size().context("reading the window size")?);
+                    self.turn(&[], out)?;
+                }
+                Wake::Due => {
+                    self.turn(&[], out)?;
+                }
+                Wake::Closed(reason) => return exit_code(&reason),
+            }
+
+            // The next WAKE-UP, which is a different thing from `due()`, and
+            // conflating the two is a busy loop rather than an optimisation.
+            //
+            // `due()` is the floor on how often a frame may be offered, and it
+            // is driven by `last_send`. But `offer_frame` only sets `last_send`
+            // when `make_frame` actually produced a frame, and `make_frame`
+            // returns `None` whenever neither side has moved and no ack is
+            // owed — which is precisely what a quiet session looks like. So in
+            // a quiet session `last_send` never advances, `due()` stays true,
+            // and a deadline derived from it is always already in the past:
+            // `sleep_until` returns instantly, every lap, for ever.
+            //
+            // Asking again one interval from NOW costs one cheap check per
+            // interval when there is nothing to say, and nothing at all when
+            // there is — typing and resizing both clear `last_send` and send
+            // inside the very `turn` above.
+            deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
+        }
     }
 
     /// Move to a new local socket without dropping the connection.
@@ -1206,6 +1433,223 @@ mod tests {
             .await,
             "the shell's TERM was not what the emulator supports: {:?}",
             text(client.screen())
+        );
+    }
+
+    // ---- ClientSession::run ------------------------------------------------
+
+    /// A socket pair standing in for the keyboard.
+    ///
+    /// The first half goes to the session, the second is what a person would
+    /// be typing on. A socket pair is pollable, which a regular file is not:
+    /// `epoll` refuses one outright, so a test that fed the loop a temporary
+    /// file would fail at `AsyncFd::with_interest` and prove nothing about the
+    /// loop at all.
+    fn keyboard() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        std::os::unix::net::UnixStream::pair().expect("a socket pair")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_carries_typing_to_the_shell_and_its_exit_code_back() {
+        // One assertion, both directions. The shell can only exit 42 because
+        // the client read "exit 42" off the keyboard and put it on the wire,
+        // and the client can only report 42 because the host hung it on the
+        // QUIC close and this loop unpicked it.
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        typing.write_all(b"exit 42\n").expect("type");
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(20), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+
+        assert_eq!(code, 42, "the exit status did not survive the trip");
+        assert_eq!(
+            host_loop.await.expect("host task").expect("host loop"),
+            42,
+            "the host disagrees about what the shell did"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_paints_what_the_host_sent() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        // The `sleep` is load-bearing rather than padding: closing a QUIC
+        // connection discards whatever is still in flight, so a shell that
+        // printed and exited in the same breath could legitimately take its
+        // last screen with it and this would be a race, not a test.
+        typing
+            .write_all(b"printf 'marker-here\\r\\n'\nsleep 1\nexit 0\n")
+            .expect("type");
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(30), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+
+        assert_eq!(code, 0);
+        assert!(
+            text(client.screen()).contains("marker-here"),
+            "the loop never took the host's output in; screen was {:?}",
+            text(client.screen())
+        );
+        assert!(!out.is_empty(), "the renderer was never asked to paint");
+        let _ = host_loop.await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_keyboard_at_end_of_file_neither_ends_the_session_nor_spins() {
+        // Two failures, one test, because they are the two halves of the same
+        // arm. Ending the session on end of file kills a live remote shell
+        // because the local terminal went away — the thing this project exists
+        // to survive. And LEAVING the arm in place instead is a silent spin: a
+        // descriptor at end of file is readable for ever, so the loop would
+        // wake on it as fast as the runtime can go, for the life of the
+        // session, with a perfectly correct screen the whole time.
+        //
+        // Nothing is typed at all: the host is driven by hand and closes on
+        // its own, so the session's whole life happens with the keyboard shut.
+        //
+        // Measured, by leaving the arm in place: this does not merely go over
+        // the bar below, it HANGS. An always-ready `AsyncFd` arm never yields,
+        // so on a current-thread runtime it starves the host task and the
+        // timeout with it. Recorded because a regression here will look like a
+        // stuck test rather than a failing one, and because it is why the bar
+        // cannot be the only thing standing here — the `assert_eq!` on the
+        // exit code is what fails cleanly if the arm ends the session instead.
+        let (mut host, mut client) = pair("").await;
+        let (keys, typing) = keyboard();
+        drop(typing);
+
+        let idle = Duration::from_secs(2);
+        let host_loop = tokio::spawn(async move {
+            let deadline = Instant::now() + idle;
+            while Instant::now() < deadline {
+                host.turn().expect("host turn");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            host.close(5);
+            host
+        });
+
+        let before = thread_cpu_millis();
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(idle * 4, client.run_on(keys, &mut out))
+            .await
+            .expect("a keyboard at end of file ended the session, or hung it")
+            .expect("the client loop failed");
+        let spent = thread_cpu_millis() - before;
+        let _host = host_loop.await.expect("host task");
+
+        assert_eq!(code, 5, "the session did not outlive the keyboard");
+        assert!(
+            spent < 400,
+            "the loop burned {spent} ms of CPU across {} ms with the keyboard \
+             shut: an arm was left watching a descriptor at end of file",
+            idle.as_millis()
+        );
+    }
+
+    #[test]
+    fn only_an_application_close_is_an_exit_status() {
+        // A host that was killed and a path that went away end the session
+        // too. Reporting either as "the shell exited 0" would be a lie the
+        // user acts on, so the status has to come from the shell or not at
+        // all.
+        let closed = quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(42),
+            reason: Default::default(),
+        };
+        assert_eq!(
+            exit_code(&quinn::ConnectionError::ApplicationClosed(closed)).unwrap(),
+            42
+        );
+        assert!(exit_code(&quinn::ConnectionError::TimedOut).is_err());
+        assert!(exit_code(&quinn::ConnectionError::LocallyClosed).is_err());
+    }
+
+    /// This THREAD's CPU time, in milliseconds.
+    ///
+    /// Per-thread and not per-process: the test binary runs several tests at
+    /// once, and a process-wide figure would be measuring them instead.
+    /// `#[tokio::test]` with no flavor is a current-thread runtime, so the
+    /// loop under test and every task it spawns stay on this one thread.
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_millis() -> u64 {
+        let stat =
+            std::fs::read_to_string("/proc/thread-self/stat").expect("/proc/thread-self/stat");
+        // The comm field can hold spaces and brackets, so the fields are taken
+        // from after the LAST ')' rather than by splitting the whole line.
+        let tail = &stat[stat.rfind(')').expect("a comm field") + 1..];
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        // utime and stime are fields 14 and 15 of the line, so 11 and 12 of
+        // what is left. USER_HZ is 100, and has been for this interface's
+        // whole life.
+        let ticks: u64 =
+            fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
+        ticks * 10
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_idle_loop_does_not_spin() {
+        // THE test for the pacing deadline, and it has to measure CPU because
+        // nothing about the SCREEN can see this bug. A loop whose wake-up is
+        // derived from `due()` instead of from the clock finds its deadline
+        // permanently in the past the moment both sides fall quiet — because
+        // `offer_frame` only advances `last_send` when `make_frame` actually
+        // produced a frame — and `sleep_until` then returns instantly, for
+        // ever. The session stays perfectly correct and burns a whole core.
+        let (mut host, mut client) = pair("").await;
+        let (keys, _typing) = keyboard();
+
+        // The host is driven by hand and slowly. `HostSession::run` polls at
+        // 250 Hz and this test measures the thread both loops share, so the
+        // host's own cadence must not be what is being weighed. It still acks,
+        // which is the point: an unacked client always has something to send
+        // and would never reach the quiet state this is about.
+        let idle = Duration::from_secs(2);
+        let host_loop = tokio::spawn(async move {
+            let deadline = Instant::now() + idle;
+            while Instant::now() < deadline {
+                host.turn().expect("host turn");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            host.close(0);
+            host
+        });
+
+        let before = thread_cpu_millis();
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(idle * 4, client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+        let spent = thread_cpu_millis() - before;
+        let _host = host_loop.await.expect("host task");
+
+        assert_eq!(code, 0);
+        // A spinning loop spends the whole wall-clock window on a core; a
+        // paced one spends a few milliseconds. The bar sits well below the
+        // spin and well above the healthy figure, so it is a gap rather than a
+        // threshold tuned to one observation.
+        assert!(
+            spent < 400,
+            "the idle loop burned {spent} ms of CPU across {} ms of wall clock: \
+             that is a spin, not a pace",
+            idle.as_millis()
         );
     }
 }
