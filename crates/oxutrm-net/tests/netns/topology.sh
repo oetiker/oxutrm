@@ -45,7 +45,20 @@ shift
 if [ "${OXUTRM_NETNS_INNER:-}" != "1" ]; then
     OXUTRM_NETNS_INNER=1
     export OXUTRM_NETNS_INNER
-    exec unshare --user --map-root-user --net --mount --fork \
+    # `--pid --mount-proc` is a LEAK FIX, not tidiness. `cleanup` below kills
+    # the pids it recorded, but `nsx` is a shell function, so `nsx ... &`
+    # backgrounds a SUBSHELL and `$!` names that subshell rather than the
+    # responder it goes on to run. Killing it orphaned the STUN responders to
+    # init on every ordinary run; 448 of them accumulated over one day. A trap
+    # cannot fix that, and cannot run at all when the harness is SIGKILLed by
+    # the OOM killer, which is the other way they escaped.
+    #
+    # With `--pid`, this script becomes pid 1 of a new pid namespace, and the
+    # kernel SIGKILLs every process in it when pid 1 exits — grandchildren
+    # included, and however pid 1 died. `cleanup` stays as the tidy path; this
+    # is the backstop underneath it. `--mount-proc` is required so that /proc
+    # reflects the new namespace rather than the host's.
+    exec unshare --user --map-root-user --net --mount --pid --mount-proc --fork \
         "$0" "$TOPOLOGY" -- "$@"
 fi
 

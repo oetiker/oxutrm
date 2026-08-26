@@ -14,5 +14,10 @@ description = "oxutrm local half: rendering, input and the terminal guard"
 # binary has no controlling terminal, so the restore path could not otherwise
 # be exercised at all.
 rustix = { workspace = true, features = ["pty"] }
+# Only for `sigaction` in `RawGuard`. rustix exposes no stable way to install a
+# signal handler (`rustix::runtime` is explicitly unstable), and a terminal left
+# in raw mode by `kill <pid>` is not a thing to leave unhandled for want of a
+# binding. Nothing else in this crate touches libc.
+libc.workspace = true
 anyhow.workspace = true
 oxutrm-proto.workspace = true

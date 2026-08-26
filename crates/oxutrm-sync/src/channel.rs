@@ -141,23 +141,77 @@ impl<S: SyncState> Sender<S> {
 }
 
 /// Applies incoming frames to a replicated state.
+///
+/// # It keeps a ring, for the same reason the [`Sender`] does
+///
+/// The sender diffs against the newest state the peer ACKNOWLEDGED, and an
+/// acknowledgement takes a round trip to come back. Every frame put on the
+/// wire inside that window therefore names a base the receiver has already
+/// left behind. A receiver that held only its current state could apply none
+/// of them — and each one carries a screen strictly NEWER than the one it is
+/// showing. Under a flood that is not an edge case, it is the steady state:
+/// measured, half of every frame sent was dropped this way at one round trip
+/// of ack latency, seven in eight at eight.
+///
+/// The base is never unknown to the receiver, only forgotten: it stood on that
+/// exact state a moment ago. So it keeps what it stood on, and a diff applies
+/// to whichever of those states it names.
+///
+/// The ring is self-pruning rather than merely capped. Every frame's
+/// `from_state` reveals which base the sender is still working from, and
+/// nothing older can ever be named again, so it goes. In steady state that
+/// leaves two entries, not [`STATE_RING`].
 pub struct Receiver<S: SyncState> {
-    state: S,
+    /// Oldest first; the last entry is the state actually held.
+    ///
+    /// Every entry after the peer's first frame was authored by the PEER. The
+    /// locally invented initial state is evicted the moment that frame lands,
+    /// because its sequence number names a screen the peer never had — the
+    /// attach collision, which must not come back through the ring.
+    ring: VecDeque<S>,
     peer_ack: u64,
     /// Whether anything from the peer has been applied yet.
     ///
     /// Narrows the initial-collision exception in `on_frame` to the one frame
     /// it exists for.
     applied_any: bool,
+    /// Applied frames that carried a real diff (`from_state != 0`).
+    diffs_applied: u64,
+    /// Applied frames that carried a whole screen.
+    ///
+    /// Counted because a full state is the protocol's RESCUE, and a rescue that
+    /// is silently doing all the work looks exactly like health. When the
+    /// sender's ring cannot reach the peer's acknowledged base it falls back to
+    /// a full state, which applies unconditionally — so a session in which base
+    /// drift is completely broken still converges, rejects nothing, and passes
+    /// any test that only counts rejections. Nothing counted this before, and
+    /// that is why the defect this ring fixes went unnoticed until it was
+    /// measured. A gate that cannot tell the two regimes apart is not a gate.
+    full_states_applied: u64,
 }
 
 impl<S: SyncState> Receiver<S> {
     pub fn new(initial: S) -> Receiver<S> {
+        let mut ring = VecDeque::with_capacity(STATE_RING);
+        ring.push_back(initial);
         Receiver {
-            state: initial,
+            ring,
             peer_ack: 0,
             applied_any: false,
+            diffs_applied: 0,
+            full_states_applied: 0,
         }
+    }
+
+    /// Applied frames that carried a diff, and applied frames that carried a
+    /// whole screen, in that order.
+    ///
+    /// For diagnostics and for tests that must tell a healthy session from one
+    /// converging entirely on the full-state rescue. The two look identical
+    /// from the outside: both reject nothing and both paint the right screen.
+    #[must_use]
+    pub fn applied_kinds(&self) -> (u64, u64) {
+        (self.diffs_applied, self.full_states_applied)
     }
 
     /// Apply one frame. `true` when the state advanced.
@@ -211,10 +265,11 @@ impl<S: SyncState> Receiver<S> {
         // applies only before anything from the peer has been applied. A
         // duplicate full state arriving later is a duplicate like any other,
         // and re-applying it would repaint the screen for nothing.
+        let current_seq = self.state().seq();
         let stale = if f.from_state == 0 && !self.applied_any {
-            f.my_state < self.state.seq()
+            f.my_state < current_seq
         } else {
-            f.my_state <= self.state.seq()
+            f.my_state <= current_seq
         };
         if stale {
             return Ok(false);
@@ -229,25 +284,115 @@ impl<S: SyncState> Receiver<S> {
         let diff: S::Diff = postcard::from_bytes(&payload)
             .map_err(|e| ApplyError::Decode(format!("decoding diff: {e}")))?;
 
-        let mut next = self.state.clone();
+        // The diff builds on the state the SENDER named, which is whichever of
+        // ours it last heard about — not necessarily the one we hold now.
+        // A base we no longer have falls through to the current state, so
+        // `apply` reports the mismatch: the rule about what is a legal base
+        // stays in one place, and a genuinely unusable base is still refused
+        // rather than guessed at.
+        let mut next = match self.ring.iter().find(|s| s.seq() == f.from_state) {
+            Some(base) if f.from_state != 0 => base.clone(),
+            _ => self.state().clone(),
+        };
+        if f.from_state == 0 {
+            self.full_states_applied = self.full_states_applied.saturating_add(1);
+        } else {
+            self.diffs_applied = self.diffs_applied.saturating_add(1);
+        }
         next.apply(f.from_state, f.my_state, &diff)?;
         // AFTER apply, never before: the question is whether the RESULT is a
         // legal state, and the state we already hold is legal by induction.
-        next.validate()?;
+        //
+        // `validate_transition`, not `validate`: the state we are replacing is
+        // the only thing that can show the invariants a single value cannot —
+        // I5, the bell is a monotonic counter, and I6, scrollback never
+        // shrinks. Both were enforced NOWHERE until this call existed, while
+        // `oxutrm-proto`'s tests called the checker directly and reported
+        // green. The default implementation of `validate_transition` is
+        // `validate`, so nothing is lost for a state with no transition rules.
+        //
+        // This is where the "a rejected frame never disconnects the session"
+        // rule is paid for: the check runs against a CLONE, so a failure
+        // leaves `self.state` and `ack()` exactly as they were, and the
+        // session loop logs and carries on.
+        // `self.state()` is the ring's newest entry, which is what the single
+        // `state` field was before the receiver gained a ring. It is the right
+        // `previous` even when the diff was applied to an OLDER base out of the
+        // ring: I5 and I6 are monotonic over the host's whole sequence, so the
+        // newest state we have seen is the floor they must not fall below.
+        // Checking against the base instead would let a bell counter go
+        // backwards relative to a state we already hold.
+        next.validate_transition(self.state())?;
 
-        self.state = next;
+        // Everything we held before the peer's first frame we invented
+        // ourselves. Those sequence numbers name our screens, never the
+        // peer's, so they are not diff bases and must not survive as any.
+        if !self.applied_any {
+            self.ring.clear();
+        }
+        // The sender is diffing from `from_state`, and `Sender::on_ack` never
+        // walks backwards, so nothing older can ever be named again.
+        while self.ring.front().is_some_and(|s| s.seq() < f.from_state) {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(next);
+        // A cap as well as the pruning: a peer whose acks are all being lost
+        // keeps naming one ancient base, so the pruning alone never fires.
+        //
+        // **The cap and `STATE_RING` are coupled, and the margin is one entry.**
+        // `Sender::update` pushes exactly ONE state per call and caps at
+        // `STATE_RING`, so a sender naming base `B` still holds it, which means
+        // its current sequence is at most `B + STATE_RING - 1`. We therefore
+        // hold `B` plus at most `STATE_RING - 1` newer entries — exactly
+        // `STATE_RING` — and popping the front, which is `B` itself, would
+        // evict the very base the sender is working from.
+        //
+        // The `+ 1` is that margin, and it is deliberate rather than a
+        // fencepost. Without it the arithmetic is exact and any change to
+        // either side — a sender that pushed two states in a turn, a sender
+        // ring made deeper than this cap — evicts the base and reinstates the
+        // base-drift defect INVISIBLY, because in that regime the sender's ring
+        // is also near exhaustion, every frame degrades to a full state, and a
+        // full state applies unconditionally. The bug would be masked by its
+        // own consequence.
+        while self.ring.len() > STATE_RING + 1 {
+            self.ring.pop_front();
+        }
         self.applied_any = true;
-        self.peer_ack = self.peer_ack.max(f.ack_state);
+        // `peer_ack` is already advanced at the top of `on_frame`, before any
+        // early return, and `max` is idempotent — so this second assignment is
+        // dead. Do not "restore" it: the one at the top carries the reasoning
+        // about reordered acknowledgements and is the load-bearing copy.
         Ok(true)
     }
 
     pub fn state(&self) -> &S {
-        &self.state
+        self.ring
+            .back()
+            .expect("the ring always holds at least one state")
     }
 
     /// The sequence number to put in our outgoing `ack_state`.
+    ///
+    /// **Zero until the peer's first frame has been applied**, and that is the
+    /// whole point rather than a detail. An `ack_state` is a promise: "I hold
+    /// YOUR state N, diff against it." The state a receiver starts from was
+    /// invented locally — the client's blank screen, the host's empty input
+    /// queue — and both ends invent theirs numbered 1. Acknowledging that 1
+    /// tells the peer we hold a screen we have never seen, and the peer then
+    /// diffs against its own state 1, which we cannot apply and never will be
+    /// able to. It is the attach collision wearing a different hat: a sequence
+    /// number says which generation, never which content.
+    ///
+    /// Zero means "I have nothing of yours", which is true, and it is the one
+    /// value `Sender::make_frame` cannot find in its ring — so it sends a full
+    /// state, which is exactly the first frame an attach is supposed to carry.
     pub fn ack(&self) -> u64 {
-        self.state.seq()
+        if self.applied_any {
+            self.state().seq()
+        } else {
+            0
+        }
     }
 
     /// The peer's `ack_state` from the last frame we accepted.
@@ -471,6 +616,45 @@ mod tests {
         assert_eq!(rx.state().cells, host_screen.cells);
     }
 
+    /// The same collision, seen from the ACKNOWLEDGING side.
+    ///
+    /// The rule above lets the peer's first full state land. This one stops
+    /// the receiver from asking for a diff it could never apply in the first
+    /// place. A receiver's initial state was invented locally and is numbered
+    /// 1 like everyone else's; acknowledging that 1 tells the sender "I hold
+    /// YOUR state 1", so the sender diffs against a screen the receiver has
+    /// never seen. Every such frame is unapplicable on arrival and on every
+    /// retry, until the sender's ring evicts the base and a full state goes by
+    /// accident — the rescue that hides the breakage.
+    #[test]
+    fn a_receiver_does_not_acknowledge_the_state_it_invented() {
+        let mut host_screen = screen();
+        host_screen.cells[0] = oxutrm_proto::Cell {
+            text: oxutrm_proto::CellText::from("H"),
+            ..oxutrm_proto::Cell::blank()
+        };
+        let mut tx: Sender<ScreenState> = Sender::new(host_screen);
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+        assert_eq!(
+            rx.state().seq,
+            1,
+            "the receiver invented a state numbered 1"
+        );
+
+        // The sender moves on, and hears the receiver's acknowledgement.
+        tx.update(screen());
+        tx.on_ack(rx.ack());
+        let f = tx.make_frame(rx.ack()).expect("make_frame").expect("frame");
+        assert_eq!(
+            f.from_state, 0,
+            "the sender was told the receiver holds state 1 and diffed against \
+             its own state 1, which the receiver has never seen"
+        );
+        assert!(rx.on_frame(&f).expect("apply"));
+        assert_eq!(rx.state(), tx.current());
+        assert_eq!(rx.ack(), 2, "now the ack names a state the SENDER authored");
+    }
+
     /// The rule is narrow on purpose: only a FULL state may apply without
     /// advancing the sequence number. A diff at the same number is a genuine
     /// duplicate and must still be ignored.
@@ -492,6 +676,98 @@ mod tests {
             "a duplicate diff was applied a second time"
         );
         assert_eq!(rx.state().seq, seq);
+    }
+
+    /// A diff whose base the receiver has already moved past must still apply.
+    ///
+    /// The sender diffs against the newest state the peer ACKNOWLEDGED, and an
+    /// acknowledgement takes a round trip to come back. Every frame the sender
+    /// puts on the wire inside that window therefore names a base the receiver
+    /// has already left. Requiring the base to EQUAL the state currently held
+    /// throws all of them away — and what is thrown away is strictly NEWER
+    /// than the screen the receiver is showing, sitting in its own hand.
+    ///
+    /// The base is not unknown to the receiver. It is FORGOTTEN: the receiver
+    /// stood on that exact state one frame ago and then overwrote it. Keeping
+    /// a ring of what it held — the same ring the sender already keeps, for
+    /// the same reason — makes the diff applicable and costs one clone.
+    #[test]
+    fn a_diff_from_a_base_the_receiver_has_left_behind_still_applies() {
+        fn marked(c: &str) -> ScreenState {
+            let mut s = screen();
+            s.cells[0] = oxutrm_proto::Cell {
+                text: oxutrm_proto::CellText::from(c),
+                ..oxutrm_proto::Cell::blank()
+            };
+            s
+        }
+
+        let mut tx: Sender<ScreenState> = Sender::new(screen());
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+
+        // Get both ends onto the same state 1, so what follows are genuine
+        // diffs rather than full states.
+        let hello = tx.make_frame(rx.ack()).expect("mf").expect("full state");
+        assert_eq!(hello.from_state, 0);
+        rx.on_frame(&hello).expect("apply");
+        tx.on_ack(rx.ack());
+
+        // The sender's state moves twice with no ack coming back, which is
+        // exactly what one round trip of ack latency looks like. Both frames
+        // are therefore diffed from state 1.
+        tx.update(marked("A"));
+        let first = tx.make_frame(rx.ack()).expect("mf").expect("frame");
+        tx.update(marked("B"));
+        let second = tx.make_frame(rx.ack()).expect("mf").expect("frame");
+        assert_eq!(first.from_state, 1, "diffed against the acknowledged base");
+        assert_eq!(second.from_state, 1, "the ack has not come back yet");
+        assert_eq!(second.my_state, 3);
+
+        assert!(
+            rx.on_frame(&first).expect("apply"),
+            "the first diff applies"
+        );
+        assert_eq!(rx.state().seq, 2, "the receiver has now left state 1");
+
+        assert!(
+            rx.on_frame(&second)
+                .expect("a strictly newer state must never be an error"),
+            "the receiver dropped a screen NEWER than the one it is showing, \
+             because it had forgotten the base it stood on one frame ago"
+        );
+        assert_eq!(rx.state(), tx.current(), "the ends did not converge");
+    }
+
+    /// The ring is bounded, so a base older than it is still unusable — and
+    /// must still be refused rather than guessed at.
+    #[test]
+    fn a_base_older_than_the_receivers_ring_is_still_a_base_mismatch() {
+        let mut tx: Sender<ScreenState> = Sender::new(screen());
+        let mut rx: Receiver<ScreenState> = Receiver::new(screen());
+        let hello = tx.make_frame(rx.ack()).expect("mf").expect("full state");
+        rx.on_frame(&hello).expect("apply");
+        tx.on_ack(rx.ack());
+
+        // Walk the receiver past a whole ring's worth of states.
+        for _ in 0..(STATE_RING as u64 + 2) {
+            tx.update(screen());
+            tx.on_ack(rx.ack());
+            let f = tx.make_frame(rx.ack()).expect("mf").expect("frame");
+            rx.on_frame(&f).expect("apply");
+        }
+
+        // A frame that names state 1 — long gone from both rings.
+        let stale_base = Frame {
+            my_state: rx.state().seq + 1,
+            from_state: 1,
+            ack_state: 0,
+            flags: 0,
+            payload: postcard::to_stdvec(&screen().diff_from(&screen())).expect("encode"),
+        };
+        assert!(matches!(
+            rx.on_frame(&stale_base),
+            Err(ApplyError::BaseMismatch { base: 1, .. })
+        ));
     }
 
     #[test]
@@ -551,7 +827,12 @@ mod tests {
     fn ack_is_the_sequence_number_of_the_state_actually_held() {
         let mut tx = Sender::new(screen());
         let mut rx = Receiver::new(screen());
-        assert_eq!(rx.ack(), 1);
+        assert_eq!(
+            rx.ack(),
+            0,
+            "a receiver that has applied nothing holds nothing OF THE PEER'S, \
+             whatever number its own invented state carries"
+        );
 
         tx.update(screen());
         tx.update(screen());

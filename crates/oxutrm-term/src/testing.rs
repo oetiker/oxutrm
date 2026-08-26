@@ -14,7 +14,7 @@ use crate::listener::EventSink;
 /// Most of this crate is a pure function of what the emulator holds, so most
 /// of it can be tested without spawning anything.
 pub fn term_with(rows: u16, cols: u16, bytes: &[u8]) -> Term<EventSink> {
-    let dims = GridSize::new(TermSize { cols, rows }, 100);
+    let dims = GridSize::new(TermSize { cols, rows }, 100).expect("test size is legal");
     let mut term = Term::new(Config::default(), &dims, EventSink::new());
     let mut parser: Processor = Processor::new();
     parser.advance(&mut term, bytes);

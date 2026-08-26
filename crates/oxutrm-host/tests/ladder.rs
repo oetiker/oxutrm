@@ -1,69 +1,21 @@
-//! The ladder: which rungs get tried, which get skipped, and what happens when
-//! none of them works.
+//! The ladder's policy: which rungs get tried, which get skipped, and the
+//! ordering rule that stops a rung-4 session from detaching.
 //!
-//! Every rung here is supplied by a fake runner, so the decision logic is under
-//! test without a network. The real implementations drop in behind the same
-//! seam.
+//! There is no fake runner here any more. The nomination tests that used one
+//! went with `RungRunner` itself: the trait's only implementor in the entire
+//! tree was the double in this file, and the mechanism it stood in for cannot
+//! be expressed rung-by-rung anyway — rungs 0 to 2 are candidate classes on one
+//! shared socket, and rung 3 hands back a socket no `RungResult` could carry.
+//! See the module docs on `oxutrm_host::ladder`. What remains under test is the
+//! part that was always worth testing without a network: the plan.
+//!
+//! The status-line assertions went to their surviving implementation,
+//! `oxutrm_client::status_line`, which is exercised in
+//! `crates/oxutrm-client/src/status.rs`.
 
-use std::sync::Arc;
-
-use oxutrm_host::ladder::{LadderError, LadderPlan, RungResult, RungRunner, nominate, status_line};
+use oxutrm_host::ladder::LadderPlan;
 use oxutrm_host::{DetachPermit, SessionMeta, daemonize_session, settle_detachability};
-use oxutrm_proto::{NatType, PathDescription, Rung, TermSize};
-
-fn nominated(rtt_ms: u32, probes_sent: u32) -> RungResult {
-    RungResult::Nominated {
-        local: "198.51.100.4:51234".parse().unwrap(),
-        remote: "192.0.2.7:443".parse().unwrap(),
-        probes_sent,
-        rtt_ms,
-        mtu: 1392,
-    }
-}
-
-/// A runner whose answer for each rung is decided up front, and which records
-/// what it was actually asked to do.
-struct Scripted {
-    answers: Vec<(Rung, RungResult)>,
-    asked: Arc<std::sync::Mutex<Vec<Rung>>>,
-    /// Milliseconds each attempt takes, so a race has something to race.
-    delay_ms: u64,
-}
-
-impl Scripted {
-    fn new(answers: Vec<(Rung, RungResult)>) -> (Arc<Self>, Arc<std::sync::Mutex<Vec<Rung>>>) {
-        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        (
-            Arc::new(Scripted {
-                answers,
-                asked: Arc::clone(&asked),
-                delay_ms: 0,
-            }),
-            asked,
-        )
-    }
-}
-
-impl RungRunner for Scripted {
-    fn attempt(
-        self: Arc<Self>,
-        rung: Rung,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RungResult> + Send>> {
-        Box::pin(async move {
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
-            }
-            if let Ok(mut g) = self.asked.lock() {
-                g.push(rung);
-            }
-            self.answers
-                .iter()
-                .find(|(r, _)| *r == rung)
-                .map(|(_, res)| res.clone())
-                .unwrap_or_else(|| RungResult::Failed("no script entry".to_string()))
-        })
-    }
-}
+use oxutrm_proto::{NatType, Rung, TermSize};
 
 fn meta() -> SessionMeta {
     SessionMeta {
@@ -146,170 +98,6 @@ fn the_tunnel_is_always_last() {
             "the tunnel is the fallback of last resort for {nat:?}"
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Nomination
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn the_first_validated_path_wins_the_race() {
-    let plan = LadderPlan::for_nat(NatType::EndpointIndependent);
-    let (runner, _asked) = Scripted::new(vec![
-        (Rung::Ipv6Direct, nominated(11, 0)),
-        (Rung::PortMapped, nominated(38, 0)),
-        (Rung::StunPunch, nominated(61, 4)),
-    ]);
-
-    let path = nominate(&plan, NatType::EndpointIndependent, runner)
-        .await
-        .expect("something must win");
-    assert!(
-        plan.raced.contains(&path.rung),
-        "the winner came from the raced group, not from later: {:?}",
-        path.rung
-    );
-}
-
-#[tokio::test]
-async fn the_ladder_falls_through_to_the_tunnel_when_nothing_else_forms() {
-    let plan = LadderPlan::for_nat(NatType::Symmetric);
-    let (runner, asked) = Scripted::new(vec![
-        (
-            Rung::Ipv6Direct,
-            RungResult::Failed("no global v6".to_string()),
-        ),
-        (
-            Rung::PortMapped,
-            RungResult::Failed("no NAT-PMP".to_string()),
-        ),
-        (
-            Rung::Birthday,
-            RungResult::Failed("budget exhausted".to_string()),
-        ),
-        (Rung::SshTunnel, nominated(45, 0)),
-    ]);
-
-    let path = nominate(&plan, NatType::Symmetric, runner)
-        .await
-        .expect("the tunnel always works if ssh is up");
-    assert_eq!(path.rung, Rung::SshTunnel);
-    assert_eq!(path.nat_type, NatType::Symmetric, "carried into the result");
-
-    let asked = asked.lock().unwrap().clone();
-    assert!(
-        !asked.contains(&Rung::StunPunch),
-        "the skipped rung must never be attempted: {asked:?}"
-    );
-    assert_eq!(
-        asked.last(),
-        Some(&Rung::SshTunnel),
-        "and the tunnel is reached last: {asked:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_path_description_is_filled_in_from_what_happened() {
-    // This is what the status line renders and what a user pastes into a bug
-    // report, so no field may be left at a default.
-    let plan = LadderPlan::for_nat(NatType::AddressDependent);
-    let (runner, _) = Scripted::new(vec![(Rung::Ipv6Direct, nominated(11, 7))]);
-
-    let path = nominate(&plan, NatType::AddressDependent, runner)
-        .await
-        .expect("nominated");
-    assert_eq!(path.rung, Rung::Ipv6Direct);
-    assert_eq!(path.rtt_ms, 11);
-    assert_eq!(path.probes_sent, 7);
-    assert_eq!(path.mtu, 1392);
-    assert_eq!(path.nat_type, NatType::AddressDependent);
-    assert_eq!(path.local.port(), 51234);
-    assert_eq!(path.remote.port(), 443);
-}
-
-#[tokio::test]
-async fn every_rung_failing_reports_each_reason_rather_than_connection_failed() {
-    let plan = LadderPlan::for_nat(NatType::Symmetric);
-    let (runner, _) = Scripted::new(vec![
-        (
-            Rung::Ipv6Direct,
-            RungResult::Failed("no global v6 address".to_string()),
-        ),
-        (
-            Rung::PortMapped,
-            RungResult::Failed("gateway refused PCP".to_string()),
-        ),
-        (
-            Rung::Birthday,
-            RungResult::Failed("65k probes, no hit".to_string()),
-        ),
-        (
-            Rung::SshTunnel,
-            RungResult::Failed("ssh channel closed".to_string()),
-        ),
-    ]);
-
-    let err = nominate(&plan, NatType::Symmetric, runner)
-        .await
-        .expect_err("nothing worked");
-    let LadderError::NoPath { .. } = &err;
-
-    let text = err.to_string();
-    for expected in [
-        "no global v6 address",
-        "gateway refused PCP",
-        "65k probes, no hit",
-        "ssh channel closed",
-    ] {
-        assert!(text.contains(expected), "must keep {expected:?}: {text}");
-    }
-    assert!(
-        text.contains("skipped"),
-        "and must distinguish a skipped rung from a failed one: {text}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Rung 4 is announced, not silent
-// ---------------------------------------------------------------------------
-
-fn described(rung: Rung, nat: NatType, probes: u32) -> PathDescription {
-    PathDescription {
-        rung,
-        local: "198.51.100.4:51234".parse().unwrap(),
-        remote: "192.0.2.7:443".parse().unwrap(),
-        probes_sent: probes,
-        nat_type: nat,
-        rtt_ms: 45,
-        mtu: 1392,
-    }
-}
-
-#[test]
-fn the_tunnel_status_line_is_a_warning_that_names_what_was_lost() {
-    let line = status_line(&described(Rung::SshTunnel, NatType::Symmetric, 0));
-    assert!(line.contains("[warning]"), "{line}");
-    assert!(line.contains("SSH tunnel"), "{line}");
-    assert!(
-        line.contains("cannot roam") && line.contains("cannot be reattached"),
-        "silent degradation is worse than slow; the user finds out by closing \
-         their laptop otherwise: {line}"
-    );
-}
-
-#[test]
-fn an_ordinary_path_is_one_quiet_line() {
-    let line = status_line(&described(Rung::Ipv6Direct, NatType::None, 0));
-    assert!(!line.contains("warning"), "{line}");
-    assert!(line.contains("IPv6 direct"), "{line}");
-    assert!(line.contains("mtu 1392"), "{line}");
-}
-
-#[test]
-fn a_birthday_path_reports_what_it_cost() {
-    let line = status_line(&described(Rung::Birthday, NatType::Symmetric, 312));
-    assert!(line.contains("312 probes"), "the cost was real: {line}");
-    assert!(line.contains("symmetric NAT"), "{line}");
 }
 
 // ---------------------------------------------------------------------------

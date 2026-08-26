@@ -83,4 +83,64 @@ pub enum ApplyError {
     /// **I6.** Lines that have scrolled off do not come back.
     #[error("scrollback shrank: was {was}, now {now}")]
     ScrollbackShrank { was: u64, now: u64 },
+
+    /// **I7.** The screen is larger than [`MAX_SCREEN_CELLS`] cells, or one of
+    /// its dimensions exceeds [`MAX_SCREEN_DIM`].
+    ///
+    /// Unlike every other invariant here, this one has to be checked *before*
+    /// the state is built. `rows` and `cols` are `u16`, so a diff of a few
+    /// bytes can name 4.29e9 cells; allocating that and then rejecting it is
+    /// not a rejection, it is the attack. See [`TermSize::check_bounds`].
+    ///
+    /// [`MAX_SCREEN_CELLS`]: crate::types::MAX_SCREEN_CELLS
+    /// [`MAX_SCREEN_DIM`]: crate::types::MAX_SCREEN_DIM
+    /// [`TermSize::check_bounds`]: crate::TermSize::check_bounds
+    #[error(
+        "screen {rows}x{cols} exceeds the maximum of {} cells / {} per side",
+        crate::types::MAX_SCREEN_CELLS,
+        crate::types::MAX_SCREEN_DIM
+    )]
+    ScreenTooLarge { rows: u16, cols: u16 },
+
+    /// **I8.** A cell's text, or the title, carries a scalar the terminal
+    /// reads as a *command* rather than as a glyph — C0, DEL, or C1.
+    ///
+    /// This is the invariant that makes the asymmetric trust model true rather
+    /// than merely intended. The host is not trusted; the client renders a
+    /// [`ScreenState`] by writing bytes to the user's REAL terminal. Without
+    /// this rule a hostile host puts `\x1b]52;c;<base64>\x07` in one cell and
+    /// the client obediently writes the user's clipboard, or `\x1b[?1049h` and
+    /// the client's own screen accounting is gone. C1 counts because a
+    /// terminal in UTF-8 mode reads U+009B as CSI just as it reads `\x1b[`.
+    ///
+    /// **Rejected, never filtered.** Stripping the control bytes out would
+    /// paint a screen the host did not send and leave the two ends silently
+    /// disagreeing about every column after it — the same reasoning that makes
+    /// [`ApplyError::CursorOutOfBounds`] a rejection rather than a clamp. A
+    /// refusal is visible; a repair is not.
+    ///
+    /// [`ScreenState`]: crate::ScreenState
+    #[error("{field} contains control scalar U+{scalar:04X}")]
+    ControlInText {
+        field: crate::TextField,
+        scalar: u32,
+    },
+
+    /// **I8.** A cell's text, or the title, is longer than its field allows.
+    ///
+    /// Like [`ApplyError::ScreenTooLarge`] this has to be checked **before the
+    /// expansion**, not after it. Nothing else in the protocol bounds
+    /// bytes-per-cell, and `ScreenState::apply` clones a run's cells
+    /// `repeat + 1` times across a row: one 60 MiB cell repeated across 2048
+    /// columns is ~123 GiB of clones. Validating the result afterwards is
+    /// validating a machine that has already fallen over.
+    ///
+    /// [`MAX_CELL_TEXT`]: crate::types::MAX_CELL_TEXT
+    /// [`MAX_TITLE`]: crate::types::MAX_TITLE
+    #[error("{field} is {len} bytes, over the maximum of {max}")]
+    TextTooLong {
+        field: crate::TextField,
+        len: usize,
+        max: usize,
+    },
 }

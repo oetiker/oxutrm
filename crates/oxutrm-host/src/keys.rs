@@ -133,26 +133,41 @@ pub fn begin_attach(meta: &mut SessionMeta, cert_spki_sha256: [u8; 32]) -> std::
     })
 }
 
-/// Proof that the rung has been nominated and this session is allowed to
-/// detach.
+/// Proof that the rung has been nominated and this session is allowed to close
+/// the descriptors it inherited from ssh.
 ///
-/// It cannot be constructed except by [`settle_detachability`], and
-/// [`crate::daemonize_session`] demands one. That is the ordering made
-/// structural rather than remembered: there is no way to write a call that
-/// daemonizes before the rung is known, because there is nothing to pass.
+/// It cannot be constructed except by [`settle_detachability`], and both
+/// [`crate::sever_from_ssh`] and [`crate::daemonize_session`] demand one. That
+/// is the ordering made structural rather than remembered: there is no way to
+/// write a call that severs before the rung is known, because there is nothing
+/// to pass.
 ///
 /// The failure it prevents is not hypothetical. A rung-4 session carries its
-/// QUIC traffic inside the ssh connection, and `daemonize` closes every
-/// inherited descriptor — so a session that detached on the handshake's
-/// optimistic intent would destroy the link it was about to use, and the
-/// symptom would be a session that dies the moment it is left alone.
+/// QUIC traffic inside the ssh connection, and severing closes every inherited
+/// descriptor — so a session that cut the pipes on the handshake's optimistic
+/// intent would destroy the link it was about to use, and the symptom would be
+/// a session that dies the moment it is left alone.
+///
+/// # What it gates, exactly
+///
+/// **Descriptor closure, and only that.** Detaching is two operations, and
+/// [`crate::detach_process`] — fork, `setsid`, fork — deliberately needs no
+/// permit: forking away from ssh is harmless for every rung, including rung 4,
+/// because it touches no descriptor. A rung-4 session forks like any other and
+/// then simply never severs, keeping its pipes and its ssh for life.
+///
+/// That is narrower than what this token gated when detaching was one function,
+/// and it is not a weakening: closing the descriptors is the operation the
+/// paragraph above describes, and it is now the operation the type is attached
+/// to. The other ordering the split introduced — sever only *after* forking —
+/// has its own token, [`crate::Detached`], for the same reason.
 #[derive(Debug)]
 pub struct DetachPermit {
     _private: (),
 }
 
 /// Settle detachability from the nominated rung, and say whether this session
-/// may daemonize.
+/// may sever itself from ssh.
 ///
 /// `Some` for every rung that carries its own UDP socket. `None` for
 /// [`Rung::SshTunnel`], whose session must stay attached to the ssh connection

@@ -1,4 +1,4 @@
-//! The six `ScreenState` invariants, each proved by its **rejection**.
+//! The eight `ScreenState` invariants, each proved by its **rejection**.
 //!
 //! An invariant that is only documented is not an invariant. Every test here
 //! builds a state that breaks one rule and asserts the exact error, because a
@@ -6,7 +6,8 @@
 //! deletes the check.
 
 use oxutrm_proto::{
-    ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, Modes, MouseMode, ScreenState,
+    ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, MAX_CELL_TEXT, MAX_SCREEN_CELLS,
+    MAX_SCREEN_DIM, MAX_TITLE, Modes, MouseMode, ScreenState, TermSize, TextField,
 };
 
 /// A valid 3x4 state, for tests that then break exactly one thing about it.
@@ -219,6 +220,14 @@ fn i4_the_title_is_the_only_osc_derived_string() {
 }
 
 // ---------------------------------------------------------------- I5
+//
+// The I5 and I6 cases below call `validate_transition` DIRECTLY, and that
+// proves only that the function computes the right answer. It says nothing
+// about whether the path a state actually travels ever asks — and for the
+// whole life of this crate it did not, while these tests reported green.
+// `oxutrm-sync/tests/faults.rs` is where enforcement is proved, by pushing a
+// backwards bell and a shrinking scrollback through `Receiver::on_frame`.
+// Keep both: these pin the rule, that one pins the caller.
 
 #[test]
 fn i5_a_bell_that_goes_backwards_is_rejected() {
@@ -335,6 +344,95 @@ fn a_valid_transition_still_validates_both_states() {
     );
 }
 
+// ---------------------------------------------------------------- I7
+
+/// I7 is the one invariant that must be checked BEFORE the state exists.
+///
+/// `rows` and `cols` are `u16` and a `Cell` is around 40 bytes, so the wire can
+/// name 4.29e9 cells — about 170 GB — in a message of a few bytes. Every other
+/// invariant here is checked on a built state, because building it is cheap.
+/// Building this one is the attack, so `blank` and the resize arm of `apply`
+/// both call [`TermSize::check_bounds`] first, and `validate` checks it again
+/// so that no oversized state can exist however it was made.
+#[test]
+fn i7_a_screen_larger_than_the_cap_cannot_be_constructed() {
+    // 1024x1024 is just over a million cells, well past the cap, and small
+    // enough that this test run RED merely allocates 40 MB rather than
+    // taking the machine down.
+    assert_eq!(
+        ScreenState::blank(1024, 1024),
+        Err(ApplyError::ScreenTooLarge {
+            rows: 1024,
+            cols: 1024
+        })
+    );
+}
+
+#[test]
+fn i7_the_largest_size_the_wire_can_name_is_refused() {
+    // Safe to run only because the check exists. Do not prove this one red.
+    assert_eq!(
+        ScreenState::blank(u16::MAX, u16::MAX),
+        Err(ApplyError::ScreenTooLarge {
+            rows: u16::MAX,
+            cols: u16::MAX
+        })
+    );
+}
+
+/// The per-side bound is not implied by the cell bound. A 65535x2 screen is
+/// only 131,070 cells — under [`MAX_SCREEN_CELLS`] — and is still nonsense.
+#[test]
+fn i7_a_single_dimension_is_bounded_even_when_the_area_is_not() {
+    let size = TermSize {
+        rows: u16::MAX,
+        cols: 2,
+    };
+    assert!(
+        (size.rows as usize * size.cols as usize) < MAX_SCREEN_CELLS,
+        "this test is only meaningful while the area is under the cell cap"
+    );
+    assert_eq!(
+        size.check_bounds(),
+        Err(ApplyError::ScreenTooLarge {
+            rows: u16::MAX,
+            cols: 2
+        })
+    );
+}
+
+/// I7 is checked before I1, so a state that breaks both reports the one that
+/// would have cost something. Getting this order wrong is not cosmetic: it is
+/// the difference between refusing an allocation and reporting it.
+#[test]
+fn i7_is_checked_before_the_length() {
+    let mut s = good();
+    s.rows = 4096;
+    s.cols = 4096;
+    // `cells` is still 12 long, so I1 is violated too.
+    assert_eq!(
+        s.validate(),
+        Err(ApplyError::ScreenTooLarge {
+            rows: 4096,
+            cols: 4096
+        })
+    );
+}
+
+/// The cap is a ceiling, not a policy. The largest terminal anyone actually
+/// runs must sit well inside it.
+#[test]
+fn i7_a_real_terminal_is_nowhere_near_the_cap() {
+    // A 4K display at a 6-pixel font is about 400x120.
+    ScreenState::blank(120, 400).expect("a 400x120 terminal is ordinary");
+    // Both sides are constants, so the claim is checkable at compile time and
+    // clippy insists it be checked there. That is the stronger form anyway: a
+    // ceiling lowered below an ordinary terminal should fail the build rather
+    // than one test run.
+    const { assert!(MAX_SCREEN_DIM > 400) };
+    const { assert!(MAX_SCREEN_CELLS > 400 * 120 * 4) };
+}
+
 #[test]
 fn a_resize_between_two_states_is_a_legal_transition() {
     let before = good();
@@ -343,6 +441,268 @@ fn a_resize_between_two_states_is_a_legal_transition() {
     after.bell = before.bell;
     after.scrollback_len = before.scrollback_len;
     assert_eq!(after.validate_transition(&before), Ok(()));
+}
+
+// ---------------------------------------------------------------- I8
+
+/// A state whose cell 5 holds exactly `text`.
+fn with_cell_text(text: &str) -> ScreenState {
+    let mut s = good();
+    s.cells[5] = Cell {
+        text: text.into(),
+        ..Cell::blank()
+    };
+    s
+}
+
+/// A state whose title is exactly `title`.
+fn with_title(title: &str) -> ScreenState {
+    let mut s = good();
+    s.title = title.to_owned();
+    s
+}
+
+/// **The hole I8 exists to close.**
+///
+/// I1 to I7 constrain the SHAPE of a screen and say nothing about what a cell
+/// may CONTAIN, and the client paints a cell by copying its text verbatim into
+/// the byte stream it writes to the user's real terminal. So before I8, a
+/// hostile host put one OSC 52 in one cell and the client wrote the user's
+/// clipboard for it — no exploit, no memory bug, just the renderer doing
+/// exactly what it was told.
+///
+/// The reason this went unnoticed is that nothing ever tested cell CONTENT:
+/// the golden fixtures drive `alacritty_terminal`, which never puts an ESC in
+/// a cell, and the renderer's own tests all use printable text. Every case
+/// below is therefore one a fixture could not have produced.
+#[test]
+fn i8_a_control_scalar_in_a_cell_is_rejected() {
+    struct Case {
+        what: &'static str,
+        text: &'static str,
+        scalar: u32,
+    }
+    let cases = [
+        Case {
+            what: "OSC 52 — writes the user's clipboard",
+            text: "\x1b]52;c;aGVsbG8=\x07",
+            scalar: 0x1b,
+        },
+        Case {
+            what: "a bare ESC — the start of anything at all",
+            text: "\x1b",
+            scalar: 0x1b,
+        },
+        Case {
+            what: "BEL — closes an OSC the renderer opened",
+            text: "\x07",
+            scalar: 0x07,
+        },
+        Case {
+            what: "CR — moves the caret the renderer is tracking",
+            text: "\r",
+            scalar: 0x0d,
+        },
+        Case {
+            what: "NUL",
+            text: "\0",
+            scalar: 0x00,
+        },
+        Case {
+            // The case a byte-oriented filter misses entirely: in UTF-8 mode a
+            // terminal reads U+009B as CSI exactly as it reads `\x1b[`, and it
+            // arrives on the wire as the two bytes 0xC2 0x9B — neither of which
+            // is below 0x20.
+            what: "U+009B — CSI in C1 form",
+            text: "\u{9b}2J",
+            scalar: 0x9b,
+        },
+    ];
+
+    for c in cases {
+        assert_eq!(
+            with_cell_text(c.text).validate(),
+            Err(ApplyError::ControlInText {
+                field: TextField::CellText,
+                scalar: c.scalar,
+            }),
+            "{} must be refused",
+            c.what
+        );
+    }
+}
+
+/// The title is interpolated between `\x1b]0;` and BEL by the client, with no
+/// terminator escaping. A title carrying its own terminator therefore closes
+/// that OSC early and everything after it is a fresh command stream — which is
+/// a shorter path to the same place as the cell case, through a field nobody
+/// thinks of as data.
+#[test]
+fn i8_a_title_that_can_close_the_renderer_s_osc_is_rejected() {
+    for (what, title) in [
+        ("BEL terminates the OSC", "vim\x07\x1b]52;c;AAAA\x07"),
+        ("ST terminates it too", "vim\x1b\\\x1b]52;c;AAAA\x07"),
+        ("a bare ESC is enough on its own", "vim\x1b"),
+        ("so is C1 CSI", "vim\u{9b}2J"),
+    ] {
+        let err = with_title(title)
+            .validate()
+            .expect_err(&format!("{what}: this title must be refused"));
+        assert!(
+            matches!(
+                err,
+                ApplyError::ControlInText {
+                    field: TextField::Title,
+                    ..
+                }
+            ),
+            "{what}: expected a title rejection, got {err:?}"
+        );
+    }
+}
+
+/// The amplification half of I8, at the level of one state.
+///
+/// Nothing else in the protocol measures bytes-per-cell. `MAX_DECOMPRESSED` is
+/// 64 MiB, so one cell may legally arrive carrying ~60 MiB of perfectly
+/// printable text. The sibling test in `oxutrm-sync` covers what that costs
+/// once a run expands it.
+#[test]
+fn i8_an_over_long_cell_text_is_rejected() {
+    let text = "a".repeat(MAX_CELL_TEXT + 1);
+    assert_eq!(
+        with_cell_text(&text).validate(),
+        Err(ApplyError::TextTooLong {
+            field: TextField::CellText,
+            len: MAX_CELL_TEXT + 1,
+            max: MAX_CELL_TEXT,
+        })
+    );
+
+    // The boundary itself is legal, so the cap is a ceiling rather than an
+    // off-by-one waiting to reject a real grapheme.
+    assert_eq!(
+        with_cell_text(&"a".repeat(MAX_CELL_TEXT)).validate(),
+        Ok(())
+    );
+}
+
+#[test]
+fn i8_an_over_long_title_is_rejected() {
+    let title = "t".repeat(MAX_TITLE + 1);
+    assert_eq!(
+        with_title(&title).validate(),
+        Err(ApplyError::TextTooLong {
+            field: TextField::Title,
+            len: MAX_TITLE + 1,
+            max: MAX_TITLE,
+        })
+    );
+    assert_eq!(with_title(&"t".repeat(MAX_TITLE)).validate(), Ok(()));
+}
+
+/// Length before content, and the order is not cosmetic.
+///
+/// It is the same ordering argument as I7 being checked before I1: the length
+/// bound is the half of I8 that stops an allocation, so it must be the half
+/// that runs first. A 60 MiB cell that also happens to contain an ESC should
+/// be refused for being 60 MiB.
+#[test]
+fn i8_the_length_is_checked_before_the_content() {
+    let text = format!("\x1b{}", "a".repeat(MAX_CELL_TEXT));
+    assert!(
+        matches!(
+            with_cell_text(&text).validate(),
+            Err(ApplyError::TextTooLong { .. })
+        ),
+        "the bound that stops an allocation must be the one that runs first"
+    );
+}
+
+/// **The over-correction guard, and it matters as much as the rejections.**
+///
+/// A rule that refuses control characters is trivially satisfiable by refusing
+/// everything. Every case here is text a real terminal really paints, and I8
+/// must leave all of it alone.
+#[test]
+fn i8_ordinary_text_is_still_ordinary() {
+    for (what, text) in [
+        ("plain ASCII", "x"),
+        ("a space, which is what a blank cell holds", " "),
+        ("the empty text of a wide continuation cell", ""),
+        ("a two-byte scalar", "é"),
+        ("a three-byte CJK ideograph", "\u{4f60}"),
+        ("a four-byte emoji", "🦀"),
+        ("an emoji with a variation selector", "🦀\u{fe0f}"),
+        ("an emoji with a joiner", "\u{1f468}\u{200d}"),
+        ("a keycap sequence", "1\u{fe0f}\u{20e3}"),
+        ("a decomposed accent", "e\u{301}"),
+        ("Vietnamese, two marks on one base", "e\u{302}\u{301}"),
+        (
+            "Hebrew with nikud and cantillation",
+            "\u{5d0}\u{5b8}\u{5bc}\u{591}",
+        ),
+        ("a Devanagari cluster", "\u{915}\u{93f}\u{902}\u{951}"),
+        ("a Tibetan stack", "\u{f40}\u{f90}\u{fb5}\u{f72}"),
+        ("Thai with a vowel and a tone mark", "\u{e01}\u{e35}\u{e49}"),
+        ("U+00A0, which is NOT a control", "\u{a0}"),
+        (
+            "a title's worth of ordinary path",
+            "vim ~/src/main.rs — host",
+        ),
+    ] {
+        assert_eq!(
+            with_cell_text(text).validate(),
+            Ok(()),
+            "{what}: {text:?} is text a terminal really paints"
+        );
+    }
+}
+
+/// Is 32 bytes actually enough for a grapheme the emulator can produce?
+///
+/// Partly. Every real cluster above fits with room to spare — the widest is
+/// four three-byte scalars, half the budget. But `alacritty_terminal` puts no
+/// cap at all on `zerowidth()`, and Unicode's own Stream-Safe Text Format
+/// (UAX #15) tolerates up to 30 non-starters after a base, which at three
+/// bytes each would need 94. So 32 is a deliberate cut below what Unicode
+/// permits and far above what any script requires, and it is only safe to make
+/// that cut because `oxutrm-term` *fits* its cells at the source rather than
+/// letting the host emit something its own peer will reject.
+///
+/// This test pins the margin. If a legitimate cluster ever fails it, raise
+/// `MAX_CELL_TEXT` — do not weaken the check.
+#[test]
+fn i8_a_real_grapheme_cluster_fits_inside_the_cap_with_room_to_spare() {
+    let widest = [
+        "\u{f40}\u{f90}\u{fb5}\u{f72}\u{f7e}", // Tibetan, four subjoined marks
+        "\u{5d0}\u{5b8}\u{5bc}\u{591}\u{5a0}", // Hebrew, four marks
+        "\u{915}\u{93f}\u{902}\u{951}\u{93c}", // Devanagari, four marks
+        "1\u{fe0f}\u{20e3}",                   // keycap
+    ];
+    for cluster in widest {
+        assert!(
+            cluster.len() * 2 <= MAX_CELL_TEXT,
+            "{cluster:?} is {} bytes; the cap should leave at least 2x headroom",
+            cluster.len()
+        );
+        assert_eq!(with_cell_text(cluster).validate(), Ok(()));
+    }
+}
+
+/// I8 rides `validate`, so it is on the transition path too — which is the
+/// path `Receiver::on_frame` actually takes. A rule enforced only by a
+/// function nobody calls in production is the failure mode this suite already
+/// caught once, for I5 and I6.
+#[test]
+fn i8_reaches_the_transition_check_as_well() {
+    let before = good();
+    let mut after = with_cell_text("\x1b]52;c;AAAA\x07");
+    after.seq = 2;
+    assert!(matches!(
+        after.validate_transition(&before),
+        Err(ApplyError::ControlInText { .. })
+    ));
 }
 
 // ------------------------------------------------------------ value types

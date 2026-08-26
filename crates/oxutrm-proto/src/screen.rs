@@ -82,6 +82,11 @@ impl ScreenState {
     /// validates: a type whose invariants are checked everywhere except at
     /// construction is a type whose invariants are checked nowhere.
     pub fn blank(rows: u16, cols: u16) -> Result<ScreenState, ApplyError> {
+        // I7 BEFORE the allocation below, not after it via `validate`. A
+        // caller that took these dimensions from a peer — `ClientHello` does —
+        // would otherwise allocate the whole hostile screen and only then be
+        // told it was too big.
+        crate::TermSize { rows, cols }.check_bounds()?;
         let state = ScreenState {
             seq: 1,
             rows,
@@ -134,8 +139,8 @@ impl ScreenState {
     }
 
     /// Check every invariant that one state can carry on its own: **I1**
-    /// (exact length), **I2** (cursor in bounds) and **I3** (sequence not the
-    /// sentinel).
+    /// (exact length), **I2** (cursor in bounds), **I3** (sequence not the
+    /// sentinel) and **I8** (painted text is text, not control).
     ///
     /// Called by every constructor, and by the sync layer after it applies a
     /// diff. A comment is not a constraint anyone checks; this is.
@@ -144,6 +149,16 @@ impl ScreenState {
     /// an out-of-range cursor: clamping turns a detectable desynchronisation
     /// into a session that looks healthy while the two ends drift apart.
     pub fn validate(&self) -> Result<(), ApplyError> {
+        // I7 first. It is the only invariant here that also has to be enforced
+        // BEFORE a state is built, so checking it again on a built one is
+        // belt-and-braces: it means no oversized `ScreenState` can exist at
+        // all, however it was constructed.
+        crate::TermSize {
+            rows: self.rows,
+            cols: self.cols,
+        }
+        .check_bounds()?;
+
         // I1. Exactly, not at least. A long vector never panics - it just
         // makes every computed offset address the wrong cell.
         let expected = self.rows as usize * self.cols as usize;
@@ -172,6 +187,23 @@ impl ScreenState {
             });
         }
 
+        // I8. The only invariant here about CONTENT rather than shape, and the
+        // reason it is worth a linear scan of a state that is about to be
+        // painted anyway: the client renders these cells by writing them to
+        // the user's real terminal, so a cell holding `\x1b]52;c;...\x07` is
+        // the host reaching through the client to the user's clipboard.
+        //
+        // Checking it here makes a violating `ScreenState` impossible to hold
+        // however it was constructed, and puts I8 on `Receiver::on_frame`'s
+        // path for free by way of `validate_transition`. It is NOT where the
+        // invariant is cheap, though: by the time a state exists its cells have
+        // already been cloned. The enforcement that bounds the allocation is
+        // the one in `ScreenState::apply`, before the run expansion.
+        for cell in &self.cells {
+            crate::check_cell_text(&cell.text)?;
+        }
+        crate::check_title(&self.title)?;
+
         Ok(())
     }
 
@@ -179,15 +211,21 @@ impl ScreenState {
     /// (the bell never goes backwards) and **I6** (scrollback never shrinks).
     ///
     /// `validate` cannot see either of these, because one state in isolation
-    /// carries no history. This is the check the sync layer runs after
-    /// applying a diff, with the pre-application state as `previous`.
+    /// carries no history.
+    ///
+    /// The production caller is `oxutrm_sync::Receiver::on_frame`, which runs
+    /// it after applying a diff to a clone, with the pre-application state as
+    /// `previous`. A failure therefore **rejects the frame** and leaves the
+    /// receiver's state and ack untouched; it never ends the session.
     ///
     /// Validates `self` on its own first, so a transition check can never let
     /// a malformed state through.
     ///
-    /// Note what is deliberately *not* checked here: `seq` ordering, sizes,
-    /// and content. States legitimately resize, and the sequence relationship
-    /// belongs to the frame that carried the diff, not to the states.
+    /// Note what is deliberately *not* checked here: `seq` ordering and sizes.
+    /// States legitimately resize, and the sequence relationship belongs to
+    /// the frame that carried the diff, not to the states. Content is not
+    /// absent from the contract — I8 covers it — but it is a property of one
+    /// state, so `validate` above owns it and this function inherits it.
     pub fn validate_transition(&self, previous: &ScreenState) -> Result<(), ApplyError> {
         self.validate()?;
 

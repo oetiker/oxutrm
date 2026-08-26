@@ -32,11 +32,21 @@ pub use screen::{RowPatch, Run, ScreenDiff};
 
 use oxutrm_proto::ApplyError;
 
-/// How many recent states the sender keeps so it can diff against whatever the
-/// peer last acknowledged.
+/// The depth of BOTH rings, and they are coupled.
 ///
-/// Once the peer's ack falls out of this window there is nothing to diff
-/// against and a full state goes instead — correct, just larger.
+/// The sender keeps this many recent states so it can diff against whatever
+/// the peer last acknowledged. Once the peer's ack falls out of that window
+/// there is nothing to diff against and a full state goes instead — correct,
+/// just larger.
+///
+/// The RECEIVER caps its ring at the same number, and that is not a
+/// coincidence to be tidied away: the sender can only name a base within its
+/// last `STATE_RING` updates, so a receiver cap of at least `STATE_RING` is
+/// what guarantees the named base is still held. Lowering the receiver's cap
+/// alone silently reinstates the base-drift defect (R4) — and HIDES it,
+/// because in that regime ring exhaustion degrades every frame to a full
+/// state, and a full state applies unconditionally (R3). The rescue masks the
+/// bug, which is why the defect went unnoticed until it was measured.
 pub const STATE_RING: usize = 32;
 
 /// A replicated value.
@@ -52,10 +62,28 @@ pub trait SyncState: Clone {
 
     /// Check this value's own invariants.
     ///
-    /// [`Receiver::on_frame`] calls this **after** [`SyncState::apply`], never
-    /// before: the question is whether the *result* is a legal state, and the
-    /// state already held is legal by induction.
+    /// Called **after** [`SyncState::apply`], never before: the question is
+    /// whether the *result* is a legal state, and the state already held is
+    /// legal by induction.
     fn validate(&self) -> Result<(), ApplyError>;
+
+    /// Check the invariants that exist only **between** two states — the ones
+    /// a single value cannot show, because one state in isolation carries no
+    /// history.
+    ///
+    /// This is what [`Receiver::on_frame`] calls after [`SyncState::apply`],
+    /// with the pre-application state as `previous`. It replaces the bare
+    /// [`SyncState::validate`] call rather than joining it: the default
+    /// implementation here *is* `validate`, so a state whose invariants are
+    /// all properties of one value gets exactly the old behaviour and an
+    /// implementor cannot forget to chain.
+    ///
+    /// A failure here is a **rejection with a reason**, never a fatal error:
+    /// `on_frame` applies to a clone, so the live state and the ack are both
+    /// untouched, and the session carries on.
+    fn validate_transition(&self, _previous: &Self) -> Result<(), ApplyError> {
+        self.validate()
+    }
 
     /// The diff that turns `base` into `self`.
     fn diff_from(&self, base: &Self) -> Self::Diff;

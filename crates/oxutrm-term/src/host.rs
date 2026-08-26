@@ -9,7 +9,8 @@ use alacritty_terminal::term::{Config, Osc52, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as VteCursorShape, Processor, Rgb};
 
 use oxutrm_proto::{
-    Attrs, Cell, CellText, Cursor, CursorShape, Modes, MouseMode, ScreenState, TermSize,
+    Attrs, Cell, CellText, Cursor, CursorShape, MAX_CELL_TEXT, Modes, MouseMode, ScreenState,
+    TermSize, fit_cell_text, fit_title, is_control_scalar,
 };
 
 use crate::blink::{BlinkPlane, BlinkTap};
@@ -67,9 +68,12 @@ impl HostTerm {
         size: TermSize,
         scrollback: usize,
     ) -> anyhow::Result<HostTerm> {
+        // Before the PTY, not after: `size` came from the client and this is
+        // the host. Spawning a shell and then discovering the geometry was
+        // hostile means a process to clean up as well as an error to report.
+        let dims = GridSize::new(size, scrollback)?;
         let pty = Pty::spawn(shell, args, env, size)?;
         let events = EventSink::new();
-        let dims = GridSize::new(size, scrollback);
         let config = Config {
             scrolling_history: scrollback,
             // Accept paste requests as well as copies; the default is
@@ -107,8 +111,11 @@ impl HostTerm {
     /// grid never reflows and has no history, which is `alacritty_terminal`'s
     /// behaviour and correct: a full-screen application redraws itself.
     pub fn resize(&mut self, size: TermSize) -> anyhow::Result<()> {
+        // I7 first, and before the ioctl: a refused resize must leave the PTY
+        // and the emulator agreeing with each other about the old size.
+        let dims = GridSize::new(size, self.history)?;
         self.pty.resize(size)?;
-        self.term.resize(GridSize::new(size, self.history));
+        self.term.resize(dims);
         self.size = size;
         // Reflow moves content, so recorded blink positions no longer mean
         // anything. Clearing is honest; shifting them would paint blink on
@@ -311,7 +318,14 @@ pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
         cells,
         cursor,
         modes: modes_of(term.mode()),
-        title: meta.title,
+        // I8, maintained rather than checked — same reasoning as `cell_text`,
+        // and here the input is even less under our control: the title is the
+        // payload of an OSC 0/2 written by whatever program the user ran, and
+        // `alacritty_terminal` hands it over unexamined. Fitted at the point
+        // the state is BUILT rather than where `HostTerm` records it, so that
+        // every path that constructs a `ScreenState` in this crate — the
+        // golden harness included — inherits the guarantee.
+        title: fit_title(meta.title),
         bell: meta.bell,
         scrollback_len: meta.scrollback_len,
     }
@@ -346,6 +360,29 @@ fn blink_of(blink: &BlinkPlane, point: Point) -> Attrs {
 /// hang off the base cell in `zerowidth()`. Dropping them would turn an
 /// accented character into a bare one, and treating them as cells would shift
 /// the whole row.
+///
+/// # This is where I8 is *maintained*, not merely checked
+///
+/// Every consumer of a [`ScreenState`] rejects a cell that breaks I8, and a
+/// rejection is the right answer there — the peer is not trusted. Here it
+/// would be the wrong answer twice over. Sanitising on the host does nothing
+/// for the client's safety: a hostile host simply would not run this code, so
+/// the client's own check is what protects the user. What this buys is
+/// **liveness**. A host that emits a state its own peer refuses is a session
+/// that freezes with no log line explaining why, and `alacritty_terminal` can
+/// genuinely produce such a state: it puts **no cap at all** on how many
+/// zero-width marks it stacks onto one base character (`Term::input` pushes
+/// every width-0 scalar onto the previous cell, unbounded), so a program that
+/// prints combining marks in a loop grows one cell without limit. That is not
+/// hypothetical hostility — it is what `cat` of a file full of stacked
+/// diacritics does.
+///
+/// So the bound is applied at the source, and applied while the string is
+/// being built rather than after: filtering a megabyte of marks down to 32
+/// bytes still costs the megabyte if it was assembled first.
+/// [`fit_cell_text`] then backstops the result, which is what makes the
+/// property total rather than merely likely — including for `cell.c` itself,
+/// which `alacritty_terminal` never sets to a control today.
 fn cell_text(cell: &VteCell) -> CellText {
     // The right-hand half of a wide character carries a space in `c`. Sending
     // that space would make a renderer paint one and shift the row, so the
@@ -357,10 +394,17 @@ fn cell_text(cell: &VteCell) -> CellText {
         return CellText::const_new("");
     }
 
-    match cell.zerowidth() {
+    let text = match cell.zerowidth() {
         Some(marks) if !marks.is_empty() => {
             let mut text = CellText::new(cell.c.to_string());
             for m in marks {
+                // Stop at the cap instead of assembling the whole stack and
+                // trimming it afterwards. `break`, not `continue`: the marks
+                // are ordered, and keeping a later one after dropping an
+                // earlier one would reorder the cluster.
+                if is_control_scalar(*m) || text.len() + m.len_utf8() > MAX_CELL_TEXT {
+                    break;
+                }
                 text.push(*m);
             }
             text
@@ -369,7 +413,8 @@ fn cell_text(cell: &VteCell) -> CellText {
             let mut buf = [0u8; 4];
             CellText::new(cell.c.encode_utf8(&mut buf))
         }
-    }
+    };
+    fit_cell_text(text)
 }
 
 fn attrs_of(flags: Flags) -> Attrs {
@@ -438,6 +483,81 @@ mod tests {
         TermSize { cols: 40, rows: 10 }
     }
 
+    /// One emulator cell holding `base` with `marks` stacked on it, exactly as
+    /// `Term::input` builds one.
+    fn vte_cell(base: char, marks: &[char]) -> VteCell {
+        let mut cell = VteCell {
+            c: base,
+            ..VteCell::default()
+        };
+        for m in marks {
+            cell.push_zerowidth(*m);
+        }
+        cell
+    }
+
+    /// **I8 is MAINTAINED here, and it has to be — an honest host really can
+    /// produce a cell the peer would reject.**
+    ///
+    /// `alacritty_terminal` puts no cap on `zerowidth()`: `Term::input` pushes
+    /// every width-0 scalar onto the previous cell, forever. So a program that
+    /// prints combining marks in a loop — a `cat` of stacked diacritics, not
+    /// an attack — grows one cell without limit, and if the host shipped that
+    /// state the client would refuse the frame and the session would freeze
+    /// with nothing in any log to explain it. Fitting at the source is what
+    /// keeps a rejection on the client an event that only a hostile host can
+    /// cause.
+    #[test]
+    fn a_cell_the_emulator_can_over_fill_is_fitted_at_the_source() {
+        let cell = vte_cell('e', &['\u{301}'; 500]);
+        // The emulator held 1001 bytes in one cell, with no complaint.
+        assert_eq!(cell.zerowidth().expect("marks").len(), 500);
+
+        let text = cell_text(&cell);
+        assert!(
+            text.len() <= MAX_CELL_TEXT,
+            "the host must not emit {} bytes in one cell",
+            text.len()
+        );
+        oxutrm_proto::check_cell_text(&text).expect("what the host emits must be acceptable");
+        assert!(
+            text.starts_with('e'),
+            "the base character is what must survive: {text:?}"
+        );
+    }
+
+    /// The over-correction guard for the same code path. Fitting must be
+    /// invisible to every cell that was already legal — which is all of them.
+    #[test]
+    fn a_real_grapheme_cluster_passes_through_the_host_untouched() {
+        let clusters: [(char, &[char]); 6] = [
+            ('e', &['\u{301}']),
+            ('e', &['\u{302}', '\u{301}']),
+            ('\u{5d0}', &['\u{5b8}', '\u{5bc}', '\u{591}']),
+            ('\u{f40}', &['\u{f90}', '\u{fb5}', '\u{f72}']),
+            ('🦀', &['\u{fe0f}']),
+            ('1', &['\u{fe0f}', '\u{20e3}']),
+        ];
+        for (base, marks) in clusters {
+            let mut want = String::from(base);
+            want.extend(marks.iter());
+            assert_eq!(
+                cell_text(&vte_cell(base, marks)).as_str(),
+                want,
+                "a real cluster must survive intact"
+            );
+        }
+    }
+
+    /// A plain character is the overwhelming majority of every screen, and it
+    /// must come through the fitting untouched as well.
+    #[test]
+    fn ordinary_characters_are_unchanged_by_the_fitting() {
+        for c in ['x', ' ', 'é', '\u{4f60}', '🦀'] {
+            assert_eq!(cell_text(&vte_cell(c, &[])).as_str(), c.to_string());
+        }
+    }
+
     fn sh(script: &str, size: TermSize) -> HostTerm {
         HostTerm::spawn(
             "/bin/sh",
@@ -447,6 +567,61 @@ mod tests {
             200,
         )
         .expect("spawn")
+    }
+
+    /// **I7 on the host side, which is the side that matters.**
+    ///
+    /// The size in a resize is chosen by the CLIENT and handed to
+    /// `Term::resize`, which allocates `(rows + history) * cols` emulator
+    /// cells with no bound of its own. History multiplies it, so this is the
+    /// same memory bomb as the resize arm of `ScreenState::apply` and strictly
+    /// worse: a client that has merely connected can ask a host for hundreds
+    /// of gigabytes.
+    ///
+    /// 1024x1024 is over the cap and small enough to run this test RED
+    /// without taking the machine down; it was, and red it resizes happily.
+    #[test]
+    fn a_client_cannot_resize_the_host_beyond_the_cap() {
+        let mut t = sh("sleep 5", size());
+        let err = t
+            .resize(TermSize {
+                cols: 1024,
+                rows: 1024,
+            })
+            .expect_err("a screen that large must be refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "expected the I7 error, got: {err}"
+        );
+        assert_eq!(
+            t.size(),
+            size(),
+            "a refused resize must leave the PTY and the emulator agreeing"
+        );
+        // And the session is still usable — a rejected resize is not fatal.
+        t.resize(TermSize { cols: 60, rows: 20 })
+            .expect("an ordinary resize still works");
+        assert_eq!(t.size(), TermSize { cols: 60, rows: 20 });
+    }
+
+    /// The spawn path takes the client's size too, from `ClientHello`.
+    #[test]
+    fn a_host_terminal_cannot_be_spawned_beyond_the_cap() {
+        let got = HostTerm::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "true".to_owned()],
+            &[],
+            TermSize {
+                cols: u16::MAX,
+                rows: u16::MAX,
+            },
+            200,
+        );
+        let err = got.err().expect("a screen that large must be refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "expected the I7 error, got: {err}"
+        );
     }
 
     /// Poll until `f` is satisfied, or give up. There is a real process on

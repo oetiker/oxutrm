@@ -30,7 +30,7 @@ use alacritty_terminal::Term;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::vte::ansi::Processor;
 
-use oxutrm_proto::{Attrs, Color, ScreenState, TermSize};
+use oxutrm_proto::{Attrs, Color, MAX_TITLE, ScreenState, TermSize};
 
 use crate::blink::{BlinkPlane, BlinkTap};
 use crate::grid::GridSize;
@@ -45,7 +45,7 @@ use crate::palette::palette;
 /// would exercise a different path from production.
 fn render(rows: u16, cols: u16, bytes: &[u8]) -> (ScreenState, String) {
     let size = TermSize { cols, rows };
-    let dims = GridSize::new(size, 100);
+    let dims = GridSize::new(size, 100).expect("test size is legal");
     let events = EventSink::new();
     let mut term = Term::new(Config::default(), &dims, events.clone());
     let mut parser: Processor = Processor::new();
@@ -230,6 +230,52 @@ fn an_osc_two_title() {
     insta::assert_snapshot!(text);
 }
 
+/// **I8 end to end: every state this crate builds must satisfy the rules the
+/// other end will check it against.**
+///
+/// The golden suite is where the hole hid. These fixtures drive
+/// `alacritty_terminal`, which never puts an ESC in a cell, so no fixture ever
+/// produced one and nothing here ever looked at cell CONTENT — only at shape,
+/// colour and attributes. This test asks the one question the suite was not
+/// asking: is what we produce something our own peer would accept?
+///
+/// The stream is a program behaving badly rather than a program attacking: a
+/// title far longer than any real one, and a base character buried under a
+/// mark stack `alacritty_terminal` will happily grow without limit.
+#[test]
+fn a_state_built_from_an_abusive_stream_still_satisfies_i8() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x1b]2;");
+    bytes.extend(std::iter::repeat_n(b't', 900));
+    bytes.push(0x07);
+    bytes.push(b'e');
+    for _ in 0..500 {
+        bytes.extend_from_slice("\u{301}".as_bytes());
+    }
+
+    let (state, _) = render(2, 12, &bytes);
+    assert_eq!(
+        state.validate(),
+        Ok(()),
+        "the host must never build a state its own peer would refuse"
+    );
+    assert!(
+        state.title.len() <= MAX_TITLE,
+        "title is {} bytes",
+        state.title.len()
+    );
+    assert!(
+        state.title.starts_with("tttt"),
+        "fitting keeps the front of the title: {:?}",
+        state.title
+    );
+    assert!(
+        state.cell(0, 0).text.starts_with('e'),
+        "the base character survives the mark stack: {:?}",
+        state.cell(0, 0).text
+    );
+}
+
 #[test]
 fn blink_strikethrough_and_hidden_together() {
     // Blink is the one attribute alacritty_terminal parses and then DISCARDS,
@@ -270,7 +316,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
     // is wrapped when the window narrows and unwrapped when it widens, and the
     // text must survive the round trip intact.
     let size_wide = TermSize { cols: 20, rows: 4 };
-    let dims = GridSize::new(size_wide, 100);
+    let dims = GridSize::new(size_wide, 100).expect("test size is legal");
     let events = EventSink::new();
     let mut term = Term::new(Config::default(), &dims, events.clone());
     let mut parser: Processor = Processor::new();
@@ -296,7 +342,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
 
     // Narrow, then widen back.
     let narrow = TermSize { cols: 8, rows: 4 };
-    term.resize(GridSize::new(narrow, 100));
+    term.resize(GridSize::new(narrow, 100).expect("test size is legal"));
     let shrunk = screen_state_of(
         &term,
         &blink,
@@ -310,7 +356,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
         },
     );
 
-    term.resize(GridSize::new(size_wide, 100));
+    term.resize(GridSize::new(size_wide, 100).expect("test size is legal"));
     let after = screen_state_of(
         &term,
         &blink,
