@@ -425,8 +425,12 @@ fn i7_is_checked_before_the_length() {
 fn i7_a_real_terminal_is_nowhere_near_the_cap() {
     // A 4K display at a 6-pixel font is about 400x120.
     ScreenState::blank(120, 400).expect("a 400x120 terminal is ordinary");
-    assert!(MAX_SCREEN_DIM > 400);
-    assert!(MAX_SCREEN_CELLS > 400 * 120 * 4);
+    // Both sides are constants, so the claim is checkable at compile time and
+    // clippy insists it be checked there. That is the stronger form anyway: a
+    // ceiling lowered below an ordinary terminal should fail the build rather
+    // than one test run.
+    const { assert!(MAX_SCREEN_DIM > 400) };
+    const { assert!(MAX_SCREEN_CELLS > 400 * 120 * 4) };
 }
 
 #[test]
