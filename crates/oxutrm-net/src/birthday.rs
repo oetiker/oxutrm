@@ -24,6 +24,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use oxutrm_proto::Psk;
+
 use crate::{
     CheckKind, Direction, IceCredentials, IceRole, NetConfig, build_check_request,
     build_check_response, parse_check, random_transaction_id, to_socket_family, unmap,
@@ -88,7 +90,7 @@ pub fn guessed_ports(base: u16, count: u16) -> Vec<u16> {
 /// `Ok(None)` means the budget expired without a hole — an ordinary outcome
 /// for this rung, not an error. `Err` means the blast could not start at all.
 pub async fn birthday_blast(
-    psk: [u8; 32],
+    psk: &Psk,
     role: IceRole,
     peer_base: SocketAddr,
     cfg: &NetConfig,
@@ -101,7 +103,7 @@ pub async fn birthday_blast(
         "the blast needs at least one socket and one port"
     );
 
-    let creds = IceCredentials::derive(&psk);
+    let creds = IceCredentials::derive(psk.as_bytes());
     let outbound = IceCredentials::outbound(role);
     let inbound = IceCredentials::inbound(role);
     let ports = guessed_ports(peer_base.port(), cfg.birthday_ports);
@@ -256,7 +258,7 @@ fn into_std(sockets: &[Arc<tokio::net::UdpSocket>], idx: usize) -> anyhow::Resul
 mod tests {
     use super::*;
 
-    const PSK: [u8; 32] = [0x33; 32];
+    const PSK: Psk = Psk::new([0x33; 32]);
 
     fn cfg(sockets: u16, ports: u16, budget_ms: u64) -> NetConfig {
         NetConfig {
@@ -333,7 +335,7 @@ mod tests {
         let addr = sock.local_addr().expect("addr");
         let s = sock.clone();
         tokio::spawn(async move {
-            let creds = IceCredentials::derive(&PSK);
+            let creds = IceCredentials::derive(PSK.as_bytes());
             // The peer is the host, so it verifies the client's outbound
             // direction and signs its answers with the same one.
             let d = IceCredentials::inbound(IceRole::Controlled);
@@ -366,7 +368,7 @@ mod tests {
         let base = SocketAddr::new(peer_addr.ip(), peer_addr.port().wrapping_sub(3));
 
         let cfg = cfg(4, 32, 4000);
-        let got = birthday_blast(PSK, IceRole::Controlling, base, &cfg)
+        let got = birthday_blast(&PSK, IceRole::Controlling, base, &cfg)
             .await
             .expect("the blast must not error")
             .expect("the hole was inside the range and must have been found");
@@ -387,7 +389,7 @@ mod tests {
     async fn the_blast_finds_a_hole_sitting_exactly_on_the_base() {
         let (_peer, peer_addr) = lurking_peer(0).await;
         let cfg = cfg(2, 8, 3000);
-        let got = birthday_blast(PSK, IceRole::Controlling, peer_addr, &cfg)
+        let got = birthday_blast(&PSK, IceRole::Controlling, peer_addr, &cfg)
             .await
             .expect("no error")
             .expect("the base was correct");
@@ -405,7 +407,7 @@ mod tests {
         let started = Instant::now();
         let got = tokio::time::timeout(
             Duration::from_secs(10),
-            birthday_blast(PSK, IceRole::Controlling, base, &cfg),
+            birthday_blast(&PSK, IceRole::Controlling, base, &cfg),
         )
         .await
         .expect("the budget must be honoured, not merely intended")
@@ -428,7 +430,7 @@ mod tests {
             ..NetConfig::default()
         };
         let base: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let got = birthday_blast(PSK, IceRole::Controlling, base, &cfg)
+        let got = birthday_blast(&PSK, IceRole::Controlling, base, &cfg)
             .await
             .expect("no error");
         assert!(got.is_none());
@@ -438,12 +440,12 @@ mod tests {
     async fn a_zero_sized_blast_is_refused_rather_than_looping_forever() {
         let base: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(
-            birthday_blast(PSK, IceRole::Controlling, base, &cfg(0, 8, 200))
+            birthday_blast(&PSK, IceRole::Controlling, base, &cfg(0, 8, 200))
                 .await
                 .is_err()
         );
         assert!(
-            birthday_blast(PSK, IceRole::Controlling, base, &cfg(4, 0, 200))
+            birthday_blast(&PSK, IceRole::Controlling, base, &cfg(4, 0, 200))
                 .await
                 .is_err()
         );
@@ -479,7 +481,7 @@ mod tests {
             }
         });
 
-        let got = birthday_blast(PSK, IceRole::Controlling, addr, &cfg(2, 4, 500))
+        let got = birthday_blast(&PSK, IceRole::Controlling, addr, &cfg(2, 4, 500))
             .await
             .expect("no error");
         assert!(

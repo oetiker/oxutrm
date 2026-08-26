@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use oxutrm_proto::SpkiSha256;
 use quinn::rustls;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -72,7 +73,7 @@ fn server_config(
     Ok(cfg)
 }
 
-fn client_config(expect_spki_sha256: [u8; 32]) -> anyhow::Result<quinn::ClientConfig> {
+fn client_config(expect_spki_sha256: SpkiSha256) -> anyhow::Result<quinn::ClientConfig> {
     // Its own step, and not optional: without a process-default provider
     // `QuicClientConfig::try_from` below fails with an error that says nothing
     // about providers.
@@ -82,7 +83,7 @@ fn client_config(expect_spki_sha256: [u8; 32]) -> anyhow::Result<quinn::ClientCo
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("selecting TLS 1.3")?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(expect_spki_sha256)))
+        .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(*expect_spki_sha256.as_bytes())))
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -126,13 +127,18 @@ pub async fn quic_server(
 
 /// Connect to `peer`, trusting exactly `expect_spki_sha256` and nothing else.
 ///
+/// The fingerprint arrives as the wire crate's [`SpkiSha256`] rather than a
+/// bare `[u8; 32]`, and that is the whole point: it is the same 32 bytes the
+/// host put in `HostHello`, carried in a type that a `Psk` — also 32 bytes,
+/// also on that message — cannot be mistaken for.
+///
 /// The endpoint comes back alongside the connection because `quinn` drives the
 /// socket from it and M4 needs the same handle for `Endpoint::rebind` when the
 /// local address changes while roaming.
 pub async fn quic_client(
     socket: &Arc<tokio::net::UdpSocket>,
     peer: SocketAddr,
-    expect_spki_sha256: [u8; 32],
+    expect_spki_sha256: SpkiSha256,
 ) -> anyhow::Result<(quinn::Connection, quinn::Endpoint, StunRx)> {
     let (mut endpoint, stun_rx) = endpoint_over(socket, None)?;
     endpoint.set_default_client_config(client_config(expect_spki_sha256)?);
@@ -200,9 +206,10 @@ mod tests {
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) = quic_client(&client_sock, server_addr, fingerprint)
-            .await
-            .unwrap();
+        let (conn, _ep, _stun) =
+            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
+                .await
+                .unwrap();
 
         assert!(
             conn.max_datagram_size().is_some(),
@@ -233,9 +240,10 @@ mod tests {
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) = quic_client(&client_sock, server_addr, fingerprint)
-            .await
-            .unwrap();
+        let (conn, _ep, _stun) =
+            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
+                .await
+                .unwrap();
 
         let payload = vec![0xABu8; 64 * 1024];
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -277,7 +285,7 @@ mod tests {
         let client_sock = socket().await;
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            quic_client(&client_sock, server_addr, other_fp),
+            quic_client(&client_sock, server_addr, SpkiSha256::new(other_fp)),
         )
         .await
         .expect("must not hang");
@@ -316,7 +324,7 @@ mod tests {
 
         let (conn, _ep, _client_stun) = tokio::time::timeout(
             Duration::from_secs(20),
-            quic_client(&client_sock, server_addr, fingerprint),
+            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint)),
         )
         .await
         .expect("the handshake must not be starved by the STUN traffic")
@@ -358,9 +366,10 @@ mod tests {
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
-        let (conn, _ep, _stun) = quic_client(&client_sock, server_addr, fingerprint)
-            .await
-            .unwrap();
+        let (conn, _ep, _stun) =
+            quic_client(&client_sock, server_addr, SpkiSha256::new(fingerprint))
+                .await
+                .unwrap();
         assert_eq!(
             conn.handshake_data()
                 .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())

@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Candidate, NatType, PROTO_VERSION, PathDescription, ProtoError, TermSize, TerminalCaps,
+    Candidate, NatType, PROTO_VERSION, PathDescription, ProtoError, Psk, SpkiSha256, TermSize,
+    TerminalCaps,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,10 +25,16 @@ pub enum Signal {
         /// `--attach` from the current one. Signalling and `meta.json` only —
         /// never per-frame, since each attach is a distinct QUIC connection.
         attach_id: u64,
-        /// base64 of the SHA-256 of the host certificate's SPKI.
-        cert_spki_sha256: String,
-        /// base64 of 32 CSPRNG bytes. Never written to disk, on either side.
-        psk: String,
+        /// The SHA-256 of the host certificate's SPKI. base64 on the wire, 32
+        /// bytes everywhere else — see [`SpkiSha256`], which is what makes
+        /// those two the same value rather than two values that happen to
+        /// share a field name.
+        cert_spki_sha256: SpkiSha256,
+        /// 32 CSPRNG bytes, base64 on the wire. Never written to disk, on
+        /// either side. A [`Psk`] and not a [`SpkiSha256`] deliberately: they
+        /// are the same size and were both `String` here, so passing one where
+        /// the other belonged used to type-check.
+        psk: Psk,
         candidates: Vec<Candidate>,
         nat_type: NatType,
         bound_port: u16,
@@ -165,8 +172,10 @@ mod tests {
                 proto: PROTO_VERSION,
                 session_id: "00112233445566778899aabbccddeeff".to_string(),
                 attach_id: 3,
-                cert_spki_sha256: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=".to_string(),
-                psk: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+                // The same 32 bytes the base64 literals here used to spell
+                // out, written as the bytes they are.
+                cert_spki_sha256: SpkiSha256::new(*b"abcdefghijklmnopqrstuvwxyz123456"),
+                psk: Psk::new(*b"0123456789abcdef0123456789abcdef"),
                 candidates: vec![cand.clone()],
                 nat_type: NatType::EndpointIndependent,
                 bound_port: 443,
@@ -217,6 +226,29 @@ mod tests {
         let got: Vec<Signal> = (0..5).map(|_| read_signal(&mut r).expect("read")).collect();
         for (a, b) in got.iter().zip(every_variant().iter()) {
             assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        }
+
+        // `Psk`'s Debug is redacted, so the loop above compares two copies of
+        // "<redacted>" and would pass on a PSK that did not survive at all.
+        // Check the key material directly, or the one field whose round trip
+        // matters most is the one field asserted vacuously.
+        match (&got[0], &every_variant()[0]) {
+            (
+                Signal::HostHello {
+                    psk: a,
+                    cert_spki_sha256: ca,
+                    ..
+                },
+                Signal::HostHello {
+                    psk: b,
+                    cert_spki_sha256: cb,
+                    ..
+                },
+            ) => {
+                assert_eq!(a, b, "the PSK did not survive the round trip");
+                assert_eq!(ca, cb, "the fingerprint did not survive the round trip");
+            }
+            _ => panic!("the first variant must be the HostHello"),
         }
     }
 
@@ -280,15 +312,22 @@ mod tests {
 
     // ---- the hard version check ----
 
+    /// A byte-exact `HostHello` line with a caller-chosen protocol version.
+    ///
+    /// The key material used to be `"YWJj"` and `"ZGVm"` — `b"abc"` and
+    /// `b"def"`, three bytes each. Nothing rejected them, which is precisely
+    /// the hole these fixtures now cannot express: the fields are 32-byte
+    /// types, so a fixture with the wrong length fails to parse rather than
+    /// sailing through and taking the version check with it.
     fn skewed_host_hello(proto: u32) -> String {
         format!(
             concat!(
                 r#"{{"t":"HostHello","proto":{},"session_id":"00112233445566778899aabbccddeeff","#,
-                r#""attach_id":1,"cert_spki_sha256":"YWJj","psk":"ZGVm","candidates":[],"#,
+                r#""attach_id":1,"cert_spki_sha256":"{}","psk":"{}","candidates":[],"#,
                 r#""nat_type":"Unknown","bound_port":443,"detachable":true}}"#,
                 "\n"
             ),
-            proto
+            proto, GOOD_32, GOOD_32
         )
     }
 
@@ -348,6 +387,104 @@ mod tests {
             read_signal(&mut r),
             Ok(Signal::CandidateUpdate { .. })
         ));
+    }
+
+    // ---- key material is 32 bytes, or the message is not a message ----
+
+    /// 32 bytes, correctly encoded. The shape every case below deviates from.
+    const GOOD_32: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    /// 31 bytes — and note it is *also* 44 characters. base64 pads to a
+    /// multiple of four, so 31, 32 and 33 bytes all encode to 44 characters,
+    /// and a character count on its own cannot tell them apart.
+    const SHORT_31: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw==";
+    /// 33 bytes, and 44 characters again.
+    const LONG_33: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAh";
+
+    /// One `HostHello` line whose `psk` is whatever the caller wants to try.
+    /// Everything else in it is valid, so a rejection can only be about the
+    /// PSK.
+    fn host_hello_with_psk(psk: &str) -> String {
+        let mut s = String::from(r#"{"t":"HostHello","proto":"#);
+        s.push_str(&PROTO_VERSION.to_string());
+        s.push_str(
+            r#","session_id":"00112233445566778899aabbccddeeff","attach_id":1,"cert_spki_sha256":""#,
+        );
+        s.push_str(GOOD_32);
+        s.push_str(r#"","psk":""#);
+        s.push_str(psk);
+        s.push_str(r#"","candidates":[],"nat_type":"Unknown","bound_port":443,"detachable":true}"#);
+        s.push('\n');
+        s
+    }
+
+    fn read_one(line: &str) -> Result<Signal, ProtoError> {
+        let mut r = BufReader::new(line.as_bytes());
+        read_signal(&mut r)
+    }
+
+    /// The control. Without it, every rejection below could be a `HostHello`
+    /// that never parsed for some unrelated reason.
+    #[test]
+    fn a_correctly_sized_psk_is_accepted() {
+        assert!(matches!(
+            read_one(&host_hello_with_psk(GOOD_32)),
+            Ok(Signal::HostHello { .. })
+        ));
+    }
+
+    #[test]
+    fn a_psk_that_decodes_to_thirty_one_bytes_is_rejected() {
+        let got = read_one(&host_hello_with_psk(SHORT_31));
+        assert!(
+            matches!(got, Err(ProtoError::Malformed(_))),
+            "a 31-byte PSK reached the session: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_psk_that_decodes_to_thirty_three_bytes_is_rejected() {
+        let got = read_one(&host_hello_with_psk(LONG_33));
+        assert!(
+            matches!(got, Err(ProtoError::Malformed(_))),
+            "a 33-byte PSK reached the session: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_psk_outside_the_base64_alphabet_is_rejected() {
+        // 44 characters, so a length check alone lets it through. The fake-ssh
+        // fixture used to emit exactly this shape, with a `}` in the middle.
+        let bad = "AQIDBAUGBwgJCgsMDQ4PEBES}xQVFhcYGRobHB0eHyA=";
+        assert_eq!(
+            bad.len(),
+            44,
+            "the case is only interesting at the right length"
+        );
+        let got = read_one(&host_hello_with_psk(bad));
+        assert!(
+            matches!(got, Err(ProtoError::Malformed(_))),
+            "a PSK that is not base64 at all reached the session: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_megabyte_of_base64_is_rejected_and_the_length_is_what_rejects_it() {
+        let huge = "A".repeat(1024 * 1024);
+        let got = read_one(&host_hello_with_psk(&huge));
+        let shown = format!("{got:?}");
+        assert!(
+            matches!(got, Err(ProtoError::Malformed(_))),
+            "a megabyte of PSK reached the session: {shown}"
+        );
+        // Evidence of ORDER, which the error variant alone cannot give: the
+        // rejection names the length it was handed. A decode-first
+        // implementation would report what the DECODER made of a megabyte,
+        // not how long the field was.
+        assert!(
+            shown.contains(&huge.len().to_string()),
+            "the rejection does not name the offending length, so nothing here \
+             shows the length was checked before the decode: {shown}"
+        );
     }
 
     // ---- SSH noise before the first message ----

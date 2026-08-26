@@ -28,10 +28,12 @@ thiserror.workspace = true
 # The signalling channel is a pair of pipes on a child `ssh`, and the attach
 # path is a Unix socket, so both are async.
 tokio.workspace = true
-# The PSK is 32 bytes from the OS CSPRNG, fresh per attach, and travels
-# base64-encoded in HostHello.
+# The PSK is 32 bytes from the OS CSPRNG, fresh per attach. It travels
+# base64-encoded, but this crate does NOT encode it: that lives in
+# `oxutrm_proto::Psk`'s serde impl, which is the only encoder and the only
+# decoder. Hence no `base64` here — a second encode site is what let the mint
+# and the consume ends drift apart in the first place.
 rand.workspace = true
-base64.workspace = true
 
 [dev-dependencies]
 # Declared here rather than in [workspace.dependencies] so that adding it does

@@ -10,7 +10,8 @@ use std::io::Cursor;
 
 use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_proto::{
-    Candidate, CandidateKind, NatType, PROTO_VERSION, ProtoError, Signal, TermSize, TerminalCaps,
+    Candidate, CandidateKind, NatType, PROTO_VERSION, ProtoError, Psk, Signal, SpkiSha256,
+    TermSize, TerminalCaps,
 };
 
 fn host_hello(attach_id: u64) -> Signal {
@@ -22,8 +23,10 @@ fn host_hello_with_proto(attach_id: u64, proto: u32) -> Signal {
         proto,
         session_id: "00112233445566778899aabbccddeeff".to_string(),
         attach_id,
-        cert_spki_sha256: "YmFzZTY0Y2VydGZpbmdlcnByaW50MzJieXRlc2xvbmc=".to_string(),
-        psk: "cHNrYmFzZTY0dGhpcnR5dHdvYnl0ZXNvZmVudHJvcHk=".to_string(),
+        // The same 32 bytes the base64 literals here used to spell out. The
+        // field is a 32-byte type now, so the fixture says so directly.
+        cert_spki_sha256: SpkiSha256::new(*b"base64certfingerprint32byteslong"),
+        psk: Psk::new(*b"pskbase64thirtytwobytesofentropy"),
         candidates: vec![Candidate {
             addr: "192.0.2.7:443".parse().unwrap(),
             kind: CandidateKind::ServerReflexive,

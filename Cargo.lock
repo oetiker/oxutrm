@@ -1293,7 +1293,6 @@ name = "oxutrm-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "libc",
  "oxutrm-proto",
  "rand 0.9.5",

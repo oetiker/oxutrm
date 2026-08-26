@@ -10,13 +10,16 @@
 //! `tests/no_keys_on_disk.rs` enforces that by reading every byte of every file
 //! under it.
 
-use base64::Engine as _;
+use oxutrm_proto::{Psk, SpkiSha256};
 use rand::TryRngCore as _;
 
 use crate::SessionMeta;
 
 /// The length of a PSK, in bytes. 32 bytes from the OS CSPRNG.
-pub const PSK_LEN: usize = 32;
+///
+/// Re-exported from the wire crate rather than restated, because the wire is
+/// what decides it: `oxutrm_proto::Psk` cannot hold any other length.
+pub const PSK_LEN: usize = oxutrm_proto::WIRE_KEY_LEN;
 
 /// The secrets of one attach.
 ///
@@ -25,9 +28,15 @@ pub const PSK_LEN: usize = 32;
 /// certificate itself is made by the transport layer that will present it —
 /// generating a plausible-looking fingerprint here would be a fake that reads
 /// like the real thing.
+///
+/// Both halves are held in the **wire crate's** types, not in bare arrays.
+/// That is the point of the change that introduced them: these values are
+/// minted here and consumed at the far end, and while the mint side spoke
+/// `[u8; 32]` and the wire spoke `String` there was nothing to join the two —
+/// so nothing did.
 pub struct AttachKeys {
-    psk: [u8; PSK_LEN],
-    cert_spki_sha256: [u8; 32],
+    psk: Psk,
+    cert_spki_sha256: SpkiSha256,
 }
 
 impl AttachKeys {
@@ -37,37 +46,33 @@ impl AttachKeys {
     /// `OsRng` is the operating system's CSPRNG. It is used directly rather
     /// than through a seeded generator, because a seeded one can be reproduced
     /// and this value must not be.
-    pub fn fresh(cert_spki_sha256: [u8; 32]) -> std::io::Result<AttachKeys> {
+    pub fn fresh(cert_spki_sha256: SpkiSha256) -> std::io::Result<AttachKeys> {
         let mut psk = [0u8; PSK_LEN];
         rand::rngs::OsRng
             .try_fill_bytes(&mut psk)
             .map_err(|e| std::io::Error::other(format!("the OS CSPRNG refused: {e}")))?;
         Ok(AttachKeys {
-            psk,
+            psk: Psk::new(psk),
             cert_spki_sha256,
         })
     }
 
+    /// The PSK, in the type that goes into `HostHello`.
+    ///
+    /// There is no `psk_base64()` beside this any more, and that is
+    /// deliberate. Encoding now happens in exactly one place — `Psk`'s
+    /// `Serialize` — so there is no second encoder to drift out of step with
+    /// the decoder. A hand-rolled encode with no matching decode is what made
+    /// this seam silently broken in the first place.
     #[must_use]
-    pub fn psk(&self) -> &[u8; PSK_LEN] {
+    pub fn psk(&self) -> &Psk {
         &self.psk
     }
 
-    /// The PSK as it travels in `HostHello`.
+    /// The certificate fingerprint, in the type that goes into `HostHello`.
     #[must_use]
-    pub fn psk_base64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.psk)
-    }
-
-    #[must_use]
-    pub fn cert_spki_sha256(&self) -> &[u8; 32] {
-        &self.cert_spki_sha256
-    }
-
-    /// The certificate fingerprint as it travels in `HostHello`.
-    #[must_use]
-    pub fn cert_spki_sha256_base64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.cert_spki_sha256)
+    pub fn cert_spki_sha256(&self) -> SpkiSha256 {
+        self.cert_spki_sha256
     }
 }
 
@@ -83,25 +88,13 @@ impl std::fmt::Debug for AttachKeys {
     }
 }
 
-impl Drop for AttachKeys {
-    /// Overwrite the PSK before the memory is reused.
-    ///
-    /// A best effort rather than a guarantee, and worth being exact about what
-    /// it is not: the value may already have been copied by a `base64` encode,
-    /// nothing stops the allocator handing the page to someone else, and
-    /// without a volatile write the compiler is entitled to elide a dead store.
-    /// The fence makes elision unlikely rather than impossible.
-    ///
-    /// It is kept anyway because it costs one pass over 32 bytes and removes
-    /// the longest-lived copy, which is the one worth removing. Doing it
-    /// properly would mean `write_volatile` and a second `unsafe` module in a
-    /// crate that currently has exactly one, which is a worse trade for a
-    /// guarantee this cannot make either way.
-    fn drop(&mut self) {
-        self.psk.fill(0);
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }
-}
+// There is no `Drop for AttachKeys`. `Psk` has one, so dropping an
+// `AttachKeys` zeroes its PSK anyway — through the field, without this crate
+// having to remember. The caveat the old implementation had to document is
+// also narrower now: it said the value "may already have been copied by a
+// base64 encode", and that copy was a `String` nothing could scrub. The encode
+// happens on a 44-byte stack buffer inside `Psk::serialize`, which zeroes it
+// before returning.
 
 /// One attach generation: a bumped counter and a brand-new set of secrets.
 #[derive(Debug)]
@@ -125,7 +118,10 @@ pub struct Attach {
 /// Note what this does **not** touch: `meta.detachable`. That is settled from
 /// the nominated rung, long after this runs — see
 /// [`SessionMeta::set_detachable`].
-pub fn begin_attach(meta: &mut SessionMeta, cert_spki_sha256: [u8; 32]) -> std::io::Result<Attach> {
+pub fn begin_attach(
+    meta: &mut SessionMeta,
+    cert_spki_sha256: SpkiSha256,
+) -> std::io::Result<Attach> {
     meta.attach_id = meta.attach_id.saturating_add(1);
     Ok(Attach {
         attach_id: meta.attach_id,

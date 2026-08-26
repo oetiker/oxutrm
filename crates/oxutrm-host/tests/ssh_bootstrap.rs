@@ -63,7 +63,13 @@ async fn a_full_handshake_survives_a_banner_and_a_motd() {
     };
     assert_eq!(session_id.len(), 32, "128 bits as lowercase hex");
     assert_eq!(attach_id, 1);
-    assert!(!psk.is_empty());
+    // The PSK is a 32-byte type now, so "not empty" is no longer sayable and
+    // no longer the useful claim. What is useful is that the fixture actually
+    // put entropy in it: an all-zero PSK would have decoded perfectly.
+    assert!(
+        psk.as_bytes().iter().any(|b| *b != 0),
+        "the fixture sent an all-zero PSK"
+    );
 
     ch.send(&client_hello()).await.expect("send ClientHello");
 
