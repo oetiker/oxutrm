@@ -24,6 +24,68 @@ pub const MAX_SCREEN_CELLS: usize = 262_144;
 /// terminal: an 8K display at a 4-pixel font would be about 1920 columns.
 pub const MAX_SCREEN_DIM: u16 = 2048;
 
+/// The most bytes one cell's text may carry — the ceiling behind **I8**.
+///
+/// A cell holds one grapheme cluster: a base character plus whatever combining
+/// marks hang off it. Four bytes of base plus a long stack of three-byte marks
+/// covers every script anyone writes — a fully pointed Hebrew word, a Tibetan
+/// stack, a Devanagari conjunct, an emoji with a variation selector and a ZWJ
+/// all fit inside 32 bytes with room to spare.
+///
+/// It is a ceiling, not a policy on typography, and it is the bound that stops
+/// the amplification. Nothing else in the protocol measures bytes-per-cell:
+/// `MAX_DECOMPRESSED` is 64 MiB, so without this one cell could legally carry
+/// ~60 MiB of text, and the apply loop clones a run's cells `repeat + 1` times
+/// across a row — up to [`MAX_SCREEN_DIM`] columns. That is ~123 GiB from a
+/// diff of a few hundred bytes. Same shape as the resize bomb I7 closed,
+/// entering through the one dimension I7 does not measure.
+///
+/// Note that `alacritty_terminal` puts **no** cap on how many zero-width marks
+/// it stacks on one cell, so an honest host running an honest program can
+/// exceed this. That is why `oxutrm-term` *maintains* the bound at the source
+/// rather than asserting it: see `cell_text` there.
+pub const MAX_CELL_TEXT: usize = 32;
+
+/// The most bytes a window title may carry — the second half of **I8**.
+///
+/// Comfortably past any real title: a path plus a command name plus a host
+/// name is well under a hundred bytes. The number exists so that "the title"
+/// is a bounded quantity at all, because the client interpolates it into an
+/// OSC sequence written to the user's real terminal.
+pub const MAX_TITLE: usize = 512;
+
+/// Which piece of text an **I8** rejection is about.
+///
+/// The two fields obey the same rule with different bounds, and an error that
+/// did not say which one it meant would send whoever reads the log looking at
+/// the wrong half of the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextField {
+    /// [`Cell::text`](crate::Cell::text).
+    CellText,
+    /// [`ScreenState::title`](crate::ScreenState::title).
+    Title,
+}
+
+impl TextField {
+    /// The ceiling this field is held to.
+    pub const fn max_bytes(self) -> usize {
+        match self {
+            TextField::CellText => MAX_CELL_TEXT,
+            TextField::Title => MAX_TITLE,
+        }
+    }
+}
+
+impl std::fmt::Display for TextField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TextField::CellText => f.write_str("cell text"),
+            TextField::Title => f.write_str("title"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TermSize {
     pub cols: u16,

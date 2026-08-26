@@ -225,6 +225,16 @@ impl SyncState for ScreenState {
             });
         }
 
+        // I8 for the title, before ANYTHING is applied. It could equally be
+        // checked at the assignment further down, and that would be wrong: by
+        // then the row patches have already been painted, so a rejection would
+        // leave a half-applied screen behind. `ApplyError` promises that
+        // nothing was applied, and here that promise costs one line of
+        // ordering.
+        if let Some(t) = &d.title {
+            oxutrm_proto::check_title(t)?;
+        }
+
         // The resize comes first, because every row index below is relative to
         // the NEW geometry. The buffer is reallocated blank rather than
         // reshaped: a full state's row patches then cover it completely, and a
@@ -265,6 +275,23 @@ impl SyncState for ScreenState {
                         cols: self.cols,
                     });
                 }
+                // I8, and it MUST be here rather than three lines down. This
+                // is the same shape as I7 and it enters through the one
+                // dimension I7 does not measure: nothing else in the protocol
+                // bounds bytes-per-cell. `MAX_DECOMPRESSED` is 64 MiB, so a
+                // single cell may legally arrive carrying ~60 MiB of text, and
+                // the loop below clones the run's cells `repeat + 1` times —
+                // up to a full 2048-column row, or roughly 123 GiB of clones
+                // from a diff of a few hundred bytes. Checking the result
+                // afterwards would be validating a machine that has already
+                // fallen over.
+                //
+                // `run.cells` is what came off the wire, so this is bounded by
+                // the run's own width, not by the expansion.
+                for cell in &run.cells {
+                    oxutrm_proto::check_cell_text(&cell.text)?;
+                }
+
                 let mut col = start;
                 for _ in 0..=run.repeat {
                     for cell in &run.cells {
@@ -401,6 +428,155 @@ mod tests {
         };
         s.apply(1, 2, &d).expect("a 400x120 terminal is ordinary");
         assert_eq!(s.cells.len(), 400 * 120);
+    }
+
+    /// **I8, at the only place it can be enforced usefully — same argument as
+    /// I7, through the one dimension I7 does not measure.**
+    ///
+    /// I7 bounds how many cells a screen has. Nothing bounded how many BYTES
+    /// one of them holds: `MAX_DECOMPRESSED` is 64 MiB, so a single cell may
+    /// legally arrive carrying ~60 MiB of text, and the expansion below clones
+    /// a run's cells `repeat + 1` times across the row. At 2048 columns that
+    /// is ~123 GiB of live clones from a diff of a few hundred bytes.
+    ///
+    /// The assertion that makes this a test of the ORDER rather than merely of
+    /// the rejection is the last one: the destination cells must still be
+    /// blank. A check placed after the expansion loop would return the same
+    /// error — having already done all the copying, which is the entire cost.
+    /// So the error alone proves nothing; the untouched row does. This was
+    /// run RED to check exactly that: with the check moved below the loop the
+    /// test fails on the "refused BEFORE it is expanded" assertion, not on the
+    /// error variant.
+    ///
+    /// 64 KiB across 2048 columns is 128 MiB if the check ever moves, which is
+    /// deliberately survivable: this test has to be runnable RED on a shared
+    /// machine, exactly like `a_resize_beyond_the_cap_is_refused_before_...`.
+    #[test]
+    fn an_over_long_cell_is_refused_before_the_run_expands() {
+        let mut s = ScreenState::blank(1, 2048).expect("blank");
+        let bomb = cell(&"a".repeat(64 * 1024));
+        let d = ScreenDiff {
+            resize: None,
+            rows: vec![RowPatch {
+                row: 0,
+                runs: vec![Run {
+                    start_col: 0,
+                    repeat: 2047,
+                    cells: vec![bomb],
+                }],
+            }],
+            cursor: None,
+            modes: None,
+            title: None,
+            bell: None,
+            scrollback_len: None,
+        };
+
+        let err = s
+            .apply(1, 2, &d)
+            .expect_err("60 MiB in one cell is not text");
+        assert!(
+            matches!(
+                err,
+                ApplyError::TextTooLong {
+                    field: oxutrm_proto::TextField::CellText,
+                    ..
+                }
+            ),
+            "expected TextTooLong, got {err:?}"
+        );
+        assert!(
+            s.row(0).iter().all(|c| *c == Cell::blank()),
+            "the run must be refused BEFORE it is expanded, not after"
+        );
+    }
+
+    /// The security case, at the layer that actually receives it from the peer.
+    #[test]
+    fn a_control_sequence_in_a_run_never_reaches_the_screen() {
+        let mut s = ScreenState::blank(1, 4).expect("blank");
+        let d = ScreenDiff {
+            resize: None,
+            rows: vec![RowPatch {
+                row: 0,
+                runs: vec![Run {
+                    start_col: 0,
+                    repeat: 0,
+                    // OSC 52: this is the host asking the client to write the
+                    // user's clipboard, dressed as a cell.
+                    cells: vec![cell("\x1b]52;c;aGVsbG8=\x07")],
+                }],
+            }],
+            cursor: None,
+            modes: None,
+            title: None,
+            bell: None,
+            scrollback_len: None,
+        };
+        assert!(matches!(
+            s.apply(1, 2, &d),
+            Err(ApplyError::ControlInText { .. })
+        ));
+        assert_eq!(s.cell(0, 0).text, " ", "nothing may be painted");
+    }
+
+    /// The title is checked at the TOP of `apply`, not where it is assigned.
+    ///
+    /// `ApplyError` promises that nothing was applied. Checking the title at
+    /// the assignment — after the row loop — would break that promise for
+    /// every diff that carried both rows and a bad title, leaving a screen
+    /// half-painted from a frame that was refused.
+    #[test]
+    fn a_hostile_title_is_refused_before_any_row_is_painted() {
+        let mut s = ScreenState::blank(1, 4).expect("blank");
+        let d = ScreenDiff {
+            resize: None,
+            rows: vec![RowPatch {
+                row: 0,
+                runs: vec![Run {
+                    start_col: 0,
+                    repeat: 0,
+                    cells: vec![cell("h"), cell("i")],
+                }],
+            }],
+            cursor: None,
+            modes: None,
+            title: Some("vim\x07\x1b]52;c;AAAA\x07".to_owned()),
+            bell: None,
+            scrollback_len: None,
+        };
+        assert!(matches!(
+            s.apply(1, 2, &d),
+            Err(ApplyError::ControlInText { .. })
+        ));
+        assert!(
+            s.row(0).iter().all(|c| *c == Cell::blank()),
+            "a refused diff must leave the screen exactly as it was"
+        );
+        assert_eq!(s.seq, 1, "and must not advance the sequence either");
+    }
+
+    /// The over-correction guard at this layer: real text still round-trips,
+    /// including the grapheme clusters I8 could most easily have broken.
+    #[test]
+    fn ordinary_text_still_survives_a_diff_and_apply() {
+        let base = ScreenState::blank(1, 6).expect("blank");
+        let mut target = base.clone();
+        target.seq = 2;
+        target.title = "vim ~/src/main.rs".to_owned();
+        for (i, text) in ["x", "é", "\u{4f60}", "🦀", "e\u{301}", "\u{f40}\u{f90}"]
+            .into_iter()
+            .enumerate()
+        {
+            target.cells[i] = cell(text);
+        }
+
+        let d = target.diff_from(&base);
+        let mut got = base.clone();
+        got.apply(1, 2, &d)
+            .expect("real text is not a control sequence");
+        assert_eq!(got, target);
+        assert_eq!(got.validate(), Ok(()));
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //!
 //! # The screen invariants
 //!
-//! [`ScreenState`] carries six rules that are **enforced rather than
+//! [`ScreenState`] carries eight rules that are **enforced rather than
 //! documented**:
 //!
 //! | | Rule | Enforced by |
@@ -38,6 +38,8 @@
 //! | I4 | there is no `icon` field; `vte` drops OSC 1 | the type itself |
 //! | I5 | `bell` is a monotonic counter | [`ScreenState::validate_transition`] |
 //! | I6 | `scrollback_len` never shrinks | [`ScreenState::validate_transition`] |
+//! | I7 | the screen fits inside the cell and side caps | [`TermSize::check_bounds`] |
+//! | I8 | painted text is text, not control, and bounded | [`text::check_cell_text`] |
 //!
 //! I1 to I3 are properties of one state, so [`ScreenState::validate`] can see
 //! them and every constructor calls it. I5 and I6 are properties of a
@@ -45,6 +47,19 @@
 //! [`ScreenState::validate_transition`]. I4 is enforced by the strongest
 //! mechanism available: the field does not exist, and an exhaustive struct
 //! literal in the test suite stops anyone adding it back without noticing.
+//!
+//! I7 and I8 are the two that also have to be enforced **before** the state
+//! exists, because for both of them building the offending state IS the
+//! damage. `validate` checks them again on a built state so that a violating
+//! `ScreenState` cannot exist however it was constructed, but the enforcement
+//! that matters is upstream of the allocation: `TermSize::check_bounds` before
+//! the cell buffer is allocated, and `text::check_cell_text` before a run's
+//! cells are cloned `repeat + 1` times across a row.
+//!
+//! I8 is also the only invariant about *content*. It exists because the trust
+//! model is asymmetric — the client renders the host's cells by writing them
+//! to the user's real terminal, so a cell holding `\x1b]52;c;…\x07` is the
+//! host reaching through the client to the user's clipboard. See [`text`].
 //!
 //! ## Where the transition check actually runs
 //!
@@ -81,6 +96,7 @@ pub mod ids;
 pub mod screen;
 pub mod signal;
 pub mod stream;
+pub mod text;
 pub mod types;
 
 pub use cell::{Attrs, Cell, CellText, Color};
@@ -90,9 +106,10 @@ pub use ids::SessionId;
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
 pub use signal::{Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
+pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
-    Candidate, CandidateKind, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, NatType, PathDescription, Rung,
-    TermSize, TerminalCaps,
+    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType,
+    PathDescription, Rung, TermSize, TerminalCaps, TextField,
 };
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,

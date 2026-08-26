@@ -139,8 +139,8 @@ impl ScreenState {
     }
 
     /// Check every invariant that one state can carry on its own: **I1**
-    /// (exact length), **I2** (cursor in bounds) and **I3** (sequence not the
-    /// sentinel).
+    /// (exact length), **I2** (cursor in bounds), **I3** (sequence not the
+    /// sentinel) and **I8** (painted text is text, not control).
     ///
     /// Called by every constructor, and by the sync layer after it applies a
     /// diff. A comment is not a constraint anyone checks; this is.
@@ -187,6 +187,23 @@ impl ScreenState {
             });
         }
 
+        // I8. The only invariant here about CONTENT rather than shape, and the
+        // reason it is worth a linear scan of a state that is about to be
+        // painted anyway: the client renders these cells by writing them to
+        // the user's real terminal, so a cell holding `\x1b]52;c;...\x07` is
+        // the host reaching through the client to the user's clipboard.
+        //
+        // Checking it here makes a violating `ScreenState` impossible to hold
+        // however it was constructed, and puts I8 on `Receiver::on_frame`'s
+        // path for free by way of `validate_transition`. It is NOT where the
+        // invariant is cheap, though: by the time a state exists its cells have
+        // already been cloned. The enforcement that bounds the allocation is
+        // the one in `ScreenState::apply`, before the run expansion.
+        for cell in &self.cells {
+            crate::check_cell_text(&cell.text)?;
+        }
+        crate::check_title(&self.title)?;
+
         Ok(())
     }
 
@@ -204,9 +221,11 @@ impl ScreenState {
     /// Validates `self` on its own first, so a transition check can never let
     /// a malformed state through.
     ///
-    /// Note what is deliberately *not* checked here: `seq` ordering, sizes,
-    /// and content. States legitimately resize, and the sequence relationship
-    /// belongs to the frame that carried the diff, not to the states.
+    /// Note what is deliberately *not* checked here: `seq` ordering and sizes.
+    /// States legitimately resize, and the sequence relationship belongs to
+    /// the frame that carried the diff, not to the states. Content is not
+    /// absent from the contract — I8 covers it — but it is a property of one
+    /// state, so `validate` above owns it and this function inherits it.
     pub fn validate_transition(&self, previous: &ScreenState) -> Result<(), ApplyError> {
         self.validate()?;
 
