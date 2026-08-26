@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Candidate, NatType, PROTO_VERSION, PathDescription, ProtoError, Psk, SpkiSha256, TermSize,
-    TerminalCaps,
+    Candidate, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, ProtoError, Psk,
+    TermSize, TerminalCaps,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,11 +25,17 @@ pub enum Signal {
         /// `--attach` from the current one. Signalling and `meta.json` only —
         /// never per-frame, since each attach is a distinct QUIC connection.
         attach_id: u64,
-        /// The SHA-256 of the host certificate's SPKI. base64 on the wire, 32
-        /// bytes everywhere else — see [`SpkiSha256`], which is what makes
-        /// those two the same value rather than two values that happen to
-        /// share a field name.
-        cert_spki_sha256: SpkiSha256,
+        /// The SHA-256 of the **host** certificate's SPKI. base64 on the wire,
+        /// 32 bytes everywhere else — see [`crate::SpkiSha256`], which is what
+        /// makes those two the same value rather than two values that happen
+        /// to share a field name.
+        ///
+        /// [`HostSpki`] rather than the bare encoding type because
+        /// `ClientHello` now carries a field of exactly the same name, shape
+        /// and encoding pointing the other way. The client pins this one; the
+        /// host pins the other. Both fingerprints are in scope on both sides,
+        /// and a swap is a compile error.
+        cert_spki_sha256: HostSpki,
         /// 32 CSPRNG bytes, base64 on the wire. Never written to disk, on
         /// either side. A [`Psk`] and not a [`SpkiSha256`] deliberately: they
         /// are the same size and were both `String` here, so passing one where
@@ -52,6 +58,20 @@ pub enum Signal {
     /// client -> host, first line.
     ClientHello {
         proto: u32,
+        /// The SHA-256 of the **client** certificate's SPKI, for the host to
+        /// pin in its QUIC `ClientCertVerifier`.
+        ///
+        /// The ordering this relies on is already the ordering the ladder has:
+        /// `HostHello` goes out first, this reply comes back, and the QUIC
+        /// endpoint is not built until after nomination — so the host holds
+        /// the fingerprint well before it needs it. That is why the host's
+        /// endpoint can require it by value with no `Option` and no setter,
+        /// and why "pin it afterwards" is not a thing anyone can write.
+        ///
+        /// Without this the PSK is the only thing gating the punched socket,
+        /// and the PSK never reaches TLS — it authenticates path discovery.
+        /// Anything that completed the handshake reached `Command::new(shell)`.
+        cert_spki_sha256: ClientSpki,
         candidates: Vec<Candidate>,
         nat_type: NatType,
         caps: TerminalCaps,
@@ -174,7 +194,7 @@ mod tests {
                 attach_id: 3,
                 // The same 32 bytes the base64 literals here used to spell
                 // out, written as the bytes they are.
-                cert_spki_sha256: SpkiSha256::new(*b"abcdefghijklmnopqrstuvwxyz123456"),
+                cert_spki_sha256: HostSpki::new(*b"abcdefghijklmnopqrstuvwxyz123456"),
                 psk: Psk::new(*b"0123456789abcdef0123456789abcdef"),
                 candidates: vec![cand.clone()],
                 nat_type: NatType::EndpointIndependent,
@@ -183,6 +203,10 @@ mod tests {
             },
             Signal::ClientHello {
                 proto: PROTO_VERSION,
+                // Deliberately NOT the host's 32 bytes above: a fixture that
+                // reused them would round-trip identically whether or not the
+                // two fields are distinct values.
+                cert_spki_sha256: ClientSpki::new(*b"654321zyxwvutsrqponmlkjihgfedcba"),
                 candidates: vec![cand.clone()],
                 nat_type: NatType::Symmetric,
                 caps: caps(),
@@ -365,12 +389,16 @@ mod tests {
 
     #[test]
     fn a_skewed_client_hello_fails_as_well() {
-        let line = concat!(
-            r#"{"t":"ClientHello","proto":99,"candidates":[],"nat_type":"Unknown","#,
-            r#""caps":{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
-            r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"},"#,
-            r#""size":{"cols":80,"rows":24}}"#,
-            "\n"
+        let line = format!(
+            concat!(
+                r#"{{"t":"ClientHello","proto":99,"cert_spki_sha256":"{}","#,
+                r#""candidates":[],"nat_type":"Unknown","#,
+                r#""caps":{{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
+                r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"}},"#,
+                r#""size":{{"cols":80,"rows":24}}}}"#,
+                "\n"
+            ),
+            GOOD_32
         );
         let mut r = BufReader::new(line.as_bytes());
         assert!(matches!(
@@ -485,6 +513,86 @@ mod tests {
             "the rejection does not name the offending length, so nothing here \
              shows the length was checked before the decode: {shown}"
         );
+    }
+
+    // ---- the client's fingerprint is not optional ----
+
+    /// One `ClientHello` line whose `cert_spki_sha256` is whatever the caller
+    /// wants to try — including nothing at all, via `None`.
+    fn client_hello_with_fingerprint(fp: Option<&str>) -> String {
+        let mut s = String::from(r#"{"t":"ClientHello","proto":"#);
+        s.push_str(&PROTO_VERSION.to_string());
+        if let Some(fp) = fp {
+            s.push_str(r#","cert_spki_sha256":""#);
+            s.push_str(fp);
+            s.push('"');
+        }
+        s.push_str(concat!(
+            r#","candidates":[],"nat_type":"Unknown","#,
+            r#""caps":{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
+            r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"},"#,
+            r#""size":{"cols":80,"rows":24}}"#,
+        ));
+        s.push('\n');
+        s
+    }
+
+    /// The control, without which every rejection below could be a
+    /// `ClientHello` that failed to parse for an unrelated reason.
+    #[test]
+    fn a_client_hello_with_a_well_formed_fingerprint_is_accepted() {
+        assert!(matches!(
+            read_one(&client_hello_with_fingerprint(Some(GOOD_32))),
+            Ok(Signal::ClientHello { .. })
+        ));
+    }
+
+    /// The regression this whole change exists to make impossible: a client
+    /// that sends no fingerprint is not a client with a defaulted field, it is
+    /// a client the host has nothing to pin. `#[serde(default)]` here — or an
+    /// `Option` — would silently restore the un-authenticated handshake while
+    /// every positive test kept passing.
+    #[test]
+    fn a_client_hello_with_no_fingerprint_at_all_is_rejected() {
+        let got = read_one(&client_hello_with_fingerprint(None));
+        assert!(
+            matches!(got, Err(ProtoError::Malformed(_))),
+            "a ClientHello with no certificate fingerprint was accepted: {got:?}"
+        );
+    }
+
+    /// The role types delegate their decoding rather than re-implementing it,
+    /// and this is the assertion that would notice if one grew its own: 31 and
+    /// 33 bytes are both 44 characters, so only a decoded-length check rejects
+    /// them.
+    #[test]
+    fn a_client_fingerprint_that_is_not_thirty_two_bytes_is_rejected() {
+        for bad in [SHORT_31, LONG_33] {
+            let got = read_one(&client_hello_with_fingerprint(Some(bad)));
+            assert!(
+                matches!(got, Err(ProtoError::Malformed(_))),
+                "a wrongly sized client fingerprint reached the session: {got:?}"
+            );
+        }
+    }
+
+    /// The two fingerprints are distinct values on the wire even though they
+    /// share a field name — proof that nothing collapses them into one.
+    #[test]
+    fn the_two_hellos_carry_two_different_fingerprints() {
+        let host = match &every_variant()[0] {
+            Signal::HostHello {
+                cert_spki_sha256, ..
+            } => *cert_spki_sha256.as_bytes(),
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let client = match &every_variant()[1] {
+            Signal::ClientHello {
+                cert_spki_sha256, ..
+            } => *cert_spki_sha256.as_bytes(),
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert_ne!(host, client);
     }
 
     // ---- SSH noise before the first message ----

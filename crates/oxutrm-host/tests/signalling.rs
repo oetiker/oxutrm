@@ -10,8 +10,8 @@ use std::io::Cursor;
 
 use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_proto::{
-    Candidate, CandidateKind, NatType, PROTO_VERSION, ProtoError, Psk, Signal, SpkiSha256,
-    TermSize, TerminalCaps,
+    Candidate, CandidateKind, ClientSpki, HostSpki, NatType, PROTO_VERSION, ProtoError, Psk,
+    Signal, TermSize, TerminalCaps,
 };
 
 fn host_hello(attach_id: u64) -> Signal {
@@ -25,7 +25,7 @@ fn host_hello_with_proto(attach_id: u64, proto: u32) -> Signal {
         attach_id,
         // The same 32 bytes the base64 literals here used to spell out. The
         // field is a 32-byte type now, so the fixture says so directly.
-        cert_spki_sha256: SpkiSha256::new(*b"base64certfingerprint32byteslong"),
+        cert_spki_sha256: HostSpki::new(*b"base64certfingerprint32byteslong"),
         psk: Psk::new(*b"pskbase64thirtytwobytesofentropy"),
         candidates: vec![Candidate {
             addr: "192.0.2.7:443".parse().unwrap(),
@@ -41,6 +41,10 @@ fn host_hello_with_proto(attach_id: u64, proto: u32) -> Signal {
 fn client_hello() -> Signal {
     Signal::ClientHello {
         proto: PROTO_VERSION,
+        // The fingerprint of the client's throwaway certificate. The host
+        // pins this in its QUIC `ClientCertVerifier`, so a `ClientHello`
+        // without it is a client the host has nothing to authenticate.
+        cert_spki_sha256: ClientSpki::new([0x11; 32]),
         candidates: vec![],
         nat_type: NatType::Unknown,
         caps: TerminalCaps {

@@ -10,7 +10,7 @@
 //! `tests/no_keys_on_disk.rs` enforces that by reading every byte of every file
 //! under it.
 
-use oxutrm_proto::{Psk, SpkiSha256};
+use oxutrm_proto::{HostSpki, Psk};
 use rand::TryRngCore as _;
 
 use crate::SessionMeta;
@@ -36,7 +36,7 @@ pub const PSK_LEN: usize = oxutrm_proto::WIRE_KEY_LEN;
 /// so nothing did.
 pub struct AttachKeys {
     psk: Psk,
-    cert_spki_sha256: SpkiSha256,
+    cert_spki_sha256: HostSpki,
 }
 
 impl AttachKeys {
@@ -46,7 +46,7 @@ impl AttachKeys {
     /// `OsRng` is the operating system's CSPRNG. It is used directly rather
     /// than through a seeded generator, because a seeded one can be reproduced
     /// and this value must not be.
-    pub fn fresh(cert_spki_sha256: SpkiSha256) -> std::io::Result<AttachKeys> {
+    pub fn fresh(cert_spki_sha256: HostSpki) -> std::io::Result<AttachKeys> {
         let mut psk = [0u8; PSK_LEN];
         rand::rngs::OsRng
             .try_fill_bytes(&mut psk)
@@ -71,7 +71,7 @@ impl AttachKeys {
 
     /// The certificate fingerprint, in the type that goes into `HostHello`.
     #[must_use]
-    pub fn cert_spki_sha256(&self) -> SpkiSha256 {
+    pub fn cert_spki_sha256(&self) -> HostSpki {
         self.cert_spki_sha256
     }
 }
@@ -118,10 +118,7 @@ pub struct Attach {
 /// Note what this does **not** touch: `meta.detachable`. That is settled from
 /// the nominated rung, long after this runs — see
 /// [`SessionMeta::set_detachable`].
-pub fn begin_attach(
-    meta: &mut SessionMeta,
-    cert_spki_sha256: SpkiSha256,
-) -> std::io::Result<Attach> {
+pub fn begin_attach(meta: &mut SessionMeta, cert_spki_sha256: HostSpki) -> std::io::Result<Attach> {
     meta.attach_id = meta.attach_id.saturating_add(1);
     Ok(Attach {
         attach_id: meta.attach_id,

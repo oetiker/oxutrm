@@ -20,8 +20,8 @@
 use std::io::{BufRead, Write};
 
 use oxutrm_proto::{
-    Candidate, CandidateKind, NatType, PROTO_VERSION, PathDescription, Psk, Rung, Signal,
-    SpkiSha256, TermSize, write_signal,
+    Candidate, CandidateKind, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk, Rung, Signal,
+    TermSize, write_signal,
 };
 
 /// What a real login prints before the command's own output.
@@ -175,7 +175,7 @@ fn host_hello(attach_id: u64, proto: u32) -> Signal {
         proto,
         session_id: "00112233445566778899aabbccddeeff".to_string(),
         attach_id,
-        cert_spki_sha256: SpkiSha256::new(fingerprint),
+        cert_spki_sha256: HostSpki::new(fingerprint),
         psk: Psk::new(psk),
         candidates: vec![Candidate {
             addr: "192.0.2.7:443".parse().expect("literal address"),

@@ -104,7 +104,7 @@ pub use cell::{Attrs, Cell, CellText, Color};
 pub use error::ApplyError;
 pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
-pub use keymat::{Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
+pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
 pub use signal::{Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
@@ -116,7 +116,14 @@ pub use types::{
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,
 /// loud failure rather than a negotiation (spec §4.2).
-pub const PROTO_VERSION: u32 = 1;
+///
+/// **2**: `ClientHello` gained `cert_spki_sha256`. The QUIC handshake now
+/// authenticates the client as well as the host, and the host cannot build its
+/// endpoint without that fingerprint — so a version-1 client is not a client
+/// with one missing field, it is a client that can never be let in. A hard
+/// version failure with both numbers in it is the only useful outcome, and it
+/// is what `check_version` already does.
+pub const PROTO_VERSION: u32 = 2;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProtoError {
