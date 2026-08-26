@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Renderer, status_line, terminal_size};
+use oxutrm_client::{Renderer, status_line, terminal_size_of};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender};
 use oxutrm_term::HostTerm;
@@ -57,6 +57,14 @@ use crate::link::{Link, SendOutcome};
 /// Short enough that a keystroke is never sitting in a buffer, long enough
 /// that an idle session costs nothing.
 const IDLE_POLL: Duration = Duration::from_millis(4);
+
+/// How long [`ClientSession::drain`] will keep taking frames off a closed
+/// link before handing the user their prompt back.
+///
+/// The work it bounds is local — decode, apply, paint — so this is never
+/// reached in practice. It exists so that a reader task which somehow outlives
+/// its connection cannot hold a person's terminal hostage.
+const FINAL_DRAIN: Duration = Duration::from_secs(2);
 
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
@@ -206,19 +214,43 @@ impl HostSession {
         Ok(())
     }
 
+    /// The frame the current state owes the peer, if any, and the bookkeeping
+    /// that says it has been offered.
+    ///
+    /// Split out from [`HostSession::offer_frame`] so the two ways of putting
+    /// it on the wire — paced and unreliable, or final and reliable — differ
+    /// only in the sending, never in what is sent.
+    fn next_frame(&mut self) -> Option<Frame> {
+        self.screen_tx.on_ack(self.input_rx.peer_ack());
+        match self.screen_tx.make_frame(self.input_rx.ack()) {
+            Ok(Some(f)) => {
+                self.last_send = Some(Instant::now());
+                Some(f)
+            }
+            // Nothing to send, or a diff that could not be built. Neither ends
+            // the session.
+            Ok(None) | Err(_) => None,
+        }
+    }
+
     fn offer_frame(&mut self) -> Option<SendOutcome> {
         if !self.due() {
             return None;
         }
-        self.screen_tx.on_ack(self.input_rx.peer_ack());
-        let frame = match self.screen_tx.make_frame(self.input_rx.ack()) {
-            Ok(Some(f)) => f,
-            // Nothing to send, or a diff that could not be built. Neither ends
-            // the session.
-            Ok(None) | Err(_) => return None,
-        };
-        self.last_send = Some(Instant::now());
+        let frame = self.next_frame()?;
         Some(self.link.sink.send(&frame))
+    }
+
+    /// [`HostSession::offer_frame`], on a stream that is finished and
+    /// acknowledged before this returns.
+    ///
+    /// For the last frame of a session only. See [`crate::link::FrameSink::send_final`].
+    async fn offer_frame_reliably(&mut self) -> Option<SendOutcome> {
+        if !self.due() {
+            return None;
+        }
+        let frame = self.next_frame()?;
+        Some(self.link.sink.send_final(&frame).await)
     }
 
     fn due(&self) -> bool {
@@ -244,11 +276,43 @@ impl HostSession {
         loop {
             let turn = self.turn()?;
             if let Some(code) = turn.exited {
-                self.close(code);
+                self.finish(code).await;
                 return Ok(code);
             }
             tokio::time::sleep(IDLE_POLL).await;
         }
+    }
+
+    /// The last screen, and only then the close. `ls; exit` lives or dies here.
+    ///
+    /// Three separate things were losing it, and all three had to go:
+    ///
+    /// **The shell's last write and its exit are two events.** `turn` polls
+    /// the pty and *then* reaps the child, so a shell that printed and exited
+    /// in the same breath leaves its output in the pty buffer, unread, on the
+    /// very turn that reports the exit. One more poll collects it.
+    ///
+    /// **Pacing has nothing left to defer to.** `offer_frame` is gated by
+    /// `due()`, which at an 8 ms interval against a 4 ms poll is false on
+    /// roughly half the turns. Normally that costs one interval; here it costs
+    /// the screen, because there is no next interval. Clearing `last_send` is
+    /// what makes the final offer unconditional.
+    ///
+    /// **`close` discards whatever is still in flight.** A datagram, or a
+    /// stream whose writer task has not yet reached `open_uni`. So the final
+    /// frame goes on a stream that is finished and *acknowledged* before the
+    /// close is sent.
+    ///
+    /// Infallible on purpose: nothing here is worth reporting instead of the
+    /// status of a shell that has already exited.
+    pub async fn finish(&mut self, code: i32) {
+        if self.term.poll().unwrap_or(false) {
+            let snapshot = self.term.snapshot(1);
+            self.screen_tx.update(snapshot);
+        }
+        self.last_send = None;
+        self.offer_frame_reliably().await;
+        self.close(code);
     }
 
     /// Tell the client the shell is gone, and with what status.
@@ -262,12 +326,15 @@ impl HostSession {
     /// A code outside `u32` cannot come from a shell; `child_exited` invents
     /// `-1` for a child it can no longer wait on, and that becomes 255, the
     /// same thing every shell reports for "something went wrong out here".
+    ///
+    /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
+    /// decoration. See its own note.
     pub fn close(&self, code: i32) {
         let code = u32::try_from(code).unwrap_or(255);
         self.link
             .sink
             .connection()
-            .close(quinn::VarInt::from_u32(code), b"the shell exited");
+            .close(quinn::VarInt::from_u32(code), SHELL_EXITED);
     }
 
     pub fn screen(&self) -> &ScreenState {
@@ -310,18 +377,43 @@ async fn keys_readable<K: AsRawFd>(
     }
 }
 
+/// The one application close on a session connection that means "the shell
+/// exited, and the error code beside me is its status".
+///
+/// `ApplicationClosed` on its own says nothing: it is what *every* deliberate
+/// close looks like, from anywhere, and the error code beside it is whatever
+/// that closer chose. A reattach superseding an old attach, `accept_one`
+/// tearing down a second inbound connection, a clean detach — all three are
+/// application closes, and all three would have made the old client print
+/// `exit 0` at somebody whose shell is still running on the far end. That is
+/// not a cosmetic wrong answer: it is a user being told their work finished.
+///
+/// QUIC already carries a reason phrase, so distinguishing them costs nothing
+/// on the wire. This is the only phrase [`exit_code`] accepts, and
+/// [`HostSession::close`] is the only place that sends it.
+pub const SHELL_EXITED: &[u8] = b"the shell exited";
+
 /// Why the session ended, as an exit status.
 ///
 /// The shell's exit code has no field in the protocol and needs none: the host
 /// closes the QUIC connection with it as the application error code, so it
 /// rides the mechanism that ends the session. Anything else closed the link —
-/// a timeout, a reset, a host that was killed — and that is an error rather
-/// than a status, because no shell said it.
+/// a timeout, a reset, a host that was killed, or an application close that
+/// was not [`SHELL_EXITED`] — and that is an error rather than a status,
+/// because no shell said it.
 fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
     match reason {
-        quinn::ConnectionError::ApplicationClosed(closed) => {
+        quinn::ConnectionError::ApplicationClosed(closed)
+            if closed.reason.as_ref() == SHELL_EXITED =>
+        {
             Ok(i32::try_from(closed.error_code.into_inner()).unwrap_or(255))
         }
+        // An application close from somewhere that is not a shell finishing.
+        // Saying so beats inventing a status the user would believe.
+        quinn::ConnectionError::ApplicationClosed(closed) => Err(anyhow::anyhow!(
+            "the host closed the session without the shell exiting: {}",
+            String::from_utf8_lossy(&closed.reason)
+        )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
         )),
@@ -437,6 +529,25 @@ impl ClientSession {
         }
 
         // ---- inbound: the screen -------------------------------------------
+        self.take_frames(first, out, &mut turn)?;
+
+        // ---- outbound: keystrokes and the size we want ---------------------
+        turn.sent = self.offer_frame();
+        Ok(turn)
+    }
+
+    /// Apply everything waiting on the link and repaint if anything landed.
+    ///
+    /// The inbound half of [`ClientSession::turn_with`], on its own so the
+    /// end of a session can run it without the outbound half: once the
+    /// connection is closed there is nobody left to offer a frame to, and
+    /// asking a dead link to send one would only produce noise.
+    fn take_frames<W: Write>(
+        &mut self,
+        first: Option<Frame>,
+        out: &mut W,
+        turn: &mut Turn,
+    ) -> Result<()> {
         let mut painted = false;
         let mut next = first;
         while let Some(frame) = next.take().or_else(|| self.link.source.try_recv()) {
@@ -462,9 +573,39 @@ impl ClientSession {
                 .context("painting the terminal")?;
             out.flush().context("flushing the terminal")?;
         }
+        Ok(())
+    }
 
-        // ---- outbound: keystrokes and the size we want ---------------------
-        turn.sent = self.offer_frame();
+    /// Paint everything the host managed to deliver before it closed.
+    ///
+    /// The frames this collects are **not in flight**. They have arrived, been
+    /// decoded, and are sitting in an mpsc channel; nothing on the network can
+    /// lose them any more, and only returning early can. `tokio::select!`
+    /// picks at random among ready arms, so once `conn.closed()` has fired,
+    /// every queued frame had roughly even odds per lap of never being
+    /// painted — which is to say the last screen of a session was a coin toss
+    /// even when the host had delivered it perfectly.
+    ///
+    /// This terminates rather than hanging: a closed connection retires the
+    /// datagram reader and the stream acceptor, and quinn deliberately lets
+    /// already-received streams be drained from a closed connection ("which
+    /// are necessarily finite"), so every sender is eventually dropped and
+    /// `recv` yields `None`. The timeout is belt and braces on the one path
+    /// where the user's own terminal is what is being held up.
+    async fn drain<W: Write>(&mut self, out: &mut W) -> Result<Turn> {
+        let mut turn = Turn::default();
+        let drained = tokio::time::timeout(FINAL_DRAIN, async {
+            while let Some(frame) = self.link.source.recv().await {
+                self.take_frames(Some(frame), out, &mut turn)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        // A timeout is not an error — the user is still owed their shell's
+        // status. A failure to paint is, and is not swallowed by the wrapper.
+        if let Ok(result) = drained {
+            result?;
+        }
         Ok(turn)
     }
 
@@ -545,6 +686,20 @@ impl ClientSession {
         // never comes, and that is not a mistake to leave available.
         rustix::io::ioctl_fionbio(keys.as_fd(), true)
             .context("making the keyboard non-blocking")?;
+
+        // The window size is asked of the KEYBOARD's descriptor. In `run` that
+        // is `/dev/tty` — the controlling terminal, and the only descriptor in
+        // this function that is certainly a terminal at all. Asking fd 1
+        // instead means `oxutrm connect host > transcript.txt`, typed by
+        // somebody sitting in a real terminal, has no window size to read.
+        //
+        // Duplicated rather than borrowed so the question survives the
+        // keyboard: end of file retires the read arm below, and a terminal
+        // that stopped producing input still changes shape.
+        let window = keys
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating the terminal to read its size")?;
         let mut keys = Some(
             tokio::io::unix::AsyncFd::with_interest(keys, tokio::io::Interest::READABLE)
                 .context("watching the keyboard")?,
@@ -558,6 +713,9 @@ impl ClientSession {
                 .context("watching for window size changes")?;
 
         let mut buf = [0u8; 8192];
+        // Whether the "cannot read the window size" note has been printed.
+        // See the `Winch` arm.
+        let mut warned_size = false;
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
         // carries our ack of zero (R5).
@@ -568,6 +726,19 @@ impl ClientSession {
                 r = keys_readable(&mut keys) => match r {
                     Ok(mut guard) => match guard.try_io(|k| k.get_mut().read(&mut buf)) {
                         Ok(Ok(n)) => Wake::Keys(n),
+                        // A signal arrived mid-read. Nothing was lost and
+                        // nothing is wrong; the next lap reads again.
+                        //
+                        // Measured rather than assumed, because the guard is
+                        // worth having either way: every signal handler this
+                        // process installs sets SA_RESTART — tokio's, through
+                        // `signal_hook_registry`, and `RawGuard`'s own — and
+                        // the descriptor is non-blocking besides, so oxutrm's
+                        // own signals cannot produce this. A handler installed
+                        // by anything else in the process still can, and the
+                        // cost of being wrong is a killed remote shell against
+                        // one match arm.
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => Wake::Nothing,
                         Ok(Err(e)) => return Err(e).context("reading the keyboard"),
                         // Readiness that evaporated; `try_io` has already
                         // cleared it, so the next lap will wait properly.
@@ -603,14 +774,48 @@ impl ClientSession {
                 Wake::Frame(frame) => {
                     self.turn_with(&[], Some(frame), out)?;
                 }
+                // A window that cannot be measured is not a reason to end a
+                // remote shell. The `Keys(0)` arm above makes exactly that
+                // argument about a keyboard that went away, and this one has
+                // to follow it: "the local terminal changed shape" killing a
+                // live session is the precise opposite of what this project
+                // is for.
+                //
+                // Two live failures, one remedy. The descriptor may not be a
+                // terminal — `oxutrm connect host > transcript.txt` used to
+                // die on the first resize with `ENOTTY`, in a real terminal.
+                // And the report may be `0x0`, which emulators emit while
+                // tearing down and some multiplexers emit transiently on
+                // detach. In both cases the size we already have is the last
+                // thing that was true, and the next resize corrects it.
                 Wake::Winch => {
-                    self.resize(terminal_size().context("reading the window size")?);
+                    match terminal_size_of(&window) {
+                        Ok(size) => self.resize(size),
+                        // Once. The condition lasts as long as the descriptor
+                        // does, so repeating it would bury everything else —
+                        // and this is stderr, which shares the user's screen.
+                        Err(e) if !warned_size => {
+                            warned_size = true;
+                            eprintln!(
+                                "oxutrm: cannot read the window size ({e:#}); keeping \
+                                 {}x{}. The session is unaffected.",
+                                self.size.cols, self.size.rows
+                            );
+                        }
+                        Err(_) => {}
+                    }
                     self.turn(&[], out)?;
                 }
                 Wake::Due => {
                     self.turn(&[], out)?;
                 }
-                Wake::Closed(reason) => return exit_code(&reason),
+                // The link is gone, but what already arrived over it is not.
+                // Paint it before answering, or `ls; exit` shows the user
+                // nothing at all.
+                Wake::Closed(reason) => {
+                    self.drain(out).await?;
+                    return exit_code(&reason);
+                }
             }
 
             // The next WAKE-UP, which is a different thing from `due()`, and
@@ -1497,18 +1702,29 @@ mod tests {
         );
     }
 
+    /// `ls; exit` — the single most user-visible thing this project can get
+    /// wrong.
+    ///
+    /// This test used to say `printf ...; sleep 1; exit 0`, with a comment
+    /// calling the sleep load-bearing "because closing a QUIC connection
+    /// discards whatever is still in flight". The comment was right that
+    /// something was rescuing the test and wrong about what: the sleep was not
+    /// working around a property of QUIC, it was working around three defects
+    /// in this file, and it is a rescue no real user has. A shell that prints
+    /// and exits in the same breath is not an edge case — it is what every
+    /// last command of every session does.
+    ///
+    /// Measured before the fix, with the sleep removed and nothing else
+    /// changed: 30 runs, 30 failures, screen entirely blank. Not flaky —
+    /// reliably red. The sleep stays out so this can fail again.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_paints_what_the_host_sent() {
         let (mut host, mut client) = pair("").await;
         let (keys, mut typing) = keyboard();
         let host_loop = tokio::spawn(async move { host.run().await });
 
-        // The `sleep` is load-bearing rather than padding: closing a QUIC
-        // connection discards whatever is still in flight, so a shell that
-        // printed and exited in the same breath could legitimately take its
-        // last screen with it and this would be a race, not a test.
         typing
-            .write_all(b"printf 'marker-here\\r\\n'\nsleep 1\nexit 0\n")
+            .write_all(b"printf 'marker-here\\r\\n'\nexit 0\n")
             .expect("type");
 
         let mut out = Vec::new();
@@ -1524,6 +1740,124 @@ mod tests {
             text(client.screen())
         );
         assert!(!out.is_empty(), "the renderer was never asked to paint");
+        let _ = host_loop.await;
+    }
+
+    /// The client's half of the same bug, on its own.
+    ///
+    /// `run_paints_what_the_host_sent` above cannot show this one: on loopback
+    /// the host now waits for its final frame to be acknowledged, which gives
+    /// the client's loop time to wake on the frame and paint it long before
+    /// the close lands. Measured — with the client's drain removed and the
+    /// host's fix in place, that test passed 20 out of 20.
+    ///
+    /// So the drain is exercised where it is decidable instead: the whole
+    /// session happens with the client's loop never running, so every frame
+    /// the host delivered is decoded and sitting in an mpsc channel at the
+    /// moment the connection closes. Those frames are not in flight and
+    /// nothing on the network can lose them — only returning without looking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frames_already_taken_off_a_closed_link_are_still_painted() {
+        let (mut host, mut client) = pair("printf 'last-word\\r\\n'\nexit 3\n").await;
+
+        // The host runs to completion by hand. The client is never driven, so
+        // it acknowledges nothing and paints nothing.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut exited = None;
+        while Instant::now() < deadline {
+            if let Some(code) = host.turn().expect("host turn").exited {
+                exited = Some(code);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let code = exited.expect("the shell never exited");
+        assert_eq!(code, 3);
+        host.finish(code).await;
+
+        // The connection is closed before a single frame has been looked at.
+        let mut out = Vec::new();
+        let turn = client
+            .drain(&mut out)
+            .await
+            .expect("draining a closed link");
+        assert!(
+            turn.applied > 0,
+            "nothing was taken off the link after it closed, so a session that \
+             ends the moment it produces output shows the user nothing"
+        );
+        assert!(
+            text(client.screen()).contains("last-word"),
+            "the shell's last output was dropped along with the connection; \
+             screen was {:?}",
+            text(client.screen())
+        );
+        assert!(!out.is_empty(), "the drained frames were never painted");
+    }
+
+    /// A SIGWINCH used to be able to kill a live session.
+    ///
+    /// `terminal_size()` asked **fd 1**, and nothing in oxutrm requires fd 1
+    /// to be a terminal: `RawGuard::enter` asserts `isatty(0)` and the
+    /// keyboard is opened on `/dev/tty` by name. So `oxutrm connect host >
+    /// transcript.txt`, typed by somebody sitting in a real terminal, died on
+    /// the first window resize with `ENOTTY` — and the `?` on that `Err`
+    /// carried it straight out of the loop. A `0x0` report, which emulators
+    /// emit while tearing down, did the same through the `ensure!`.
+    ///
+    /// The keyboard here is a socket pair, which answers `tcgetwinsize`
+    /// exactly the way a redirected stdout does. So this is that session:
+    /// every resize is unmeasurable, and the shell must still be the thing
+    /// that decides when the session ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_window_resize_that_cannot_be_measured_does_not_end_the_session() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        assert!(
+            terminal_size_of(&keys).is_err(),
+            "this test needs a keyboard that cannot answer tcgetwinsize"
+        );
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        // A resize storm for the whole life of the session, so that a signal
+        // certainly lands after `run_on` has installed its own listener —
+        // otherwise this would be a test that cannot fail.
+        let winching = tokio::spawn(async move {
+            loop {
+                let _ = rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::WINCH,
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // Typed only once the storm has been running for a while, so the
+        // session outlives many resizes rather than racing the first one.
+        let typist = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            typing.write_all(b"exit 7\n").expect("type");
+            typing
+        });
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(30), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect(
+                "a window resize ended the session: the local terminal changing shape \
+                 is not a reason to kill a remote shell",
+            );
+        assert_eq!(code, 7, "the shell's own status did not come back");
+        assert_eq!(
+            client.size(),
+            size(),
+            "an unreadable window size was adopted anyway; the last size that WAS \
+             measured is the only honest answer"
+        );
+
+        winching.abort();
+        let _ = typist.await;
         let _ = host_loop.await;
     }
 
@@ -1581,22 +1915,43 @@ mod tests {
         );
     }
 
+    fn application_close(code: u32, reason: &'static [u8]) -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: reason.into(),
+        })
+    }
+
     #[test]
-    fn only_an_application_close_is_an_exit_status() {
+    fn only_the_hosts_own_close_is_an_exit_status() {
         // A host that was killed and a path that went away end the session
         // too. Reporting either as "the shell exited 0" would be a lie the
         // user acts on, so the status has to come from the shell or not at
         // all.
-        let closed = quinn::ApplicationClose {
-            error_code: quinn::VarInt::from_u32(42),
-            reason: Default::default(),
-        };
-        assert_eq!(
-            exit_code(&quinn::ConnectionError::ApplicationClosed(closed)).unwrap(),
-            42
-        );
+        assert_eq!(exit_code(&application_close(42, SHELL_EXITED)).unwrap(), 42);
         assert!(exit_code(&quinn::ConnectionError::TimedOut).is_err());
         assert!(exit_code(&quinn::ConnectionError::LocallyClosed).is_err());
+
+        // And `ApplicationClosed` alone is not enough, which is the part that
+        // was wrong. Every deliberate close in the system looks like this and
+        // carries whatever error code its closer chose: a reattach superseding
+        // an old attach, `accept_one` tearing down a second inbound
+        // connection, a clean detach. Each one used to print
+        // "exit 0" at a user whose shell is still running on the far end.
+        for reason in [
+            b"superseded by a newer attach".as_slice(),
+            b"only one connection is served".as_slice(),
+            b"detached".as_slice(),
+            b"".as_slice(),
+        ] {
+            let got = exit_code(&application_close(0, reason));
+            assert!(
+                got.is_err(),
+                "an application close reading {:?} was reported to the user as \
+                 `exit 0`, so a live shell looks like a finished one",
+                String::from_utf8_lossy(reason)
+            );
+        }
     }
 
     /// This THREAD's CPU time, in milliseconds.
