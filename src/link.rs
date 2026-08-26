@@ -421,8 +421,10 @@ mod tests {
     use std::time::Instant;
 
     use oxutrm_net::{
-        ALPN, CERT_NAME, PinnedSpki, generate_cert, install_crypto_provider, provider,
+        ALPN, CERT_NAME, PinnedClientSpki, PinnedSpki, generate_cert, install_crypto_provider,
+        provider,
     };
+    use oxutrm_proto::{ClientSpki, HostSpki};
     use quinn::rustls;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -446,13 +448,19 @@ mod tests {
     fn server_config(
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
+        expect_client: ClientSpki,
         datagrams: bool,
     ) -> quinn::ServerConfig {
         install_crypto_provider();
         let mut tls = rustls::ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
-            .with_no_client_auth()
+            // Mirrors `oxutrm_net::quic`, deliberately. These fixtures build
+            // their own configs so they can turn datagrams off, and a fixture
+            // that quietly kept `with_no_client_auth()` would be a second,
+            // unauthenticated way to build an oxutrm server living in the same
+            // binary as the tests that prove there is none.
+            .with_client_cert_verifier(Arc::new(PinnedClientSpki::new(expect_client)))
             .with_single_cert(vec![cert], key)
             .unwrap();
         tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -462,14 +470,20 @@ mod tests {
         cfg
     }
 
-    fn client_config(fingerprint: [u8; 32], datagrams: bool) -> quinn::ClientConfig {
+    fn client_config(
+        fingerprint: [u8; 32],
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        datagrams: bool,
+    ) -> quinn::ClientConfig {
         install_crypto_provider();
         let mut tls = rustls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(fingerprint)))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(HostSpki::new(fingerprint))))
+            .with_client_auth_cert(vec![cert], key)
+            .unwrap();
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
         let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
@@ -484,10 +498,14 @@ mod tests {
     /// The endpoints come back because dropping them closes the connection.
     async fn pair(peer_datagrams: bool) -> (FrameSink, FrameSource, Vec<quinn::Endpoint>) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let server_ep =
-            quinn::Endpoint::server(server_config(cert, key, peer_datagrams), addr).unwrap();
+        let server_ep = quinn::Endpoint::server(
+            server_config(cert, key, ClientSpki::new(client_fp), peer_datagrams),
+            addr,
+        )
+        .unwrap();
         let server_addr = server_ep.local_addr().unwrap();
         let accepting = {
             let ep = server_ep.clone();
@@ -495,7 +513,12 @@ mod tests {
         };
 
         let mut client_ep = quinn::Endpoint::client(addr).unwrap();
-        client_ep.set_default_client_config(client_config(fingerprint, true));
+        client_ep.set_default_client_config(client_config(
+            fingerprint,
+            client_cert,
+            client_key,
+            true,
+        ));
         let client_conn = client_ep
             .connect(server_addr, CERT_NAME)
             .unwrap()

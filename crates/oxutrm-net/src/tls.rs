@@ -34,11 +34,13 @@
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
+use oxutrm_proto::{ClientSpki, HostSpki};
 use quinn::rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
 
 /// The SAN in the generated certificate and the SNI oxutrm sends.
 ///
@@ -93,16 +95,93 @@ pub fn generate_cert() -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer
     Ok((cert, key, fingerprint))
 }
 
+// ---------------------------------------------------------------------------
+// The two genuinely shared bodies
+// ---------------------------------------------------------------------------
+//
+// Exactly two things are the same in both directions, and only those two are
+// factored: the SPKI comparison, and the three provider-delegating signature
+// methods. Everything else about the two verifiers differs — different traits,
+// different method sets, and `ClientCertVerifier` additionally requires
+// `root_hint_subjects`, which has no server-side counterpart. Sharing more
+// than this would mean inventing an abstraction over two traits that rustls
+// deliberately kept apart.
+
+/// The whole trust decision: this certificate's SPKI, or nothing.
+///
+/// `what` names the peer, because a pinning failure that does not say which
+/// end failed sends you looking at the wrong half of the connection.
+fn spki_is(
+    expected: &[u8; 32],
+    end_entity: &CertificateDer<'_>,
+    what: &'static str,
+) -> Result<(), TlsError> {
+    let got = crate::der::spki_sha256(end_entity.as_ref())
+        .ok_or_else(|| TlsError::General(format!("{what} certificate has no parsable SPKI")))?;
+    if got != *expected {
+        return Err(TlsError::General(format!(
+            "{what} certificate SPKI does not match the pinned fingerprint"
+        )));
+    }
+    Ok(())
+}
+
+/// Delegated to the provider. Returning `Ok` here unconditionally is the
+/// common shortcut and it throws away proof of key possession — in **either**
+/// direction. Stubbing these on the client verifier reproduces the identical
+/// hole the module docs describe, pointing the other way: anyone who has seen
+/// the client's certificate could then attach as that client.
+fn tls12_signature(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, TlsError> {
+    rustls::crypto::verify_tls12_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+/// The one that actually runs: oxutrm is TLS 1.3 only.
+fn tls13_signature(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, TlsError> {
+    rustls::crypto::verify_tls13_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+/// If this were empty the handshake would have nothing to negotiate and the
+/// signature check would never run at all.
+fn verify_schemes(provider: &CryptoProvider) -> Vec<SignatureScheme> {
+    provider
+        .signature_verification_algorithms
+        .supported_schemes()
+}
+
 /// Accepts exactly one SPKI fingerprint — and still checks the handshake
 /// signature.
+///
+/// The **host's**, and the type says so. Both fingerprints are 32 bytes, both
+/// are in scope on both sides, and handing this one the client's used to
+/// compile — see [`HostSpki`].
 #[derive(Debug)]
 pub struct PinnedSpki {
-    expected: [u8; 32],
+    expected: HostSpki,
     provider: Arc<CryptoProvider>,
 }
 
 impl PinnedSpki {
-    pub fn new(expected: [u8; 32]) -> PinnedSpki {
+    pub fn new(expected: HostSpki) -> PinnedSpki {
         PinnedSpki {
             expected,
             provider: provider(),
@@ -126,51 +205,122 @@ impl ServerCertVerifier for PinnedSpki {
         // This alone would NOT be enough - see the module docs. The signature
         // methods below are what turn "presents this certificate" into "holds
         // its private key".
-        let got = crate::der::spki_sha256(end_entity.as_ref())
-            .ok_or_else(|| TlsError::General("peer certificate has no parsable SPKI".into()))?;
-        if got != self.expected {
-            return Err(TlsError::General(
-                "peer certificate SPKI does not match the pinned fingerprint".into(),
-            ));
-        }
+        spki_is(self.expected.as_bytes(), end_entity, "host")?;
         Ok(ServerCertVerified::assertion())
     }
 
-    /// Delegated to the provider. Returning `Ok` here unconditionally is the
-    /// common shortcut and it throws away proof of key possession.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        tls12_signature(&self.provider, message, cert, dss)
     }
 
-    /// The one that actually runs: oxutrm is TLS 1.3 only.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        tls13_signature(&self.provider, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
+        verify_schemes(&self.provider)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The other direction
+// ---------------------------------------------------------------------------
+
+/// Accepts exactly one **client** SPKI fingerprint — and still checks the
+/// handshake signature.
+///
+/// This is the half the project shipped without, and the exposure was not a
+/// probe surface. Once the host's endpoint listens on the punched socket,
+/// anything that completes the handshake runs
+/// `Link::new` → `HostSession::spawn` → `HostTerm::spawn` → `Pty::spawn` →
+/// `Command::new(shell)`. The pre-shared key does not help: it is HKDF'd into
+/// STUN credentials and never reaches TLS, so it authenticates path discovery
+/// and not the endpoint. `StunDemuxSocket` hands quinn every non-STUN datagram
+/// from **any** source; nomination decides where *we* send, and nothing about
+/// what quinn accepts.
+///
+/// [`PinnedSpki`] could not be reused for this. It implements
+/// [`ServerCertVerifier`]; this needs [`ClientCertVerifier`] — a different
+/// trait whose `verify_client_cert` takes no server name and no OCSP response,
+/// and which additionally requires [`ClientCertVerifier::root_hint_subjects`].
+/// Only the two bodies that are genuinely identical are shared.
+///
+/// **`offer_client_auth` and `client_auth_mandatory` are not overridden.**
+/// Both default to `true` in rustls, and a `false` in either would silently
+/// revert this entire change while every positive test still passed — so they
+/// are asserted in the tests below rather than restated here, where a wrong
+/// value would look like a decision.
+#[derive(Debug)]
+pub struct PinnedClientSpki {
+    expected: ClientSpki,
+    provider: Arc<CryptoProvider>,
+}
+
+impl PinnedClientSpki {
+    pub fn new(expected: ClientSpki) -> PinnedClientSpki {
+        PinnedClientSpki {
+            expected,
+            provider: provider(),
+        }
+    }
+}
+
+impl ClientCertVerifier for PinnedClientSpki {
+    /// Empty, deliberately. Per RFC 8446 §4.2.4 an empty
+    /// `certificate_authorities` tells the client to send whatever certificate
+    /// it has — which is exactly right when the trust root is a fingerprint
+    /// carried over SSH rather than a CA. There is no CA here to hint at, and
+    /// inventing one would only tell the peer to send something we would then
+    /// refuse.
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        // As on the other side: name, expiry, chain and CA are irrelevant and
+        // deliberately unchecked. The fingerprint that arrived over SSH in
+        // `ClientHello` is the whole trust decision, and the signature methods
+        // below are what make it mean "holds the private key" rather than
+        // "has seen the certificate".
+        spki_is(self.expected.as_bytes(), end_entity, "client")?;
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        tls12_signature(&self.provider, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        tls13_signature(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        verify_schemes(&self.provider)
     }
 }
 
@@ -223,7 +373,7 @@ mod tests {
         let (other, _k2, other_fp) = generate_cert().unwrap();
         assert_ne!(fp, other_fp);
 
-        let v = PinnedSpki::new(fp);
+        let v = PinnedSpki::new(HostSpki::new(fp));
         let name = ServerName::try_from(CERT_NAME).unwrap();
         let now = UnixTime::now();
 
@@ -237,7 +387,7 @@ mod tests {
     #[test]
     fn the_verifier_ignores_the_server_name() {
         let (cert, _k, fp) = generate_cert().unwrap();
-        let v = PinnedSpki::new(fp);
+        let v = PinnedSpki::new(HostSpki::new(fp));
         let wrong = ServerName::try_from("something.else.invalid").unwrap();
         assert!(
             v.verify_server_cert(&cert, &[], &wrong, &[], UnixTime::now())
@@ -247,7 +397,7 @@ mod tests {
 
     #[test]
     fn the_verifier_rejects_a_certificate_it_cannot_parse() {
-        let v = PinnedSpki::new([0u8; 32]);
+        let v = PinnedSpki::new(HostSpki::new([0u8; 32]));
         let junk = CertificateDer::from(vec![0xFFu8; 64]);
         let name = ServerName::try_from(CERT_NAME).unwrap();
         assert!(
@@ -264,7 +414,7 @@ mod tests {
         // verify_tls13_signature to Ok(...) would accept this, which is
         // exactly how pinning gets reduced to "knows a public certificate".
         let (cert, _key, fp) = generate_cert().unwrap();
-        let v = PinnedSpki::new(fp);
+        let v = PinnedSpki::new(HostSpki::new(fp));
 
         assert!(
             v.verify_server_cert(
@@ -295,13 +445,145 @@ mod tests {
     fn the_verifier_advertises_real_signature_schemes() {
         // If this were empty, the handshake would have nothing to negotiate
         // and the signature check would never run at all.
-        let v = PinnedSpki::new([0u8; 32]);
+        let v = PinnedSpki::new(HostSpki::new([0u8; 32]));
         let schemes = v.supported_verify_schemes();
         assert!(!schemes.is_empty());
         assert!(
             schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256),
             "expected the scheme rcgen's default key uses, got {schemes:?}"
         );
+    }
+
+    // ---- the other direction: the host pinning the client ----
+
+    #[test]
+    fn the_client_verifier_accepts_exactly_the_pinned_fingerprint() {
+        let (cert, _k, fp) = generate_cert().unwrap();
+        let (other, _k2, other_fp) = generate_cert().unwrap();
+        assert_ne!(fp, other_fp);
+
+        let v = PinnedClientSpki::new(ClientSpki::new(fp));
+        let now = UnixTime::now();
+
+        assert!(v.verify_client_cert(&cert, &[], now).is_ok());
+        assert!(
+            v.verify_client_cert(&other, &[], now).is_err(),
+            "a client certificate the host never heard about must not be accepted"
+        );
+    }
+
+    #[test]
+    fn the_client_verifier_rejects_a_certificate_it_cannot_parse() {
+        let v = PinnedClientSpki::new(ClientSpki::new([0u8; 32]));
+        let junk = CertificateDer::from(vec![0xFFu8; 64]);
+        assert!(v.verify_client_cert(&junk, &[], UnixTime::now()).is_err());
+    }
+
+    /// The mirror of `a_forged_handshake_signature_is_rejected`, and it has to
+    /// exist separately: the two verifiers implement different traits, so
+    /// nothing about the server-side test constrains this code at all. Stubbing
+    /// these three to `Ok(..)` here would reduce client pinning to "has seen
+    /// the client's certificate" — and the client's certificate travels to the
+    /// host on every attach.
+    #[test]
+    fn a_forged_client_handshake_signature_is_rejected() {
+        let (cert, _key, fp) = generate_cert().unwrap();
+        let v = PinnedClientSpki::new(ClientSpki::new(fp));
+
+        assert!(
+            v.verify_client_cert(&cert, &[], UnixTime::now()).is_ok(),
+            "the certificate itself must pass, or this proves nothing"
+        );
+
+        let dss = signed_struct(SignatureScheme::ECDSA_NISTP256_SHA256, &[0u8; 64]);
+        assert!(
+            v.verify_tls13_signature(b"a transcript the peer never signed", &cert, &dss)
+                .is_err(),
+            "a signature that does not verify must be refused - anything else \
+             discards proof that the client holds the private key"
+        );
+        assert!(
+            v.verify_tls12_signature(b"a transcript the peer never signed", &cert, &dss)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_client_verifier_advertises_real_signature_schemes() {
+        let v = PinnedClientSpki::new(ClientSpki::new([0u8; 32]));
+        let schemes = v.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+        assert!(
+            schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256),
+            "expected the scheme rcgen's default key uses, got {schemes:?}"
+        );
+    }
+
+    /// **The test that guards the whole change against a one-word reversion.**
+    ///
+    /// Both default to `true` and the implementation deliberately does not
+    /// override them, which means there is no line of code anywhere that
+    /// states the requirement — a future `fn client_auth_mandatory(&self) ->
+    /// bool { false }` would look like a considered decision and would turn
+    /// the certificate request into a polite suggestion. Every positive test
+    /// in this repository would still pass: a well-behaved client sends its
+    /// certificate regardless.
+    ///
+    /// `offer_client_auth` false is worse still — no CertificateRequest is
+    /// sent at all, so `verify_client_cert` is never reached and the pin never
+    /// runs.
+    #[test]
+    fn client_auth_is_both_offered_and_mandatory() {
+        let v = PinnedClientSpki::new(ClientSpki::new([0u8; 32]));
+        assert!(
+            v.offer_client_auth(),
+            "without a CertificateRequest the client is never asked, and the pin never runs"
+        );
+        assert!(
+            v.client_auth_mandatory(),
+            "a non-mandatory client auth accepts a peer that simply declines to \
+             present a certificate, which is the entire hole this change closes"
+        );
+    }
+
+    /// RFC 8446 §4.2.4: an empty `certificate_authorities` tells the client to
+    /// send whatever certificate it has. That is right here — the trust root
+    /// is a fingerprint carried over SSH, and there is no CA to name.
+    #[test]
+    fn the_client_verifier_hints_at_no_certificate_authorities() {
+        let v = PinnedClientSpki::new(ClientSpki::new([0u8; 32]));
+        assert!(v.root_hint_subjects().is_empty());
+    }
+
+    /// The failure text says which end failed. Two pins now run on every
+    /// attach and they fail identically otherwise, so a message that does not
+    /// name the peer sends you to the wrong half of the connection.
+    #[test]
+    fn a_pin_failure_names_which_peer_it_was_about() {
+        let (_c, _k, fp) = generate_cert().unwrap();
+        let (other, _k2, _ofp) = generate_cert().unwrap();
+        let now = UnixTime::now();
+
+        let host_err = format!(
+            "{:?}",
+            PinnedSpki::new(HostSpki::new(fp))
+                .verify_server_cert(
+                    &other,
+                    &[],
+                    &ServerName::try_from(CERT_NAME).unwrap(),
+                    &[],
+                    now
+                )
+                .unwrap_err()
+        );
+        let client_err = format!(
+            "{:?}",
+            PinnedClientSpki::new(ClientSpki::new(fp))
+                .verify_client_cert(&other, &[], now)
+                .unwrap_err()
+        );
+        assert!(host_err.contains("host"), "{host_err}");
+        assert!(client_err.contains("client"), "{client_err}");
     }
 
     #[test]

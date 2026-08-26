@@ -18,6 +18,12 @@
 // temporary and should come off with that wiring - it is here rather than a
 // fabricated call site because inventing a use to satisfy the linter hides
 // exactly the fact worth knowing, which is that this code has no caller yet.
+// `accept` carries the same caveat and one more: it is the host's whole accept
+// path, built with its hardening rather than hardened later, because there is
+// no accept path to add it to afterwards. Its caller is `run_host --serve`,
+// which is the next piece of wiring and does not exist yet.
+#[allow(dead_code)]
+mod accept;
 #[allow(dead_code)]
 mod link;
 mod loopback;
