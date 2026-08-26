@@ -187,6 +187,9 @@ pub const FLAG_ZSTD: u8 = 0x01;
 pub struct Frame {
     pub my_state: u64,
     pub from_state: u64,
+    /// The highest state OF THE PEER'S that we have applied. **Zero is legal
+    /// and means "nothing of yours yet" (R5)** — it is never a real sequence
+    /// number, so it cannot collide with I3.
     pub ack_state: u64,
     pub flags: u8,
     pub payload: Vec<u8>,
@@ -411,7 +414,10 @@ impl ScreenState {
 //     BIG it may be, and that gap was a remote memory bomb: `rows` and `cols`
 //     are `u16` and a `Cell` is ~40 bytes, so a peer-supplied `TermSize` in a
 //     resize diff of a few bytes named 4.29e9 cells — about 170 GB — and both
-//     ends keep a ring of states.
+//     ends keep a ring of states. Since R4 the RECEIVER keeps one too, so the
+//     I7 ceiling is multiplied by `STATE_RING` on the parsing side as well:
+//     I7 is load-bearing twice over, and without it R4 would have turned a
+//     170 GB single allocation into a 5.4 TB one.
 //
 //     The ORDER is the rule, not a detail. Every other invariant here is
 //     checked on a state that already exists, because building one is cheap
@@ -433,6 +439,59 @@ impl ScreenState {
 //     a 6-pixel font is about 400x120 — 48,000 cells — so the cap is roughly
 //     five times the largest terminal anyone runs, and one state is capped at
 //     about 10 MB.
+
+// I8. **TEXT THAT IS PAINTED IS TEXT, NOT CONTROL — AND ITS LENGTH IS BOUNDED
+//     BEFORE IT IS EXPANDED.** No `Cell::text` and no `title` may contain a
+//     scalar value in C0 (U+0000..=U+001F), U+007F, or C1 (U+0080..=U+009F).
+//     A `Cell::text` is at most `MAX_CELL_TEXT` (32) bytes; a `title` is at
+//     most `MAX_TITLE` (512) bytes.
+//
+//     I1 to I7 constrain the SHAPE of a screen — lengths, cursor, sequence,
+//     dimensions — and say nothing about what a cell may CONTAIN. That gap is
+//     the whole trust model inverted. The client renders a `ScreenState` by
+//     writing escape sequences to the user's REAL terminal:
+//     `Renderer::write_cells` appends `cell.text` verbatim and
+//     `Renderer::write_title` interpolates `title` between `\x1b]0;` and BEL.
+//     A host is not trusted — it is the machine the user connected to, and it
+//     may be compromised — so a cell holding `\x1b]52;c;...\x07` is not a
+//     character on a grid, it is a command to the terminal the user is sitting
+//     in front of, and it writes their clipboard. Nothing on screen shows it:
+//     the escape consumes itself and paints nothing. **The grid must be a
+//     picture, never a channel.**
+//
+//     REJECTED, NOT STRIPPED, for I2's reason. Filtering the control bytes out
+//     would paint a screen the host did not send and leave the two ends
+//     silently disagreeing about every column after it. A refusal is visible:
+//     `ApplyError::ControlInText` / `ApplyError::TextTooLong`, a REJECTED FRAME
+//     like any other, the state untouched, the session alive.
+//
+//     The ORDER is the rule here too, exactly as in I7. The length half is
+//     checked BEFORE the run is expanded, not after: a `Run` clones its cells
+//     `repeat + 1` times, so one 60 MiB cell in a run repeated across a
+//     2048-column row is about 123 GiB — built in the receiver, then
+//     concatenated again into the renderer's single output buffer.
+//     `MAX_DECOMPRESSED` bounds the frame and I7 bounds the cell COUNT;
+//     neither bounds the bytes per cell, and the product is where the bomb
+//     lives. This is the resize bomb's shape entering through the one
+//     dimension I7 does not measure.
+//
+//     32 bytes is a ceiling, not a policy: the longest thing a cell
+//     legitimately holds is a base character plus its combining marks, which
+//     `HostTerm` builds from `cell.zerowidth()`. 512 is comfortably past any
+//     real window title.
+//
+//     I8 does NOT cover exit-time restoration, and that hole is still open. A
+//     hostile host can set `alt_screen`, mouse reporting and a hidden cursor,
+//     all of which are legitimate mid-session, and then drop the connection.
+//     `RawGuard` restores termios and emits no escape at all, so the user is
+//     returned to a shell on the alternate buffer with SGR mouse reports on
+//     every twitch. No content invariant fixes that; it needs a guaranteed
+//     teardown emission — leave alternate buffer, all mouse modes off, cursor
+//     shown, SGR reset, bracketed paste off — on the same paths `RawGuard`
+//     already covers. It must be writable from a signal handler, which
+//     constrains it to a single `write(2)` of a `const` byte string: no
+//     allocation, async-signal-safe, the discipline `restore_and_reraise`
+//     already follows.
 
 /// PTY + `alacritty_terminal::term::Term`, fed by a re-exported
 /// `alacritty_terminal::vte::ansi::Processor`. Owns the child process.
@@ -510,6 +569,12 @@ pub fn negotiate_term() -> (String /*TERM*/, Option<String> /*COLORTERM*/);
 ### `oxutrm-sync`
 
 ```rust
+/// The depth of BOTH rings, and they are coupled. The sender can only name a
+/// base within its last `STATE_RING` updates, so a receiver cap of at least
+/// `STATE_RING` is what guarantees the named base is still held. Lowering the
+/// receiver's cap alone silently reinstates the R4 defect — and HIDES it,
+/// because in that regime ring exhaustion degrades every frame to a full state
+/// and a full state applies unconditionally (R3). The rescue masks the bug.
 pub const STATE_RING: usize = 32;
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -659,9 +724,15 @@ impl<S: SyncState> Receiver<S> {
 //
 //     The ring is self-pruning: a frame's `from_state` reveals which base the
 //     sender is still working from, and nothing older can be named again.
-//     Steady state is two entries. `STATE_RING` is the cap, for a peer whose
-//     acks are all being lost. A base older than the ring is still a
-//     `BaseMismatch` — refused, never guessed at.
+//     Steady state is two entries **while diffs are flowing**. The prune is
+//     keyed on `from_state`, and a full state carries `from_state == 0`, so a
+//     RUN OF FULL STATES PRUNES NOTHING and the ring fills to `STATE_RING`.
+//     That run is exactly the R3 recovery regime, so the reassuring number is
+//     false in precisely the regime that matters. `STATE_RING` is the cap and
+//     in that regime it is the only bound: 32 x 262_144 cells x ~40 B is about
+//     320 MiB per side, which I7's ceilings make survivable and nothing else
+//     does. A base older than the ring is still a `BaseMismatch` — refused,
+//     never guessed at.
 //
 // R5. **A receiver MUST NOT acknowledge a state it invented.** `ack()` is 0
 //     until the peer's first frame has been applied. This is R1 seen from the
@@ -672,6 +743,17 @@ impl<S: SyncState> Receiver<S> {
 //     one value `make_frame` cannot find in its ring, so it sends the full
 //     state R1 requires. Without R5 the very first frame after an attach is
 //     unapplicable, and the session is rescued only by ring eviction later.
+//
+//     **R5 corollary — a reattach MUST construct a NEW `Sender`/`Receiver`
+//     pair on both ends.** `Sender::on_ack` is monotonic, so a fresh
+//     receiver's `ack() == 0` cannot pull a live sender's `peer_saw` back down.
+//     The attach keys already require both `seq` counters to reset to 1 at
+//     every attach; this is the same rule stated where it can be violated.
+//     `HostSession::spawn` builds its sender once, so a reattach path that
+//     REUSES it gets a client correctly acking 0 against a sender whose
+//     `peer_saw` is still high, and every host frame is unapplicable until ring
+//     eviction accidentally rescues it. Recorded now, before M3's reattach is
+//     written, because R5 turns a pre-existing hazard into a certainty.
 //
 // R4 and R5 are the same lesson as R2, and it is the lesson of this whole
 // section: a sequence number names a GENERATION, never a piece of content, and
@@ -811,6 +893,81 @@ pub async fn quic_client(
     expect_spki_sha256: [u8; 32],
 ) -> anyhow::Result<quinn::Connection>;
 ```
+
+// **QUIC MUST AUTHENTICATE THE CLIENT, AND IT MUST DO SO IN THE SAME CHANGE
+// THAT FIRST WIRES THE DATA PATH — never afterwards.**
+//
+// `quic_server` is built `.with_no_client_auth()`. Pinning is one-directional
+// by design, and the PSK gates PATH NOMINATION, not the QUIC handshake, so the
+// gate people assume protects the port does not touch it: `IceAgent` verifies
+// every check with PSK-derived credentials, but it never sees a QUIC packet.
+// `StunDemuxSocket::poll_recv` splits the batch on `is_stun` and hands every
+// non-STUN datagram to quinn FROM ANY SOURCE ADDRESS, with no reference to the
+// nominated pair. Nomination decides where WE send; it decides nothing about
+// what quinn accepts.
+//
+// What an unauthenticated connection reaches is not a probe surface, it is the
+// session: inbound frames go to `on_frame` and the accumulated bytes are
+// written to the PTY — keystroke injection into the user's shell — and a naive
+// accept loop calls `HostSession::spawn`, which starts a fresh shell as the ssh
+// user. That is remote code execution, not a lesser harm.
+//
+// The exposure TODAY is nil, because there is no production caller: both
+// `--serve` and connect return "not wired up yet", and every call site of
+// `quic_server`/`quic_client` is a test. That is exactly why this is cheap now
+// and expensive later — the whole cost is test churn across eleven call sites.
+//
+// Do not argue this away with "the punched port is a moving target". The
+// canonical oxutrm host is a public-IP server with NO NAT filtering, the socket
+// prefers a FIXED port (443) before an ephemeral one, and the host's
+// server-reflexive candidate — the exact IP:port — is handed to one of four
+// third-party STUN operators by default. An on-path attacker or a malicious
+// STUN server has it outright.
+//
+// The mechanism is SYMMETRIC SPKI PINNING, mirroring the verifier that already
+// exists: the client generates a throwaway cert with `generate_cert()` and
+// sends its fingerprint on the ssh channel; the host pins it in a
+// `ClientCertVerifier`. The ordering already works — `HostHello` is written
+// first, the client replies with `ClientHello`, and QUIC is built only AFTER
+// nomination — so the host holds the fingerprint well before it needs it.
+// `ClientHello` gains `cert_spki_sha256` and `PROTO_VERSION` goes to 2.
+//
+//   * **The three signature methods MUST delegate to the provider**, for the
+//     identical reason given above for the server verifier. Stubbing them here
+//     reproduces the same hole pointing the other way.
+//   * A TLS external PSK is NOT available — rustls 0.23 exposes no such API.
+//     An application-level first-frame check over the TLS exporter would work
+//     and needs no proto change, but it leaves the attacker with a completed
+//     handshake and open streams, and puts the whole guarantee in a "do not
+//     read a frame or spawn anything before this check" ORDERING RULE. This
+//     codebase makes such orderings structural instead — `DetachPermit` and
+//     `Detached` exist for exactly that reason. Mutual pinning pushes the
+//     rejection into the handshake, where the accept simply fails and nothing
+//     downstream is reachable by mistake.
+//
+// Against the design precedent: Mosh authenticates EVERY datagram with a key
+// passed over ssh and accepts a roaming peer only after a datagram
+// authenticates. oxutrm's pinning authenticates the host to the client only; in
+// the client-to-host direction it currently has no equivalent by any other
+// means. Mutual pinning makes it equivalent or stronger — TLS 1.3 mutual auth,
+// AEAD on every packet, and QUIC path validation for the roam.
+//
+// Cheap hardening for the SAME accept loop, none of which substitutes for the
+// above: refuse an `Incoming` whose `remote_address()` is not the nominated
+// remote (this does not break roaming — a roam reuses the connection via path
+// validation, not a new handshake); prefer `ignore()` over `refuse()` so a port
+// scanner gets silence; accept exactly ONE connection per attach and then stop,
+// because a second inbound connection is always wrong under this model; and
+// wire address validation against spoofed-source floods. There is no rate limit
+// today and no accept path to hold one, so build it with the accept loop.
+//
+// **The PSK seam is still OPEN and must be closed by the same change.** The PSK
+// and the host fingerprint are minted base64 at one end and consumed as raw
+// `[u8; 32]` at the other, and NO base64 decoder exists anywhere in the tree to
+// join them — the two encode sites are the only non-test base64 calls there
+// are. Closing the seam already requires writing that decode path for two
+// values; the client fingerprint is a third on the same path, so it costs one
+// more call to a helper that has to be written regardless.
 
 ### `oxutrm-host`
 

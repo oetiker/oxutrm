@@ -32,11 +32,21 @@ pub use screen::{RowPatch, Run, ScreenDiff};
 
 use oxutrm_proto::ApplyError;
 
-/// How many recent states the sender keeps so it can diff against whatever the
-/// peer last acknowledged.
+/// The depth of BOTH rings, and they are coupled.
 ///
-/// Once the peer's ack falls out of this window there is nothing to diff
-/// against and a full state goes instead — correct, just larger.
+/// The sender keeps this many recent states so it can diff against whatever
+/// the peer last acknowledged. Once the peer's ack falls out of that window
+/// there is nothing to diff against and a full state goes instead — correct,
+/// just larger.
+///
+/// The RECEIVER caps its ring at the same number, and that is not a
+/// coincidence to be tidied away: the sender can only name a base within its
+/// last `STATE_RING` updates, so a receiver cap of at least `STATE_RING` is
+/// what guarantees the named base is still held. Lowering the receiver's cap
+/// alone silently reinstates the base-drift defect (R4) — and HIDES it,
+/// because in that regime ring exhaustion degrades every frame to a full
+/// state, and a full state applies unconditionally (R3). The rescue masks the
+/// bug, which is why the defect went unnoticed until it was measured.
 pub const STATE_RING: usize = 32;
 
 /// A replicated value.
