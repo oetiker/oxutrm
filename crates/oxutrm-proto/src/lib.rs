@@ -90,7 +90,10 @@ pub use ids::SessionId;
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
 pub use signal::{Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
-pub use types::{Candidate, CandidateKind, NatType, PathDescription, Rung, TermSize, TerminalCaps};
+pub use types::{
+    Candidate, CandidateKind, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, NatType, PathDescription,
+    Rung, TermSize, TerminalCaps,
+};
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,
 /// loud failure rather than a negotiation (spec §4.2).

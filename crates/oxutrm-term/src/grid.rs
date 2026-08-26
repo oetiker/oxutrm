@@ -6,7 +6,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Boundary, Point};
 use alacritty_terminal::term::cell::Cell as VteCell;
 
-use oxutrm_proto::TermSize;
+use oxutrm_proto::{ApplyError, TermSize};
 
 /// A screen size the emulator will accept.
 ///
@@ -22,12 +22,29 @@ pub struct GridSize {
 }
 
 impl GridSize {
-    pub fn new(size: TermSize, history: usize) -> GridSize {
-        GridSize {
+    /// **The choke point where a peer-chosen `TermSize` becomes an
+    /// allocation**, so I7 is enforced here and it is fallible for that
+    /// reason alone.
+    ///
+    /// The client sends its window size to the host, in `ClientHello` and
+    /// again on every resize. `Term::new` and `Term::resize` allocate
+    /// `(screen_lines + history) * columns` emulator cells from whatever this
+    /// returns, with no bound of their own. `rows` and `cols` are `u16`, so an
+    /// unchecked size means a client can ask a host it has merely connected to
+    /// for hundreds of gigabytes — the same memory bomb as the resize arm of
+    /// `ScreenState::apply`, pointing the other way down the wire, and worse
+    /// because `history` multiplies it.
+    ///
+    /// Returning a `Result` rather than clamping is deliberate and matches I2:
+    /// a clamped size means the two ends silently disagree about how big the
+    /// screen is. A refused one is visible.
+    pub fn new(size: TermSize, history: usize) -> Result<GridSize, ApplyError> {
+        // FAULT INJECTION
+        Ok(GridSize {
             screen_lines: size.rows as usize,
             columns: size.cols as usize,
             history,
-        }
+        })
     }
 }
 
@@ -70,7 +87,7 @@ mod tests {
 
     #[test]
     fn dimensions_are_what_the_emulator_asks_for() {
-        let g = GridSize::new(TermSize { cols: 80, rows: 24 }, 1_000);
+        let g = GridSize::new(TermSize { cols: 80, rows: 24 }, 1_000).expect("80x24 is legal");
         assert_eq!(g.columns(), 80);
         assert_eq!(g.screen_lines(), 24);
         assert_eq!(g.total_lines(), 1_024);

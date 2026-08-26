@@ -45,7 +45,7 @@ use crate::palette::palette;
 /// would exercise a different path from production.
 fn render(rows: u16, cols: u16, bytes: &[u8]) -> (ScreenState, String) {
     let size = TermSize { cols, rows };
-    let dims = GridSize::new(size, 100);
+    let dims = GridSize::new(size, 100).expect("test size is legal");
     let events = EventSink::new();
     let mut term = Term::new(Config::default(), &dims, events.clone());
     let mut parser: Processor = Processor::new();
@@ -270,7 +270,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
     // is wrapped when the window narrows and unwrapped when it widens, and the
     // text must survive the round trip intact.
     let size_wide = TermSize { cols: 20, rows: 4 };
-    let dims = GridSize::new(size_wide, 100);
+    let dims = GridSize::new(size_wide, 100).expect("test size is legal");
     let events = EventSink::new();
     let mut term = Term::new(Config::default(), &dims, events.clone());
     let mut parser: Processor = Processor::new();
@@ -296,7 +296,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
 
     // Narrow, then widen back.
     let narrow = TermSize { cols: 8, rows: 4 };
-    term.resize(GridSize::new(narrow, 100));
+    term.resize(GridSize::new(narrow, 100).expect("test size is legal"));
     let shrunk = screen_state_of(
         &term,
         &blink,
@@ -310,7 +310,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
         },
     );
 
-    term.resize(GridSize::new(size_wide, 100));
+    term.resize(GridSize::new(size_wide, 100).expect("test size is legal"));
     let after = screen_state_of(
         &term,
         &blink,

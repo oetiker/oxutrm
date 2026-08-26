@@ -82,6 +82,11 @@ impl ScreenState {
     /// validates: a type whose invariants are checked everywhere except at
     /// construction is a type whose invariants are checked nowhere.
     pub fn blank(rows: u16, cols: u16) -> Result<ScreenState, ApplyError> {
+        // I7 BEFORE the allocation below, not after it via `validate`. A
+        // caller that took these dimensions from a peer — `ClientHello` does —
+        // would otherwise allocate the whole hostile screen and only then be
+        // told it was too big.
+        crate::TermSize { rows, cols }.check_bounds()?;
         let state = ScreenState {
             seq: 1,
             rows,
@@ -144,6 +149,16 @@ impl ScreenState {
     /// an out-of-range cursor: clamping turns a detectable desynchronisation
     /// into a session that looks healthy while the two ends drift apart.
     pub fn validate(&self) -> Result<(), ApplyError> {
+        // I7 first. It is the only invariant here that also has to be enforced
+        // BEFORE a state is built, so checking it again on a built one is
+        // belt-and-braces: it means no oversized `ScreenState` can exist at
+        // all, however it was constructed.
+        crate::TermSize {
+            rows: self.rows,
+            cols: self.cols,
+        }
+        .check_bounds()?;
+
         // I1. Exactly, not at least. A long vector never panics - it just
         // makes every computed offset address the wrong cell.
         let expected = self.rows as usize * self.cols as usize;

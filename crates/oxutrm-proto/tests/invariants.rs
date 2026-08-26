@@ -1,4 +1,4 @@
-//! The six `ScreenState` invariants, each proved by its **rejection**.
+//! The seven `ScreenState` invariants, each proved by its **rejection**.
 //!
 //! An invariant that is only documented is not an invariant. Every test here
 //! builds a state that breaks one rule and asserts the exact error, because a
@@ -6,7 +6,8 @@
 //! deletes the check.
 
 use oxutrm_proto::{
-    ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, Modes, MouseMode, ScreenState,
+    ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, MAX_SCREEN_CELLS,
+    MAX_SCREEN_DIM, Modes, MouseMode, ScreenState, TermSize,
 };
 
 /// A valid 3x4 state, for tests that then break exactly one thing about it.
@@ -341,6 +342,91 @@ fn a_valid_transition_still_validates_both_states() {
         }),
         "a transition check must not let a malformed state through"
     );
+}
+
+// ---------------------------------------------------------------- I7
+
+/// I7 is the one invariant that must be checked BEFORE the state exists.
+///
+/// `rows` and `cols` are `u16` and a `Cell` is around 40 bytes, so the wire can
+/// name 4.29e9 cells — about 170 GB — in a message of a few bytes. Every other
+/// invariant here is checked on a built state, because building it is cheap.
+/// Building this one is the attack, so `blank` and the resize arm of `apply`
+/// both call [`TermSize::check_bounds`] first, and `validate` checks it again
+/// so that no oversized state can exist however it was made.
+#[test]
+fn i7_a_screen_larger_than_the_cap_cannot_be_constructed() {
+    // 1024x1024 is just over a million cells, well past the cap, and small
+    // enough that this test run RED merely allocates 40 MB rather than
+    // taking the machine down.
+    assert_eq!(
+        ScreenState::blank(1024, 1024),
+        Err(ApplyError::ScreenTooLarge {
+            rows: 1024,
+            cols: 1024
+        })
+    );
+}
+
+#[test]
+fn i7_the_largest_size_the_wire_can_name_is_refused() {
+    // Safe to run only because the check exists. Do not prove this one red.
+    assert_eq!(
+        ScreenState::blank(u16::MAX, u16::MAX),
+        Err(ApplyError::ScreenTooLarge {
+            rows: u16::MAX,
+            cols: u16::MAX
+        })
+    );
+}
+
+/// The per-side bound is not implied by the cell bound. A 65535x2 screen is
+/// only 131,070 cells — under [`MAX_SCREEN_CELLS`] — and is still nonsense.
+#[test]
+fn i7_a_single_dimension_is_bounded_even_when_the_area_is_not() {
+    let size = TermSize {
+        rows: u16::MAX,
+        cols: 2,
+    };
+    assert!(
+        (size.rows as usize * size.cols as usize) < MAX_SCREEN_CELLS,
+        "this test is only meaningful while the area is under the cell cap"
+    );
+    assert_eq!(
+        size.check_bounds(),
+        Err(ApplyError::ScreenTooLarge {
+            rows: u16::MAX,
+            cols: 2
+        })
+    );
+}
+
+/// I7 is checked before I1, so a state that breaks both reports the one that
+/// would have cost something. Getting this order wrong is not cosmetic: it is
+/// the difference between refusing an allocation and reporting it.
+#[test]
+fn i7_is_checked_before_the_length() {
+    let mut s = good();
+    s.rows = 4096;
+    s.cols = 4096;
+    // `cells` is still 12 long, so I1 is violated too.
+    assert_eq!(
+        s.validate(),
+        Err(ApplyError::ScreenTooLarge {
+            rows: 4096,
+            cols: 4096
+        })
+    );
+}
+
+/// The cap is a ceiling, not a policy. The largest terminal anyone actually
+/// runs must sit well inside it.
+#[test]
+fn i7_a_real_terminal_is_nowhere_near_the_cap() {
+    // A 4K display at a 6-pixel font is about 400x120.
+    ScreenState::blank(120, 400).expect("a 400x120 terminal is ordinary");
+    assert!(MAX_SCREEN_DIM > 400);
+    assert!(MAX_SCREEN_CELLS > 400 * 120 * 4);
 }
 
 #[test]

@@ -83,4 +83,22 @@ pub enum ApplyError {
     /// **I6.** Lines that have scrolled off do not come back.
     #[error("scrollback shrank: was {was}, now {now}")]
     ScrollbackShrank { was: u64, now: u64 },
+
+    /// **I7.** The screen is larger than [`MAX_SCREEN_CELLS`] cells, or one of
+    /// its dimensions exceeds [`MAX_SCREEN_DIM`].
+    ///
+    /// Unlike every other invariant here, this one has to be checked *before*
+    /// the state is built. `rows` and `cols` are `u16`, so a diff of a few
+    /// bytes can name 4.29e9 cells; allocating that and then rejecting it is
+    /// not a rejection, it is the attack. See [`TermSize::check_bounds`].
+    ///
+    /// [`MAX_SCREEN_CELLS`]: crate::types::MAX_SCREEN_CELLS
+    /// [`MAX_SCREEN_DIM`]: crate::types::MAX_SCREEN_DIM
+    /// [`TermSize::check_bounds`]: crate::TermSize::check_bounds
+    #[error(
+        "screen {rows}x{cols} exceeds the maximum of {} cells / {} per side",
+        crate::types::MAX_SCREEN_CELLS,
+        crate::types::MAX_SCREEN_DIM
+    )]
+    ScreenTooLarge { rows: u16, cols: u16 },
 }

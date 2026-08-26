@@ -3,10 +3,60 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The largest screen oxutrm will hold — the ceiling behind **I7**.
+///
+/// `rows` and `cols` are `u16`, so the wire permits 65535x65535 = 4.29e9 cells.
+/// A `Cell` is around 40 bytes, so a peer could ask for ~170 GB of allocation
+/// with a ten-byte diff, and both ends keep a ring of states. A bound is not a
+/// nicety here: without one, the smallest hostile message in the protocol is
+/// also the most expensive.
+///
+/// 256Ki cells is roughly five times the largest terminal anyone actually
+/// runs — a 4K display at a 6-pixel font is about 400x120, or 48,000 cells —
+/// and caps one state at about 10 MB. It is deliberately generous: the point
+/// is to make the allocation bounded, not to police window sizes.
+pub const MAX_SCREEN_CELLS: usize = 262_144;
+
+/// The largest value either dimension may take on its own.
+///
+/// [`MAX_SCREEN_CELLS`] already bounds the allocation; this bounds the
+/// *geometry*, so a 65535x4 screen cannot exist either. It is beyond any real
+/// terminal: an 8K display at a 4-pixel font would be about 1920 columns.
+pub const MAX_SCREEN_DIM: u16 = 2048;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TermSize {
     pub cols: u16,
     pub rows: u16,
+}
+
+impl TermSize {
+    /// **I7.** Both dimensions are within [`MAX_SCREEN_DIM`] and their product
+    /// is within [`MAX_SCREEN_CELLS`].
+    ///
+    /// Call this **before allocating**, never after. Every other invariant can
+    /// be checked on a state that already exists, because building the state
+    /// is cheap and being wrong about it is what costs. I7 is the opposite: by
+    /// the time an oversized state exists, the damage — the allocation — has
+    /// already been done. That is why this is a method on the size rather than
+    /// only another arm of [`ScreenState::validate`], and why `validate` calls
+    /// it rather than the other way round.
+    ///
+    /// [`ScreenState::validate`]: crate::ScreenState::validate
+    pub fn check_bounds(self) -> Result<(), crate::ApplyError> {
+        // `usize` is at least 32 bits on every platform oxutrm targets and both
+        // operands are `u16`, so this product cannot overflow.
+        if self.rows > MAX_SCREEN_DIM
+            || self.cols > MAX_SCREEN_DIM
+            || self.rows as usize * self.cols as usize > MAX_SCREEN_CELLS
+        {
+            return Err(crate::ApplyError::ScreenTooLarge {
+                rows: self.rows,
+                cols: self.cols,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// How a candidate address was learned (ICE terminology).

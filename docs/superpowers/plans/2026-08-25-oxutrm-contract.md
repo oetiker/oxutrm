@@ -403,6 +403,36 @@ impl ScreenState {
 //     `saturating_add`s it, which is what makes enforcing I6 safe: a healthy
 //     session cannot produce a frame this rejects. The scrollback FETCH path
 //     is what reconciles the counter with the lines actually still held.
+// I7. **THE DIMENSIONS ARE BOUNDED, AND THE BOUND IS CHECKED BEFORE THE
+//     ALLOCATION.** `rows as usize * cols as usize <= MAX_SCREEN_CELLS`
+//     (262_144) and `rows, cols <= MAX_SCREEN_DIM` (2048).
+//
+//     I1 to I6 constrain what a screen may CONTAIN and say nothing about how
+//     BIG it may be, and that gap was a remote memory bomb: `rows` and `cols`
+//     are `u16` and a `Cell` is ~40 bytes, so a peer-supplied `TermSize` in a
+//     resize diff of a few bytes named 4.29e9 cells — about 170 GB — and both
+//     ends keep a ring of states.
+//
+//     The ORDER is the rule, not a detail. Every other invariant here is
+//     checked on a state that already exists, because building one is cheap
+//     and being wrong about it is what costs. For I7 the building IS the cost,
+//     so `TermSize::check_bounds()` is called BEFORE `vec![Cell::blank(); ..]`
+//     at every site that allocates from a peer-chosen size:
+//       * `ScreenState::blank`
+//       * the `d.resize` arm of `ScreenState::apply` (`oxutrm-sync`)
+//     `ScreenState::validate` checks it as well, so no oversized state can
+//     exist however it was constructed — but validation alone is NOT
+//     sufficient, and a future implementer who moves the check into `validate`
+//     and deletes the pre-allocation call has reintroduced the bug with every
+//     test still green except the one that says so.
+//
+//     A rejected resize is a REJECTED FRAME like any other: `ApplyError::
+//     ScreenTooLarge`, the state untouched, the session alive.
+//
+//     The numbers are a ceiling, not a policy on window sizes. A 4K display at
+//     a 6-pixel font is about 400x120 — 48,000 cells — so the cap is roughly
+//     five times the largest terminal anyone runs, and one state is capped at
+//     about 10 MB.
 
 /// PTY + `alacritty_terminal::term::Term`, fed by a re-exported
 /// `alacritty_terminal::vte::ansi::Processor`. Owns the child process.

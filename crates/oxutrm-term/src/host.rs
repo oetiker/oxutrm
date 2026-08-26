@@ -67,9 +67,12 @@ impl HostTerm {
         size: TermSize,
         scrollback: usize,
     ) -> anyhow::Result<HostTerm> {
+        // Before the PTY, not after: `size` came from the client and this is
+        // the host. Spawning a shell and then discovering the geometry was
+        // hostile means a process to clean up as well as an error to report.
+        let dims = GridSize::new(size, scrollback)?;
         let pty = Pty::spawn(shell, args, env, size)?;
         let events = EventSink::new();
-        let dims = GridSize::new(size, scrollback);
         let config = Config {
             scrolling_history: scrollback,
             // Accept paste requests as well as copies; the default is
@@ -107,8 +110,11 @@ impl HostTerm {
     /// grid never reflows and has no history, which is `alacritty_terminal`'s
     /// behaviour and correct: a full-screen application redraws itself.
     pub fn resize(&mut self, size: TermSize) -> anyhow::Result<()> {
+        // I7 first, and before the ioctl: a refused resize must leave the PTY
+        // and the emulator agreeing with each other about the old size.
+        let dims = GridSize::new(size, self.history)?;
         self.pty.resize(size)?;
-        self.term.resize(GridSize::new(size, self.history));
+        self.term.resize(dims);
         self.size = size;
         // Reflow moves content, so recorded blink positions no longer mean
         // anything. Clearing is honest; shifting them would paint blink on
@@ -447,6 +453,61 @@ mod tests {
             200,
         )
         .expect("spawn")
+    }
+
+    /// **I7 on the host side, which is the side that matters.**
+    ///
+    /// The size in a resize is chosen by the CLIENT and handed to
+    /// `Term::resize`, which allocates `(rows + history) * cols` emulator
+    /// cells with no bound of its own. History multiplies it, so this is the
+    /// same memory bomb as the resize arm of `ScreenState::apply` and strictly
+    /// worse: a client that has merely connected can ask a host for hundreds
+    /// of gigabytes.
+    ///
+    /// 1024x1024 is over the cap and small enough to run this test RED
+    /// without taking the machine down; it was, and red it resizes happily.
+    #[test]
+    fn a_client_cannot_resize_the_host_beyond_the_cap() {
+        let mut t = sh("sleep 5", size());
+        let err = t
+            .resize(TermSize {
+                cols: 1024,
+                rows: 1024,
+            })
+            .expect_err("a screen that large must be refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "expected the I7 error, got: {err}"
+        );
+        assert_eq!(
+            t.size(),
+            size(),
+            "a refused resize must leave the PTY and the emulator agreeing"
+        );
+        // And the session is still usable — a rejected resize is not fatal.
+        t.resize(TermSize { cols: 60, rows: 20 })
+            .expect("an ordinary resize still works");
+        assert_eq!(t.size(), TermSize { cols: 60, rows: 20 });
+    }
+
+    /// The spawn path takes the client's size too, from `ClientHello`.
+    #[test]
+    fn a_host_terminal_cannot_be_spawned_beyond_the_cap() {
+        let got = HostTerm::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "true".to_owned()],
+            &[],
+            TermSize {
+                cols: u16::MAX,
+                rows: u16::MAX,
+            },
+            200,
+        );
+        let err = got.err().expect("a screen that large must be refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "expected the I7 error, got: {err}"
+        );
     }
 
     /// Poll until `f` is satisfied, or give up. There is a real process on
