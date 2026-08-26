@@ -924,6 +924,46 @@ pub fn sever_from_ssh(detached: Detached, permit: DetachPermit) -> anyhow::Resul
 // Recorded here rather than kept as uncalled code, because this project has
 // twice found that an abstraction with no caller drifts away from the rule the
 // live code follows.
+
+// The `RungRunner` trait that once lived in `oxutrm-host::ladder` is removed for
+// the same reason, and `ladder` now holds the connection POLICY only. The trait
+// never appeared in this contract: an agent invented it, its only implementor
+// was its own test double, and it could not have carried a real rung. Its
+// `status_line` was an unauthorised second copy of the one specified under
+// `oxutrm-client` below, and a wrong one — it printed every punched rung as
+// "IPv4", including an IPv6 server-reflexive path.
+//
+// `oxutrm-host` MUST NOT depend on `oxutrm-net`. The driver belongs in the root
+// binary, which already depends on both; its manifest records why this crate's
+// narrowness is deliberate.
+//
+// When the ladder driver IS built, it MUST carry four properties. The first
+// three are why the trait could not have worked, and are easy to lose when
+// rewriting from scratch:
+//   1. ONE SOCKET. Rungs 0 to 2 are not three attempts; they are three
+//      candidate CLASSES on one socket, and `IceAgent` already races every pair
+//      on it and reports which `Rung` the winner belonged to. Racing them as
+//      separate futures means concurrent receive loops on one socket stealing
+//      each other's datagrams — the failure `StunDemuxSocket` exists to
+//      prevent. NAT mappings are per-socket: an address learned on any other
+//      socket names a hole our traffic will never emerge from.
+//   2. THE NOMINATION RETURNS THE SOCKET, not merely an address. Rung 3 punches
+//      with a fresh socket and `birthday_blast` returns it, because the mapping
+//      belongs to that socket and no other, and QUIC must adopt that exact one.
+//      A result type of `SocketAddr`s silently drops it and leaves an address
+//      describing a hole nothing owns.
+//   3. NO MTU BEFORE THE HANDSHAKE. Path MTU is a `quinn` property discovered
+//      after the handshake, which is strictly after nomination ends. A per-rung
+//      `mtu` field can only be guessed, and a guess renders as a plausible
+//      status line for a number nobody measured. The removed code carried one,
+//      and a test asserted the fabricated value back.
+//   4. EVERY RUNG'S REASON SURVIVES A TOTAL FAILURE, and a SKIPPED rung reads
+//      differently from a FAILED one. "Connection failed" is useless; the rung
+//      that got closest is the one worth reading, and which rungs were never
+//      attempted is the first thing a bug report needs. `LadderPlan.skipped`
+//      already carries the reasons as data, but nothing aggregates or renders
+//      them, and the one test that held this property went with the trait.
+//      This is the only requirement here that WAS tested and is now not.
 ```
 
 ### `oxutrm-client`

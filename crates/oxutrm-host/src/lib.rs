@@ -45,7 +45,7 @@ pub mod ssh;
 
 pub use daemon::{Detached, daemonize, daemonize_session, detach_process, sever_from_ssh};
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
-pub use ladder::{LadderError, LadderPlan, RungResult, RungRunner, nominate, status_line};
+pub use ladder::LadderPlan;
 pub use registry::{
     META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot,
     RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, check_socket_path_length,
@@ -62,3 +62,21 @@ pub use registry::{
 // framing for rung 4, described a wire nothing speaks: `oxutrm_net::ice` never
 // nominates `Rung::SshTunnel`, so it will be written next to the code that
 // carries it, and asks its size question again there.
+
+// For the same reason there is no `RungRunner`, `RungResult` or `nominate`
+// here any more. `ladder` keeps the policy — [`LadderPlan`], which is pure
+// reasoning over `NatType` and `Rung` and needs no socket to be worth testing —
+// and nothing else. The mechanism belongs in the binary, next to the socket it
+// cannot be separated from, and HAS NOT BEEN WRITTEN YET; the contract records
+// what it must do. `ladder`'s module docs record why the separation was not
+// merely awkward but unrepresentable. Two facts are worth repeating where a
+// reader looking for the missing API will land:
+//
+//   * `status_line` is `oxutrm_client::status_line` and only that. The copy
+//     that lived here spelt every punched rung "IPv4", which is simply wrong
+//     for a v6 path; the client's derives the family from `path.remote`. The
+//     host never prints a status line, so it has no business owning one.
+//   * The trait's only implementor in the whole tree was its own test double.
+//     A seam with one mock behind it is not an abstraction, and this one hid
+//     the single thing the connectivity code exists to keep hold of: the
+//     socket the NAT mapping belongs to.
