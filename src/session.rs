@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Renderer, status_line, terminal_size};
+use oxutrm_client::{Renderer, status_line, terminal_size_of};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender};
 use oxutrm_term::HostTerm;
@@ -658,6 +658,20 @@ impl ClientSession {
         // never comes, and that is not a mistake to leave available.
         rustix::io::ioctl_fionbio(keys.as_fd(), true)
             .context("making the keyboard non-blocking")?;
+
+        // The window size is asked of the KEYBOARD's descriptor. In `run` that
+        // is `/dev/tty` — the controlling terminal, and the only descriptor in
+        // this function that is certainly a terminal at all. Asking fd 1
+        // instead means `oxutrm connect host > transcript.txt`, typed by
+        // somebody sitting in a real terminal, has no window size to read.
+        //
+        // Duplicated rather than borrowed so the question survives the
+        // keyboard: end of file retires the read arm below, and a terminal
+        // that stopped producing input still changes shape.
+        let window = keys
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating the terminal to read its size")?;
         let mut keys = Some(
             tokio::io::unix::AsyncFd::with_interest(keys, tokio::io::Interest::READABLE)
                 .context("watching the keyboard")?,
@@ -671,6 +685,9 @@ impl ClientSession {
                 .context("watching for window size changes")?;
 
         let mut buf = [0u8; 8192];
+        // Whether the "cannot read the window size" note has been printed.
+        // See the `Winch` arm.
+        let mut warned_size = false;
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
         // carries our ack of zero (R5).
@@ -716,8 +733,36 @@ impl ClientSession {
                 Wake::Frame(frame) => {
                     self.turn_with(&[], Some(frame), out)?;
                 }
+                // A window that cannot be measured is not a reason to end a
+                // remote shell. The `Keys(0)` arm above makes exactly that
+                // argument about a keyboard that went away, and this one has
+                // to follow it: "the local terminal changed shape" killing a
+                // live session is the precise opposite of what this project
+                // is for.
+                //
+                // Two live failures, one remedy. The descriptor may not be a
+                // terminal — `oxutrm connect host > transcript.txt` used to
+                // die on the first resize with `ENOTTY`, in a real terminal.
+                // And the report may be `0x0`, which emulators emit while
+                // tearing down and some multiplexers emit transiently on
+                // detach. In both cases the size we already have is the last
+                // thing that was true, and the next resize corrects it.
                 Wake::Winch => {
-                    self.resize(terminal_size().context("reading the window size")?);
+                    match terminal_size_of(&window) {
+                        Ok(size) => self.resize(size),
+                        // Once. The condition lasts as long as the descriptor
+                        // does, so repeating it would bury everything else —
+                        // and this is stderr, which shares the user's screen.
+                        Err(e) if !warned_size => {
+                            warned_size = true;
+                            eprintln!(
+                                "oxutrm: cannot read the window size ({e:#}); keeping \
+                                 {}x{}. The session is unaffected.",
+                                self.size.cols, self.size.rows
+                            );
+                        }
+                        Err(_) => {}
+                    }
                     self.turn(&[], out)?;
                 }
                 Wake::Due => {
@@ -1707,6 +1752,72 @@ mod tests {
             text(client.screen())
         );
         assert!(!out.is_empty(), "the drained frames were never painted");
+    }
+
+    /// A SIGWINCH used to be able to kill a live session.
+    ///
+    /// `terminal_size()` asked **fd 1**, and nothing in oxutrm requires fd 1
+    /// to be a terminal: `RawGuard::enter` asserts `isatty(0)` and the
+    /// keyboard is opened on `/dev/tty` by name. So `oxutrm connect host >
+    /// transcript.txt`, typed by somebody sitting in a real terminal, died on
+    /// the first window resize with `ENOTTY` — and the `?` on that `Err`
+    /// carried it straight out of the loop. A `0x0` report, which emulators
+    /// emit while tearing down, did the same through the `ensure!`.
+    ///
+    /// The keyboard here is a socket pair, which answers `tcgetwinsize`
+    /// exactly the way a redirected stdout does. So this is that session:
+    /// every resize is unmeasurable, and the shell must still be the thing
+    /// that decides when the session ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_window_resize_that_cannot_be_measured_does_not_end_the_session() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        assert!(
+            terminal_size_of(&keys).is_err(),
+            "this test needs a keyboard that cannot answer tcgetwinsize"
+        );
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        // A resize storm for the whole life of the session, so that a signal
+        // certainly lands after `run_on` has installed its own listener —
+        // otherwise this would be a test that cannot fail.
+        let winching = tokio::spawn(async move {
+            loop {
+                let _ = rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::WINCH,
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // Typed only once the storm has been running for a while, so the
+        // session outlives many resizes rather than racing the first one.
+        let typist = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            typing.write_all(b"exit 7\n").expect("type");
+            typing
+        });
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(30), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect(
+                "a window resize ended the session: the local terminal changing shape \
+                 is not a reason to kill a remote shell",
+            );
+        assert_eq!(code, 7, "the shell's own status did not come back");
+        assert_eq!(
+            client.size(),
+            size(),
+            "an unreadable window size was adopted anyway; the last size that WAS \
+             measured is the only honest answer"
+        );
+
+        winching.abort();
+        let _ = typist.await;
+        let _ = host_loop.await;
     }
 
     #[cfg(target_os = "linux")]

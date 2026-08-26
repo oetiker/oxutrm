@@ -41,11 +41,36 @@ use oxutrm_proto::TermSize;
 
 /// The size of the terminal the user is sitting in front of.
 ///
-/// Read from the controlling terminal rather than from `$LINES`/`$COLUMNS`,
-/// which go stale the moment the window is resized.
+/// Read from the terminal rather than from `$LINES`/`$COLUMNS`, which go stale
+/// the moment the window is resized.
+///
+/// Asked of **standard input**, not standard output, and the difference is a
+/// live bug rather than a preference. Nothing in oxutrm requires fd 1 to be a
+/// terminal: [`RawGuard::enter`] asserts `isatty(0)` and the keyboard is read
+/// from the controlling terminal by name. So `oxutrm … > transcript.txt`, run
+/// by a person sitting in a real terminal, is an ordinary thing to do and has
+/// no window size to report on fd 1 at all — `tcgetwinsize` answers `ENOTTY`.
+///
+/// A caller with a better descriptor to hand — the one it already opened on
+/// `/dev/tty`, say — should use [`terminal_size_of`] and not rely on any
+/// standard descriptor being the terminal.
 pub fn terminal_size() -> anyhow::Result<TermSize> {
-    let ws =
-        rustix::termios::tcgetwinsize(rustix::stdio::stdout()).context("read the terminal size")?;
+    terminal_size_of(rustix::stdio::stdin())
+}
+
+/// [`terminal_size`], asked of a specific descriptor.
+///
+/// Fails for a descriptor that is not a terminal, and for a window reported as
+/// zero in either dimension — emulators emit `0x0` while tearing down and some
+/// multiplexers emit it transiently on detach, and a zero-sized screen is not
+/// a state the rest of this program is prepared to hold.
+///
+/// **Both failures are things a caller has to survive.** A window that cannot
+/// be measured says nothing about whether the session should continue; the
+/// last size that *was* measured is still the best answer available, and the
+/// next resize will correct it.
+pub fn terminal_size_of<F: std::os::fd::AsFd>(fd: F) -> anyhow::Result<TermSize> {
+    let ws = rustix::termios::tcgetwinsize(fd).context("read the terminal size")?;
     anyhow::ensure!(
         ws.ws_col > 0 && ws.ws_row > 0,
         "the terminal reported a zero-sized window ({}x{})",
