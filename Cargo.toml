@@ -111,7 +111,13 @@ oxutrm-client.workspace = true
 # non-blocking, because fd 0's description belongs to the user's shell. `pty`
 # is used only by the tests, which need a real terminal to observe that.
 # The terminal itself belongs to oxutrm-client's RawGuard.
-rustix = { workspace = true, features = ["event", "pty"] }
+# `time` is for one test only, and it is load-bearing: the ladder's
+# closed-update-channel guard has to measure CPU, not wall clock. A select that
+# spins on a ready-but-empty channel still finishes on schedule -- it just eats
+# a core doing it -- so an elapsed-time assertion cannot see the bug at all.
+# Measured, not theorised: the naive wall-clock version passed against a
+# deliberately reintroduced spin.
+rustix = { workspace = true, features = ["event", "pty", "time"] }
 # src/link.rs adapts a Frame onto a QUIC connection - datagram if it fits, a
 # fresh unidirectional stream if not. It lives here rather than in oxutrm-net
 # because it is transport POLICY for the session loops, not connectivity, and

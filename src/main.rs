@@ -21,9 +21,15 @@
 // `accept` carries the same caveat and one more: it is the host's whole accept
 // path, built with its hardening rather than hardened later, because there is
 // no accept path to add it to afterwards. Its caller is `run_host --serve`,
-// which is the next piece of wiring and does not exist yet.
+// which is the next piece of wiring and does not exist yet. `ladder` is the
+// same: it is the connection ladder's mechanism, and BOTH halves call it -
+// `run_connect` as the controlling side and `run_host --serve` as the
+// controlled one - so it lands before either of them rather than inside
+// whichever is written first.
 #[allow(dead_code)]
 mod accept;
+#[allow(dead_code)]
+mod ladder;
 #[allow(dead_code)]
 mod link;
 mod loopback;
