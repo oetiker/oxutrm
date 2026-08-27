@@ -34,6 +34,8 @@ mod ladder;
 mod link;
 mod loopback;
 #[allow(dead_code)]
+mod serve;
+#[allow(dead_code)]
 mod session;
 
 use std::io::{Read as _, Write as _};
