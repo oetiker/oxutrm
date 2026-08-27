@@ -27,11 +27,42 @@
 //! * **Exactly one connection per attach.** A second inbound connection is
 //!   always wrong under this model: one attach is one client. Roaming does not
 //!   need a second one — a roam reuses the existing connection through QUIC
-//!   path validation, not a new handshake.
+//!   path validation, not a new handshake. This one is not a check inside the
+//!   loop but a property of the signature: [`accept_one`] consumes an
+//!   [`AcceptPermit`], `quic_server` mints exactly one per endpoint, and a
+//!   second call does not compile. See that type for why the rule was moved
+//!   out of this comment and into the type system.
+//! * **A deadline.** Every bullet above is about a datagram that *arrived*.
+//!   [`ACCEPT_TIMEOUT`] is about the one that never does.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use oxutrm_net::AcceptPermit;
+
+/// How long the host waits for its one client before giving up.
+///
+/// **Not a tuning knob — the alternative to it is a leak.** Without a deadline
+/// `Endpoint::accept()` simply never returns when no datagram ever arrives, and
+/// the host is left parked on it for ever: a registered session in the
+/// registry, a process holding a punched socket, and no shell behind either.
+/// Nothing else in the attach path can notice, because from the accept's point
+/// of view "silent" and "still coming" are the same thing.
+///
+/// Thirty seconds, matching the `max_idle_timeout` `oxutrm_net` already sets on
+/// the transport. That number is chosen against what quinn itself will do, not
+/// picked for feel: a handshake still unfinished after thirty idle seconds is
+/// one quinn is about to abandon anyway, so this deadline cuts nothing short
+/// that would have succeeded. What it bounds is the case quinn cannot see at
+/// all — no handshake to time out, because no peer ever spoke.
+///
+/// It is generous for the case that matters. ICE has already completed
+/// connectivity checks over this very path by the time anything here runs, so
+/// the client is known to be reachable and its `ClientHello` is one round trip
+/// away; the address-validation `retry()` below costs one more. Thirty seconds
+/// is tens of round trips on a link bad enough to be worth keeping.
+pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wait for the one connection this attach expects.
 ///
@@ -44,14 +75,149 @@ use anyhow::{Context as _, Result};
 /// fails exactly here, and a loop that swallowed it would turn "this peer is
 /// not our client" into "still waiting", which is the shape of every accept
 /// loop that quietly lets the next attempt through.
+///
+/// # One connection, enforced by the signature
+///
+/// The [`AcceptPermit`] is consumed. `oxutrm_net::quic_server` mints one per
+/// endpoint, this is the only thing in the tree that takes one, and calling
+/// this function twice is therefore a compile error rather than a rule in a
+/// comment.
+///
+/// The permit comes **back** in [`AcceptFailed::retry`] when — and only when —
+/// the attempt ended with a peer that reached the handshake and failed it. No
+/// connection was admitted, so the attach's one connection is still unspent,
+/// and a caller that wants to keep listening may. A caller that does not want
+/// to is written `?`, which drops the permit and ends the attach; that is what
+/// `run_host --serve` will do, because under ICE the peer at the nominated
+/// address *is* the client, and a client that fails the certificate pin is not
+/// going to pass it on the next try.
+///
+/// Nothing comes back when the deadline expires or the endpoint closes: in
+/// neither case is there anything left to wait for.
 pub async fn accept_one(
+    permit: AcceptPermit,
+    nominated: SocketAddr,
+) -> Result<quinn::Connection, AcceptFailed> {
+    let nominated = oxutrm_net::unmap(nominated);
+
+    // Bound the WHOLE loop, not one `accept()`. A deadline on the individual
+    // call would be no deadline at all: every `ignore()`d datagram from a
+    // stranger would start it again, so anyone able to send a packet a second
+    // could hold the host open indefinitely.
+    let outcome =
+        tokio::time::timeout(ACCEPT_TIMEOUT, accept_loop(permit.endpoint(), nominated)).await;
+
+    match outcome {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(Rejection::Peer(error))) => AcceptFailed::retryable(permit, error),
+        Ok(Err(Rejection::Endpoint(error))) => AcceptFailed::final_(error),
+        Err(_) => AcceptFailed::final_(anyhow::anyhow!(
+            "no client completed a QUIC handshake from {nominated} within \
+             {ACCEPT_TIMEOUT:?}"
+        )),
+    }
+}
+
+/// A failed accept, and — when the attach still has its one connection left to
+/// spend — the permit to try again.
+///
+/// # Why the permit lives in the error
+///
+/// It is the only place it can live where a caller cannot get it wrong. On
+/// success the permit is spent and there is nothing to hand back; on failure
+/// whether it is spent is precisely what the caller cannot work out for itself,
+/// because both outcomes look like "no connection". Putting it here makes the
+/// question unaskable in the success path and unavoidable in the failure one.
+///
+/// A caller that does not care writes `?`: [`AcceptFailed`] is a
+/// `std::error::Error`, so it converts to `anyhow::Error` and the permit is
+/// dropped with it. That is the right default — under ICE the peer at the
+/// nominated address *is* the client, and a client that fails the certificate
+/// pin will not pass it on the next try.
+pub struct AcceptFailed {
+    error: anyhow::Error,
+    /// `Some` only when a peer reached the handshake and failed it.
+    permit: Option<AcceptPermit>,
+}
+
+impl AcceptFailed {
+    /// A peer arrived from the nominated address and failed the handshake.
+    ///
+    /// Nothing was admitted, so the attach's one connection is still unspent
+    /// and the permit comes back with the error.
+    fn retryable(permit: AcceptPermit, error: anyhow::Error) -> Result<quinn::Connection, Self> {
+        Err(AcceptFailed {
+            error,
+            permit: Some(permit),
+        })
+    }
+
+    /// Nothing is left to wait for: the deadline expired, or the endpoint is
+    /// gone. The permit dies with the attempt, because there is no attempt
+    /// left to make.
+    fn final_(error: anyhow::Error) -> Result<quinn::Connection, Self> {
+        Err(AcceptFailed {
+            error,
+            permit: None,
+        })
+    }
+
+    /// The unspent permit, if this failure left one.
+    ///
+    /// Consuming `self` is the point: the error and the permit cannot both be
+    /// kept, so "I am going to try again" and "I am going to report this" stay
+    /// the exclusive choices they are on the wire.
+    #[must_use]
+    pub fn retry(self) -> Option<AcceptPermit> {
+        self.permit
+    }
+}
+
+/// Delegated to the inner `anyhow::Error` — including its report and backtrace,
+/// which is what an `expect_err` in a test should print.
+impl std::fmt::Debug for AcceptFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.error, f)
+    }
+}
+
+impl std::fmt::Display for AcceptFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+/// This impl is what makes `?` work on `accept_one`, and with it the "drop the
+/// permit and end the attach" default described above.
+impl std::error::Error for AcceptFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// Why one pass of the accept ended.
+///
+/// The distinction is the only thing the caller cannot work out for itself,
+/// and it is exactly the one that decides whether the permit survives.
+enum Rejection {
+    /// A peer arrived from the nominated address and failed the handshake —
+    /// the certificate pin, almost always. Nothing was admitted.
+    Peer(anyhow::Error),
+    /// The endpoint is gone. Nothing will ever arrive on it again.
+    Endpoint(anyhow::Error),
+}
+
+/// The accept itself, with no deadline and no permit: both belong to
+/// [`accept_one`], which is the only caller and must stay so.
+async fn accept_loop(
     endpoint: &quinn::Endpoint,
     nominated: SocketAddr,
-) -> Result<quinn::Connection> {
-    let nominated = oxutrm_net::unmap(nominated);
+) -> Result<quinn::Connection, Rejection> {
     loop {
         let Some(incoming) = endpoint.accept().await else {
-            anyhow::bail!("the QUIC endpoint closed before the client connected");
+            return Err(Rejection::Endpoint(anyhow::anyhow!(
+                "the QUIC endpoint closed before the client connected"
+            )));
         };
 
         // `unmap` on both sides: a dual-stack endpoint reports an IPv4 peer as
@@ -74,9 +240,13 @@ pub async fn accept_one(
             continue;
         }
 
+        // A peer that got this far and failed is the retryable case: it
+        // reached the handshake, so nothing was admitted and the permit is
+        // still good. `Endpoint` is for faults with nothing left behind them.
         return incoming
             .await
-            .context("completing the QUIC handshake with the nominated peer");
+            .context("completing the QUIC handshake with the nominated peer")
+            .map_err(Rejection::Peer);
     }
 }
 
@@ -157,14 +327,16 @@ mod tests {
     /// gets nowhere.
     fn serve(
         endpoint: quinn::Endpoint,
+        permit: AcceptPermit,
         socket: Arc<tokio::net::UdpSocket>,
         nominated: SocketAddr,
         shells: Shells,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut live = Vec::new();
+            let mut permit = permit;
             loop {
-                match accept_one(&endpoint, nominated).await {
+                match accept_one(permit, nominated).await {
                     Ok(conn) => {
                         let session = HostSession::spawn(
                             "/bin/sh",
@@ -177,8 +349,19 @@ mod tests {
                         // Held so the PTY is not reaped mid-test; dropped with
                         // the task.
                         live.push(session);
+                        // The permit is spent. A real attach stops here too.
+                        return;
                     }
-                    Err(_) => continue,
+                    // The permissiveness this harness is documented to have now
+                    // has a name: the permit comes back only when a peer
+                    // reached the handshake and failed it, and coming back for
+                    // another attempt is what B must survive and A must then
+                    // get through. When it does not come back there is nothing
+                    // left to wait on.
+                    Err(failed) => match failed.retry() {
+                        Some(unspent) => permit = unspent,
+                        None => return,
+                    },
                 }
             }
         })
@@ -271,9 +454,15 @@ mod tests {
         // Pinned to A. B is a perfectly well-formed oxutrm client with a
         // perfectly valid certificate; it is simply not the one that came in
         // over ssh.
-        let (endpoint, _stun) = quic_server(&host_sock, cert, key, a.spki).await.unwrap();
+        let (endpoint, permit, _stun) = quic_server(&host_sock, cert, key, a.spki).await.unwrap();
         let shells = Shells::default();
-        let host = serve(endpoint, Arc::clone(&host_sock), nominated, shells.clone());
+        let host = serve(
+            endpoint,
+            permit,
+            Arc::clone(&host_sock),
+            nominated,
+            shells.clone(),
+        );
 
         // B first, from the nominated address, so the address hardening is not
         // what rejects it — the certificate pin has to be.
@@ -332,11 +521,17 @@ mod tests {
         // this test about the address and nothing else.
         let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let (endpoint, _stun) = quic_server(&host_sock, cert, key, client.spki)
+        let (endpoint, permit, _stun) = quic_server(&host_sock, cert, key, client.spki)
             .await
             .unwrap();
         let shells = Shells::default();
-        let host = serve(endpoint, Arc::clone(&host_sock), elsewhere, shells.clone());
+        let host = serve(
+            endpoint,
+            permit,
+            Arc::clone(&host_sock),
+            elsewhere,
+            shells.clone(),
+        );
 
         attempt(host_addr, host_fp, &client).await;
         settle().await;
@@ -361,16 +556,79 @@ mod tests {
         let client_sock = udp().await;
         let nominated = client_sock.local_addr().unwrap();
 
-        let (endpoint, _stun) = quic_server(&host_sock, cert, key, client.spki)
+        let (endpoint, permit, _stun) = quic_server(&host_sock, cert, key, client.spki)
             .await
             .unwrap();
         let shells = Shells::default();
-        let host = serve(endpoint, Arc::clone(&host_sock), nominated, shells.clone());
+        let host = serve(
+            endpoint,
+            permit,
+            Arc::clone(&host_sock),
+            nominated,
+            shells.clone(),
+        );
 
         attempt_from(&client_sock, host_addr, host_fp, &client).await;
         wait_for(&shells, 1).await;
 
         host.abort();
+    }
+
+    /// The accept gives up on its own, and it does so at `ACCEPT_TIMEOUT`.
+    ///
+    /// The outer 120 s is the harness's own patience, not the thing under
+    /// test: if `accept_one` had no deadline at all this would still terminate,
+    /// and the assertion on `elapsed` is what tells the two apart. Under
+    /// `start_paused` the clock jumps to the next deadline whenever the runtime
+    /// idles, so a thirty-second wait costs no wall-clock seconds and the
+    /// assertion is on the very const the code uses.
+    #[tokio::test(start_paused = true)]
+    async fn the_accept_gives_up_when_no_client_ever_arrives() {
+        let (cert, key, _host_fp) = generate_cert().unwrap();
+        let client = ClientId::new();
+        let host_sock = udp().await;
+        let nominated: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (_endpoint, permit, _stun) = quic_server(&host_sock, cert, key, client.spki)
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(120), accept_one(permit, nominated)).await;
+        let elapsed = started.elapsed();
+        assert!(outcome.is_ok(), "accept_one never gave up: {elapsed:?}");
+        assert!(
+            elapsed >= ACCEPT_TIMEOUT,
+            "accept_one gave up after {elapsed:?}, short of its own ACCEPT_TIMEOUT"
+        );
+    }
+
+    /// A deadline that expires spends the permit; a failed handshake does not.
+    ///
+    /// This is the whole point of the two constructors, and the only assertion
+    /// that can tell them apart. Nothing arrived here, so there is no peer to
+    /// give a second chance to — and a caller that retried on a silent endpoint
+    /// would hold the attach open for ever, which is the shape the deadline
+    /// exists to prevent. `accepts_a_rejects_b` pins the other half: there, the
+    /// permit must come back or A could never get in behind B.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_that_expires_hands_no_permit_back() {
+        let (cert, key, _host_fp) = generate_cert().unwrap();
+        let client = ClientId::new();
+        let host_sock = udp().await;
+        let nominated: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (_endpoint, permit, _stun) = quic_server(&host_sock, cert, key, client.spki)
+            .await
+            .unwrap();
+
+        let failed = accept_one(permit, nominated)
+            .await
+            .expect_err("nothing ever connected");
+        assert!(
+            failed.retry().is_none(),
+            "the deadline handed the permit back, so a caller may keep an \
+             attach open on an endpoint no client is using"
+        );
     }
 
     /// One attach is one client, so exactly one shell is started even when the
@@ -391,7 +649,7 @@ mod tests {
         let client_sock = udp().await;
         let nominated = client_sock.local_addr().unwrap();
 
-        let (endpoint, _stun) = quic_server(&host_sock, cert, key, client.spki)
+        let (endpoint, permit, _stun) = quic_server(&host_sock, cert, key, client.spki)
             .await
             .unwrap();
         let shells = Shells::default();
@@ -401,7 +659,9 @@ mod tests {
         let sock = Arc::clone(&host_sock);
         let counter = shells.clone();
         let host = tokio::spawn(async move {
-            let conn = accept_one(&ep, nominated).await.expect("the first client");
+            let conn = accept_one(permit, nominated)
+                .await
+                .expect("the first client");
             let session =
                 HostSession::spawn("/bin/sh", size(), 200, Link::new(conn, ep, sock)).unwrap();
             counter.0.fetch_add(1, Ordering::SeqCst);
