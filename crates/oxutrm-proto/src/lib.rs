@@ -106,7 +106,7 @@ pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
 pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
-pub use signal::{Signal, read_signal, write_signal};
+pub use signal::{MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
@@ -133,4 +133,20 @@ pub enum ProtoError {
     Malformed(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A signalling line ran past [`MAX_SIGNAL_LINE`] bytes without a newline.
+    ///
+    /// Distinguishable from [`ProtoError::Malformed`] on purpose. "The peer
+    /// sent something I cannot parse" and "the peer sent more than I am willing
+    /// to hold" are different faults with different responses: the first is
+    /// version skew or a bug, the second is a peer — or a compromised SSH hop —
+    /// trying to make us allocate on its behalf. A caller that cannot tell them
+    /// apart logs the wrong thing for whichever one it is having.
+    ///
+    /// The limit is named in the message because the number is the actionable
+    /// part: a legitimate signal is kilobytes, so anything that trips this is
+    /// three orders of magnitude away from normal and the reader wants to know
+    /// where the wall is.
+    #[error("signalling line exceeds the {limit} byte limit without a newline")]
+    SignalLineTooLong { limit: usize },
 }
