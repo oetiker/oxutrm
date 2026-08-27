@@ -190,7 +190,10 @@ impl LadderReport {
     }
 
     /// Every rung and its verdict, in ladder order.
-    /// For rendering a failed ladder to the user, which is `run_connect`'s job.
+    /// **No caller.** `run_connect` renders a failed ladder through this
+    /// type's `Display`, which prints every rung in order; per-rung iteration
+    /// would be for a caller that wants to lay the verdicts out differently,
+    /// and there is not one.
     #[allow(dead_code)]
     pub fn entries(&self) -> impl Iterator<Item = (Rung, &Verdict)> {
         self.entries.iter().map(|(r, v)| (*r, v))

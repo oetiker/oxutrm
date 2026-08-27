@@ -263,3 +263,61 @@ async fn a_chatty_stderr_does_not_deadlock_the_handshake() {
         .expect("the handshake deadlocked on an undrained stderr");
     assert!(matches!(hello, Signal::HostHello { .. }));
 }
+
+// ---- reading and writing at the same time ----------------------------------
+//
+// `recv` and `send` both take `&mut self`, so with those alone the channel is
+// strictly half duplex: nothing may be written while a read is outstanding.
+// That is fine for a handshake with strict turns and impossible for the ICE
+// ladder, whose whole premise is that candidates appear on both sides at
+// unpredictable moments and must cross as they appear. `halves` is what makes
+// the two directions independent.
+
+/// The claim, in the only form that distinguishes it: a read is already
+/// outstanding, and the write that unblocks it happens *while* it is pending.
+/// Written with `recv`/`send` this does not compile, which is the point.
+#[tokio::test]
+async fn both_directions_can_be_in_flight_at_once() {
+    let mut ch = SshChannel::open(&fake("serve"), "bastion.example.net")
+        .await
+        .expect("the fake host answers");
+
+    let (reader, writer) = ch.halves();
+
+    // Nothing has been read yet; the host's offer is first.
+    let hello = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        oxutrm_host::signalling::read_signal_async(reader),
+    )
+    .await
+    .expect("the offer must arrive")
+    .expect("and must parse");
+    assert!(matches!(hello, Signal::HostHello { .. }));
+
+    // Now park a read on the NEXT message before answering. The fixture will
+    // not send it until it has seen our hello, so this read can only complete
+    // if the write below happens while it is still pending.
+    let pending = oxutrm_host::signalling::read_signal_async(reader);
+    tokio::pin!(pending);
+
+    let established = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            // Never ready first: the fixture is waiting on us.
+            got = &mut pending => got,
+            () = async {
+                oxutrm_host::signalling::write_signal_async(writer, &client_hello())
+                    .await
+                    .expect("answering while a read is outstanding");
+                std::future::pending::<()>().await;
+            } => unreachable!("the writer arm never finishes"),
+        }
+    })
+    .await
+    .expect("the answer never arrived, so the two directions are not independent")
+    .expect("and must parse");
+
+    assert!(
+        matches!(established, Signal::Established { .. }),
+        "expected the link to be declared up, got {established:?}"
+    );
+}

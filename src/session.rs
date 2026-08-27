@@ -337,6 +337,9 @@ impl HostSession {
             .close(quinn::VarInt::from_u32(code), SHELL_EXITED);
     }
 
+    /// The authoritative screen, for tests. Nothing in the session loop reads
+    /// it: the loop ships diffs and never inspects what it shipped.
+    #[allow(dead_code)]
     pub fn screen(&self) -> &ScreenState {
         self.screen_tx.current()
     }
@@ -839,6 +842,11 @@ impl ClientSession {
     }
 
     /// Move to a new local socket without dropping the connection.
+    ///
+    /// **No caller: roaming is not wired.** The mechanism is here and tested;
+    /// what is missing is whatever notices that this machine's address changed
+    /// and decides to use it. See [`Link::rebind`].
+    #[allow(dead_code)]
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> Result<()> {
         self.link.rebind(socket)?;
         // The path changed; what is on the terminal is still correct, so
@@ -846,17 +854,25 @@ impl ClientSession {
         Ok(())
     }
 
+    /// The screen as applied, for tests. The renderer is what the user sees;
+    /// this is the state behind it.
+    #[allow(dead_code)]
     pub fn screen(&self) -> &ScreenState {
         self.screen_rx.state()
     }
 
     /// Applied screen frames that carried a diff, and those that carried a
-    /// whole screen. See `Receiver::applied_kinds`.
+    /// whole screen. See `Receiver::applied_kinds`. For tests: the loop does
+    /// not care which kind arrived, and that indifference is the point.
+    #[allow(dead_code)]
     #[must_use]
     pub fn applied_kinds(&self) -> (u64, u64) {
         self.screen_rx.applied_kinds()
     }
 
+    /// For tests. The loop tracks the size it was given and asks the terminal
+    /// directly for the current one.
+    #[allow(dead_code)]
     pub fn size(&self) -> TermSize {
         self.size
     }

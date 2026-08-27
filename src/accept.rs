@@ -137,7 +137,7 @@ pub async fn accept_one(
 pub struct AcceptFailed {
     error: anyhow::Error,
     /// `Some` only when a peer reached the handshake and failed it.
-    /// Read only by [`AcceptFailed::retry`], which has no caller yet.
+    /// Read only by [`AcceptFailed::retry`], which has no caller.
     #[allow(dead_code)]
     permit: Option<AcceptPermit>,
 }
@@ -170,8 +170,14 @@ impl AcceptFailed {
     /// kept, so "I am going to try again" and "I am going to report this" stay
     /// the exclusive choices they are on the wire.
     #[must_use]
-    /// Nothing in the host path calls this: it uses `?`. `run_connect`'s
-    /// side of a failed accept is where a retry could ever make sense.
+    /// **No caller, on either side.** `run_host --serve` writes `?`, which is
+    /// the right default under ICE -- the peer at the nominated address IS the
+    /// client -- and `run_connect` never accepts at all. The affordance is
+    /// kept because the alternative is worse: without it the permit would have
+    /// to be dropped inside the error path, and "was the attach's one
+    /// connection spent?" would become a question the caller cannot answer.
+    /// Recorded here rather than deleted, and recorded as unused rather than
+    /// given a fabricated call site.
     #[allow(dead_code)]
     pub fn retry(self) -> Option<AcceptPermit> {
         self.permit

@@ -21,11 +21,12 @@
 // every one of them must come off. An allow that cannot be removed then is a
 // piece of code with no caller on either side, which is worth knowing.
 mod accept;
+mod candidates;
+mod connect;
 mod ladder;
 mod link;
 mod loopback;
 mod serve;
-#[allow(dead_code)]
 mod session;
 
 use std::io::{Read as _, Write as _};
@@ -58,7 +59,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             std::process::exit(2);
         }
         // Anything else is an ssh target: connect, or reattach.
-        Some(_) => run_connect(args),
+        Some(_) => connect::run_connect(args),
     }
 }
 
@@ -271,23 +272,6 @@ const IMMEDIATELY: rustix::event::Timespec = rustix::event::Timespec {
     tv_sec: 0,
     tv_nsec: 0,
 };
-
-/// The default path: drive `ssh` to start or find a session on the far end,
-/// exchange candidates over that channel, bring up QUIC, then become the
-/// client. Connect and reattach are deliberately one code path.
-fn run_connect(args: &[String]) -> Result<()> {
-    let target = args.first().map_or("<ssh-target>", String::as_str);
-    Err(anyhow::anyhow!(
-        "connecting to {target} is not wired up yet. Every piece it needs \
-         exists and is tested on its own -- driving ssh, the signalling \
-         handshake and its failure messages, the connection ladder, \
-         detachability settled from the nominated rung, the registry and \
-         daemonize -- but the session loop that would carry the screen is \
-         still being fixed, so connecting would attach you to a terminal that \
-         never paints.\n\nRun `oxutrm loopback` to use the terminal core \
-         today, or `oxutrm host --list` to see what this machine is tracking."
-    ))
-}
 
 const HOST_USAGE: &str = "\
 oxutrm host — the remote half of a session. Normally spawned over ssh rather

@@ -301,6 +301,25 @@ impl SshChannel {
             .map_err(BootstrapError::Protocol)
     }
 
+    /// The two directions, borrowed independently.
+    ///
+    /// [`SshChannel::recv`] and [`SshChannel::send`] both take `&mut self`, so
+    /// with those alone the channel is half duplex: nothing may be written
+    /// while a read is outstanding. That is exactly right for a handshake with
+    /// strict turns, and it cannot carry the ICE ladder, where candidates
+    /// appear on both sides at moments neither end chooses and have to cross
+    /// as they appear.
+    ///
+    /// Two `&mut` to distinct fields rather than a `split()` that consumes the
+    /// channel, because the child, its stderr buffer and
+    /// [`SshChannel::diagnose`] must all still be here afterwards: when the
+    /// far end stops talking, the reason is in the exit status and the stderr,
+    /// and a split that gave those away would leave the caller with a closed
+    /// pipe and nothing to say about it.
+    pub fn halves(&mut self) -> (&mut BufReader<ChildStdout>, &mut ChildStdin) {
+        (&mut self.stdout, &mut self.stdin)
+    }
+
     #[must_use]
     pub fn target(&self) -> &str {
         &self.target
