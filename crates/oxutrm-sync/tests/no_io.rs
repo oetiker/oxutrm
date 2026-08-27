@@ -251,7 +251,18 @@ const TRANSITIVE_ALLOWED: &[&str] = &[
 /// `-e normal`, and it accounts for feature resolution. Running a subprocess
 /// is I/O — in the **test**, which is allowed; the crate under test still
 /// performs none.
-fn transitive_closure() -> Vec<String> {
+///
+/// **Computed at most once per test binary.** Every call is a NESTED cargo, and
+/// a nested cargo blocks on the package-cache lock rather than failing when the
+/// outer build still holds it - so a second call is not a slow test, it is a
+/// test that can hang indefinitely. `OnceLock` also makes the cost independent
+/// of how many tests happen to ask.
+fn transitive_closure() -> &'static [String] {
+    static CLOSURE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CLOSURE.get_or_init(compute_transitive_closure)
+}
+
+fn compute_transitive_closure() -> Vec<String> {
     let out = std::process::Command::new(env!("CARGO"))
         .args([
             "tree",

@@ -171,14 +171,26 @@ fn no_named_network_crate_appears_anywhere_in_the_manifest() {
 fn the_denylist_test_would_actually_catch_something() {
     // A guard on the guard: if the comment-stripping above were too greedy it
     // could leave nothing to search, and the test would pass vacuously.
+    //
+    // Both halves are asserted STRUCTURALLY rather than against the manifest's
+    // wording. An earlier version quoted the comment's first two words back at
+    // it, which made rewording the comment fail this test - for a reason
+    // nobody would believe in, which is the failure mode this file's own doc
+    // comment names as the way a guard gets deleted.
     let code = manifest_without_comments();
     assert!(
-        code.contains("oxutrm-proto"),
+        code.contains("[dependencies]"),
         "comment stripping ate the manifest; the denylist test would pass on an empty string"
     );
+    // Something was actually removed. If this goes red the manifest has no
+    // comments left, so the stripping is no longer exercised by this fixture
+    // and the test above proves less than it claims - which is worth being
+    // told about, and is a different fact from "the comment was reworded".
     assert!(
-        !code.contains("Deliberately narrow"),
-        "comment stripping did not actually strip the comments"
+        code.len() < MANIFEST.len(),
+        "comment stripping removed nothing: the manifest has no comments, so \
+         `no_named_network_crate_appears_anywhere_in_the_manifest` is no longer \
+         exercising the strip it depends on"
     );
     // And the search itself must be able to say yes, not only no.
     assert!(
@@ -203,7 +215,18 @@ fn manifest_without_comments() -> String {
 /// `cargo tree` rather than hand-parsing lock files: it is cargo's own answer
 /// to the question, it already excludes dev- and build-dependencies with
 /// `-e normal`, and it accounts for feature resolution.
-fn transitive_closure() -> Vec<String> {
+///
+/// **Computed at most once per test binary.** Every call is a NESTED cargo, and
+/// a nested cargo blocks on the package-cache lock rather than failing when the
+/// outer build still holds it - so a second call is not a slow test, it is a
+/// test that can hang indefinitely. `OnceLock` also makes the count independent
+/// of how many tests happen to ask.
+fn transitive_closure() -> &'static [String] {
+    static CLOSURE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CLOSURE.get_or_init(compute_transitive_closure)
+}
+
+fn compute_transitive_closure() -> Vec<String> {
     let out = std::process::Command::new(env!("CARGO"))
         .args([
             "tree",
