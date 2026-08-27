@@ -12,28 +12,18 @@
 //! oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes the
 //! user has already made `ssh <target>` work, by whatever means.
 
-// M4's session loops and the QUIC framing under them. Nothing in `main`
-// reaches them yet: `oxutrm host --serve` and the connect path are M3's, and
-// they are what will call `HostSession` and `ClientSession`. The allow is
-// temporary and should come off with that wiring - it is here rather than a
-// fabricated call site because inventing a use to satisfy the linter hides
-// exactly the fact worth knowing, which is that this code has no caller yet.
-// `accept` carries the same caveat and one more: it is the host's whole accept
-// path, built with its hardening rather than hardened later, because there is
-// no accept path to add it to afterwards. Its caller is `run_host --serve`,
-// which is the next piece of wiring and does not exist yet. `ladder` is the
-// same: it is the connection ladder's mechanism, and BOTH halves call it -
-// `run_connect` as the controlling side and `run_host --serve` as the
-// controlled one - so it lands before either of them rather than inside
-// whichever is written first.
-#[allow(dead_code)]
+// `session` holds both loops. `HostSession` is live from here -- `host --serve`
+// is wired -- but `ClientSession` and everything that feeds it has no caller
+// until `run_connect` lands (L1-L14 in `docs/cli-wiring-design.md`), so the
+// allow stays on this module and this module only. Everywhere else the linter
+// is watching: `accept`, `ladder` and `link` carry item-level allows naming
+// exactly which items belong to the client half, and when `run_connect` lands
+// every one of them must come off. An allow that cannot be removed then is a
+// piece of code with no caller on either side, which is worth knowing.
 mod accept;
-#[allow(dead_code)]
 mod ladder;
-#[allow(dead_code)]
 mod link;
 mod loopback;
-#[allow(dead_code)]
 mod serve;
 #[allow(dead_code)]
 mod session;
@@ -81,13 +71,7 @@ fn run_host(args: &[String]) -> Result<()> {
         }
         // Works today: it needs the registry and nothing else.
         Some("--list") => run_host_list(),
-        Some("--serve") => Err(anyhow::anyhow!(
-            "`oxutrm host --serve` is not wired up yet. The pieces exist and are \
-             tested -- the ssh handshake, the registry, daemonize, the ladder -- \
-             but the session loop they feed is still being fixed, so serving \
-             would start a session that never paints. Use `oxutrm loopback` to \
-             exercise the terminal core in the meantime."
-        )),
+        Some("--serve") => serve::run_host_serve(),
         Some("--attach") => Err(anyhow::anyhow!(
             "`oxutrm host --attach` is not wired up yet, for the same reason as \
              --serve: there is no live session to attach to until serving works."
@@ -314,7 +298,9 @@ USAGE
   oxutrm host --serve         Create a session and hand it to a client.
   oxutrm host --attach <id>   Relay a new attach into a running session.
 
-Only --list works today; the others say why when you run them.
+--attach does not work yet and says so when you run it. --serve creates the
+session, but the local half that connects to it is still being wired, so a
+session it starts has nobody to paint for.
 
 A session that reached the far end over an ssh tunnel (rung 4) is listed as
 NOT detachable: it carries its data inside that ssh connection, so it dies
@@ -346,6 +332,7 @@ USAGE
 
   oxutrm host --serve
       Run the remote half. Spawned over SSH; not normally typed by hand.
+      The local half that drives it is still being wired.
 
   oxutrm host --list
       List sessions on this machine, pruning any whose process is gone.

@@ -137,6 +137,8 @@ pub async fn accept_one(
 pub struct AcceptFailed {
     error: anyhow::Error,
     /// `Some` only when a peer reached the handshake and failed it.
+    /// Read only by [`AcceptFailed::retry`], which has no caller yet.
+    #[allow(dead_code)]
     permit: Option<AcceptPermit>,
 }
 
@@ -168,6 +170,9 @@ impl AcceptFailed {
     /// kept, so "I am going to try again" and "I am going to report this" stay
     /// the exclusive choices they are on the wire.
     #[must_use]
+    /// Nothing in the host path calls this: it uses `?`. `run_connect`'s
+    /// side of a failed accept is where a retry could ever make sense.
+    #[allow(dead_code)]
     pub fn retry(self) -> Option<AcceptPermit> {
         self.permit
     }

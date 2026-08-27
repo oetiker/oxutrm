@@ -190,6 +190,8 @@ impl LadderReport {
     }
 
     /// Every rung and its verdict, in ladder order.
+    /// For rendering a failed ladder to the user, which is `run_connect`'s job.
+    #[allow(dead_code)]
     pub fn entries(&self) -> impl Iterator<Item = (Rung, &Verdict)> {
         self.entries.iter().map(|(r, v)| (*r, v))
     }
@@ -542,7 +544,7 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
 /// blocking socket at run time rather than at compile time. It is already true
 /// in practice — the blast dups a tokio socket's descriptor — but "already
 /// true in practice" is a property of someone else's code.
-fn adopt(socket: std::net::UdpSocket) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
+pub(crate) fn adopt(socket: std::net::UdpSocket) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
     socket.set_nonblocking(true)?;
     Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?))
 }

@@ -434,6 +434,8 @@ impl FrameSource {
     }
 
     /// The next frame, or `None` once the connection is gone.
+    /// `ClientSession::run_on` awaits frames; the host polls with `try_recv`.
+    #[allow(dead_code)]
     pub async fn recv(&mut self) -> Option<Frame> {
         self.rx.recv().await
     }
@@ -450,6 +452,8 @@ pub struct Link {
     pub sink: FrameSink,
     pub source: FrameSource,
     /// Kept so the session can rebind it while roaming.
+    /// Read by [`Link::rebind`], which `run_connect` will call.
+    #[allow(dead_code)]
     pub endpoint: quinn::Endpoint,
     /// The socket the ladder punched. Held because ICE keepalives send on it
     /// directly, alongside QUIC.
@@ -477,6 +481,9 @@ impl Link {
     /// `quinn`, to repoint an established connection at a different *remote*
     /// address — so a better path discovered later is lost for this attach and
     /// picked up on the next one.
+    /// Roaming is a client property: only the client may change its local
+    /// address. `run_connect` is what will call this.
+    #[allow(dead_code)]
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> anyhow::Result<()> {
         let (demux, _stun) = oxutrm_net::StunDemuxSocket::new(&socket)?;
         self.endpoint.rebind_abstract(demux)?;

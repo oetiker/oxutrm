@@ -48,6 +48,11 @@ tokio = { version = "1", features = [
     # client would be back to asking the terminal its size 250 times a second
     # for an answer that changes twice a day.
     "signal",
+    # The host's signalling channel IS descriptors 0 and 1 -- ssh's pipes --
+    # so `host --serve` reads and writes its handshake on stdin and stdout
+    # asynchronously. `io-util` gives the traits; only `io-std` gives the two
+    # handles that implement them for the real descriptors.
+    "io-std",
 ] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

@@ -66,6 +66,34 @@ impl SessionMeta {
     }
 }
 
+/// A fresh session identifier: 32 lowercase hex characters.
+///
+/// The length and the alphabet are what `HostHello.session_id` documents, and
+/// they are not decoration. The identifier is a **directory name** under the
+/// registry root, chosen by this process and joined onto a path, so anything
+/// outside `[0-9a-f]` would put path syntax into a filename — and `..` is
+/// spelled entirely in characters a laxer alphabet would allow. A fixed-length
+/// hex string cannot express one.
+///
+/// CSPRNG rather than a counter or a pid: two sessions started in the same
+/// second must not collide, and a guessable identifier is a guessable socket
+/// path in a directory other users can list.
+pub fn new_session_id() -> std::io::Result<String> {
+    use rand::TryRngCore as _;
+    use std::fmt::Write as _;
+
+    let mut raw = [0u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut raw)
+        .map_err(|e| std::io::Error::other(format!("reading the system CSPRNG: {e}")))?;
+
+    let mut out = String::with_capacity(32);
+    for byte in raw {
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
 /// `detachable = rung != Rung::SshTunnel`.
 ///
 /// Every other rung carries QUIC over its own UDP socket, which survives the

@@ -367,3 +367,31 @@ fn a_corrupt_meta_is_ignored_and_kept() {
     assert!(Registry::list_in(&root).expect("list").is_empty());
     assert!(bad.exists());
 }
+
+// ---- session identifiers ---------------------------------------------------
+//
+// The identifier is a DIRECTORY NAME under the registry root, chosen by this
+// process and joined onto a path. That is what makes its alphabet a safety
+// property rather than a formatting preference: anything outside `[0-9a-f]`
+// would put path syntax into a filename, and `..` is spelled entirely in
+// characters a laxer alphabet would allow.
+
+#[test]
+fn a_session_identifier_is_thirty_two_lowercase_hex_characters() {
+    let id = oxutrm_host::registry::new_session_id().expect("the system CSPRNG");
+    assert_eq!(id.len(), 32, "wrong length: {id:?}");
+    assert!(
+        id.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "a session id must not be able to spell a path component: {id:?}"
+    );
+}
+
+/// Two sessions started in the same second must not collide, and an
+/// identifier anyone can guess is a socket path anyone can guess.
+#[test]
+fn two_session_identifiers_are_not_the_same() {
+    let a = oxutrm_host::registry::new_session_id().expect("the system CSPRNG");
+    let b = oxutrm_host::registry::new_session_id().expect("the system CSPRNG");
+    assert_ne!(a, b, "session identifiers are not being drawn at random");
+}
