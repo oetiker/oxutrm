@@ -55,6 +55,56 @@ while both were `String` the swap type-checked. So:
   * **L9** takes the `SpkiSha256` unchanged:
     `quic_client(&sock, remote, cert_spki_sha256)` — the same line, now with a
     type behind it that means what the step always intended.
+
+**R1 AND R12 ARE BOTH WRONG, AND THEY WERE FOUND BY RUNNING IT, 2026-08-28.**
+
+Both claims in the R table are about what happens *outside* this program, and
+both were assumptions nobody had asked the operating system to confirm.
+
+**R1 says the parent `_exit(0)`s and "the channel stays open because the
+grandchild holds 0/1/2". Only the write direction stays open.** Measured
+against a real sshd, with none of oxutrm involved — a plain `python3 -c` that
+double forks and exits:
+
+```text
+[out] GRANDCHILD_ALIVE                    <- it can still WRITE
+[err] GRANDCHILD_SAW_EOF_ON_STDIN at t+1  <- but its stdin is already closed
+[t+2s] ssh rc=0
+```
+
+sshd closes the session's **stdin** as soon as the process it is waiting on
+exits, whatever else still holds the descriptor. The whole handshake reads from
+it — R7's `ClientHello`, and every `CandidateUpdate` that crosses while the
+ladder races — so detaching at R1 makes rungs 0 to 3 unreachable. The symptom
+is a broken pipe on the client's very first message, which reads as a network
+fault.
+
+The fork still happens first, because it must happen before a thread exists.
+What changed is which process leaves: the original one **stays**, holding ssh
+open and doing nothing else, and goes at the sever. So the user's prompt comes
+back at R12 rather than at R1 — which is where this document already says the
+session becomes detached. A rung-4 session never severs and keeps its ssh for
+life, which is the behaviour rung 4 requires.
+
+**R12 says "close every fd > 2". That closes the punched UDP socket.** By R12
+this process has bound the socket at R5, punched it through the ladder and
+handed it to QUIC — and that socket cannot be reopened afterwards, because the
+NAT mapping belongs to that exact socket. It is the reason a nomination hands
+back the socket rather than an address (see §5 point 2 above). Measured: with
+the sever in place the host vanished the instant it detached and the client
+painted nothing; with the sever skipped, the session ran.
+
+The enumeration is still indiscriminate — an inventory of "except these" is
+still the seam a descriptor survives through. It now enumerates at the only
+moment when "everything open" and "everything inherited from ssh" are the same
+set: inside `detach_process`, before this process has opened anything of its
+own. The snapshot travels in the `Detached` token, which is already the thing
+proving the fork happened.
+
+With both corrected, the whole path runs: `oxutrm <target>` reaches a shell,
+paints it, survives the sever, appears in `--list` as detachable, and outlives
+the client that started it.
+
 -->
 
 # Wiring `oxutrm <ssh-target>` — a design

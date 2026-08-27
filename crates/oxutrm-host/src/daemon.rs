@@ -31,7 +31,21 @@ use anyhow::{Context, anyhow};
 /// Deliberately **not** `Clone` or `Copy`: one fork, one sever.
 #[derive(Debug)]
 pub struct Detached {
-    _private: (),
+    /// Every descriptor this process held at the instant it finished forking,
+    /// which is the last instant at which "everything open" and "everything
+    /// inherited from ssh" are the same set. [`sever_from_ssh`] closes exactly
+    /// these and nothing else.
+    ///
+    /// The snapshot lives here rather than being taken at sever time, and that
+    /// is the whole correction: by the time a session severs it has bound the
+    /// UDP socket the ladder punched and QUIC adopted, and an enumeration then
+    /// would close it. That socket cannot be reopened afterwards -- the NAT
+    /// mapping belongs to that exact socket, which is why a nomination hands
+    /// back the socket and not merely an address.
+    ///
+    /// This is still an enumeration and still keeps no list of exceptions. It
+    /// enumerates at the right moment instead of the wrong one.
+    inherited: Vec<i32>,
 }
 
 /// Phase 1 of detaching: double fork, `setsid`, `umask`. **No descriptor is
@@ -91,17 +105,47 @@ pub struct Detached {
 /// leader acquires a controlling terminal the moment it opens one. Forking
 /// again leaves a process that is a session member and can never acquire one.
 pub fn detach_process() -> anyhow::Result<Detached> {
+    // The pipe that tells the holder below when it may go. Created BEFORE the
+    // fork, so every descendant inherits the write end; nothing is ever sent
+    // on it, because what carries the signal is its CLOSURE. `sever_from_ssh`
+    // performs that closure for free -- it closes every inherited descriptor
+    // by enumeration -- and a grandchild that dies performs it too.
+    let mut fds = [0i32; 2];
+    // SAFETY: `pipe` writes exactly two ints into a two-int array we own.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("sever-notification pipe");
+    }
+    let (read_end, write_end) = (fds[0], fds[1]);
+
+    // Close-on-exec, so the shell started at the end of the wiring does not
+    // inherit it. Without this a rung-4 session's shell would hold the pipe
+    // open after the session itself had gone, and the holder would wait for a
+    // process that is no longer the session.
+    // SAFETY: `fcntl` on a descriptor this function owns.
+    unsafe { libc::fcntl(write_end, libc::F_SETFD, libc::FD_CLOEXEC) };
+
     // SAFETY: `fork` is called before this process has created any thread —
     // rule 2 above — so there is no other thread whose lock the child could
     // inherit held. The child does nothing between here and `_exit`/the
     // syscalls below that allocates or takes a lock.
     match unsafe { libc::fork() } {
-        -1 => return Err(std::io::Error::last_os_error()).context("first fork"),
-        0 => {}
-        // SAFETY: `_exit` terminates immediately without running destructors or
-        // atexit handlers, which is rule 1: a RegistryGuard held by the caller
-        // must not delete the session directory from this dying parent.
-        _ => unsafe { libc::_exit(0) },
+        -1 => {
+            // SAFETY: two descriptors this function owns and is abandoning.
+            unsafe {
+                libc::close(read_end);
+                libc::close(write_end);
+            }
+            return Err(std::io::Error::last_os_error()).context("first fork");
+        }
+        0 => {
+            // SAFETY: the holder's end has no reader here.
+            unsafe { libc::close(read_end) };
+        }
+        first_child => {
+            // SAFETY: the session's end belongs to the descendants.
+            unsafe { libc::close(write_end) };
+            hold_ssh_open(first_child, read_end);
+        }
     }
 
     // New session, no controlling terminal.
@@ -114,14 +158,132 @@ pub fn detach_process() -> anyhow::Result<Detached> {
     match unsafe { libc::fork() } {
         -1 => return Err(std::io::Error::last_os_error()).context("second fork"),
         0 => {}
-        // SAFETY: see the first `_exit`.
+        // SAFETY: see [`hold_ssh_open`] for why this one still exits at once.
+        // It closes its copy of the write end as it goes, which is what leaves
+        // exactly one holder of it: the grandchild.
         _ => unsafe { libc::_exit(0) },
     }
 
     // Anything this process creates from here on is its own business.
     rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
 
-    Ok(Detached { _private: () })
+    Ok(Detached {
+        inherited: open_descriptors()?,
+    })
+}
+
+/// Every descriptor this process currently holds.
+///
+/// `/proc/self/fd` and not a guessed range: closing a guessed range is how a
+/// descriptor survives a detach, and `tests/daemonize.rs` exists because that
+/// failure is invisible from inside the process.
+fn open_descriptors() -> anyhow::Result<Vec<i32>> {
+    let dir = std::fs::read_dir("/proc/self/fd").context(
+        "reading /proc/self/fd; oxutrm needs /proc mounted to detach safely, \
+         because closing a guessed range of descriptors is how one survives",
+    )?;
+    let listed: Vec<i32> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+        .collect();
+    drop_the_listing_handle();
+
+    // The enumeration lists ITS OWN directory handle, and that handle is shut
+    // as soon as the iterator drops. Keeping the number would be a bug with a
+    // long fuse: this list is closed much later, and by then the kernel has
+    // handed that very number to the next thing opened -- in a real session,
+    // the UDP socket. So each number is checked to be open still. Nothing else
+    // opens a descriptor between the two, so exactly one number can fail, and
+    // filtering rather than naming it keeps this free of a special case.
+    //
+    // This was measured, not foreseen: with the stale number left in, the file
+    // the probe opens after detaching came back `EBADF` from the far side of
+    // the sever.
+    Ok(listed.into_iter().filter(|&fd| is_open(fd)).collect())
+}
+
+/// Nothing. The `read_dir` iterator above is dropped at the end of its own
+/// statement; this exists so the ordering it relies on is written down rather
+/// than inferred from where a temporary happens to die.
+fn drop_the_listing_handle() {}
+
+/// Is this descriptor still open in this process?
+fn is_open(fd: i32) -> bool {
+    // SAFETY: `F_GETFD` reads a flag and changes nothing. An invalid
+    // descriptor is reported, not undefined.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+}
+
+/// Keep the process `ssh` is waiting on alive until the session severs, then
+/// exit — and never return.
+///
+/// # Why this exists, and why the obvious version is wrong
+///
+/// The obvious version is `_exit(0)` right after the first fork: the command
+/// finishes, `ssh` reports it finished, and the grandchild carries on holding
+/// the inherited descriptors. That is what this function replaced, and it does
+/// not work, for a reason that is a property of **sshd** rather than of this
+/// code.
+///
+/// Measured against a real sshd on 2026-08-28, with none of oxutrm involved —
+/// a plain `python3 -c` that double forks and exits:
+///
+/// ```text
+/// [out] GRANDCHILD_ALIVE                    <- it can still WRITE
+/// [err] GRANDCHILD_SAW_EOF_ON_STDIN at t+1  <- but its stdin is already closed
+/// [t+2s] ssh rc=0
+/// ```
+///
+/// **Only the write direction survives.** sshd closes the session's *stdin* as
+/// soon as the process it is waiting on exits, whatever else still holds the
+/// descriptor. And the entire handshake reads from it: `ClientHello`, and every
+/// `CandidateUpdate` that crosses while the ladder races. Detaching at once
+/// therefore makes rungs 0 to 3 unreachable, and the symptom is a broken pipe
+/// on the client's first message — a failure that looks like the network.
+///
+/// So the fork still happens first, for the reason it always did: it must
+/// happen before a thread exists. What changed is *which* process leaves. The
+/// original stays, holding ssh open and doing nothing else, and goes when the
+/// session no longer needs ssh — which is exactly [`sever_from_ssh`], the point
+/// the module has always documented as "the moment the session becomes
+/// detached". A rung-4 session never severs, so this never returns, and its ssh
+/// lives as long as it does. That is the behaviour rung 4 requires.
+///
+/// It reads nothing from the ssh pipes. Both this process and the grandchild
+/// hold descriptor 0, and two readers on one pipe would take each other's
+/// bytes.
+fn hold_ssh_open(first_child: libc::pid_t, read_end: i32) -> ! {
+    // Reap the middle process. It exits immediately after the second fork, and
+    // with this process now staying it would otherwise sit as a zombie for the
+    // whole life of the session.
+    let mut status: libc::c_int = 0;
+    // SAFETY: waiting on this process's own child.
+    unsafe { libc::waitpid(first_child, &raw mut status, 0) };
+
+    // Block until nothing holds the write end any more.
+    let mut byte = [0u8; 1];
+    loop {
+        // SAFETY: reading one byte into a one-byte buffer we own.
+        let n = unsafe { libc::read(read_end, byte.as_mut_ptr().cast(), 1) };
+        if n == 0 {
+            break;
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if n < 0 {
+            break;
+        }
+        // Nothing writes on this pipe. A byte would mean somebody misused it,
+        // and waiting for a closure that has already been signalled some other
+        // way is not better than leaving.
+        break;
+    }
+
+    // SAFETY: `_exit` runs no destructor and no atexit handler — rule 1. This
+    // process may hold a `RegistryGuard`'s directory open through an inherited
+    // descriptor, and unwinding here would delete the live session's directory.
+    unsafe { libc::_exit(0) }
 }
 
 /// Phase 2 of detaching: `chdir("/")`, close every inherited descriptor and
@@ -157,8 +319,8 @@ pub fn sever_from_ssh(detached: Detached, permit: crate::DetachPermit) -> anyhow
     // sever. Neither binding is read, because neither has anything to read --
     // their whole content is the fact that they exist and could only have come
     // from the call that had to happen first.
-    let (Detached { .. }, _) = (detached, permit);
-    sever()
+    let (Detached { inherited }, _) = (detached, permit);
+    sever(&inherited)
 }
 
 /// The body of [`sever_from_ssh`], without the two tokens.
@@ -166,12 +328,12 @@ pub fn sever_from_ssh(detached: Detached, permit: crate::DetachPermit) -> anyhow
 /// Private, and it must stay private: every public route to it either carries
 /// the tokens or is [`daemonize`], which forks immediately beforehand and is
 /// documented as the whole-hog version for a caller that has no ladder to run.
-fn sever() -> anyhow::Result<()> {
+fn sever(inherited: &[i32]) -> anyhow::Result<()> {
     // Do not hold a mount busy, and do not depend on a directory that may be
     // unmounted or deleted while the session runs for a week.
     std::env::set_current_dir("/").context("chdir to /")?;
 
-    close_inherited_descriptors()?;
+    close_inherited_descriptors(inherited);
     reopen_standard_descriptors()?;
     Ok(())
 }
@@ -194,8 +356,8 @@ fn sever() -> anyhow::Result<()> {
 /// threads do not survive `fork`) and sever before it (impossible — signalling
 /// still needs the pipes).
 pub fn daemonize() -> anyhow::Result<()> {
-    let Detached { .. } = detach_process()?;
-    sever()
+    let Detached { inherited } = detach_process()?;
+    sever(&inherited)
 }
 
 /// Close every descriptor above 2.
@@ -210,30 +372,16 @@ pub fn daemonize() -> anyhow::Result<()> {
 /// `6152a29` records that skipping this function was one of three injected
 /// faults that test caught. Anything that must outlive the sever is opened
 /// *after* it, which is why the session's Unix socket is bound afterwards.
-fn close_inherited_descriptors() -> anyhow::Result<()> {
-    // Collect first and close afterwards: closing while the directory handle is
-    // open would invalidate the iterator. The handle's own descriptor is in the
-    // collected list and is already closed by the time the loop reaches it,
-    // which is harmless — nothing opens a new descriptor in between, so that
-    // number cannot have been reused by something we must keep.
-    let fds: Vec<i32> = {
-        let dir = std::fs::read_dir("/proc/self/fd").context(
-            "reading /proc/self/fd; oxutrm needs /proc mounted to detach safely, \
-             because closing a guessed range of descriptors is how one survives",
-        )?;
-        dir.filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
-            .collect()
-    };
-    for fd in fds {
+fn close_inherited_descriptors(inherited: &[i32]) {
+    for &fd in inherited {
         if fd > 2 {
-            // SAFETY: `close` on a descriptor number we just read from
-            // /proc/self/fd. A double close cannot happen because each number
-            // appears once, and nothing in this loop opens anything.
+            // SAFETY: a descriptor number enumerated from /proc/self/fd inside
+            // `detach_process`, before this process opened anything of its own.
+            // Each number appears once, so there is no double close, and
+            // nothing this process opened afterwards is in the list.
             unsafe { libc::close(fd) };
         }
     }
-    Ok(())
 }
 
 /// Point 0, 1 and 2 at `/dev/null`.

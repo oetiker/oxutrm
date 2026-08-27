@@ -265,13 +265,14 @@ fn inherited_descriptors_survive_the_fork_and_die_at_the_sever() {
 
     let (child_pid, mut child) = spawn_probe_with(&report_path, &["--split"]);
 
-    // As in the daemonize test: the probe sleeps between the two phases, so a
-    // report that exists already means no fork happened and everything below
-    // would be measuring this test's own child rather than a grandchild.
-    assert!(
-        !report_path.exists(),
-        "the probe reported before its parent died; the test proves nothing"
-    );
+    // There is deliberately no "the report cannot exist yet" check here any
+    // more, and its absence is not a weakening. It was a timing proxy for "a
+    // fork happened", and it worked because the parent left long before the
+    // report was written. The parent now leaves *at* the sever — it has to,
+    // or sshd closes the session's stdin under a handshake that still needs it
+    // — so the two events are simultaneous by design and the proxy could only
+    // ever be a race. The claim it stood for is asserted directly below, on
+    // `ppid`, where it does not depend on timing at all.
 
     // Reading to EOF is itself part of the proof. The write end is held by the
     // grandchild alone once the two intermediates have `_exit`ed, so this call
@@ -363,4 +364,121 @@ fn inherited_descriptors_survive_the_fork_and_die_at_the_sever() {
     // The split must end in exactly the state `daemonize` ends in. Same bar,
     // same helper, so the two cannot drift apart.
     assert_nothing_but_dev_null_survived(&report);
+}
+
+// ---- the process ssh is waiting on -----------------------------------------
+//
+// Everything above is about descriptors. This is about a PROCESS, and it is
+// the claim `oxutrm host --serve` actually rests on.
+//
+// Measured against a real sshd, 2026-08-28, with no oxutrm involved -- a plain
+// `python3 -c` that double forks and exits:
+//
+//     [out] GRANDCHILD_ALIVE                    <- it can still WRITE
+//     [err] GRANDCHILD_SAW_EOF_ON_STDIN at t+1  <- its stdin is already closed
+//     [t+2s] ssh rc=0
+//
+// So "the channel stays open because the grandchild holds 0/1/2" is only half
+// true. sshd closes the session's STDIN as soon as the process it is waiting
+// on exits, and the whole handshake reads from it: `ClientHello`, and every
+// `CandidateUpdate` that crosses while the ladder races. A detach that lets
+// that process go at once makes rungs 0 to 3 unreachable, and the symptom is a
+// broken pipe on the client's very first message.
+//
+// Hence: the process the parent waits on must stay alive until the session
+// severs. That is what this asserts, and it needs no sshd to do it -- sshd's
+// rule is "the command exited", and this watches exactly that.
+
+/// The sever must close what came from ssh, and only that.
+///
+/// `close_inherited_descriptors` enumerates rather than keeping a list of
+/// exceptions, and that indiscriminacy is the whole of its value -- an
+/// inventory of "except these" is precisely the seam a descriptor survives
+/// through. But *when* it enumerates decides what it means. Run at the end of a
+/// handshake it does not close "everything inherited from ssh": it closes
+/// everything open, and by then that includes the UDP socket bound at R5,
+/// punched by the ladder and adopted by QUIC.
+///
+/// That socket cannot be opened after the sever. The NAT mapping belongs to
+/// that exact socket -- it is why a nomination hands back the socket and not
+/// just an address -- so closing it destroys the connection the sever was
+/// supposed to make independent. Measured: with the sever in place the host
+/// vanished the instant it detached, leaving the client painting nothing; with
+/// it skipped, the session ran.
+///
+/// So the enumeration moves to the only moment at which "everything open" and
+/// "everything from ssh" are the same set: inside `detach_process`, before this
+/// process has opened anything of its own. Still no exception list.
+#[test]
+fn a_descriptor_opened_after_the_detach_survives_the_sever() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let report_path = tmp.path().join("split.txt");
+
+    let (_child_pid, _child) = spawn_probe_with(&report_path, &["--split", "--keep-open"]);
+    let report = wait_for(&report_path, Duration::from_secs(20));
+
+    assert_eq!(
+        field(&report, "opened_after_detach"),
+        "ok",
+        "the sever closed a descriptor this process opened for itself after          forking. In a real session that is the punched UDP socket, and the          session dies at the moment it detaches."
+    );
+}
+
+/// Between `detach_process` and `sever_from_ssh`, the process the caller is
+/// waiting on must still be running. Everything the session says over ssh
+/// happens in that window.
+#[test]
+fn the_process_ssh_waits_on_stays_alive_until_the_session_severs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let report = tmp.path().join("report");
+    let go = tmp.path().join("report.go");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxutrm-daemon-probe"))
+        .arg(&report)
+        .arg("--split")
+        .arg("--gate")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the probe");
+
+    // Give the double fork every chance to have happened. The probe writes its
+    // phase-1 marker on stdout from the grandchild, so seeing that byte means
+    // the detach is done and we are inside the window.
+    let mut stdout = child.stdout.take().expect("the probe's stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let _ = stdout.read(&mut buf);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the grandchild must reach phase 1");
+
+    assert!(
+        child.try_wait().expect("asking after the probe").is_none(),
+        "the process ssh waits on exited before the session severed. sshd \
+         closes the session's stdin at exactly that moment, so the handshake \
+         that has not happened yet would read EOF instead of the client's hello."
+    );
+
+    // Now let it sever, which is the moment ssh is *meant* to be released.
+    std::fs::write(&go, b"go").expect("opening the gate");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("asking after the probe") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the process ssh waits on never exited after the sever, so the \
+             user's prompt would never come back"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "it must exit cleanly, or ssh reports a failed command: {status:?}"
+    );
 }

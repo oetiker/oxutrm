@@ -31,13 +31,25 @@ fn main() {
     let report = args
         .next()
         .expect("usage: oxutrm-daemon-probe <report-path> [--split]");
-    let split = matches!(args.next().as_deref(), Some("--split"));
+    // Collected rather than read in sequence, so the flags below are
+    // order-independent and adding one cannot silently shift another.
+    let flags: Vec<String> = args.collect();
+    let split = flags.iter().any(|f| f == "--split");
+    // With `--gate`, the probe waits for `<report>.go` to appear before it
+    // severs, so a test can hold the window between the two phases open for
+    // as long as it needs rather than racing a sleep.
+    let gate = flags.iter().any(|f| f == "--gate");
+    // With `--keep-open`, the probe opens a descriptor AFTER detaching, which
+    // must survive the sever. Behind a flag because the strict "nothing but
+    // /dev/null survived" assertion is about descriptors inherited from ssh,
+    // and this one deliberately is not.
+    let keep_open = flags.iter().any(|f| f == "--keep-open");
     let marker = format!("{report}.marker");
 
     let held = hold_descriptors(&marker);
 
     if split {
-        run_split(&report, &held);
+        run_split(&report, &held, gate, keep_open);
     } else {
         oxutrm_host::daemonize().expect("daemonize");
 
@@ -100,7 +112,7 @@ fn hold_descriptors(marker: &str) -> Vec<(String, i32)> {
 /// The order here mirrors `oxutrm host --serve` exactly: fork first, talk to
 /// ssh, settle the rung, sever. Only the "talk to ssh" part is a marker line
 /// instead of a handshake and an ICE ladder.
-fn run_split(report: &str, held: &[(String, i32)]) {
+fn run_split(report: &str, held: &[(String, i32)], gate: bool, keep_open: bool) {
     let file0 = fd_named(held, "file0");
     let high = fd_named(held, "high-900");
 
@@ -115,9 +127,33 @@ fn run_split(report: &str, held: &[(String, i32)]) {
     let phase1_file = write_line(file0, PHASE1_FILE);
     let phase1_stdout = write_line(libc::STDOUT_FILENO, PHASE1_STDOUT);
 
-    // Outlive the parent, so writing the report at all proves independence
-    // rather than a race won. This stands in for the handshake and the ladder.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // A descriptor opened AFTER the detach, standing in for the one the real
+    // session cannot do without: the UDP socket bound at R5, punched by the
+    // ladder, and adopted by QUIC. It cannot be opened after the sever -- the
+    // NAT mapping belongs to that exact socket -- so if the sever closes it
+    // the session dies the moment it detaches.
+    let after_detach_fd = if keep_open {
+        let f = std::fs::File::create(format!("{report}.after-detach"))
+            .expect("a file opened after the detach");
+        let fd = f.as_raw_fd();
+        std::mem::forget(f);
+        Some(fd)
+    } else {
+        None
+    };
+
+    // Stand in for the handshake and the ladder: the stretch during which the
+    // session is detached but has NOT yet severed, and still needs to talk to
+    // sshd. Gated on a file when the caller asks, so a test can observe the
+    // whole window instead of racing a sleep.
+    if gate {
+        let go = format!("{report}.go");
+        while !std::path::Path::new(&go).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 
     // Phase 2, gated exactly as a real session gates it: a permit that only a
     // nominated non-tunnel rung can produce. A rung-4 session gets `None` here
@@ -145,6 +181,10 @@ fn run_split(report: &str, held: &[(String, i32)]) {
     let after_sever_file = write_line(file0, PHASE2_FILE);
     let after_sever_high = write_line(high, PHASE2_FILE);
     let after_sever_stdout = write_line(libc::STDOUT_FILENO, PHASE2_STDOUT);
+    let opened_after_detach = match after_detach_fd {
+        Some(fd) => write_line(fd, "still-open"),
+        None => "not-asked-for".to_string(),
+    };
 
     write_report(
         report,
@@ -156,6 +196,7 @@ fn run_split(report: &str, held: &[(String, i32)]) {
             format!("after_sever_file={after_sever_file}"),
             format!("after_sever_high={after_sever_high}"),
             format!("after_sever_stdout={after_sever_stdout}"),
+            format!("opened_after_detach={opened_after_detach}"),
         ],
     );
 }
