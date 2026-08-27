@@ -127,11 +127,119 @@ fn endpoint_over(
     Ok((endpoint, stun_rx))
 }
 
+/// The right to accept **one** connection on the endpoint it was minted with.
+///
+/// One attach is one client. Roaming does not need a second connection — a
+/// roam reuses the existing one through QUIC path validation, not a new
+/// handshake — so a host that accepted twice would be serving a peer nobody
+/// asked it to serve, with a second shell to prove it.
+///
+/// Until this type existed that rule lived in a module comment and in a test
+/// that promised not to call the accept twice. This repository's standing
+/// lesson is that **a rule written only in prose is a rule nobody implements**:
+/// the reviewer who adds a retry loop around the accept is not being careless,
+/// they are reading a function that looks safe to call again. So the rule is
+/// now a value. [`quic_server`] mints exactly one of these per endpoint, the
+/// accept consumes it by value, and there is no way to get a second one but to
+/// build a second endpoint.
+///
+/// # What it is not
+///
+/// It is not a capability on `quinn::Endpoint::accept`, which stays reachable
+/// to anyone holding the endpoint. It gates oxutrm's accept path, which is the
+/// only path that reaches `Command::new(shell)`.
+///
+/// # The absence is machine-checked
+///
+/// A permit is spent by whatever consumes it. Using it twice does not compile:
+///
+/// ```compile_fail
+/// use oxutrm_net::AcceptPermit;
+/// fn accept(_: AcceptPermit) {}
+/// fn permit() -> AcceptPermit { unimplemented!() }
+/// let p = permit();
+/// accept(p);
+/// accept(p);
+/// ```
+///
+/// Using it once does, which is what keeps the check above honest — a
+/// `compile_fail` block passes just as happily on a typo as on the error it
+/// was written for:
+///
+/// ```no_run
+/// use oxutrm_net::AcceptPermit;
+/// fn accept(_: AcceptPermit) {}
+/// fn permit() -> AcceptPermit { unimplemented!() }
+/// let p = permit();
+/// accept(p);
+/// ```
+///
+/// Nor can a second one be cloned out of the first — the escape hatch a
+/// derive would open without anyone noticing:
+///
+/// ```compile_fail
+/// use oxutrm_net::AcceptPermit;
+/// fn needs_clone<T: Clone>(_: T) {}
+/// fn permit() -> AcceptPermit { unimplemented!() }
+/// needs_clone(permit());
+/// ```
+///
+/// The same bound with a trait it *does* satisfy compiles, so the block above
+/// fails for the missing `Clone` and not for the shape of the helper. `Send`
+/// is not an arbitrary choice: the accept runs in a spawned task, so the
+/// permit has to cross a task boundary to be usable at all.
+///
+/// ```no_run
+/// use oxutrm_net::AcceptPermit;
+/// fn needs_send<T: Send>(_: T) {}
+/// fn permit() -> AcceptPermit { unimplemented!() }
+/// needs_send(permit());
+/// ```
+///
+/// And one cannot be conjured without an endpoint. The field is private, so
+/// [`quic_server`] is the only place in the workspace that can name it:
+///
+/// ```compile_fail
+/// use oxutrm_net::AcceptPermit;
+/// fn endpoint() -> quinn::Endpoint { unimplemented!() }
+/// let _ = AcceptPermit { endpoint: endpoint() };
+/// ```
+///
+/// Its control, which also proves `quinn` resolves inside these doctests —
+/// otherwise the block above would fail on an unresolved crate and prove
+/// nothing at all:
+///
+/// ```no_run
+/// fn endpoint() -> quinn::Endpoint { unimplemented!() }
+/// fn takes(_: quinn::Endpoint) {}
+/// takes(endpoint());
+/// ```
+#[derive(Debug)]
+pub struct AcceptPermit {
+    endpoint: quinn::Endpoint,
+}
+
+impl AcceptPermit {
+    /// The endpoint this permit admits one connection on.
+    #[must_use]
+    pub fn endpoint(&self) -> &quinn::Endpoint {
+        &self.endpoint
+    }
+}
+
 /// Listen on a socket the ladder has already punched, accepting exactly one
 /// client certificate: `expect_client_spki`, and nothing else.
 ///
 /// The caller keeps `socket` for sending ICE keepalives, and receives the
 /// peeled-off STUN on the returned [`StunRx`].
+///
+/// # The permit
+///
+/// The [`AcceptPermit`] in the middle of the tuple is the right to accept one
+/// connection, and this is the only function that mints one. The endpoint
+/// comes back beside it because the session layer needs the same handle
+/// afterwards — `Endpoint::rebind` while roaming, and the link that carries
+/// the screen — and the permit is spent by the accept.
 ///
 /// # The fingerprint is by value, required, and has no setter
 ///
@@ -151,8 +259,13 @@ pub async fn quic_server(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     expect_client_spki: ClientSpki,
-) -> anyhow::Result<(quinn::Endpoint, StunRx)> {
-    endpoint_over(socket, Some(server_config(cert, key, expect_client_spki)?))
+) -> anyhow::Result<(quinn::Endpoint, AcceptPermit, StunRx)> {
+    let (endpoint, stun_rx) =
+        endpoint_over(socket, Some(server_config(cert, key, expect_client_spki)?))?;
+    let permit = AcceptPermit {
+        endpoint: endpoint.clone(),
+    };
+    Ok((endpoint, permit, stun_rx))
 }
 
 /// Connect to `peer`, trusting exactly `expect_host_spki` and nothing else,
@@ -260,7 +373,8 @@ mod tests {
         let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
+        let (endpoint, _permit, _stun) =
+            quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
@@ -300,7 +414,8 @@ mod tests {
         let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
+        let (endpoint, _permit, _stun) =
+            quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;
@@ -345,7 +460,8 @@ mod tests {
 
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
+        let (endpoint, _permit, _stun) =
+            quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = tokio::spawn(async move {
             if let Some(incoming) = endpoint.accept().await {
                 let _ = incoming.await;
@@ -392,7 +508,7 @@ mod tests {
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
         // Pinned to `expected`, and the stranger is the one who calls.
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, expected.spki)
+        let (endpoint, _permit, _stun) = quic_server(&server_sock, cert, key, expected.spki)
             .await
             .unwrap();
         let server = tokio::spawn(async move {
@@ -436,7 +552,8 @@ mod tests {
 
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, pinned).await.unwrap();
+        let (endpoint, _permit, _stun) =
+            quic_server(&server_sock, cert, key, pinned).await.unwrap();
         let server = tokio::spawn(async move {
             let incoming = endpoint.accept().await.expect("an inbound connection");
             incoming.await
@@ -483,7 +600,7 @@ mod tests {
 
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, expected.spki)
+        let (endpoint, _permit, _stun) = quic_server(&server_sock, cert, key, expected.spki)
             .await
             .unwrap();
         let server = tokio::spawn(async move {
@@ -537,7 +654,7 @@ mod tests {
         let client_sock = socket().await;
         let client_addr = client_sock.local_addr().unwrap();
 
-        let (endpoint, mut server_stun) =
+        let (endpoint, _permit, mut server_stun) =
             quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
@@ -600,7 +717,8 @@ mod tests {
         let me = client_id();
         let server_sock = socket().await;
         let server_addr = server_sock.local_addr().unwrap();
-        let (endpoint, _stun) = quic_server(&server_sock, cert, key, me.spki).await.unwrap();
+        let (endpoint, _permit, _stun) =
+            quic_server(&server_sock, cert, key, me.spki).await.unwrap();
         let server = echo_server(endpoint);
 
         let client_sock = socket().await;

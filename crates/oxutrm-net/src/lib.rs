@@ -57,7 +57,7 @@ pub use der::{spki_der, spki_sha256};
 pub use discover::{Probe, classify, stun_discover};
 pub use ice::{IceAgent, IceEvent};
 pub use mapping::{PortMapping, default_gateway};
-pub use quic::{ALPN, quic_client, quic_server};
+pub use quic::{ALPN, AcceptPermit, quic_client, quic_server};
 pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};
 pub use stunmsg::{
     Check, CheckKind, Direction, IceCredentials, IceRole, build_check_request,

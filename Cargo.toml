@@ -125,6 +125,14 @@ rustix = { workspace = true, features = ["event", "pty", "time"] }
 quinn.workspace = true
 
 [dev-dependencies]
+# `test-util` for `#[tokio::test(start_paused = true)]`, which src/accept.rs
+# needs: the accept deadline is measured in tens of seconds and a test that
+# waited for it in wall clock would be the slowest thing in the gate. Paused
+# time makes the clock jump to the next deadline whenever the runtime has
+# nothing to run, so the assertion is on the SAME const the code uses and costs
+# no seconds. Under resolver 3 a dev-dependency feature is not unified into the
+# normal build, so `test-util` never reaches the shipped binary.
+tokio = { workspace = true, features = ["test-util"] }
 # The loopback test replays the ANSI the renderer emitted through a real
 # emulator and compares it with the host's screen. That is a stronger claim
 # than "the two states match", which the sync tests already prove.

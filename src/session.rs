@@ -912,9 +912,10 @@ mod tests {
 
         let host_sock = udp().await;
         let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _stun) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-            .await
-            .unwrap();
+        let (host_ep, _permit, _stun) =
+            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+                .await
+                .unwrap();
 
         let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
         let accepting = tokio::spawn(async move {
@@ -1288,7 +1289,7 @@ mod tests {
         let (client_cert, client_key, client_fp) = generate_cert().unwrap();
         let host_sock = udp().await;
         let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _s) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+        let (host_ep, _permit, _s) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
             .await
             .unwrap();
         let client_sock = udp().await;
