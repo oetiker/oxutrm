@@ -20,8 +20,8 @@
 //! reading" become the same branch, and every other error — malformed JSON,
 //! version skew — propagates exactly as `oxutrm-proto` decided it should.
 
-use oxutrm_proto::{ProtoError, Signal};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use oxutrm_proto::{MAX_SIGNAL_LINE, ProtoError, Signal};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Read one `Signal`, discarding whatever the remote login printed first.
 ///
@@ -43,20 +43,36 @@ pub async fn read_signal_async<R>(r: &mut R) -> Result<Signal, ProtoError>
 where
     R: AsyncBufReadExt + Unpin,
 {
-    let mut line = String::new();
     loop {
-        line.clear();
-        if r.read_line(&mut line).await? == 0 {
+        let mut raw = Vec::new();
+        // The one rule this module does NOT delegate, because it cannot: a
+        // limit checked by `read_signal` is checked on bytes we have already
+        // read and are already holding. `take` caps the read itself, so a peer
+        // that never sends a newline costs us `MAX_SIGNAL_LINE` bytes and not
+        // one more. The *number* still comes from `oxutrm-proto`, so the two
+        // readers cannot draw the line in different places.
+        let taken = AsyncReadExt::take(&mut *r, MAX_SIGNAL_LINE as u64)
+            .read_until(b'\n', &mut raw)
+            .await?;
+        if taken == 0 {
             return Err(ProtoError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "signalling stream closed before a message arrived",
             )));
         }
+        // A spent budget with no terminator means the line needs at least one
+        // byte more than the limit allows. A *short* read without one is the
+        // ordinary last line of a stream that simply ended, and stays legal.
+        if taken == MAX_SIGNAL_LINE && raw.last() != Some(&b'\n') {
+            return Err(ProtoError::SignalLineTooLong {
+                limit: MAX_SIGNAL_LINE,
+            });
+        }
 
         // One line, one cursor. `read_signal` applies the same skipping and
-        // strictness rules it applies to a blocking stream; running out of
-        // cursor means the line was preamble.
-        let mut one_line = std::io::Cursor::new(line.as_bytes());
+        // strictness rules it applies to a blocking stream - UTF-8 included;
+        // running out of cursor means the line was preamble.
+        let mut one_line = std::io::Cursor::new(raw.as_slice());
         match oxutrm_proto::read_signal(&mut one_line) {
             Ok(s) => return Ok(s),
             Err(ProtoError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,

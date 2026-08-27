@@ -11,6 +11,31 @@ use crate::{
     TermSize, TerminalCaps,
 };
 
+/// The most bytes one signalling line may occupy, newline included.
+///
+/// The reader must have a wall somewhere. Without one, `read_line` grows its
+/// `String` until a newline arrives, so a peer that sends four gigabytes and no
+/// newline makes us allocate four gigabytes — over a channel that is reachable
+/// before anything is authenticated.
+///
+/// **1 MiB**, and the number is chosen from what a real line contains rather
+/// than from what feels safe. The largest legitimate signal is a hello: a
+/// candidate list at roughly fifty bytes per candidate, two base64 32-byte
+/// keys, and a terminal capability record. That is kilobytes. A megabyte
+/// leaves three orders of magnitude of headroom — enough that no plausible
+/// growth of the message reaches it — while removing unbounded growth
+/// entirely.
+///
+/// It also has to clear the *noise*, not just the messages: the reader skips
+/// whatever the remote login printed first, and a motd line is bounded by
+/// nobody. `oxutrm-host`'s `an_enormous_preamble_line_is_still_just_preamble`
+/// pins a 200 KB preamble line as legitimate, which is deliberate intent about
+/// how long a real line gets; 1 MiB keeps that intent true with room to spare.
+///
+/// The limit covers the terminating newline, so a line of exactly this many
+/// bytes is the largest one that is still accepted.
+pub const MAX_SIGNAL_LINE: usize = 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Signal {
@@ -143,14 +168,37 @@ pub fn write_signal<W: std::io::Write>(w: &mut W, s: &Signal) -> Result<(), Prot
 /// End of stream is `ProtoError::Io` with `ErrorKind::UnexpectedEof`, so a
 /// peer that hung up cleanly can be told from one that sent rubbish.
 pub fn read_signal<R: std::io::BufRead>(r: &mut R) -> Result<Signal, ProtoError> {
+    use std::io::{BufRead as _, Read};
+
     loop {
-        let mut line = String::new();
-        if r.read_line(&mut line)? == 0 {
+        let mut raw = Vec::new();
+        // `take` IS the wall, rather than a length check applied afterwards. It
+        // caps what `read_until` may pull out of `r`, so a peer that sends no
+        // newline costs us `MAX_SIGNAL_LINE` bytes and not one more. A limit
+        // enforced after the read reports the identical error having already
+        // allocated whatever the peer chose to send, which is the whole defect.
+        let taken = Read::take(&mut *r, MAX_SIGNAL_LINE as u64).read_until(b'\n', &mut raw)?;
+        if taken == 0 {
             return Err(ProtoError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "signalling stream closed before a message arrived",
             )));
         }
+        // A spent budget with no terminator means the line needs at least one
+        // byte more than the limit allows. A *short* read without one is the
+        // ordinary last line of a stream that simply ended, and stays legal.
+        if taken == MAX_SIGNAL_LINE && raw.last() != Some(&b'\n') {
+            return Err(ProtoError::SignalLineTooLong {
+                limit: MAX_SIGNAL_LINE,
+            });
+        }
+        // `read_line` used to do this for us; the bounded read hands back bytes.
+        let line = String::from_utf8(raw).map_err(|_| {
+            ProtoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "signalling line is not valid UTF-8",
+            ))
+        })?;
         if !looks_like_signal(&line) {
             continue;
         }
@@ -495,10 +543,20 @@ mod tests {
         );
     }
 
+    /// The payload is a quarter of [`MAX_SIGNAL_LINE`] deliberately. It used to
+    /// be a full megabyte, which the line cap now refuses on sight — and a
+    /// refusal by the cap would prove nothing about the PSK, which is what this
+    /// test is about. Staying well under the wall keeps the only thing that can
+    /// reject this line the field's own length check.
     #[test]
-    fn a_megabyte_of_base64_is_rejected_and_the_length_is_what_rejects_it() {
-        let huge = "A".repeat(1024 * 1024);
-        let got = read_one(&host_hello_with_psk(&huge));
+    fn a_vast_base64_psk_is_rejected_and_the_length_is_what_rejects_it() {
+        let huge = "A".repeat(MAX_SIGNAL_LINE / 4);
+        let line = host_hello_with_psk(&huge);
+        assert!(
+            line.len() < MAX_SIGNAL_LINE,
+            "the fixture must not trip the line cap, or it proves nothing about the PSK"
+        );
+        let got = read_one(&line);
         let shown = format!("{got:?}");
         assert!(
             matches!(got, Err(ProtoError::Malformed(_))),
@@ -684,6 +742,208 @@ mod tests {
         match read_signal(&mut r).expect("second") {
             Signal::Failed { reason } => assert_eq!(reason, "second"),
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // ---- the line is bounded ----
+    //
+    // `read_line` grows a `String` until a newline arrives. On a channel that
+    // is reachable before anything is authenticated, that is an allocation the
+    // peer chooses the size of.
+
+    /// A `Failed` line whose encoded length, newline included, is exactly
+    /// `total` bytes.
+    ///
+    /// Built by measuring and padding rather than by guessing: the boundary
+    /// cases below are only worth anything if they land ON the boundary, and a
+    /// fixture that was a few bytes out would quietly turn "exactly the limit"
+    /// into "near the limit".
+    fn line_of_exactly(total: usize) -> Vec<u8> {
+        let empty = encoded(&[Signal::Failed {
+            reason: String::new(),
+        }]);
+        let pad = total
+            .checked_sub(empty.len())
+            .expect("asked for a line shorter than the empty encoding");
+        // ASCII 'a' needs no JSON escaping, so one character is one byte.
+        let line = encoded(&[Signal::Failed {
+            reason: "a".repeat(pad),
+        }]);
+        assert_eq!(line.len(), total, "the padding arithmetic is wrong");
+        line
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_limit_is_accepted() {
+        let line = line_of_exactly(MAX_SIGNAL_LINE);
+        let mut r = BufReader::new(line.as_slice());
+        match read_signal(&mut r).expect("a line at the limit is legitimate") {
+            Signal::Failed { reason } => assert!(reason.starts_with("aaa")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_byte_past_the_limit_is_refused() {
+        let line = line_of_exactly(MAX_SIGNAL_LINE + 1);
+        let mut r = BufReader::new(line.as_slice());
+        match read_signal(&mut r) {
+            Err(ProtoError::SignalLineTooLong { limit }) => {
+                assert_eq!(limit, MAX_SIGNAL_LINE);
+            }
+            other => panic!("one byte past the limit must be refused, got {other:?}"),
+        }
+    }
+
+    /// The test that a `Cursor`-shaped fixture cannot fake.
+    ///
+    /// The over-long line here **does** end in a newline, and a perfectly good
+    /// signal follows it. An unbounded reader succeeds on this input: the long
+    /// line does not start with `{`, so it is skipped as preamble and the
+    /// signal after it is returned. Only a reader that stops at the limit can
+    /// fail here — so this cannot pass by hitting end of file and reporting
+    /// "no newline found", which is the wrong reason a naive fixture would
+    /// have made it pass for.
+    #[test]
+    fn an_over_long_line_is_refused_even_though_the_stream_would_recover() {
+        let mut input = vec![b'x'; MAX_SIGNAL_LINE + 1];
+        input.push(b'\n');
+        input.extend_from_slice(&encoded(&[Signal::Failed {
+            reason: "a perfectly good signal, one line later".into(),
+        }]));
+
+        // The rescue this guards against, stated as an assertion rather than a
+        // hope: everything needed for a successful read IS in the stream.
+        assert!(input.ends_with(b"\n"), "the stream is well framed");
+
+        let mut r = BufReader::new(input.as_slice());
+        match read_signal(&mut r) {
+            Err(ProtoError::SignalLineTooLong { limit }) => assert_eq!(limit, MAX_SIGNAL_LINE),
+            other => panic!(
+                "an over-long preamble line must stop the reader even when the \
+                 stream recovers afterwards, got {other:?}"
+            ),
+        }
+    }
+
+    /// A reader that serves `b'x'` until the test's patience runs out, and
+    /// counts what it handed out.
+    ///
+    /// This is the only way to tell a reader that STOPS at the limit from one
+    /// that reads everything and complains afterwards. The second kind passes
+    /// every error-variant assertion above while still allocating whatever the
+    /// peer sends, which is the bug.
+    ///
+    /// # Why it ends at all
+    ///
+    /// A fixture that truly never ends proves the same property, and it does so
+    /// by making the failing case allocate without limit — which is the
+    /// diagnosis, not a test result. A red run then ends as an OOM kill of the
+    /// test binary, taking down every sibling process that shares the memory
+    /// cgroup and reporting nothing about which assertion failed.
+    ///
+    /// [`Endless::PATIENCE`] is far enough past `MAX_SIGNAL_LINE` that a
+    /// draining reader overruns the bound below by a factor of sixty-four, so
+    /// the test keeps every bit of its discriminating power and states its
+    /// verdict as an assertion instead of as a signal 9.
+    #[derive(Default)]
+    struct Endless {
+        served: usize,
+    }
+
+    impl Endless {
+        /// Well past any wall the reader could legitimately draw, and still
+        /// small enough to hold comfortably in memory.
+        const PATIENCE: usize = 64 * MAX_SIGNAL_LINE;
+    }
+
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Zero means end of stream, so running out of patience reads as a
+            // peer that hung up - a reader that got this far has already failed
+            // the bound below.
+            let n = buf.len().min(Self::PATIENCE - self.served);
+            buf[..n].fill(b'x');
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_reader_stops_at_the_limit_rather_than_draining_the_peer() {
+        const CHUNK: usize = 8 * 1024;
+        let mut r = BufReader::with_capacity(CHUNK, Endless::default());
+
+        match read_signal(&mut r) {
+            Err(ProtoError::SignalLineTooLong { limit }) => assert_eq!(limit, MAX_SIGNAL_LINE),
+            other => panic!("an endless line must be refused, got {other:?}"),
+        }
+
+        let served = r.get_ref().served;
+        assert!(
+            served <= MAX_SIGNAL_LINE + CHUNK,
+            "the reader took {served} bytes from a peer that would have sent any \
+             number - it is reporting the limit, not enforcing it"
+        );
+        // And the other side of it: a reader that gave up immediately would
+        // satisfy the bound above while rejecting lines it should accept.
+        assert!(
+            served >= MAX_SIGNAL_LINE,
+            "the reader stopped after only {served} bytes, well short of the limit"
+        );
+    }
+
+    /// A signal-shaped line gets the same wall as a noise-shaped one. Without
+    /// this, a cap applied only on the skip path leaves the actual message path
+    /// unbounded — which is the path a hostile peer would use.
+    #[test]
+    fn an_over_long_line_that_looks_like_a_signal_is_refused_too() {
+        let mut line = Vec::from(r#"{"t":"Failed","reason":""#);
+        line.extend(std::iter::repeat_n(b'a', MAX_SIGNAL_LINE));
+        line.extend_from_slice(b"\"}\n");
+        let mut r = BufReader::new(line.as_slice());
+        assert!(
+            matches!(
+                read_signal(&mut r),
+                Err(ProtoError::SignalLineTooLong { .. })
+            ),
+            "an over-long line must be refused before it is parsed"
+        );
+    }
+
+    /// The refusal must be its own fault, not a parse failure wearing a
+    /// different message. A caller has to be able to tell "the peer sent
+    /// garbage" from "the peer sent too much" — they are different incidents.
+    #[test]
+    fn the_refusal_is_distinguishable_and_names_the_limit() {
+        let line = line_of_exactly(MAX_SIGNAL_LINE + 1);
+        let mut r = BufReader::new(line.as_slice());
+        let err = read_signal(&mut r).expect_err("must refuse");
+        assert!(
+            !matches!(err, ProtoError::Malformed(_)),
+            "an over-long line is not a parse failure: {err:?}"
+        );
+        assert!(
+            !matches!(err, ProtoError::Io(_)),
+            "an over-long line is not an I/O failure: {err:?}"
+        );
+        let shown = err.to_string();
+        assert!(
+            shown.contains(&MAX_SIGNAL_LINE.to_string()),
+            "the refusal does not say where the wall is: {shown}"
+        );
+    }
+
+    /// Nothing about the cap disturbs the ordinary case: short lines, a
+    /// preamble, several messages in one stream. The control for everything
+    /// above.
+    #[test]
+    fn ordinary_short_lines_are_unaffected_by_the_cap() {
+        let mut input = String::from(REAL_WORLD_PREAMBLE);
+        input.push_str(&String::from_utf8(encoded(&every_variant())).unwrap());
+        let mut r = BufReader::new(input.as_bytes());
+        for _ in 0..5 {
+            read_signal(&mut r).expect("every variant still reads");
         }
     }
 }

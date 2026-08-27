@@ -177,6 +177,48 @@ impl std::fmt::Debug for SshChannel {
     }
 }
 
+/// How much of the child's stderr is worth keeping for a diagnostic.
+///
+/// `ssh` is spawned before anything about the far end has been established, so
+/// until it succeeds the length of its stderr is the *peer's* choice. 64 KiB is
+/// two orders of magnitude more than any real failure prints - a banner, a motd
+/// and "Permission denied" together are a few hundred bytes - and it turns a
+/// buffer the remote sizes into one we do.
+const STDERR_KEPT: usize = 64 * 1024;
+
+/// Read `r` to the end, retaining only its first `keep` bytes.
+///
+/// # Why it keeps reading after it stops keeping
+///
+/// Because the alternative deadlocks. Stopping the read at the cap leaves the
+/// pipe full and the child blocked on `write`, so the connection hangs with no
+/// error at all - strictly worse than the unbounded buffer the cap replaces.
+/// Draining costs nothing: the bytes are discarded as they arrive.
+///
+/// # Why the first bytes and not the last
+///
+/// A flood must not be able to evict the very thing stderr is kept for. `ssh`
+/// says why it failed early, so a tail buffer would let a chatty - or hostile -
+/// host push that reason out with padding of its own choosing.
+async fn drain_stderr<R>(r: &mut R, keep: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(n) => {
+                let room = keep.saturating_sub(kept.len());
+                if room > 0 {
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    }
+}
+
 impl SshChannel {
     /// Spawn `ssh <target> oxutrm host --serve` and take its pipes.
     pub async fn open(launcher: &SshLauncher, target: &str) -> Result<SshChannel, BootstrapError> {
@@ -216,14 +258,12 @@ impl SshChannel {
         let stderr = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&stderr);
         let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
             // Errors here are not worth reporting: stderr is diagnostic, and
             // losing it must never be the reason a working link fails.
-            if stderr_pipe.read_to_end(&mut buf).await.is_ok() {
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                if let Ok(mut guard) = sink.lock() {
-                    guard.push_str(&text);
-                }
+            let buf = drain_stderr(&mut stderr_pipe, STDERR_KEPT).await;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if let Ok(mut guard) = sink.lock() {
+                guard.push_str(&text);
             }
         });
 
@@ -337,4 +377,112 @@ fn trimmed(stderr: &str) -> String {
         .rev()
         .collect();
     format!("(earlier output elided) {tail}")
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::*;
+
+    /// A pipe that serves `head` bytes of `b'a'`, then `tail` bytes of `b'z'`,
+    /// then ends — and counts what it handed out.
+    ///
+    /// The two fills are what make "the first bytes" a checkable claim rather
+    /// than a length assertion: a drain that kept the *tail* would return the
+    /// right number of the wrong bytes.
+    struct Chatty {
+        head: usize,
+        tail: usize,
+        served: usize,
+    }
+
+    impl Chatty {
+        fn new(head: usize, tail: usize) -> Chatty {
+            Chatty {
+                head,
+                tail,
+                served: 0,
+            }
+        }
+
+        fn total(&self) -> usize {
+            self.head + self.tail
+        }
+    }
+
+    impl tokio::io::AsyncRead for Chatty {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            let total = me.head + me.tail;
+            let n = buf.remaining().min(total - me.served);
+            let filled = buf.initialize_unfilled_to(n);
+            for (i, slot) in filled.iter_mut().enumerate() {
+                *slot = if me.served + i < me.head { b'a' } else { b'z' };
+            }
+            buf.advance(n);
+            me.served += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stderr_is_kept_whole() {
+        let mut pipe = Chatty::new(100, 0);
+        let kept = drain_stderr(&mut pipe, STDERR_KEPT).await;
+        assert_eq!(kept, vec![b'a'; 100], "a short stderr must survive intact");
+    }
+
+    /// What a remote can make us hold is the peer's choice today. `ssh` is
+    /// spawned before anything about the far end has been established, so a
+    /// host that writes to stderr for ever grows this buffer for ever.
+    #[tokio::test]
+    async fn a_flood_of_stderr_is_capped_at_what_we_agreed_to_keep() {
+        const KEEP: usize = 4096;
+        let mut pipe = Chatty::new(KEEP, KEEP * 16);
+        let kept = drain_stderr(&mut pipe, KEEP).await;
+        assert_eq!(
+            kept.len(),
+            KEEP,
+            "the drain held {} bytes of a stderr the peer chose the length of",
+            kept.len()
+        );
+    }
+
+    /// The *first* bytes, not the last. A flood must not be able to evict the
+    /// diagnostic we keep stderr for: `ssh` says why it failed early, and a
+    /// tail buffer would let a chatty - or hostile - host push that reason out
+    /// with padding it chose itself.
+    #[tokio::test]
+    async fn the_bytes_kept_are_the_ones_that_arrived_first() {
+        const KEEP: usize = 4096;
+        let mut pipe = Chatty::new(KEEP, KEEP * 16);
+        let kept = drain_stderr(&mut pipe, KEEP).await;
+        assert!(
+            kept.iter().all(|&b| b == b'a'),
+            "the drain kept later bytes over earlier ones, so a flood can \
+             evict the reason a connection failed"
+        );
+    }
+
+    /// The property the whole task exists for, and the one a naive cap breaks.
+    ///
+    /// Stopping the read at the cap leaves the pipe full, the child blocked on
+    /// write, and the connection hung with no error at all - which is worse
+    /// than the unbounded buffer this cap replaces. So the drain must keep
+    /// reading to EOF and merely stop *retaining*.
+    #[tokio::test]
+    async fn the_pipe_is_drained_to_the_end_even_after_the_cap_is_reached() {
+        const KEEP: usize = 4096;
+        let mut pipe = Chatty::new(KEEP, KEEP * 16);
+        let total = pipe.total();
+        let _ = drain_stderr(&mut pipe, KEEP).await;
+        assert_eq!(
+            pipe.served, total,
+            "the drain stopped reading at the cap, so a chatty ssh fills the \
+             pipe, blocks on write, and the connection hangs with no error"
+        );
+    }
 }
