@@ -1,0 +1,265 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        type: choice
+        options:
+          - bugfix
+          - feature
+          - major
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify main branch
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Releases must be created from the main branch"
+            exit 1
+          fi
+
+      - name: Calculate new version
+        id: version
+        run: |
+          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1 || echo "v0.0.0")
+          if [ -z "$LATEST" ]; then
+            LATEST="v0.0.0"
+          fi
+          MAJOR=$(echo "$LATEST" | sed 's/v\([0-9]*\)\.\([0-9]*\)\.\([0-9]*\)/\1/')
+          MINOR=$(echo "$LATEST" | sed 's/v\([0-9]*\)\.\([0-9]*\)\.\([0-9]*\)/\2/')
+          PATCH=$(echo "$LATEST" | sed 's/v\([0-9]*\)\.\([0-9]*\)\.\([0-9]*\)/\3/')
+          case "${{ inputs.release_type }}" in
+            major)   NEW_VERSION="$((MAJOR+1)).0.0" ;;
+            feature) NEW_VERSION="${MAJOR}.$((MINOR+1)).0" ;;
+            bugfix)  NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+          esac
+          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "New version: ${NEW_VERSION}"
+
+      - name: Update Cargo.toml version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # The root `[package]` carries the only `^version = ` line in this
+          # file: `[workspace.package]` declares edition, rust-version and
+          # license but no version, and workspace dependencies are written
+          # `quinn = "0.11"` rather than as a `version` key. So this anchored
+          # substitution has exactly one target, and a `[workspace.package]
+          # version` added later would silently give it two -- which is why the
+          # count is checked rather than assumed.
+          MATCHES=$(grep -c '^version = ' Cargo.toml)
+          if [ "$MATCHES" != "1" ]; then
+            echo "::error::expected exactly one '^version = ' line in Cargo.toml, found ${MATCHES}"
+            exit 1
+          fi
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+
+          # The member crates keep their own versions and are deliberately left
+          # alone. Nothing here is published to crates.io, so their numbers are
+          # internal; the one number a user ever sees is the binary's.
+
+          # Cargo.lock records this package's own version too, so it has to move
+          # with Cargo.toml. If it does not, the release commit is internally
+          # inconsistent: dirty the moment anyone builds it.
+          #
+          # Not `--offline`: this job has never fetched the registry, and an
+          # offline resolve cannot find a single dependency. `--workspace` keeps
+          # it to the workspace's own entries -- no dependency is touched, which
+          # is what makes running it here safe.
+          cargo update --workspace
+
+          # Fail here rather than three jobs later if the lock did not take.
+          if ! grep -A1 '^name = "oxutrm"$' Cargo.lock | grep -qx "version = \"${VERSION}\""; then
+            echo "::error::Cargo.lock does not record version ${VERSION}"
+            exit 1
+          fi
+
+      - name: Update CHANGES.md
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          VERSION="${{ steps.version.outputs.version }}"
+          # Move the `## Unreleased` block (everything up to the next `## <version>`
+          # heading, or EOF) into a new `## <version> - <date>` section and reset
+          # Unreleased to empty subsections.
+          perl -i -0777 -pe '
+            s{^\#\# Unreleased\n(.*?)(?=\n\#\# |\z)}{
+              "## Unreleased\n\n### New\n\n### Changed\n\n### Fixed\n\n" .
+              "## '"$VERSION"' - '"$DATE"'\n$1"
+            }gmse' CHANGES.md
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGES.md
+          git commit -m "Release ${{ steps.version.outputs.tag }}"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin main --tags
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        # Pinned to the released version, not `main`: this build shape cannot be
+        # rehearsed on a developer's machine without a container engine, so it
+        # must not rest on a moving dependency.
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build binary
+        # **Static, on purpose, and it is not a preference.** The host half of
+        # every session is run on whatever machine the user sshes into, over a
+        # command line the user does not write -- so the binary has to be copied
+        # there and has to load there. A dynamically linked build does not: one
+        # linked against GLIBC_2.39 refuses to start on an Ubuntu 22.04 host at
+        # 2.35, for the sake of two symbols. Measured on 2026-08-28, and it is
+        # what stopped a working end-to-end test that day.
+        run: RUSTFLAGS="-C target-feature=+crt-static" cross build --release --bin oxutrm --target ${{ matrix.target }}
+
+      - name: Verify the binary is really static
+        # A tarball that only works on the machine that built it is worse than
+        # no tarball: it fails at the far end, in a session the user cannot see,
+        # and looks like a network fault. So this is asserted rather than
+        # assumed -- `crt-static` is a hint the linker is free to ignore.
+        run: |
+          BINARY="target/${{ matrix.target }}/release/oxutrm"
+          file "$BINARY"
+          if ! file "$BINARY" | grep -q 'static'; then
+            echo "::error::${BINARY} is not statically linked"
+            exit 1
+          fi
+          if command -v llvm-objdump >/dev/null && llvm-objdump -T "$BINARY" 2>/dev/null | grep -q GLIBC; then
+            echo "::error::${BINARY} still references glibc symbols"
+            exit 1
+          fi
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist staging/oxutrm
+          BINARY="target/${{ matrix.target }}/release/oxutrm"
+          ARCHIVE="oxutrm-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          cp "$BINARY" staging/oxutrm/
+          cp README.md CHANGES.md LICENSE staging/oxutrm/
+          tar -czvf "dist/${ARCHIVE}" -C staging oxutrm
+
+      - name: Build deb and rpm
+        run: |
+          cargo install cargo-deb --version '^3.7'
+          cargo install cargo-generate-rpm --version '^0.21'
+          # `--no-build` so both packages carry the very binary that was just
+          # verified static, rather than a fresh one built without `cross` and
+          # therefore against the runner's glibc. `--no-strip` keeps it
+          # identical to the one in the tarball.
+          cargo deb --no-build --no-strip --target ${{ matrix.target }}
+          cargo generate-rpm --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/debian/*.deb dist/
+          cp target/${{ matrix.target }}/generate-rpm/*.rpm dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxutrm-${{ matrix.target }}
+          path: dist/*
+
+  create-release:
+    name: Create GitHub Release
+    needs: [version, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: oxutrm-*
+          merge-multiple: true
+
+      - name: Extract release notes
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          # Print this version's section up to the next `## <version>` heading.
+          # Drop that trailing heading, but only if the last printed line IS
+          # one: for the final section in the file the range runs to EOF, where
+          # a blind `$d` would delete real content.
+          sed -n "/^## ${VERSION}/,/^## [0-9]/p" CHANGES.md | sed '${/^## [0-9]/d}' > release-notes.md
+
+          # Say what these files are for. Only one of the two halves is ever
+          # installed by hand: the other is run by ssh on the far machine, and
+          # a user who installs only locally gets "command not found" from a
+          # host they cannot see.
+          #
+          # Written with printf rather than an indented heredoc: inside a YAML
+          # block scalar the heredoc terminator has to reach column 0 after
+          # YAML strips the block indent, and getting that wrong swallows the
+          # rest of the step without failing it.
+          printf '%s\n' \
+            '' \
+            '## Installing' \
+            '' \
+            'oxutrm is one binary and it must be on **both** machines: the one you' \
+            'type on, and the one you connect to. `oxutrm <ssh-target>` runs' \
+            '`ssh <target> oxutrm host --serve` on the far end, so the far end needs' \
+            'it on a `PATH` that a non-interactive ssh will search.' \
+            '' \
+            'The binaries are statically linked, so they do not care which' \
+            'distribution or glibc version the far end runs.' \
+            '' \
+            'Linux only: oxutrm reads `/proc` to tell a live session from a stale' \
+            'one, and uses `fork`, `setsid`, a pty and a Unix socket. There is no' \
+            'Windows or macOS build.' \
+            >> release-notes.md
+
+          echo "Release notes:"; cat release-notes.md
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: oxutrm ${{ needs.version.outputs.tag }}
+          body_path: release-notes.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

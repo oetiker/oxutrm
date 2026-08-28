@@ -41,21 +41,54 @@ The emulator on both ends is the load-bearing difference. Mosh guesses what the
 screen will look like; oxutrm knows, because the client renders from
 authoritative state rather than approximating it.
 
+## Installing
+
+**oxutrm has to be on both machines** — the one you type on and the one you
+connect to. `oxutrm <ssh-target>` runs `ssh <target> oxutrm host --serve` on the
+far end, so the far end needs it on a `PATH` that a *non-interactive* ssh
+searches. `ssh <target> command -v oxutrm` is the check; a login shell's `PATH`
+is not the one that matters.
+
+Releases carry a `.deb`, an `.rpm` and a `.tar.gz` for `x86_64` and `aarch64`.
+
+```
+sudo dpkg -i oxutrm_<version>_amd64.deb          # Debian, Ubuntu
+sudo rpm -i oxutrm-<version>.x86_64.rpm          # Fedora, RHEL, SUSE
+tar xzf oxutrm-<version>-x86_64-unknown-linux-musl.tar.gz   # anything else
+```
+
+The binaries are **statically linked**, which matters here more than it usually
+does: the far end is a machine you did not choose and cannot rebuild for. A
+dynamically linked binary built on a current distribution refuses to start on an
+older one — glibc 2.39 against a host at 2.35 is enough — and it fails inside a
+session you cannot see. A static binary has no such argument with its
+destination.
+
+**Linux only.** oxutrm reads `/proc` to tell a live session from a stale one,
+and uses `fork`, `setsid`, a pty and a Unix socket. There is no Windows build
+and no macOS build.
+
 ## Using it
 
 ```
+oxutrm <ssh-target>          # connect to a session there
+oxutrm host --list           # sessions on this machine
 oxutrm loopback              # both halves in one process, no network
-oxutrm loopback --help
 ```
 
-`loopback` is the piece that works end to end today: a shell on a PTY, through
-the emulator, diffed, encoded to bytes, decoded, and painted — everything a
-real session does except the transport.
+`oxutrm <ssh-target>` works: it drives ssh, races the connection ladder, brings
+up QUIC on whichever rung wins, and hands you the shell. The session survives
+the client going away — `oxutrm host --list` shows it as detachable — though
+**reattaching to it does not work yet**, so a session you leave is a session you
+can see but not return to.
+
+`loopback` runs both halves in one process with no network in between: a shell
+on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.
+It stays the fastest way to exercise the terminal core.
 
 ```
-oxutrm <ssh-target>          # connect, or reattach   (not yet wired)
-oxutrm host --serve          # the remote half         (not yet wired)
-oxutrm host --list           # sessions on this machine (not yet wired)
+oxutrm host --serve          # the remote half; spawned over ssh, not by hand
+oxutrm host --attach <id>    # reattach                 (not yet wired)
 ```
 
 oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes

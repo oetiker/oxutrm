@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # The same three stages as `make check`, in the same order, so a failure
+      # here is reproducible with one command locally.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Capped at 4 the way the Makefile caps it. Several tests here bind
+      # sockets, spawn shells on ptys and fork; letting the runner's full
+      # parallelism loose on them turns real failures into timing noise.
+      - name: Run tests
+        run: cargo test --workspace --jobs 4 -- --test-threads 4
+
+  msrv:
+    name: MSRV 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The floor is not decoration: alacritty_terminal 0.26 is edition 2024
+      # with MSRV 1.85, so it applies to the whole build. Declaring it in
+      # Cargo.toml and never testing it is how it quietly rises.
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets
+
+  musl:
+    name: Static musl ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pinned, not `main`: the release depends on this build shape and a
+      # cross-compile is the thing least likely to be rehearsed locally.
+      - name: Install cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      # This is what the release ships, so it is compiled on every pull
+      # request rather than discovered at release time. `zstd-sys` needs a C
+      # compiler for the target and `ring` needs the right assembler; cross's
+      # images carry both, and a plain `cargo build --target` on the runner
+      # carries neither.
+      - name: Build
+        run: RUSTFLAGS="-C target-feature=+crt-static" cross build --release --bin oxutrm --target ${{ matrix.target }}

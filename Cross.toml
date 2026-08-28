@@ -1,0 +1,24 @@
+# Images for `cross`, pinned deliberately.
+#
+# `cross` 0.2.5's default images are old enough that a build script compiled by
+# a current rustc will not run inside them: the script is a HOST binary, it
+# links the container's glibc, and that glibc predates the symbols rustc now
+# emits. Measured on 2026-08-28, on `aarch64-unknown-linux-musl`:
+#
+#     build-script-build: /lib/x86_64-linux-gnu/libc.so.6:
+#         version `GLIBC_2.28' not found (required by build-script-build)
+#
+# The `:main` images are built from cross's own default branch against a modern
+# base. They are named here rather than left to the default so that the failure
+# above cannot come back silently on a runner, and so the two targets are built
+# in images that are actually the same generation.
+#
+# The x86_64 target does not need this today -- its default image is new enough
+# -- but it is pinned for the same reason its sibling is: the release ships
+# both, and two targets on two different image generations is a difference
+# nobody would look for.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
