@@ -67,16 +67,17 @@ jobs:
         run: cargo test --workspace --jobs 4 -- --test-threads 4
 
   msrv:
-    name: MSRV 1.85
+    name: MSRV 1.96
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # The floor is not decoration: alacritty_terminal 0.26 is edition 2024
-      # with MSRV 1.85, so it applies to the whole build. Declaring it in
-      # Cargo.toml and never testing it is how it quietly rises.
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85
+      # The floor is not decoration: declaring a version in Cargo.toml and
+      # never testing it is how it quietly rises. It rose here -- `rcgen`
+      # pulls `time`, which now needs 1.88 -- and this job is what noticed.
+      # Keep this number and `workspace.package.rust-version` in step.
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
 
       - name: Cargo check
         run: cargo check --workspace --all-targets

@@ -59,11 +59,12 @@ fn row_runs(target: &[Cell], base: Option<&[Cell]>) -> Vec<Run> {
 
     while col < target.len() {
         // Skip over cells that already match.
-        if let Some(base) = base {
-            if col < base.len() && target[col] == base[col] {
-                col += 1;
-                continue;
-            }
+        if let Some(base) = base
+            && col < base.len()
+            && target[col] == base[col]
+        {
+            col += 1;
+            continue;
         }
 
         // A maximal span of changed cells, run-length encoded within itself.

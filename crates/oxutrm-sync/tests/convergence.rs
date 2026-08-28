@@ -228,11 +228,11 @@ proptest! {
                     }
                 }
             }
-            if !matches!(how, Delivery::Delay) {
-                if let Some(old) = held.take() {
-                    // The delayed frame now arrives AFTER a newer one.
-                    to_deliver.push(old);
-                }
+            if !matches!(how, Delivery::Delay)
+                && let Some(old) = held.take()
+            {
+                // The delayed frame now arrives AFTER a newer one.
+                to_deliver.push(old);
             }
 
             for f in to_deliver {
@@ -378,10 +378,10 @@ proptest! {
                     }
                 }
             }
-            if !matches!(how, Delivery::Delay) {
-                if let Some(old) = held.take() {
-                    to_deliver.push(old);
-                }
+            if !matches!(how, Delivery::Delay)
+                && let Some(old) = held.take()
+            {
+                to_deliver.push(old);
             }
 
             for f in to_deliver {

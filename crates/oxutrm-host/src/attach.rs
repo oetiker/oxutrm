@@ -141,7 +141,7 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
     for m in sessions {
         out.push_str(&format!(
             "{}  {:>7}  {:>3}x{:<3}  attach {}  {}  {}\n",
-            &m.session_id,
+            m.session_id,
             m.pid,
             m.size.cols,
             m.size.rows,

@@ -11,9 +11,18 @@ members = [
 
 [workspace.package]
 edition = "2024"
-# alacritty_terminal 0.26 is edition 2024 with MSRV 1.85, so that floor applies
-# to the whole build.
-rust-version = "1.85"
+# The floor was 1.85 -- alacritty_terminal 0.26's own MSRV -- and the
+# dependency tree walked past it: `rcgen` pulls `time` 0.3.55, which needs
+# 1.88, so the CI job that checks this failed on a version nothing could build
+# any more. Rather than pin `time` back and fight the same battle every few
+# months, the floor moves up.
+#
+# 1.96 and not the newest stable (1.98 at the time of writing, which is what
+# the other CI jobs use) because it is the toolchain oxutrm is developed on:
+# declaring a version the maintainer's own `cargo build` would refuse buys
+# nothing. It is high enough for every dependency now in the lock, and high
+# enough for `ruzstd` 0.9 (1.87) whenever that is wanted.
+rust-version = "1.96"
 license = "Apache-2.0"
 
 # Declared once here, used by every member. Versions come from the interface
@@ -57,6 +66,8 @@ tokio = { version = "1", features = [
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 0.9 needs rustc 1.87 and is now within the floor; the pin stays at 0.8 until
+# somebody has a reason to move it, not because it is blocked.
 ruzstd = "0.8"
 # The `serde` feature is required: `Attrs` derives Serialize/Deserialize
 # inside the bitflags! macro, which needs the generated internal type to

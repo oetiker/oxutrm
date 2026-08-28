@@ -36,7 +36,7 @@ pub fn is_stun(datagram: &[u8]) -> bool {
     // The length field counts attribute bytes only, and attributes are padded
     // to a multiple of four, so a length that is not is a malformed message.
     let len = u16::from_be_bytes([datagram[2], datagram[3]]) as usize;
-    if len % 4 != 0 {
+    if !len.is_multiple_of(4) {
         return false;
     }
     // And it must actually describe the datagram in hand.

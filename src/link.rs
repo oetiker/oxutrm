@@ -640,10 +640,10 @@ mod tests {
     async fn arrived(source: &mut FrameSource, my_state: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if let Some(f) = source.try_recv() {
-                if f.my_state == my_state {
-                    return;
-                }
+            if let Some(f) = source.try_recv()
+                && f.my_state == my_state
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
