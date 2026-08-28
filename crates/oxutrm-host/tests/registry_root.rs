@@ -20,7 +20,52 @@ fn env(xdg: Option<&str>, home: Option<&str>, linger: Option<bool>) -> RootEnv {
         home: home.map(PathBuf::from),
         override_dir: None,
         linger,
+        runtime_dirs_exist: true,
     }
+}
+
+/// The whole decision table above describes a system that HAS runtime
+/// directories. macOS has none, and the difference is not cosmetic: every
+/// branch that falls back also explains itself, and on a Mac that explanation
+/// would name `XDG_RUNTIME_DIR` and tell the user to run `loginctl`, neither
+/// of which exists there. It would be printed on every session.
+#[test]
+fn a_system_without_runtime_directories_falls_back_silently() {
+    let root = choose_registry_root(&RootEnv {
+        xdg_runtime_dir: None,
+        home: Some(PathBuf::from("/Users/u")),
+        override_dir: None,
+        linger: None,
+        runtime_dirs_exist: false,
+    })
+    .expect("choose");
+
+    assert_eq!(root.kind, RegistryRootKind::StateDir);
+    assert_eq!(root.base, PathBuf::from("/Users/u/.local/state"));
+    assert!(
+        root.warning.is_none(),
+        "there is nothing to warn about and nothing to advise: {:?}",
+        root.warning
+    );
+}
+
+/// And it stays silent even if something set the variable anyway: without a
+/// way to ask whether that directory outlives the login, oxutrm cannot trust
+/// it — and on a system with no such concept there is no question to answer,
+/// so there is nothing to report either.
+#[test]
+fn a_runtime_directory_set_by_hand_is_ignored_where_the_concept_does_not_exist() {
+    let root = choose_registry_root(&RootEnv {
+        xdg_runtime_dir: Some(PathBuf::from("/tmp/runtime")),
+        home: Some(PathBuf::from("/Users/u")),
+        override_dir: None,
+        linger: None,
+        runtime_dirs_exist: false,
+    })
+    .expect("choose");
+
+    assert_eq!(root.base, PathBuf::from("/Users/u/.local/state"));
+    assert!(root.warning.is_none(), "{:?}", root.warning);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +184,7 @@ async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed()
         home: Some(fake_home.clone()),
         override_dir: None,
         linger: Some(false),
+        runtime_dirs_exist: true,
     })
     .expect("choose");
     assert_eq!(chosen.kind, RegistryRootKind::StateDir);

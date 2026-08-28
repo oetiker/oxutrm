@@ -43,7 +43,7 @@ pub mod registry;
 pub mod signalling;
 pub mod ssh;
 
-pub use daemon::{Detached, daemonize, daemonize_session, detach_process, sever_from_ssh};
+pub use daemon::{Detached, FD_DIRS, daemonize, daemonize_session, detach_process, sever_from_ssh};
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
 pub use ladder::LadderPlan;
 pub use registry::{

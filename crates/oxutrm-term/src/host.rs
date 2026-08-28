@@ -1077,21 +1077,33 @@ mod tests {
         }
     }
 
+    /// Is a process with this pid still there?
+    ///
+    /// `kill(pid, 0)` and not `/proc/<pid>`, so this test means the same thing
+    /// on macOS, which has no `/proc` and would otherwise report every child
+    /// as already dead — passing the assertion below for the wrong reason
+    /// while the leak it guards against went unnoticed.
+    ///
+    /// The two agree on the case that matters here. `Pty`'s `Drop` kills the
+    /// child **and reaps it**, so after the drop there is no zombie for either
+    /// check to see.
+    fn running(pid: u32) -> bool {
+        rustix::process::Pid::from_raw(pid as i32)
+            .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+    }
+
     #[test]
     fn dropping_the_terminal_kills_the_child() {
         // std's Child does not kill on drop. Without an explicit kill, every
         // abandoned session leaves a shell holding a pty nobody reads.
         let t = sh("yes oxutrm-orphan", size());
         let pid = t.child_pid();
-        assert!(
-            std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "the child should be running"
-        );
+        assert!(running(pid), "the child should be running");
         drop(t);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if !running(pid) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));

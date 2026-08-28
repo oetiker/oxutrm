@@ -102,13 +102,14 @@ description = "A remote terminal that survives bad networks, changing IP address
 # Packaging
 # ---------------------------------------------------------------------------
 #
-# Linux only, and that is a property of the program rather than a choice about
-# effort. `registry.rs` reads `/proc/<pid>/stat` and `/proc/stat` to tell a live
-# session from a stale entry, and `daemon.rs` enumerates `/proc/self/fd` and
-# says so in its own error message: closing a guessed range of descriptors is
-# how one survives a detach. Add the pty, `fork`, `setsid` and the session's
-# Unix socket, and there is no Windows port to attempt and no macOS build that
-# would do anything but fail at run time, which is worse than not shipping one.
+# Linux only, and that is now a choice about evidence rather than a property of
+# the program. The pty, `fork`, `setsid` and the session's Unix socket rule out
+# Windows outright. macOS is a different case: the two Linux-only calls --
+# enumerating this process's descriptors, and asking when a pid started -- both
+# have a macOS implementation as of 2026-08-28, and four of the six crates
+# type-check for `aarch64-apple-darwin`. But nothing has ever been run on a
+# Mac, so no macOS package is generated here. Shipping one on the strength of a
+# type check would be worse than not shipping it.
 #
 # Both targets are **static musl**, and that is not a preference either. The
 # host half is copied to whatever machine the user sshes into, and a binary

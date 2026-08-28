@@ -64,9 +64,12 @@ older one — glibc 2.39 against a host at 2.35 is enough — and it fails insid
 session you cannot see. A static binary has no such argument with its
 destination.
 
-**Linux only.** oxutrm reads `/proc` to tell a live session from a stale one,
-and uses `fork`, `setsid`, a pty and a Unix socket. There is no Windows build
-and no macOS build.
+**Unix only, and only Linux is shipped.** oxutrm uses `fork`, `setsid`, a pty
+and a Unix socket, so there is no Windows build. The two places that used to be
+Linux-only — enumerating this process's descriptors, and asking when a pid
+started — now have a macOS implementation, and everything but the QUIC crates
+type-checks for `aarch64-apple-darwin`. Nothing has ever been *run* on a Mac,
+and no macOS package is built, so treat it as unproven rather than supported.
 
 ## Using it
 

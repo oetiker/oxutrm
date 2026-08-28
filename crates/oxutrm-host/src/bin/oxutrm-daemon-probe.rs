@@ -235,7 +235,36 @@ fn write_line(fd: i32, line: &str) -> String {
     }
 }
 
-/// Enumerate `/proc/self/fd` and write the report.
+/// What a descriptor points at, in a form the test can compare.
+///
+/// Linux answers with a symlink inside the fd directory. macOS's `/dev/fd`
+/// entries are not symlinks at all, and `fcntl(F_GETPATH)` is the supported
+/// question there — without this the probe would report `?` for every
+/// descriptor on a Mac and the `/dev/null` assertions would fail for a reason
+/// that has nothing to do with detaching.
+#[cfg(target_os = "macos")]
+fn target_of(_dir: &str, fd: i32) -> String {
+    let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is PATH_MAX bytes, which is the most F_GETPATH writes.
+    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        // A pipe or a socket has no path. Only /dev/null may survive, so this
+        // text is only ever read out of a failure message.
+        return "?".to_string();
+    }
+    // SAFETY: on success the kernel wrote a NUL-terminated path into `buf`.
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn target_of(dir: &str, fd: i32) -> String {
+    std::fs::read_link(format!("{dir}/{fd}"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Enumerate this process's descriptors and write the report.
 ///
 /// Written last and in one call, so the test never reads half a report. The
 /// descriptor for the report file is opened after the enumeration, so it does
@@ -255,13 +284,35 @@ fn write_report(report: &str, held: &[(String, i32)], extra: &[String]) {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "?".to_string())
     ));
-    for entry in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd") {
-        let entry = entry.expect("fd entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        let target = std::fs::read_link(entry.path())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "?".to_string());
-        lines.push(format!("fd={n} -> {target}"));
+    // The same candidate list the product uses, for the same reason: one of
+    // the two exists on Linux and the other on macOS.
+    let mut found: Option<(&str, Vec<i32>)> = None;
+    for dir in oxutrm_host::FD_DIRS {
+        if let Ok(listing) = std::fs::read_dir(dir) {
+            found = Some((
+                dir,
+                listing
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+                    .collect(),
+            ));
+            break;
+        }
+    }
+    let (dir, mut listed) = found.expect("no directory of open descriptors could be read");
+    listed.sort_unstable();
+    for fd in listed {
+        // The listing above held a descriptor of its own, and it is shut by
+        // now. Reporting that number would name a survivor that does not
+        // exist -- and on Linux it used to be excluded by a filter on targets
+        // beginning with `/proc/`, which said nothing on a system where the
+        // directory is `/dev/fd`.
+        // SAFETY: `F_GETFD` reads a flag and changes nothing; an invalid
+        // descriptor is reported, not undefined.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            continue;
+        }
+        lines.push(format!("fd={fd} -> {}", target_of(dir, fd)));
     }
 
     let mut f = std::fs::File::create(report).expect("create the report");

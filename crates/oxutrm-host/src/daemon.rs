@@ -172,34 +172,72 @@ pub fn detach_process() -> anyhow::Result<Detached> {
     })
 }
 
+/// Where a process's own open descriptors can be enumerated, in the order
+/// they are tried.
+///
+/// `/dev/fd` first because it is the one **both** systems have: on macOS it is
+/// a devfs directory and the only answer there is, and on Linux it is the
+/// conventional symlink to `/proc/self/fd`. The Linux path is kept as a second
+/// candidate rather than dropped, because `/dev/fd` is a userspace convention
+/// there — a stripped container image that never created it would otherwise
+/// lose the ability to detach, and the static musl binary this ships as is
+/// exactly what gets copied into one.
+///
+/// Two candidates and not a `cfg`: a `cfg` would make the macOS path
+/// unreachable from the Linux test suite, and being able to run it here is the
+/// entire reason this port is cheap.
+///
+/// Public for the same reason [`daemonize`] is: the descriptor probe in
+/// `tests/daemonize.rs` has to look at the same descriptors from outside, and
+/// a second copy of this list in the fixture would be free to drift away from
+/// the one the product uses.
+pub const FD_DIRS: [&str; 2] = ["/dev/fd", "/proc/self/fd"];
+
 /// Every descriptor this process currently holds.
 ///
-/// `/proc/self/fd` and not a guessed range: closing a guessed range is how a
+/// An enumeration and not a guessed range: closing a guessed range is how a
 /// descriptor survives a detach, and `tests/daemonize.rs` exists because that
 /// failure is invisible from inside the process.
 fn open_descriptors() -> anyhow::Result<Vec<i32>> {
-    let dir = std::fs::read_dir("/proc/self/fd").context(
-        "reading /proc/self/fd; oxutrm needs /proc mounted to detach safely, \
-         because closing a guessed range of descriptors is how one survives",
-    )?;
-    let listed: Vec<i32> = dir
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
-        .collect();
-    drop_the_listing_handle();
+    descriptors_in(&FD_DIRS)
+}
 
-    // The enumeration lists ITS OWN directory handle, and that handle is shut
-    // as soon as the iterator drops. Keeping the number would be a bug with a
-    // long fuse: this list is closed much later, and by then the kernel has
-    // handed that very number to the next thing opened -- in a real session,
-    // the UDP socket. So each number is checked to be open still. Nothing else
-    // opens a descriptor between the two, so exactly one number can fail, and
-    // filtering rather than naming it keeps this free of a special case.
-    //
-    // This was measured, not foreseen: with the stale number left in, the file
-    // the probe opens after detaching came back `EBADF` from the far side of
-    // the sever.
-    Ok(listed.into_iter().filter(|&fd| is_open(fd)).collect())
+/// The body of [`open_descriptors`], against a given list of candidates.
+///
+/// Taking the directories as an argument is what lets the tests drive both the
+/// fall-through and the stale-number filter with real directories instead of
+/// asserting on the one path this machine happens to have.
+fn descriptors_in(dirs: &[&str]) -> anyhow::Result<Vec<i32>> {
+    for dir in dirs {
+        let Ok(listing) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let listed: Vec<i32> = listing
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+            .collect();
+        drop_the_listing_handle();
+
+        // The enumeration lists ITS OWN directory handle, and that handle is
+        // shut as soon as the iterator drops. Keeping the number would be a
+        // bug with a long fuse: this list is closed much later, and by then
+        // the kernel has handed that very number to the next thing opened --
+        // in a real session, the UDP socket. So each number is checked to be
+        // open still. Nothing else opens a descriptor between the two, so
+        // exactly one number can fail, and filtering rather than naming it
+        // keeps this free of a special case.
+        //
+        // This was measured, not foreseen: with the stale number left in, the
+        // file the probe opens after detaching came back `EBADF` from the far
+        // side of the sever.
+        return Ok(listed.into_iter().filter(|&fd| is_open(fd)).collect());
+    }
+
+    Err(anyhow!(
+        "none of {dirs:?} could be read; oxutrm needs one of them to detach \
+         safely, because closing a guessed range of descriptors is how one \
+         survives"
+    ))
 }
 
 /// Nothing. The `read_dir` iterator above is dropped at the end of its own
@@ -375,8 +413,9 @@ pub fn daemonize() -> anyhow::Result<()> {
 fn close_inherited_descriptors(inherited: &[i32]) {
     for &fd in inherited {
         if fd > 2 {
-            // SAFETY: a descriptor number enumerated from /proc/self/fd inside
-            // `detach_process`, before this process opened anything of its own.
+            // SAFETY: a descriptor number enumerated by `open_descriptors`
+            // inside `detach_process`, before this process opened anything of
+            // its own.
             // Each number appears once, so there is no double close, and
             // nothing this process opened afterwards is in the list.
             unsafe { libc::close(fd) };
@@ -436,4 +475,89 @@ pub fn daemonize_session(_permit: crate::DetachPermit) -> anyhow::Result<()> {
     // purpose -- there is nothing to read from it, because its whole content is
     // the fact that it exists.
     daemonize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd as _;
+
+    /// A number no descriptor can have: the default soft `RLIMIT_NOFILE` on
+    /// every platform oxutrm targets is orders of magnitude below it. The
+    /// tests that use it assert it is closed first, so a machine that somehow
+    /// proved this wrong would fail loudly rather than pass for the wrong
+    /// reason.
+    const IMPOSSIBLE_FD: i32 = 1_000_000;
+
+    #[test]
+    fn the_first_candidate_is_the_one_macos_has() {
+        // `/proc/self/fd` does not exist on macOS, and `/dev/fd` exists on
+        // both. Order is the whole portability decision, so it is pinned here
+        // rather than only described above: a reordering that put the Linux
+        // path first would leave every test on this machine green and break
+        // `host --serve` on a Mac at the first detach.
+        assert_eq!(FD_DIRS[0], "/dev/fd");
+    }
+
+    #[test]
+    fn the_portable_directory_lists_this_processes_descriptors() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fd = file.as_raw_fd();
+
+        let listed = descriptors_in(&["/dev/fd"]).expect("/dev/fd must be readable");
+
+        assert!(
+            listed.contains(&fd),
+            "a descriptor this process holds must appear in {listed:?}"
+        );
+        for std_fd in 0..=2 {
+            assert!(
+                listed.contains(&std_fd),
+                "fd {std_fd} missing from {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_falls_through_to_the_next() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fd = file.as_raw_fd();
+
+        let listed = descriptors_in(&["/oxutrm/no/such/directory", "/dev/fd"])
+            .expect("the second candidate answers");
+
+        assert!(listed.contains(&fd), "{listed:?}");
+    }
+
+    #[test]
+    fn a_number_that_is_no_longer_open_is_not_reported() {
+        // The enumeration lists its own directory handle, and that handle is
+        // shut before the list is used. Keeping the number would hand the
+        // sever a descriptor the kernel has since given to something else --
+        // in a real session, the UDP socket ICE punched. Measured as `EBADF`
+        // from the far side of the sever before the filter existed.
+        assert!(
+            !is_open(IMPOSSIBLE_FD),
+            "the premise of this test is that fd {IMPOSSIBLE_FD} cannot be open"
+        );
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(dir.path().join("0"), "").expect("naming an open descriptor");
+        std::fs::write(dir.path().join(IMPOSSIBLE_FD.to_string()), "")
+            .expect("naming a closed one");
+
+        let listed =
+            descriptors_in(&[dir.path().to_str().expect("utf-8")]).expect("the directory reads");
+
+        assert!(listed.contains(&0), "{listed:?}");
+        assert!(!listed.contains(&IMPOSSIBLE_FD), "{listed:?}");
+    }
+
+    #[test]
+    fn when_nothing_can_be_read_the_error_names_every_candidate() {
+        let err = descriptors_in(&["/oxutrm/no/such/directory", "/oxutrm/nor/this/one"])
+            .expect_err("no candidate can answer");
+        let text = format!("{err:#}");
+        assert!(text.contains("/oxutrm/no/such/directory"), "{text}");
+        assert!(text.contains("/oxutrm/nor/this/one"), "{text}");
+    }
 }

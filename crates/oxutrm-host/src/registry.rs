@@ -146,11 +146,21 @@ pub const PID_REUSE_SLACK_SECS: u64 = 5;
 
 /// Seconds since the epoch at which the process holding `pid` started.
 ///
-/// `None` when there is no such process, or when `/proc` cannot answer.
+/// `None` when there is no such process, or when the system will not say.
+/// Losing the answer is not fatal in either direction: [`entry_is_stale`]
+/// treats `None` as "keep the entry", because listing a dead session is much
+/// less bad than deleting a live one's socket.
+///
+/// There is no portable way to ask this, so there is one implementation per
+/// system and they agree only on the return type.
+///
+/// # Linux
+///
 /// `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot, and
 /// `/proc/stat`'s `btime` turns that into wall-clock time. The command name in
 /// field 2 may itself contain spaces and parentheses — `sh -c 'exec -a "a) b"'`
 /// is enough to do it — so parsing starts after the **last** `)`.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn process_start_unix(pid: u32) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -171,6 +181,67 @@ pub fn process_start_unix(pid: u32) -> Option<u64> {
     Some(boot + ticks / hz)
 }
 
+/// macOS has no `/proc`. `proc_pidinfo(PROC_PIDTBSDINFO)` is the supported
+/// question, and it answers with a `proc_bsdinfo` whose `pbi_start_tvsec` is
+/// already **seconds since the epoch** — so unlike Linux there is no boot time
+/// to add and no clock-tick conversion to get wrong.
+///
+/// `sysctl(KERN_PROC_PID)` would answer the same question and is what the port
+/// was planned around, but `libc` does not define `kinfo_proc` for Apple
+/// targets, so taking that route would mean declaring the kernel's struct
+/// layout here and owning it forever. This one is typed by `libc`.
+///
+/// A process belonging to another user can refuse to answer, and that is
+/// harmless: see the `None` case in [`entry_is_stale`].
+///
+/// **Compile-verified against `aarch64-apple-darwin`, never run** — nobody on
+/// the project has a Mac yet. Its failure mode if it is wrong is the mild one:
+/// a `None` costs the pid-reuse guard and nothing else.
+#[cfg(target_os = "macos")]
+// The rest of this crate is `deny(unsafe_code)` and stays that way. This is
+// one FFI call with a scalar return, kept to the smallest scope that can hold
+// it rather than a module-wide allowance.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn process_start_unix(pid: u32) -> Option<u64> {
+    let pid = i32::try_from(pid).ok()?;
+    let want = std::mem::size_of::<libc::proc_bsdinfo>();
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `info` is an owned local of exactly the type this flavour
+    // reports and of exactly the size passed as `buffersize`, and it is not
+    // aliased. `proc_pidinfo` writes at most that many bytes and returns how
+    // many it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast::<libc::c_void>(),
+            i32::try_from(want).ok()?,
+        )
+    };
+
+    // A pid that is gone, or one this user may not inspect, reports a short
+    // write rather than filling the struct. Anything less than the whole
+    // thing means the fields below were never written, so it must not be read
+    // as "started in 1970" -- that would make every entry look recycled.
+    if written != i32::try_from(want).ok()? {
+        return None;
+    }
+    Some(info.pbi_start_tvsec)
+}
+
+/// Everywhere else. The pid-reuse guard is lost — [`entry_is_stale`] keeps the
+/// entry — and nothing else changes. This arm exists so that a port to another
+/// Unix compiles and runs before anyone writes its `sysctl` call, rather than
+/// failing at the link stage with no clue why.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn process_start_unix(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Is this registry entry dead wood?
 ///
 /// Stale when the pid is gone, or when the pid now belongs to an unrelated
@@ -183,8 +254,9 @@ pub fn entry_is_stale(meta: &SessionMeta) -> bool {
     match process_start_unix(meta.pid) {
         // Started well after the entry was written: the pid was recycled.
         Some(start) => start > meta.created_unix.saturating_add(PID_REUSE_SLACK_SECS),
-        // The pid exists but `/proc` will not say more. Keep it: deleting a
-        // live session's socket is much worse than listing a dead one.
+        // The pid exists but the system will not say when it started. Keep
+        // it: deleting a live session's socket is much worse than listing a
+        // dead one.
         None => false,
     }
 }
@@ -382,6 +454,19 @@ pub struct RootEnv {
     pub override_dir: Option<PathBuf>,
     /// `None` means persistence could not be determined.
     pub linger: Option<bool>,
+    /// Whether this system has runtime directories at all.
+    ///
+    /// `false` on macOS, and the difference is not cosmetic. Every fallback
+    /// below also explains itself, and on a Mac that explanation would name
+    /// `XDG_RUNTIME_DIR` and tell the user to run `loginctl enable-linger` —
+    /// a variable that is never set and a program that is not installed — on
+    /// every single session. Where the concept does not exist there is nothing
+    /// to prefer, nothing to warn about and nothing to advise: the state
+    /// directory is simply where sessions live.
+    ///
+    /// A field rather than a `cfg` in [`choose_registry_root`], so the whole
+    /// decision table stays testable from either platform.
+    pub runtime_dirs_exist: bool,
 }
 
 /// `$HOME/.local/state`, per the XDG base directory specification.
@@ -409,7 +494,7 @@ pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
         });
     }
 
-    let fallback = |reason: &str| -> anyhow::Result<RegistryRoot> {
+    let fallback = |reason: Option<&str>| -> anyhow::Result<RegistryRoot> {
         let home = env.home.as_ref().ok_or_else(|| {
             anyhow!(
                 "neither a usable XDG_RUNTIME_DIR nor a HOME, so there is nowhere \
@@ -420,16 +505,29 @@ pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
         Ok(RegistryRoot {
             base: state_base(home),
             kind: RegistryRootKind::StateDir,
-            warning: Some(format!(
-                "oxutrm: {reason}, so sessions are recorded in {} instead of \
-                 XDG_RUNTIME_DIR. Sessions will survive, but on a networked home \
-                 directory the session socket may be unreliable. To use the \
-                 runtime directory instead, run `loginctl enable-linger $USER` on \
-                 this host; to choose the location yourself, set OXUTRM_STATE_DIR.",
-                state_base(home).join(REGISTRY_SUBDIR).display()
-            )),
+            warning: reason.map(|reason| {
+                format!(
+                    "oxutrm: {reason}, so sessions are recorded in {} instead of \
+                     XDG_RUNTIME_DIR. Sessions will survive, but on a networked \
+                     home directory the session socket may be unreliable. To use \
+                     the runtime directory instead, run `loginctl enable-linger \
+                     $USER` on this host; to choose the location yourself, set \
+                     OXUTRM_STATE_DIR.",
+                    state_base(home).join(REGISTRY_SUBDIR).display()
+                )
+            }),
         })
     };
+
+    // Nothing to prefer and nothing to explain. Note that this ignores an
+    // `XDG_RUNTIME_DIR` somebody set by hand: on a system with no runtime
+    // directories there is no way to ask whether that one outlives the login,
+    // and an unverifiable runtime directory is exactly what the table below
+    // refuses everywhere else. `OXUTRM_STATE_DIR` remains the way to say where
+    // sessions go, and it was already handled above.
+    if !env.runtime_dirs_exist {
+        return fallback(None);
+    }
 
     match (&env.xdg_runtime_dir, env.linger) {
         (Some(dir), Some(true)) => Ok(RegistryRoot {
@@ -437,14 +535,14 @@ pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
             kind: RegistryRootKind::RuntimeDir,
             warning: None,
         }),
-        (Some(_), Some(false)) => fallback(
+        (Some(_), Some(false)) => fallback(Some(
             "lingering is off for this user, so XDG_RUNTIME_DIR is destroyed at \
              logout and a detached session would become unreachable",
-        ),
-        (Some(_), None) => {
-            fallback("whether XDG_RUNTIME_DIR survives logout could not be determined")
-        }
-        (None, _) => fallback("XDG_RUNTIME_DIR is not set"),
+        )),
+        (Some(_), None) => fallback(Some(
+            "whether XDG_RUNTIME_DIR survives logout could not be determined",
+        )),
+        (None, _) => fallback(Some("XDG_RUNTIME_DIR is not set")),
     }
 }
 
@@ -473,6 +571,10 @@ pub fn linger_enabled(uid: u32) -> Option<bool> {
 pub fn read_root_env() -> RootEnv {
     let uid = rustix::process::getuid().as_raw();
     RootEnv {
+        // The one place the platform is asked. macOS has neither the variable
+        // nor `loginctl`; every other Unix oxutrm runs on is systemd-shaped
+        // enough for the table in `choose_registry_root` to apply.
+        runtime_dirs_exist: !cfg!(target_os = "macos"),
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
@@ -490,9 +592,11 @@ pub fn resolve_registry_root() -> anyhow::Result<RegistryRoot> {
     choose_registry_root(&read_root_env())
 }
 
-/// `sockaddr_un::sun_path` holds 108 bytes including the terminating NUL, and a
-/// long home directory can overflow it. Checked before binding, because the
-/// error the kernel gives otherwise says nothing useful.
+/// `sockaddr_un::sun_path` holds 108 bytes on Linux and 104 on macOS, in both
+/// cases including the terminating NUL, and a long home directory can overflow
+/// it. Checked before binding, because the error the kernel gives otherwise
+/// says nothing useful. The limit below is the smaller platform's, with room
+/// to spare, so one number is right everywhere.
 pub fn check_socket_path_length(path: &Path) -> anyhow::Result<()> {
     const SUN_PATH_MAX: usize = 100;
     let len = path.as_os_str().as_encoded_bytes().len();

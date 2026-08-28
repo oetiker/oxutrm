@@ -167,12 +167,13 @@ fn assert_nothing_but_dev_null_survived(report: &str) {
         "the probe reported no descriptors at all, so it checked nothing"
     );
 
-    // The enumeration opens a descriptor of its own to read /proc/self/fd.
-    // Everything else that survived is a genuine leak.
-    let survivors: Vec<&(i32, String)> = targets
-        .iter()
-        .filter(|(_, target)| !target.starts_with("/proc/"))
-        .collect();
+    // Everything the probe reports is a genuine survivor: the descriptor its
+    // own enumeration opened is shut before the report is written, and the
+    // probe drops it. This used to be a filter on targets beginning with
+    // `/proc/`, which was a Linux fact standing in for "the listing's own
+    // handle" -- and which quietly excluded any genuine leak of something
+    // under /proc as well.
+    let survivors: Vec<&(i32, String)> = targets.iter().collect();
 
     // THE assertion. Not "no pipe survived" -- exactly three descriptors
     // survived, and each is /dev/null. A close that missed one file, one
