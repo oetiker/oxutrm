@@ -56,7 +56,7 @@
 | `postcard` | `1` (feature `use-std`) | proto, sync |
 | `serde` | `1` (feature `derive`) | proto, sync, term |
 | `serde_json` | `1` | proto (signalling only) |
-| `zstd` | `0.13` | sync |
+| `ruzstd` | `0.8` | sync |
 | `bitflags` | `2` | term |
 | `anyhow` | `1` | all binaries |
 | `thiserror` | `2` | proto, sync |

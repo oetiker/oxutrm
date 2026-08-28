@@ -15,9 +15,14 @@ description = "oxutrm state replication and diff engine — no I/O of any kind"
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
-zstd.workspace = true
+ruzstd.workspace = true
 thiserror.workspace = true
 oxutrm-proto.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# A SECOND implementation of zstd, used only as a witness in
+# `tests/zstd_interop.rs`. The shipped compressor is pure Rust; this is
+# Facebook's C library, and the whole value of it here is that it is not the
+# same code. Dev-dependencies are out of scope for `no_io.rs` by design.
+zstd = "0.13"

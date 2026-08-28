@@ -23,8 +23,11 @@ const ALLOWED: &[&str] = &[
     "serde",
     "postcard",
     // Compression. Byte slices in, byte slices out - no files, no streams
-    // that touch the outside world.
-    "zstd",
+    // that touch the outside world. Pure Rust, so it also builds anywhere
+    // rustc does, with no C compiler and no cross toolchain: that is why it
+    // replaced the C `zstd` binding, and the wire format is unchanged, which
+    // `tests/zstd_interop.rs` proves against the C library itself.
+    "ruzstd",
     // Error derive macro; no runtime behaviour at all.
     "thiserror",
     // The wire vocabulary, which is itself I/O-free by the same rule.
@@ -221,10 +224,13 @@ const TRANSITIVE_ALLOWED: &[&str] = &[
     "spin",
     "lock_api",
     "scopeguard",
-    // Compression: byte slices in, byte slices out.
-    "zstd",
-    "zstd-safe",
-    "zstd-sys",
+    // Compression: byte slices in, byte slices out. Pure Rust -- `twox-hash`
+    // is the xxhash that zstd frames use for their content checksum, and it
+    // is arithmetic over byte slices and nothing else. This replaced `zstd`,
+    // `zstd-safe` and `zstd-sys`, three crates that reached a C library
+    // through a build script.
+    "ruzstd",
+    "twox-hash",
     // The screen model's cell text.
     "compact_str",
     "castaway",

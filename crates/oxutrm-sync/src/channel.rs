@@ -11,7 +11,13 @@ use crate::{STATE_RING, SyncState};
 /// This runs on the keystroke path. Level 1 gives most of the ratio for a
 /// fraction of the CPU of the default 3, and a screen diff is mostly runs of
 /// identical bytes, which even level 1 crushes. Latency wins over ratio here.
-const ZSTD_LEVEL: i32 = 1;
+/// Level 1: the cheapest setting that still compresses.
+///
+/// [`ruzstd::encoding::CompressionLevel::Fastest`] documents itself as
+/// "roughly equivalent to Zstd compression level 1", which is the level this
+/// was tuned at. The named constant stays so the choice keeps its reason
+/// rather than becoming an enum variant somebody reads as "go faster".
+const ZSTD_LEVEL: ruzstd::encoding::CompressionLevel = ruzstd::encoding::CompressionLevel::Fastest;
 
 /// A ceiling on what one frame may decompress to.
 ///
@@ -122,11 +128,15 @@ impl<S: SyncState> Sender<S> {
         let raw = postcard::to_stdvec(&diff)
             .map_err(|e| ApplyError::Decode(format!("encoding diff: {e}")))?;
 
-        let (payload, flags) = match zstd::stream::encode_all(raw.as_slice(), ZSTD_LEVEL) {
-            Ok(z) if z.len() < raw.len() => (z, FLAG_ZSTD),
-            // Either it did not shrink, or zstd refused. Sending it plain is
-            // always correct.
-            _ => (raw, 0),
+        // `compress_to_vec` cannot fail -- it returns a `Vec`, not a `Result`
+        // -- so the only question left is the one that always mattered: did
+        // compressing actually help? A small diff of high-entropy bytes grows
+        // under zstd, and sending it plain is always correct.
+        let compressed = ruzstd::encoding::compress_to_vec(raw.as_slice(), ZSTD_LEVEL);
+        let (payload, flags) = if compressed.len() < raw.len() {
+            (compressed, FLAG_ZSTD)
+        } else {
+            (raw, 0)
         };
 
         self.last_ack_sent = ack_state;
@@ -413,7 +423,7 @@ impl<S: SyncState> Receiver<S> {
 fn decompress(payload: &[u8]) -> Result<Vec<u8>, ApplyError> {
     use std::io::Read as _;
 
-    let mut decoder = zstd::stream::read::Decoder::new(payload)
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(payload)
         .map_err(|e| ApplyError::Decode(format!("zstd: {e}")))?;
     let mut out = Vec::new();
     // `take` caps the work regardless of what the header claims.
@@ -860,7 +870,7 @@ mod tests {
         // 100 MiB of zeros compresses to a few hundred bytes. The peer is
         // authenticated, but that is exactly the assumption that fails first.
         let bomb =
-            zstd::stream::encode_all(vec![0u8; 100 * 1024 * 1024].as_slice(), 1).expect("compress");
+            ruzstd::encoding::compress_to_vec(vec![0u8; 100 * 1024 * 1024].as_slice(), ZSTD_LEVEL);
         assert!(bomb.len() < 100_000, "the fixture must actually be a bomb");
 
         let f = Frame {
