@@ -228,9 +228,19 @@ impl LinkState {
             // It is deliberately NOT `owed_since` either, which would be a
             // different and smaller number -- the reply may have started being
             // owed long after the host went quiet. The consequence is that the
-            // displayed figure can OVERSTATE the silence, by at most
-            // `HEARTBEAT_IDLE`: `last_heard` is only as stale as the heartbeat
-            // lets it get, because a heartbeat that is answered refreshes it.
+            // displayed figure can OVERSTATE the silence. Ordinarily by at
+            // most `HEARTBEAT_IDLE`, because a heartbeat that is answered
+            // refreshes `last_heard`.
+            //
+            // Ordinarily, and not always, and the exception is written down
+            // because it is the kind of thing that gets rediscovered as a bug:
+            // `ClientSession::take_frames` applies a frame the pacing tick
+            // scavenged out of the channel without telling this module, so
+            // `last_heard` does not move for it. That cannot raise a FALSE
+            // notice -- the ack such a frame carries clears `owed_since` on
+            // the same lap, which is the whole point of measuring the owing
+            // instead of the silence -- but it can leave the counter in a real
+            // outage reading higher than the truth.
             self.phase = Phase::Silent {
                 since: self.last_heard,
             };
