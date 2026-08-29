@@ -21,3 +21,14 @@ rustix = { workspace = true, features = ["pty"] }
 libc.workspace = true
 anyhow.workspace = true
 oxutrm-proto.workspace = true
+# ratatui as a LAYOUT AND WIDGET library only. `default-features = false` is
+# what drops `crossterm`: the default feature set includes it, and taking it
+# would put a second thing that writes to the terminal into a crate whose whole
+# point is that `Renderer` is the only one. No backend, no `Terminal`, no
+# terminal ownership -- widgets are rendered into a bare `Buffer` and converted
+# to oxutrm cells by `overlay.rs`.
+ratatui.workspace = true
+# For the wide-character rule in `overlay.rs`. ratatui marks a double-width
+# glyph's second column with a SPACE; oxutrm marks it with `Attrs::WIDE_CONT`
+# and no text. Converting between them means measuring the width ourselves.
+unicode-width.workspace = true

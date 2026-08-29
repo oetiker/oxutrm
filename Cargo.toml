@@ -87,6 +87,11 @@ unicode-width = "0.2"
 # `String` would produce - which is what makes the alias swappable.
 compact_str = { version = "0.10", features = ["serde"] }
 proptest = "1"
+ratatui = { version = "0.30", default-features = false, features = [
+    "std",
+    "all-widgets",
+    "layout-cache",
+] }
 insta = "1"
 
 # Not in the contract's table; required by the M4 integration plan and declared
