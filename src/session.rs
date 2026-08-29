@@ -153,12 +153,22 @@ impl HostSession {
 
     /// One turn: apply whatever arrived, drain the PTY, offer a frame.
     pub fn turn(&mut self) -> Result<Turn> {
+        self.turn_with(None)
+    }
+
+    /// [`HostSession::turn`], plus a frame the caller has already taken off
+    /// the source.
+    ///
+    /// `run`'s select has to *receive* a frame to know one arrived, so it
+    /// arrives holding one; `try_recv` below would never see it and the
+    /// keystrokes in it would be silently dropped.
+    pub fn turn_with(&mut self, mut first: Option<Frame>) -> Result<Turn> {
         let mut turn = Turn::default();
 
         // ---- inbound: the client's keystrokes ------------------------------
         // (the size the client wants rides on the same diff, and is applied
         // below once the frames have been taken in)
-        while let Some(frame) = self.link.source.try_recv() {
+        while let Some(frame) = first.take().or_else(|| self.link.source.try_recv()) {
             // A rejected frame is not a disconnection: the state and the ack
             // are both untouched, and the peer's next diff will apply.
             match self.input_rx.on_frame(&frame) {
@@ -308,15 +318,115 @@ impl HostSession {
         Ok(())
     }
 
-    /// Run until the child exits.
+    /// Run until the child exits, waiting on descriptors rather than polling.
+    ///
+    /// Measured: the `IDLE_POLL` version this replaced cost 24-27 ms of CPU
+    /// across 2 s for a DETACHED session with nothing to do — the 1.2% of a
+    /// core the handoff recorded — against 0-1 ms for this one.
+    ///
+    /// The descriptors are duplicated out of the terminal before the loop so
+    /// the arms borrow locals rather than `self`, which is what lets the body
+    /// call `&mut self` methods afterwards (C1). A `dup` shares the file
+    /// description, harmless here in a way it is NOT for the client's
+    /// keyboard: this description is ours and we set its `O_NONBLOCK`
+    /// ourselves in `Pty::spawn`.
     pub async fn run(&mut self) -> Result<i32> {
+        let output = self.term.output_fd().try_clone_to_owned()?;
+        let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
+            .context("waiting on the pty")?;
+        let exit = match self.term.exit_wake().as_fd() {
+            Some(fd) => Some(
+                tokio::io::unix::AsyncFd::with_interest(
+                    fd.try_clone_to_owned()?,
+                    tokio::io::Interest::READABLE,
+                )
+                .context("waiting on the child")?,
+            ),
+            // Already gone when it was watched. The first turn below reports
+            // the exit before anything waits, so there is nothing to miss.
+            None => None,
+        };
+
+        // A frame taken off the source by the select, owed to the next turn.
+        let mut pending: Option<Frame> = None;
+        // The exit wake fired but `child_exited` disagreed. It is edge
+        // triggered and will not fire twice, so re-check on a timer instead of
+        // trusting the hint — the same rule that keeps PTY EOF out of this.
+        let mut recheck_child = false;
+
         loop {
-            let turn = self.turn()?;
+            let turn = match pending.take() {
+                None => self.turn()?,
+                Some(frame) => self.turn_with(Some(frame))?,
+            };
             if let Some(code) = turn.exited {
                 self.finish(code).await;
                 return Ok(code);
             }
-            tokio::time::sleep(IDLE_POLL).await;
+
+            // Bytes are still in the PTY buffer, and readiness for them has
+            // already been delivered. Go round again rather than sleeping on
+            // an edge that will not come.
+            //
+            // Honest about its status: NO test currently fails without this.
+            // Removing it leaves the suite green, because a child that has
+            // more to write supplies another edge when it writes, and the exit
+            // wake supplies the last one. What it removes is a staleness
+            // window - a detached session whose child bursts and then falls
+            // quiet would hold an emulator behind the child until something
+            // else happened, and the screen being current on reattach is the
+            // whole reason a detached session keeps emulating at all. It is
+            // kept as the cheap half of a guarantee whose expensive half
+            // (`READ_BUDGET` versus the kernel's PTY buffer) is not ours.
+            if self.term.more_output_waiting() {
+                continue;
+            }
+
+            // Armed only when a frame is owed but paced out, so a session with
+            // nothing to say holds no timer at all. `due()` goes true on the
+            // lap after it fires, which is what stops it re-arming for ever.
+            let mut deadline = if self.due() {
+                None
+            } else {
+                Some(tokio::time::Instant::now() + self.link.sink.pacing_interval())
+            };
+            if std::mem::take(&mut recheck_child) {
+                let at = tokio::time::Instant::now() + IDLE_POLL;
+                deadline = Some(deadline.map_or(at, |d| d.min(at)));
+            }
+
+            // Nothing here touches `self`; every borrow starts after the
+            // select expression has ended and dropped these futures (C1).
+            //
+            // There is deliberately NO `conn.closed()` arm. A closed
+            // connection is permanently ready, so an arm watching one would
+            // spin — and the host must not end the session anyway, since
+            // outliving a vanished client is the entire point. `turn` re-reads
+            // `close_reason` whenever something else wakes it, which is
+            // exactly when the answer can matter.
+            let wake: HostWake = tokio::select! {
+                r = output.readable() => match r {
+                    // Cleared HERE, having just established above that the PTY
+                    // came up empty. Read-then-clear is the ordering `try_io`
+                    // uses, and clearing while bytes remain would stall the
+                    // screen until the child happened to write again.
+                    Ok(mut g) => { g.clear_ready(); HostWake::Pty }
+                    Err(e) => return Err(e).context("waiting on the pty"),
+                },
+                r = async { exit.as_ref().expect("armed").readable().await }, if exit.is_some() => match r {
+                    Ok(mut g) => { g.clear_ready(); HostWake::Exit }
+                    Err(e) => return Err(e).context("waiting on the child"),
+                },
+                Some(frame) = self.link.source.recv() => HostWake::Frame(frame),
+                () = async { tokio::time::sleep_until(deadline.expect("armed")).await },
+                    if deadline.is_some() => HostWake::Due,
+            };
+
+            match wake {
+                HostWake::Frame(frame) => pending = Some(frame),
+                HostWake::Exit => recheck_child = true,
+                HostWake::Pty | HostWake::Due => {}
+            }
         }
     }
 
@@ -400,6 +510,19 @@ enum Wake {
     Closed(quinn::ConnectionError),
     /// A readiness that turned out to be nothing. Costs one lap.
     Nothing,
+}
+
+/// The host's half of the same idea. Separate from [`Wake`] because the two
+/// loops wake for entirely different reasons and a shared enum would give each
+/// of them variants it can never produce.
+enum HostWake {
+    /// The child wrote something.
+    Pty,
+    /// The child exited — a hint; `child_exited` is the authority.
+    Exit,
+    Frame(Frame),
+    /// A frame was owed but paced out, and the pace has come round.
+    Due,
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -1950,6 +2073,80 @@ mod tests {
         let _ = host_loop.await;
     }
 
+    /// A burst bigger than `READ_BUDGET`, then silence, then a marker — all
+    /// the way through the real loops rather than a hand-driven turn.
+    ///
+    /// **What this does NOT guard, stated because it was checked.** It was
+    /// written to catch the event-driven loop sleeping on bytes it had not
+    /// read, and it does not: with the `more_output_waiting` check removed it
+    /// still passes, three runs out of three. The child's own later writes
+    /// each supply a fresh readiness edge, and an attached client's acks wake
+    /// the loop besides, so the backlog gets drained anyway. It earns its
+    /// place as the only test that pushes more than `READ_BUDGET` through the
+    /// real loops at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_carries_a_burst_bigger_than_the_read_budget() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        typing
+            .write_all(b"seq 1 40000; printf 'tail-marker\\r\\n'; sleep 3; exit 0\n")
+            .expect("type");
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(30), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+
+        assert_eq!(code, 0);
+        assert!(
+            text(client.screen()).contains("tail-marker"),
+            "the tail of the burst never arrived: the loop slept on bytes it \
+             had not read. Screen was {:?}",
+            text(client.screen())
+        );
+        let _ = host_loop.await;
+    }
+
+    /// A DETACHED session whose child floods the PTY must still reach the
+    /// child's exit — through the real loop, with nobody attached.
+    ///
+    /// This is the guard on the loop's core wiring: with nobody there, the
+    /// PTY is the ONLY thing that can wake it. Fault injected — remove the
+    /// pty arm from the select and this fails at its 30 s bound, with the
+    /// child blocked writing into a buffer nobody is emptying, which is the
+    /// same deadlock as skipping the drain arrived at from the other side.
+    ///
+    /// It does NOT discriminate the `more_output_waiting` refinement: with
+    /// that check removed it still passes, because the child's own writes and
+    /// finally the exit wake supply the edges. See the note in `run`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_session_still_drains_a_flooding_child_to_its_exit() {
+        let (mut host, client) = pair("sleep 1; seq 1 40000; exit 7\n").await;
+
+        // Take the peer away before the flood starts.
+        client.link.sink.connection().close(0u32.into(), b"gone");
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.link.sink.connection().close_reason().is_none() {
+            host.turn().expect("turn");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(Instant::now() < deadline, "the connection never closed");
+        }
+
+        let code = tokio::time::timeout(Duration::from_secs(30), host.run())
+            .await
+            .expect(
+                "the detached loop never reached the child's exit: it is \
+                     asleep on bytes it did not read, and the child is blocked \
+                     writing into a PTY nobody is draining",
+            )
+            .expect("the host loop failed");
+        assert_eq!(code, 7, "the child did not run to completion");
+    }
+
     /// The client's half of the same bug, on its own.
     ///
     /// `run_paints_what_the_host_sent` above cannot show this one: on loopback
@@ -2185,6 +2382,52 @@ mod tests {
         );
     }
 
+    /// A DETACHED host session should be WAITING, not polling — this is the
+    /// case the whole complaint was about: sessions nobody is attached to,
+    /// burning CPU on a shared box.
+    ///
+    /// Attached is deliberately not what is measured. A host whose peer has
+    /// stopped acking keeps retransmitting at the pacing rate, which is
+    /// correct and is not idling; measuring that instead gave 195 wakes of
+    /// real work and told us nothing about polling.
+    #[tokio::test]
+    async fn a_detached_host_session_waits_instead_of_polling() {
+        let (mut host, client) = pair("").await;
+        // Let the shell print its prompt, then take the peer away.
+        for _ in 0..20 {
+            host.turn().expect("host turn");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The client goes away without a graceful shutdown, as a dropped
+        // network does. A bare `drop` is not enough: quinn would keep the
+        // connection alive until its idle timeout.
+        client.link.sink.connection().close(0u32.into(), b"gone");
+        drop(client);
+        // quinn needs a moment to decide the connection is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.link.sink.connection().close_reason().is_none() {
+            host.turn().expect("host turn");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(Instant::now() < deadline, "the connection never closed");
+        }
+
+        let window = Duration::from_secs(2);
+        let before = thread_cpu_millis();
+        let _ = tokio::time::timeout(window, host.run()).await;
+        let spent = thread_cpu_millis() - before;
+        // Measured both ways rather than picked, by reinstating the
+        // `IDLE_POLL` loop and rerunning: polling costs 24-27 ms across this
+        // window — the 1.2% of a core the handoff recorded for a quiet
+        // detached session — and waiting costs 0-1 ms. The bar sits in the
+        // middle of that gap, near neither.
+        assert!(
+            spent < 10,
+            "a detached host session burned {spent} ms of CPU across {} ms \
+             doing nothing: it is polling, not waiting",
+            window.as_millis()
+        );
+    }
+
     /// This THREAD's CPU time, in milliseconds.
     ///
     /// Per-thread and not per-process: the test binary runs several tests at
@@ -2238,7 +2481,6 @@ mod tests {
             .expect("the client loop failed");
         let spent = thread_cpu_millis() - before;
         let _host = host_loop.await.expect("host task");
-        eprintln!("MEASURED spent={spent} ms");
 
         assert_eq!(code, 0);
         // A spinning loop spends the whole wall-clock window on a core; a

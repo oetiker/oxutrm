@@ -38,6 +38,9 @@ const READ_BUDGET: usize = 64 * 1024;
 /// PTY + emulator. Owns the child process.
 pub struct HostTerm {
     pty: Pty,
+    /// Whether the last [`HostTerm::poll`] stopped at `READ_BUDGET` rather
+    /// than because the PTY was empty. See [`HostTerm::more_output_waiting`].
+    output_waiting: bool,
     term: Term<EventSink>,
     parser: Processor,
     events: EventSink,
@@ -85,6 +88,7 @@ impl HostTerm {
 
         Ok(HostTerm {
             pty,
+            output_waiting: false,
             term,
             parser: Processor::new(),
             events,
@@ -144,10 +148,15 @@ impl HostTerm {
             // coalescing behaviour - the emulator has already applied
             // everything read so far, so the snapshot is current either way.
             if drained >= READ_BUDGET {
+                // Stopped short: bytes are still in the PTY buffer.
+                self.output_waiting = true;
                 break;
             }
             let n = self.pty.read_ready(&mut buf)?;
             if n == 0 {
+                // Empty at this instant, which is the only safe moment to
+                // clear a reactor's readiness and go to sleep.
+                self.output_waiting = false;
                 break;
             }
             drained += n;
@@ -238,6 +247,21 @@ impl HostTerm {
             out.push(row);
         }
         out
+    }
+
+    /// Did the last [`HostTerm::poll`] leave output unread?
+    ///
+    /// `true` means it stopped at `READ_BUDGET` with more in the buffer, and
+    /// the caller must poll again rather than wait: readiness has already been
+    /// delivered for those bytes and will not be delivered twice.
+    pub fn more_output_waiting(&self) -> bool {
+        self.output_waiting
+    }
+
+    /// The PTY controller, to wait on for the child's output. Drain it with
+    /// [`HostTerm::poll`]; this is for readiness only.
+    pub fn output_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.pty.output_fd()
     }
 
     /// A descriptor that becomes readable when the child exits, so a session
@@ -606,6 +630,87 @@ mod tests {
             t.child_exited(),
             Some(4),
             "child_exited stays the authority"
+        );
+    }
+
+    /// The other half an event-driven host loop needs: something to wait on
+    /// when the child writes. Without it the loop can only poll.
+    #[test]
+    fn a_host_terminal_offers_a_descriptor_that_wakes_on_output() {
+        let mut t = sh(
+            "sleep 0.3; printf oxutrm-late",
+            TermSize { cols: 20, rows: 5 },
+        );
+        let fd = t.output_fd();
+
+        // Quiet to begin with: the child has not written yet.
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        let immediately = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ready_at_once = rustix::event::poll(&mut fds, Some(&immediately)).expect("poll");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut woke = false;
+        while Instant::now() < deadline {
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            let tick = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 20_000_000,
+            };
+            if rustix::event::poll(&mut fds, Some(&tick)).expect("poll") > 0 {
+                woke = true;
+                break;
+            }
+        }
+        assert_eq!(
+            ready_at_once, 0,
+            "the pty was readable before the child wrote"
+        );
+        assert!(woke, "the pty never became readable when the child wrote");
+        t.poll().expect("poll");
+        assert!(
+            t.snapshot(1).cells.iter().any(|c| c.text.starts_with('o')),
+            "the output that woke us is not in the emulator"
+        );
+    }
+
+    /// An event-driven caller must know whether `poll` stopped because the
+    /// PTY came up EMPTY or because it hit `READ_BUDGET` with more waiting.
+    /// Only the first is safe to sleep on: a reactor's readiness is edge
+    /// triggered, so sleeping with bytes still buffered stalls the screen
+    /// until the child happens to write again.
+    #[test]
+    fn a_terminal_says_whether_output_is_still_waiting() {
+        // Comfortably more than READ_BUDGET (64 KiB) in one burst.
+        let mut t = sh("seq 1 60000", TermSize { cols: 40, rows: 10 });
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_more_waiting = false;
+        loop {
+            assert!(Instant::now() < deadline, "the child never finished");
+            t.poll().expect("poll");
+            if t.more_output_waiting() {
+                saw_more_waiting = true;
+            } else if t.child_exited().is_some() {
+                // Drained to empty AND the child is gone: nothing can arrive.
+                break;
+            }
+        }
+        assert!(
+            saw_more_waiting,
+            "a 60000-line burst never once reported output still waiting"
+        );
+        assert!(
+            !t.more_output_waiting(),
+            "still reporting output waiting after draining to empty"
         );
     }
 

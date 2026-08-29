@@ -135,9 +135,12 @@ would become many `write(2)` calls. `turn` already flushes explicitly
 **250 Hz: replace it on the client, convert the host separately and
 deliberately.** `IDLE_POLL` (`src/session.rs:58`) adds up to 4 ms to every
 keystroke on the half a human is watching, and all five client sources are
-pollable. The host is *not* a rider on this: there is no `impl AsFd` for `Pty`
-or `HostTerm` today (`controller` is private with no accessor). And C2 applies
-with full force: converting the host with `next_due()` makes a detached session
+pollable. The host was *not* a rider on this — and is now DONE, separately and
+deliberately, as this section asked: `HostTerm::output_fd` and
+`HostTerm::exit_wake` supply the two descriptors it lacked, and
+`HostSession::run` waits on them instead of polling. Measured: a detached
+session went from 24-27 ms of CPU per 2 s to 0-1 ms. C2 still applies to the
+shape NOT taken: converting with `next_due()` would make a detached session
 wake ~3.6x more often than its own pace, for nothing (see the correction in
 C2 — this used to read "100% of a core", which measurement refuted).
 
@@ -194,9 +197,17 @@ PTYs, and the results were not what this document predicted:
    both. Its safety clause (the descriptors an `Event` names must outlive the
    kqueue) is vacuous there: the event names a PID and no descriptor.
 
-**What this does NOT do.** It supplies one of the two halves an event-driven
-host needs. The other — a pollable PTY — is still missing, and `IDLE_POLL`
-remains 4 ms. Nothing in the session loop consumes `exit_wake()` yet.
+**Both halves now exist and are consumed.** `HostTerm::output_fd` is the other
+one, and `HostSession::run` selects over the two of them plus the frame source
+and a pacing deadline. `IDLE_POLL` survives only as the bounded re-check after
+an exit hint that `child_exited` did not confirm.
+
+**One rule the loop must keep.** Readiness is edge triggered, so it may only
+sleep once the PTY has come up EMPTY — `HostTerm::more_output_waiting` reports
+whether `poll` stopped at `READ_BUDGET` instead. Read-then-clear, the ordering
+`try_io` uses. No test currently fails without that check (a child with more to
+write supplies the next edge itself); it is kept for the staleness window it
+closes, and `run` says so at the call site rather than implying coverage.
 
 ## 3. QUIC client authentication
 

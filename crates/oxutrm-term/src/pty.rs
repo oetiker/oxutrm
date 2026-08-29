@@ -132,6 +132,15 @@ impl Pty {
         }
     }
 
+    /// The controller, to wait on for the child's output.
+    ///
+    /// Readiness only — read it through [`Pty::read_ready`], which is what
+    /// knows that `EIO` on a controller means EOF rather than a failure. The
+    /// descriptor is already non-blocking, set in `spawn`.
+    pub fn output_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.controller.as_fd()
+    }
+
     /// A descriptor that becomes readable when the child exits.
     pub fn exit_wake(&self) -> &ExitWake {
         &self.exit_wake
