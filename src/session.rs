@@ -1528,7 +1528,13 @@ mod tests {
     /// so long - the cost is proportional to output, not to the poll.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_detached_session_stops_building_frames_but_keeps_draining() {
-        let (mut host, client) = pair("printf 'before\\r\\n'; seq 1 20000; exit 0\n").await;
+        // The `sleep` is load-bearing: the bulk output has to land AFTER the
+        // detach, or the test proves nothing about draining while detached.
+        // Without it this passed on macOS and failed on Linux under a loaded
+        // full-suite run, because the child reached `exit` before the host had
+        // observed the close - an ordering this test used to assume.
+        let (mut host, client) =
+            pair("printf 'before\\r\\n'; sleep 2; seq 1 20000; exit 0\n").await;
 
         // Up first, so we are measuring a detach and not a session that never
         // started.
@@ -1563,8 +1569,14 @@ mod tests {
                     frames_after_detach += 1;
                 }
             }
-            if let Some(code) = turn.exited {
-                exited = Some(code);
+            // Recorded on FIRST sight and not broken on: `child_exited` reports
+            // `Some(-1)` once the child has been reaped, and leaving the loop
+            // here is what made this test assume the child could not finish
+            // before the close was noticed.
+            if exited.is_none() {
+                exited = turn.exited;
+            }
+            if saw_detached && exited.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
