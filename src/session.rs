@@ -832,6 +832,55 @@ impl ClientSession {
         self.link_state.sent(now);
     }
 
+    /// One read from the keyboard, sent wherever it belongs.
+    ///
+    /// While a notice is showing the keyboard belongs to layer 1 -- and only
+    /// then. A healthy session passes every byte to the host untouched.
+    ///
+    /// `Some(code)` means the user asked to close oxutrm, which is the one
+    /// answer that ends the loop. A method rather than the body of the
+    /// `Wake::Keys` arm because holding someone's typing through an outage and
+    /// giving it back afterwards is the whole user-visible payload of this
+    /// phase, and the arm itself cannot be reached from a test without a real
+    /// terminal and a real two-second silence. The arm is left as a single
+    /// call to this, so what is tested is what ships.
+    fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>> {
+        if self.shown.is_none() {
+            self.turn(keys, out)?;
+            return Ok(None);
+        }
+        match self.link_state.hold_keys(keys) {
+            Some(Command::Quit) => return Ok(Some(0)),
+            Some(Command::SendHeld) => {
+                let held = self.link_state.take_held();
+                self.turn(&held, out)?;
+            }
+            Some(Command::DropHeld) => self.link_state.drop_held(),
+            None => {}
+        }
+        Ok(None)
+    }
+
+    /// Say something, purely so that an answer is owed.
+    ///
+    /// A heartbeat exists to be answered: without one, an idle session cannot
+    /// tell an outage from calm. `append(&[], size)` bumps the sequence
+    /// exactly as `resize` does, which makes `state_moved` true and obliges
+    /// the host to reply.
+    ///
+    /// Reports whether one went out, which is what lets a test hold the clock
+    /// still and ask.
+    fn heartbeat(&mut self, now: Instant) -> bool {
+        if !self.link_state.heartbeat_due(now) {
+            return false;
+        }
+        let next = self.input_tx.current().append(&[], self.size);
+        self.input_tx.update(next);
+        self.last_send = None;
+        self.note_sent(now);
+        true
+    }
+
     /// What layer 1 should be showing at `now`, if anything.
     fn notice_at(&mut self, now: Instant) -> Option<Notice> {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
@@ -856,7 +905,14 @@ impl ClientSession {
                     body,
                     keys: vec![(
                         "Ctrl-\\ q".to_string(),
-                        "close oxutrm here; your shell keeps running on the host".to_string(),
+                        // What the key DOES, not what the host is doing. The
+                        // silence being reported has a crashed host among its
+                        // plausible causes, so "your shell keeps running on
+                        // the host" -- which this used to say -- was the one
+                        // claim the client is in no position to make. A
+                        // description of the local action stays true either
+                        // way.
+                        "closes oxutrm here; it does not touch the host".to_string(),
                     )],
                 })
             }
@@ -1094,21 +1150,8 @@ impl ClientSession {
                     continue;
                 }
                 Wake::Keys(n) => {
-                    // While a notice is showing the keyboard belongs to layer 1
-                    // -- and only then. A healthy session passes every byte to
-                    // the host untouched.
-                    if self.shown.is_some() {
-                        match self.link_state.hold_keys(&buf[..n]) {
-                            Some(Command::Quit) => return Ok(0),
-                            Some(Command::SendHeld) => {
-                                let held = self.link_state.take_held();
-                                self.turn(&held, out)?;
-                            }
-                            Some(Command::DropHeld) => self.link_state.drop_held(),
-                            None => {}
-                        }
-                    } else {
-                        self.turn(&buf[..n], out)?;
+                    if let Some(code) = self.route_keys(&buf[..n], out)? {
+                        return Ok(code);
                     }
                 }
                 Wake::Frame(frame) => {
@@ -1164,16 +1207,7 @@ impl ClientSession {
                 out.flush().context("flushing the terminal")?;
             }
 
-            // A heartbeat exists to be answered: without one, an idle session
-            // cannot tell an outage from calm. `append(&[], size)` bumps the
-            // sequence exactly as `resize` does, which makes `state_moved` true
-            // and obliges the host to reply.
-            if self.link_state.heartbeat_due(now) {
-                let next = self.input_tx.current().append(&[], self.size);
-                self.input_tx.update(next);
-                self.last_send = None;
-                self.note_sent(now);
-            }
+            self.heartbeat(now);
 
             // The next WAKE-UP, which is a different thing from `due()`, and
             // conflating the two is a busy loop rather than an optimisation.
@@ -2701,17 +2735,203 @@ mod tests {
         session.note_sent(t);
 
         let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
-        let body = n.body.join(" ");
+        // Every word the notice puts on the screen, and not just its body.
+        // The headline and the key list are painted in the same box, so a
+        // claim the client cannot support is exactly as wrong in one of them
+        // as in another -- and a guard that reads only the body is how one
+        // came to sit in the key list unnoticed.
+        let shown = std::iter::once(n.headline.clone())
+            .chain(n.body.iter().cloned())
+            .chain(n.keys.iter().flat_map(|(k, d)| [k.clone(), d.clone()]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lower = shown.to_lowercase();
 
-        assert!(body.contains("6s"), "no silence duration: {body}");
+        assert!(shown.contains("6s"), "no silence duration: {shown}");
         assert!(
-            !body.to_lowercase().contains("safe"),
-            "claimed the session is safe, which the client cannot know: {body}"
+            !lower.contains("safe"),
+            "claimed the session is safe, which the client cannot know: {shown}"
         );
         assert!(
-            !body.to_lowercase().contains("retry") && !body.to_lowercase().contains("reconnect"),
-            "phase 1 promised a reconnection that does not exist: {body}"
+            !lower.contains("retry") && !lower.contains("reconnect"),
+            "phase 1 promised a reconnection that does not exist: {shown}"
         );
+        // The stricter half of the same rule. A crashed host is one of the
+        // plausible causes of the very silence being reported, so the box may
+        // not assert what is happening over there AT ALL -- not even hedged.
+        // The hedge belongs in the exit message, which is read after the
+        // session has ended and can point at `oxutrm host --list`; the box has
+        // room to say what a key DOES, and that stays true either way.
+        for claim in ["keeps running", "still running", "is running"] {
+            assert!(
+                !lower.contains(claim),
+                "asserted the shell's state, which the client cannot see: {shown}"
+            );
+        }
+    }
+
+    /// Ctrl-\, the prefix layer 1 listens for. `linkstate`'s own copy is
+    /// private to that module, and a test that reached for it would be
+    /// asserting the constant rather than the keystroke.
+    const CTRL_BACKSLASH: u8 = 0x1c;
+
+    /// A client with a real `Silent` notice showing, left exactly as the loop
+    /// leaves it: the phase decided by `notice_at`, and `shown` mirroring what
+    /// the overlay is.
+    async fn with_notice() -> (HostSession, ClientSession) {
+        let t = std::time::Instant::now();
+        let (host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        let notice = session.notice_at(t + Duration::from_secs(3));
+        assert!(notice.is_some(), "the fixture raised no notice");
+        session.shown = notice;
+        (host, session)
+    }
+
+    /// Everything the client has said to the host this session. Input is
+    /// cumulative -- the host tracks how much of it has been written to the
+    /// shell -- so this is where a keystroke lands if it was passed through.
+    fn spoken(session: &ClientSession) -> Vec<u8> {
+        session.input_tx.current().pending.clone()
+    }
+
+    /// The healthy path, and the one a regression would break silently: with
+    /// nothing showing, every byte belongs to the host and nothing is held.
+    #[tokio::test]
+    async fn keys_reach_the_host_untouched_while_nothing_is_showing() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(b"ls -l\r", &mut out).unwrap(), None);
+
+        assert!(
+            spoken(&session).ends_with(b"ls -l\r"),
+            "typing did not reach the host: {:?}",
+            spoken(&session)
+        );
+        assert!(
+            session.link_state.held().is_empty(),
+            "typing was held while the session was healthy"
+        );
+    }
+
+    /// The payload of the phase: what is typed at a dead link is kept rather
+    /// than thrown at a host that cannot hear it.
+    #[tokio::test]
+    async fn typing_into_a_notice_is_held_and_not_sent() {
+        let (_host, mut session) = with_notice().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(b"rm -rf /", &mut out).unwrap(), None);
+
+        assert_eq!(
+            session.link_state.held(),
+            b"rm -rf /",
+            "blind typing was not kept"
+        );
+        assert_eq!(
+            spoken(&session),
+            before,
+            "blind typing was sent at a host that is not answering"
+        );
+    }
+
+    /// `Ctrl-\ q` is the notice's own key, so it must not reach the shell as
+    /// two stray bytes, and it must end the client with a status of its own
+    /// rather than one invented for a shell that never exited.
+    #[tokio::test]
+    async fn the_quit_key_ends_the_client_with_a_status_of_zero() {
+        let (_host, mut session) = with_notice().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, Some(0), "the quit key did not end the client");
+        assert_eq!(spoken(&session), before, "the command reached the shell");
+    }
+
+    /// The other half of holding it: giving it back, in one piece and in
+    /// order, once the user has looked at the screen and said so.
+    #[tokio::test]
+    async fn the_send_key_delivers_what_was_typed_blind() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, None, "sending the held input ended the session");
+        assert!(
+            spoken(&session).ends_with(b"make test\r"),
+            "the held input was not delivered: {:?}",
+            spoken(&session)
+        );
+        assert!(
+            session.link_state.held().is_empty(),
+            "the held input was delivered and kept, so it can arrive twice"
+        );
+    }
+
+    /// And dropping it must actually drop it: a `d` that left the buffer full
+    /// would deliver the discarded keys at the next `s`.
+    #[tokio::test]
+    async fn the_drop_key_throws_the_blind_typing_away() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        let before = spoken(&session);
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, None, "dropping the held input ended the session");
+        assert!(session.link_state.held().is_empty(), "the drop kept it");
+        assert_eq!(spoken(&session), before, "the drop sent it instead");
+    }
+
+    /// Without a heartbeat an idle session cannot tell an outage from calm,
+    /// and the user finds out by typing into a screen that died ten minutes
+    /// ago. With one, a reply is owed and the silence becomes visible.
+    ///
+    /// The clock is a parameter, so this asks the question at five seconds
+    /// without waiting five seconds.
+    #[tokio::test]
+    async fn an_idle_session_prods_the_host_after_five_quiet_seconds() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        let before = session.input_tx.current().seq();
+
+        assert!(
+            !session.heartbeat(t + Duration::from_secs(4)),
+            "prodded a session that had only been quiet for four seconds"
+        );
+        assert_eq!(session.input_tx.current().seq(), before);
+
+        assert!(session.heartbeat(t + Duration::from_secs(5)));
+        assert_eq!(
+            session.input_tx.current().seq(),
+            before + 1,
+            "the heartbeat did not move the sequence, so the host owes no reply \
+             and the silence stays invisible"
+        );
+        assert!(
+            session.last_send.is_none(),
+            "the heartbeat waits for the pacing interval it exists to pre-empt"
+        );
+
+        // And not again until another five quiet seconds have passed: the
+        // heartbeat is 0.2 Hz, not a poll.
+        assert!(!session.heartbeat(t + Duration::from_secs(6)));
     }
 
     /// The loop rebuilds layer 1 only when the notice's CONTENT changes, and a
