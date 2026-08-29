@@ -48,24 +48,53 @@ pub enum Command {
     DropHeld,
 }
 
+/// Where to cut `bytes` for display: at most `HELD_SHOWN` bytes, backed off
+/// so the cut never lands inside a multi-byte UTF-8 sequence. A UTF-8
+/// continuation byte matches `10xxxxxx`; stepping back while the byte right
+/// after the cut is one lands the cut on a leading byte (or 0, or the end)
+/// instead of splitting a character into a mangled fragment.
+fn held_cut(bytes: &[u8]) -> usize {
+    let mut cut = bytes.len().min(HELD_SHOWN);
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0xc0) == 0x80 {
+        cut -= 1;
+    }
+    cut
+}
+
 /// Held input as something safe to put in a box.
 ///
 /// Control bytes become readable rather than being emitted: the notice is
 /// painted through the renderer, and a raw `\r` in a cell would be a control
-/// scalar the receiver's validation rejects.
+/// scalar the receiver's validation rejects. This covers both C0
+/// (0x00-0x1F, plus DEL) and C1 (U+0080-U+009F): U+009B is CSI, and
+/// terminals in UTF-8 mode act on it, so a raw C1 scalar reaching the
+/// renderer is untrusted input landing as a control sequence, the same class
+/// of bug as an unescaped C0 byte.
+///
+/// The held buffer is raw terminal input, so it is decoded as UTF-8 rather
+/// than mapped one byte to one scalar -- a character the user actually typed
+/// is very often multi-byte, and byte-for-byte mapping turns it into
+/// mojibake, which defeats the entire point of `Confirming`. Anything that
+/// is not valid UTF-8 (the cap can cut a sequence short, and a user can type
+/// any byte) becomes the replacement character rather than panicking or
+/// vanishing.
 pub fn render_held(bytes: &[u8]) -> String {
-    let shown = &bytes[..bytes.len().min(HELD_SHOWN)];
+    let cut = held_cut(bytes);
+    let shown = &bytes[..cut];
     let mut out = String::with_capacity(shown.len() + 16);
 
-    for &b in shown {
-        match b {
-            b'\r' | b'\n' => out.push('\u{21b5}'),
-            0x00..=0x1f => {
+    for ch in String::from_utf8_lossy(shown).chars() {
+        match ch {
+            '\r' | '\n' => out.push('\u{21b5}'),
+            '\u{0}'..='\u{1f}' => {
                 out.push('^');
-                out.push((b + b'@') as char);
+                out.push((ch as u8 + b'@') as char);
             }
-            0x7f => out.push_str("^?"),
-            _ => out.push(b as char),
+            '\u{7f}' => out.push_str("^?"),
+            '\u{80}'..='\u{9f}' => {
+                out.push_str(&format!("<{:02X}>", ch as u32));
+            }
+            _ => out.push(ch),
         }
     }
 
@@ -486,6 +515,49 @@ mod tests {
         assert!(
             shown.contains("more"),
             "no indication of what was elided: {shown}"
+        );
+    }
+
+    /// The held buffer is raw terminal input, so a character the user
+    /// actually typed is very often multi-byte UTF-8. Mapping byte-for-byte
+    /// turns it into mojibake, which defeats the entire point of
+    /// `Confirming`: showing people what they typed so they can decide
+    /// whether to deliver it.
+    #[test]
+    fn a_non_ascii_character_reads_back_as_itself() {
+        assert_eq!(render_held("héllo 世界 🎉".as_bytes()), "héllo 世界 🎉");
+    }
+
+    /// C1 controls (U+0080-U+009F) are a second range of control scalars
+    /// beyond C0 and DEL. U+009B is CSI, and terminals in UTF-8 mode act on
+    /// it, so one reaching the renderer raw is untrusted input landing as a
+    /// control sequence -- the same bug the C0 handling exists to prevent.
+    #[test]
+    fn a_c1_control_byte_does_not_appear_raw() {
+        // U+009B (CSI) encoded as UTF-8: 0xC2 0x9B.
+        let shown = render_held(&[b'a', 0xc2, 0x9b, b'b']);
+        assert!(
+            !shown.contains('\u{9b}'),
+            "a raw C1 control reached the output: {shown:?}"
+        );
+    }
+
+    /// `HELD_SHOWN` is a byte count, and cutting at a fixed byte offset can
+    /// land inside a multi-byte character. The cut must back off to a
+    /// character boundary rather than let a split sequence render as a
+    /// mangled fragment.
+    #[test]
+    fn a_multi_byte_character_straddling_the_shown_boundary_is_not_split() {
+        let mut buf = vec![b'a'; 199];
+        buf.extend_from_slice("世".as_bytes()); // 3 bytes, occupying indices
+        // 199..202 -- straddling the HELD_SHOWN=200 cut.
+
+        let shown = render_held(&buf);
+
+        assert!(
+            !shown.contains('\u{e4}'),
+            "the character's leading byte (0xE4) was rendered as a raw \
+             Latin-1 scalar instead of the cut being backed off: {shown:?}"
         );
     }
 }
