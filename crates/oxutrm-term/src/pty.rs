@@ -18,11 +18,19 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use rustix::termios::Winsize;
 
 use oxutrm_proto::TermSize;
+
+/// How long `Pty::drop` will drain and re-check before giving up on reaping.
+///
+/// Generous for what it does - the child is reaped on the first turn in
+/// practice - because the cost of being wrong is a zombie, while the cost of
+/// having no bound at all is a host that never returns from a drop.
+const REAP_BUDGET: Duration = Duration::from_secs(2);
 
 /// A PTY with a child attached to its user side.
 pub struct Pty {
@@ -158,6 +166,37 @@ impl Pty {
             rows: ws.ws_row,
         })
     }
+    /// Wait for the killed child, draining the PTY while we wait.
+    ///
+    /// `Child::wait` on its own **deadlocks on macOS**. A child killed while
+    /// writing to a PTY that has already been read at least once stays in `E`
+    /// (exiting) until its terminal output is consumed, so a parent blocked in
+    /// `wait4` without reading is waiting for a process that is waiting for
+    /// it. Measured with a 45-line C reproduction: draining, the child is
+    /// reaped on the first turn; not draining, it is never reaped at all, at
+    /// every flood duration tried. Linux does not care either way.
+    ///
+    /// Bounded, because dropping a session must not be able to hang the host.
+    /// A child we fail to reap becomes a zombie until this process exits -
+    /// bad, but finite, and SIGKILL has already been sent by the time we are
+    /// here.
+    fn reap(&mut self) {
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + REAP_BUDGET;
+        loop {
+            // The controller is non-blocking, so this stops at `WouldBlock`.
+            while matches!(self.controller.read(&mut buf), Ok(n) if n > 0) {}
+            match self.child.try_wait() {
+                // Reaped, or unwaitable and so nobody's zombie.
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl Drop for Pty {
@@ -184,7 +223,7 @@ impl Drop for Pty {
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
             }
         }
-        let _ = self.child.wait();
+        self.reap();
     }
 }
 

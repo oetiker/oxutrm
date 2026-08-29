@@ -1112,6 +1112,40 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_flooding_terminal_does_not_block() {
+        // The bug: `Pty`'s `Drop` killed the child and then called
+        // `Child::wait`, which on macOS never returns. A child killed while
+        // writing to a PTY that has already been READ stays in `E` (exiting)
+        // until its output is consumed, so the parent blocks in `wait4`
+        // waiting for a process that is waiting for the parent to read.
+        //
+        // The read is what arms it, which is why
+        // `dropping_the_terminal_kills_the_child` above never caught this: it
+        // drops without ever polling. Here we poll first, on purpose.
+        let mut t = sh("yes oxutrm-flood", size());
+        let pid = t.child_pid();
+        assert!(
+            poll_until(&mut t, Duration::from_secs(10), |t| {
+                t.snapshot(1).cells.iter().any(|c| c.text == "x")
+            }),
+            "the emulator never processed any of the flood, so the drop is \
+             not being tested under the condition that breaks it"
+        );
+
+        let started = Instant::now();
+        drop(t);
+        let took = started.elapsed();
+
+        // REAP_BUDGET is 2s and the child is reaped on the first turn in
+        // practice. Anything near the budget means we fell back to giving up.
+        assert!(
+            took < Duration::from_secs(1),
+            "dropping a flooding terminal took {took:?}"
+        );
+        assert!(!running(pid), "the child {pid} survived the drop");
+    }
+
+    #[test]
     fn a_quiet_terminal_polls_without_blocking() {
         let mut t = sh("sleep 5", size());
         let started = Instant::now();
