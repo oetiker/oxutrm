@@ -31,10 +31,15 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 /// A pid that is certainly gone: spawned, waited on, reaped.
+///
+/// `/bin/sh -c :` and not `/bin/true`, which is `/usr/bin/true` on macOS.
+/// POSIX places the shell at `/bin/sh` on every system we build for, and the
+/// test only needs something that exits at once.
 fn dead_pid() -> u32 {
-    let mut child = std::process::Command::new("/bin/true")
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", ":"])
         .spawn()
-        .expect("spawn /bin/true");
+        .expect("spawn /bin/sh");
     let pid = child.id();
     child.wait().expect("wait");
     pid

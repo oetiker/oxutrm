@@ -405,6 +405,20 @@ mod tests {
         );
     }
 
+    /// A terminal fd the tests can put in raw mode, plus the master that keeps
+    /// it alive.
+    ///
+    /// The **slave**, not the master. `tcgetattr` on a PTY master happens to
+    /// work on Linux, but on macOS only the slave side is a terminal and the
+    /// master answers `ENOTTY`. The slave is also the faithful fd: production
+    /// hands the guard the user's stdin, which is a slave-side tty. Keep the
+    /// returned master bound for the lifetime of the slave.
+    fn open_tty() -> (OwnedFd, OwnedFd) {
+        let (master, name) = open_pty_with_name();
+        let slave = open_slave(&name);
+        (master, slave)
+    }
+
     fn is_cooked(fd: BorrowedFd<'_>) -> bool {
         let t = rustix::termios::tcgetattr(fd).expect("tcgetattr");
         t.local_modes.contains(LocalModes::ECHO) && t.local_modes.contains(LocalModes::ICANON)
@@ -412,7 +426,7 @@ mod tests {
 
     #[test]
     fn entering_raw_mode_turns_echo_and_canonical_input_off() {
-        let pty = open_pty();
+        let (_master, pty) = open_tty();
         let borrowed = pty.try_clone().expect("dup for observation");
         assert!(is_cooked(borrowed.as_fd()), "a fresh pty should be cooked");
 
@@ -423,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_normal_drop_restores_the_terminal() {
-        let pty = open_pty();
+        let (_master, pty) = open_tty();
         let observer = pty.try_clone().expect("dup for observation");
         {
             let _guard = RawGuard::enter_on(pty).expect("enter raw mode");
@@ -439,7 +453,7 @@ mod tests {
     /// must still come back.
     #[test]
     fn a_panic_inside_the_guards_scope_restores_the_terminal() {
-        let pty = open_pty();
+        let (_master, pty) = open_tty();
         let observer = pty.try_clone().expect("dup for observation");
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -457,7 +471,7 @@ mod tests {
 
     #[test]
     fn restoring_twice_is_harmless() {
-        let pty = open_pty();
+        let (_master, pty) = open_tty();
         let observer = pty.try_clone().expect("dup for observation");
         let guard = RawGuard::enter_on(pty).expect("enter raw mode");
         drop(guard);

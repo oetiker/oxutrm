@@ -172,7 +172,7 @@ fn a_socket_path_too_long_for_sun_path_is_refused_with_advice() {
 /// with it.
 #[tokio::test]
 async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let fake_runtime = tmp.path().join("run-user-1000");
     let fake_home = tmp.path().join("home");
     std::fs::create_dir_all(&fake_runtime).expect("runtime dir");
@@ -224,4 +224,19 @@ async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed()
         "the socket must still be reachable: {connected:?}"
     );
     drop(listener);
+}
+
+/// A temporary directory short enough to hold a Unix socket path.
+///
+/// `tempfile::tempdir()` honours `TMPDIR`, which on macOS is
+/// `/var/folders/<hash>/T/` - about 50 bytes before the registry appends a
+/// 32-character session id and `/sock`, which puts the result past the
+/// 100-byte `sun_path` limit. The product already reports that clearly and
+/// says to set `OXUTRM_STATE_DIR`; these tests simply need a base that does
+/// not provoke it, so they go on testing what they are named after.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oxu-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp")
 }

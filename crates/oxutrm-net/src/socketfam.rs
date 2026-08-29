@@ -122,24 +122,34 @@ mod tests {
         assert_ne!(local.port(), 0, "a bound socket has a real port");
     }
 
-    /// The important one: 443 needs privilege, so unprivileged binding MUST
-    /// fall through to a high port rather than failing. On a developer machine
-    /// and in CI that fallback is the NORMAL path, not an error path.
+    /// The important one: `bind_socket` MUST come back with a usable socket
+    /// whether or not the preferred port was available, and any fallback it
+    /// takes must be to a port it could actually have bound. On a developer
+    /// machine and in CI the fallback is the NORMAL path, not an error path.
     #[test]
     fn a_privileged_port_falls_back_to_a_high_port() {
         let cfg = NetConfig::default();
         let sock = bind_socket(&cfg).expect("bind must succeed even without privilege");
         let port = sock.local_addr().expect("local_addr").port();
-        assert_ne!(port, 0);
+        assert_ne!(port, 0, "a bound socket has a real port");
 
-        if rustix::process::geteuid().is_root() {
-            // Root may legitimately get 443; nothing else to prove here.
+        // Judged on the OUTCOME, and deliberately not on a prior question
+        // about privilege.
+        //
+        // This asserted "an unprivileged process cannot have bound 443", which
+        // is not true everywhere: macOS hands UDP and TCP 443 to an ordinary
+        // user, measured at euid 501, so a correct bind failed the test there.
+        // Probing "can I bind 443?" first is worse - the probe is a different
+        // moment from the bind, and the sibling tests in this module bind too,
+        // so the answer goes stale in between. That version failed about one
+        // run in four, which is a race and not flakiness.
+        if port == cfg.prefer_port {
+            // The preferred port itself, legitimate wherever the platform
+            // allows it. No fallback was required, so there is none to judge.
             return;
         }
-        assert_ne!(
-            port, cfg.prefer_port,
-            "an unprivileged process cannot have bound 443"
-        );
+        // Something else, so a fallback happened: it must be a port that could
+        // have been bound without privilege in the first place.
         assert!(
             port >= 1024,
             "fell back to another privileged port, which cannot have worked: {port}"

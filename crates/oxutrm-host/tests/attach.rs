@@ -13,6 +13,21 @@ use oxutrm_proto::{
 };
 use tokio::io::BufReader;
 
+/// A temporary directory short enough to hold a Unix socket path.
+///
+/// `tempfile::tempdir()` honours `TMPDIR`, which on macOS is
+/// `/var/folders/<hash>/T/` - about 50 bytes before the registry appends a
+/// 32-character session id and `/sock`, which puts the result past the
+/// 100-byte `sun_path` limit. The product already reports that clearly and
+/// says to set `OXUTRM_STATE_DIR`; these tests simply need a base that does
+/// not provoke it, so they go on testing what they are named after.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oxu-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp")
+}
+
 fn meta(id: &str, pid: u32) -> SessionMeta {
     SessionMeta {
         session_id: id.to_string(),
@@ -71,7 +86,7 @@ async fn serving(root: &Path, id: &str) -> (RegistryGuard, tokio::net::UnixListe
 
 #[tokio::test]
 async fn attaching_reaches_the_running_session() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let root = Registry::dir_at(tmp.path());
     let id = "1111222233334444aaaabbbbccccdddd";
     let (_guard, listener) = serving(&root, id).await;
@@ -96,7 +111,7 @@ async fn attaching_reaches_the_running_session() {
 
 #[tokio::test]
 async fn an_unknown_id_lists_what_does_exist() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let root = Registry::dir_at(tmp.path());
     let live = "aaaa0000aaaa0000aaaa0000aaaa0000";
     let (_guard, _listener) = serving(&root, live).await;
@@ -121,7 +136,7 @@ async fn an_unknown_id_lists_what_does_exist() {
 
 #[tokio::test]
 async fn an_empty_registry_says_so_rather_than_listing_nothing() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let root = Registry::dir_at(tmp.path());
     let err = connect_to_session(&root, "0000000000000000aaaaaaaaaaaaaaaa")
         .await
@@ -136,7 +151,7 @@ async fn an_empty_registry_says_so_rather_than_listing_nothing() {
 /// never work, so the refusal has to explain rather than just fail.
 #[tokio::test]
 async fn a_session_that_can_never_detach_is_refused_with_the_reason() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let root = Registry::dir_at(tmp.path());
     let id = "5555666655556666555566665555dddd";
 
@@ -164,7 +179,7 @@ async fn a_session_that_can_never_detach_is_refused_with_the_reason() {
 
 #[tokio::test]
 async fn an_entry_with_no_listener_reports_an_unreachable_socket() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = short_tempdir();
     let root = Registry::dir_at(tmp.path());
     let id = "7777888877778888777788887777dddd";
     // Registered, but nothing ever bound the socket.

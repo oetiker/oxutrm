@@ -383,12 +383,24 @@ mod tests {
     /// only reach `Symmetric` through an alternate port, this fails.
     #[tokio::test]
     async fn a_default_shaped_server_list_still_reaches_symmetric() {
+        const NAME: &str = "a_default_shaped_server_list_still_reaches_symmetric";
+        let Some(second) = second_loopback_ip() else {
+            eprintln!(
+                "SKIP {}: this host has no second loopback IP \
+                 (macOS: sudo ifconfig lo0 alias 127.0.0.2)",
+                NAME
+            );
+            return;
+        };
         let (s1, _hole) =
             responder_with_a_silent_neighbour("127.0.0.1", MappingBehaviour::RewritePort(50_001))
                 .await;
-        let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::RewritePort(50_002))
-            .await
-            .expect("a second loopback IP");
+        let s3 = StunResponder::start_on(
+            a(&format!("{second}:0")),
+            MappingBehaviour::RewritePort(50_002),
+        )
+        .await
+        .expect("a second loopback IP");
 
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -411,6 +423,21 @@ mod tests {
     /// `port + 1`, so the alternate-port probe provably gets no answer. This
     /// is the inverse of a helper that stands a responder up there: it
     /// reproduces production rather than papering over it.
+    /// A second loopback IPv4 address, or `None` where this host has none.
+    ///
+    /// Linux puts the whole of `127.0.0.0/8` on `lo`, so `127.0.0.2` is simply
+    /// there. macOS assigns only `127.0.0.1` to `lo0`; a second address needs
+    /// `sudo ifconfig lo0 alias 127.0.0.2`, which a test may not require.
+    ///
+    /// Probed, not `cfg`-ed, for the same reason `FD_DIRS` is a candidate list:
+    /// a machine that HAS the alias then runs the test on either platform, and
+    /// the decision follows the host rather than the compile target.
+    fn second_loopback_ip() -> Option<&'static str> {
+        std::net::UdpSocket::bind("127.0.0.2:0")
+            .ok()
+            .map(|_| "127.0.0.2")
+    }
+
     async fn responder_with_a_silent_neighbour(
         ip: &str,
         behaviour: MappingBehaviour,
@@ -478,9 +505,18 @@ mod tests {
     /// production actually has: two server IPs and nothing on `port + 1`.
     #[tokio::test]
     async fn two_truthful_probes_classify_a_direct_path_as_no_nat() {
+        const NAME: &str = "two_truthful_probes_classify_a_direct_path_as_no_nat";
+        let Some(second) = second_loopback_ip() else {
+            eprintln!(
+                "SKIP {}: this host has no second loopback IP \
+                 (macOS: sudo ifconfig lo0 alias 127.0.0.2)",
+                NAME
+            );
+            return;
+        };
         let (s1, _hole) =
             responder_with_a_silent_neighbour("127.0.0.1", MappingBehaviour::Truthful).await;
-        let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::Truthful)
+        let s3 = StunResponder::start_on(a(&format!("{second}:0")), MappingBehaviour::Truthful)
             .await
             .expect("a second loopback IP");
 
@@ -573,6 +609,15 @@ mod tests {
     /// because the default one does not.
     #[tokio::test]
     async fn a_mapping_keyed_on_destination_ip_alone_is_address_dependent() {
+        const NAME: &str = "a_mapping_keyed_on_destination_ip_alone_is_address_dependent";
+        let Some(second) = second_loopback_ip() else {
+            eprintln!(
+                "SKIP {}: this host has no second loopback IP \
+                 (macOS: sudo ifconfig lo0 alias 127.0.0.2)",
+                NAME
+            );
+            return;
+        };
         let s1 = StunResponder::start(MappingBehaviour::RewritePort(60_001))
             .await
             .expect("s1");
@@ -581,9 +626,12 @@ mod tests {
             .await
             .expect("s1 alt port");
         // Different IP, different reported port: the destination IP did.
-        let s3 = StunResponder::start_on(a("127.0.0.2:0"), MappingBehaviour::RewritePort(60_002))
-            .await
-            .expect("a second loopback IP");
+        let s3 = StunResponder::start_on(
+            a(&format!("{second}:0")),
+            MappingBehaviour::RewritePort(60_002),
+        )
+        .await
+        .expect("a second loopback IP");
 
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await

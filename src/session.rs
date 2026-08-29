@@ -1433,6 +1433,19 @@ mod tests {
         // 127.0.0.0/8 is entirely loopback on Linux, so 127.0.0.2 is a real
         // second address to migrate onto, and the 4-tuple changes in both
         // halves rather than one.
+        // Roaming needs a SECOND local address to move to. Linux has all of
+        // 127.0.0.0/8 on `lo`; macOS gives `lo0` only 127.0.0.1, and a second
+        // one needs `sudo ifconfig lo0 alias 127.0.0.2`, which a test may not
+        // require. Probed rather than cfg-ed, so a host that has the alias
+        // runs this on either platform.
+        if tokio::net::UdpSocket::bind("127.0.0.2:0").await.is_err() {
+            eprintln!(
+                "SKIP the_session_survives_the_client_changing_its_own_local_address: \
+                 this host has no second loopback IP \
+                 (macOS: sudo ifconfig lo0 alias 127.0.0.2)"
+            );
+            return;
+        }
         let (mut host, mut client) = pair_on("127.0.0.1:0", "printf 'before-roam\r\n'\n").await;
         let mut out = Vec::new();
 
