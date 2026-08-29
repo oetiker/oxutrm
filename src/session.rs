@@ -919,15 +919,17 @@ impl ClientSession {
         // Only `Silent` carries numbers that move on their own. `Confirming`
         // shows the held buffer, which changes only when the user types --
         // and when they do, they should see it.
-        if let Phase::Silent { .. } = phase {
-            if let (Some((built_for, built_at)), Some(shown)) = (self.built, self.shown.as_ref()) {
-                // Not merely "a box is up": it has to be THIS phase's box, or
-                // the transition into `Silent` would itself be delayed by
-                // whenever the previous one happened to be built.
-                if built_for == phase && now.duration_since(built_at) < NOTICE_REFRESH {
-                    return Some(shown.clone());
-                }
-            }
+        //
+        // `built_for == phase` and not merely "a box is up": the box already
+        // there has to be THIS phase's, or entering `Silent` would itself be
+        // delayed by whenever the previous box happened to be built.
+        if let Phase::Silent { .. } = phase
+            && let Some((built_for, built_at)) = self.built
+            && let Some(shown) = self.shown.as_ref()
+            && built_for == phase
+            && now.duration_since(built_at) < NOTICE_REFRESH
+        {
+            return Some(shown.clone());
         }
         self.built = Some((phase, now));
 
@@ -1275,7 +1277,10 @@ impl ClientSession {
                 out.flush().context("flushing the terminal")?;
             }
 
-            self.heartbeat(now);
+            // The `bool` is for the tests, which hold the clock still and ask
+            // whether a prod was due. The loop does not care: it prods or it
+            // does not, and either way the next lap is the same.
+            let _ = self.heartbeat(now);
 
             // The next WAKE-UP, which is a different thing from `due()`, and
             // conflating the two is a busy loop rather than an optimisation.

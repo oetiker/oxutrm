@@ -565,7 +565,7 @@ mod tests {
     /// holding never happens. `d` discards it with no confirmation at all.
     #[test]
     fn send_and_drop_are_not_commands_under_the_silent_notice() {
-        for byte in [b's', b'd'] {
+        for &byte in b"sd" {
             let t = t0();
             let mut s = LinkState::new(t);
             s.hold_keys(b"make test");
