@@ -206,6 +206,7 @@ impl Renderer {
                 let to = screen_row as usize * cols + screen_col as usize;
                 cells[to] = o.cells[from].clone();
             }
+            repair_wide_pairs(&mut cells, cols, screen_row as usize);
         }
         std::borrow::Cow::Owned(cells)
     }
@@ -464,6 +465,63 @@ fn push_color(p: &mut String, c: Color, foreground: bool, colors: u32) {
         Color::Rgb(r, g, b) => {
             let base = if foreground { 38 } else { 48 };
             p.push_str(&format!(";{base};2;{r};{g};{b}"));
+        }
+    }
+}
+
+/// Is this the left half of a double-width glyph?
+///
+/// Measured from the text, not asserted from a flag: `WIDE_CONT` marks the
+/// right half and nothing marks the left, because nothing needed to until the
+/// overlay arrived and started landing between the two.
+fn is_wide_lead(cell: &Cell) -> bool {
+    use unicode_width::UnicodeWidthStr as _;
+    !cell.attrs.contains(Attrs::WIDE_CONT) && cell.text.width() == 2
+}
+
+/// Put back the invariant the overlay can break: a double-width glyph occupies
+/// exactly two columns, the second of them a `WIDE_CONT`.
+///
+/// The overlay is a rectangle and a wide glyph is two columns, so either edge
+/// of the box can land in the middle of one. Both halves of that are a stray
+/// half-glyph at the box edge, on any CJK-heavy screen:
+///
+/// - The **left** edge can land on the continuation of a remote glyph whose
+///   lead is outside the box. The lead survives, still two columns wide, so
+///   the terminal paints it over the box's first column and shifts the rest
+///   of the row right by one.
+/// - The **right** edge can overwrite a lead whose continuation is outside the
+///   box -- and so can the screen's own right edge, clipping the box's last
+///   column. `write_cells` skips a `WIDE_CONT`, so nothing is ever painted
+///   over that column and the right half of the old glyph stays there.
+///
+/// Both are the same broken pair seen from opposite sides, so the repair is
+/// symmetrical: a continuation whose predecessor is not a wide lead becomes a
+/// blank, and a wide lead whose continuation is gone becomes a blank. The
+/// cell's own colours are kept, so a blank inside the box still wears the
+/// box's background.
+///
+/// The whole row is scanned rather than just the two edge columns. It is one
+/// pass over a row of a grid that has just been cloned wholesale, and on a
+/// well-formed screen it changes nothing outside the damage.
+fn repair_wide_pairs(cells: &mut [Cell], cols: usize, row: usize) {
+    let base = row * cols;
+    for c in 0..cols {
+        let i = base + c;
+        let broken = if cells[i].attrs.contains(Attrs::WIDE_CONT) {
+            c == 0 || !is_wide_lead(&cells[i - 1])
+        } else if is_wide_lead(&cells[i]) {
+            c + 1 >= cols || !cells[base + c + 1].attrs.contains(Attrs::WIDE_CONT)
+        } else {
+            continue;
+        };
+
+        if broken {
+            // A space and not empty text: `write_cells` emits a cell's text
+            // verbatim, so an empty one would write nothing at all and shift
+            // every column after it -- the very fault being repaired.
+            cells[i].text = oxutrm_proto::CellText::const_new(" ");
+            cells[i].attrs = Attrs::empty();
         }
     }
 }
@@ -1243,6 +1301,101 @@ mod tests {
             !painted.contains("ABC"),
             "painted past the screen: {painted:?}"
         );
+    }
+
+    /// A screen whose row 1 holds `text` starting at `col`, as a double-width
+    /// glyph and its continuation.
+    fn screen_with_wide_glyph_at(col: usize) -> ScreenState {
+        let mut screen = ScreenState::blank(3, 8).expect("3x8 is a valid screen");
+        screen.cells[8 + col] = Cell {
+            text: CellText::new("世"),
+            ..Cell::blank()
+        };
+        screen.cells[8 + col + 1] = Cell {
+            text: CellText::const_new(""),
+            attrs: Attrs::WIDE_CONT,
+            ..Cell::blank()
+        };
+        screen
+    }
+
+    fn composited(screen: &ScreenState, o: crate::Overlay) -> Vec<Cell> {
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        r.set_overlay(Some(o));
+        r.composite(screen).into_owned()
+    }
+
+    /// The box's left edge landing on the second column of a remote glyph.
+    ///
+    /// The left half is outside the box and survives, still two columns wide,
+    /// so the terminal paints it over the box's first column and shifts the
+    /// whole row right by one -- on any CJK-heavy screen, at the edge of the
+    /// box the user is being asked to read.
+    #[test]
+    fn an_overlay_edge_on_a_glyphs_second_column_removes_the_orphaned_left_half() {
+        let screen = screen_with_wide_glyph_at(0);
+        let cells = composited(&screen, test_overlay(1, 1, "XYZ"));
+
+        assert!(
+            !is_wide_lead(&cells[8]),
+            "half a glyph was left beside the box, and it is two columns wide: \
+             {:?}",
+            cells[8].text
+        );
+        assert_eq!(cells[8].text.as_str(), " ");
+        assert_eq!(cells[9].text.as_str(), "X", "the box moved");
+    }
+
+    /// And the other side of the same broken pair: the box overwrites the
+    /// left half and the continuation is left behind. `write_cells` skips a
+    /// `WIDE_CONT`, so nothing ever repaints that column and the right half of
+    /// the old glyph stays on the screen for the life of the box.
+    #[test]
+    fn an_overlay_edge_on_a_glyphs_first_column_removes_the_orphaned_right_half() {
+        let screen = screen_with_wide_glyph_at(4);
+        // Columns 2, 3 and 4 -- so the glyph's lead at 4 goes and its
+        // continuation at 5 does not.
+        let cells = composited(&screen, test_overlay(1, 2, "XYZ"));
+
+        assert!(
+            !cells[8 + 5].attrs.contains(Attrs::WIDE_CONT),
+            "a continuation cell was left with nothing in front of it, so the \
+             column it occupies can never be repainted"
+        );
+        assert_eq!(cells[8 + 5].text.as_str(), " ");
+    }
+
+    /// The box's own wide glyph, with its continuation clipped away by the
+    /// screen's right edge. Painting the lead alone puts two columns of glyph
+    /// into one column of screen.
+    #[test]
+    fn a_wide_glyph_clipped_by_the_screen_edge_is_not_left_half_painted() {
+        let screen = ScreenState::blank(3, 8).unwrap();
+        // The overlay's last cell lands in column 7, the last one there is.
+        let cells = composited(&screen, test_overlay(1, 6, "X\u{4e16}"));
+
+        assert!(
+            !is_wide_lead(&cells[8 + 7]),
+            "a double-width glyph was left in the last column with its other \
+             half off the screen: {:?}",
+            cells[8 + 7].text
+        );
+    }
+
+    /// And a pair the box does not touch is left exactly as the host sent it.
+    /// A repair that blanked working glyphs would be the same bug with a
+    /// different sign.
+    #[test]
+    fn a_wide_pair_the_overlay_does_not_touch_survives() {
+        let screen = screen_with_wide_glyph_at(6);
+        let cells = composited(&screen, test_overlay(1, 1, "XYZ"));
+
+        assert_eq!(
+            cells[8 + 6].text.as_str(),
+            "世",
+            "a glyph the box never reached was blanked"
+        );
+        assert!(cells[8 + 7].attrs.contains(Attrs::WIDE_CONT));
     }
 
     #[test]
