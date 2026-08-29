@@ -251,6 +251,59 @@ No attempt is made to detect "it is the same client, resume the diff stream".
 A full screen is a few compressed kilobytes, once, and the alternative is
 cleverness on the one path where being wrong shows the user a corrupted screen.
 
+### 5.5 Authentication during a rebuild
+
+A rebuild runs `ssh`, and `ssh` may need to ask something: a key passphrase, a
+keyboard-interactive second factor, a host-key confirmation. On a **first**
+connect that is not a problem — `run_connect` enters raw mode late, deliberately,
+*"after every prompt ssh could possibly have shown"*. On a rebuild it is a
+problem, because raw mode is held and the screen belongs to the renderer.
+
+The answer is OpenSSH's own, and it needs no new crate:
+
+- `SSH_ASKPASS` points at **`oxutrm askpass`**, a new subcommand.
+- `SSH_ASKPASS_REQUIRE=force` (OpenSSH 8.4+) makes `ssh` use it **even though a
+  tty exists**, which is the whole trick.
+- `OXUTRM_ASKPASS_SOCK` names a Unix socket the client binds inside its own
+  runtime directory.
+
+`ssh` invokes the helper with the prompt as its argument; the helper relays it to
+the client over that socket; the client renders it in the layer-1 overlay (§8)
+and reads the reply with echo suppressed; the helper prints the reply on stdout
+and exits. A non-zero exit aborts the attempt, which is how a user declines a
+host key.
+
+This is why §8's local UI layer is load-bearing rather than decoration: an
+authentication prompt during a rebuild has nowhere else to go.
+
+Constraints:
+
+- **Only rebuilds install it.** A first connect keeps today's behaviour, where
+  `ssh` owns an ordinary terminal and prompts on it directly. Two paths, but the
+  second exists precisely because the first one's precondition is gone.
+- The socket lives in the client's runtime directory with user-only permissions,
+  and **the reply is never written to disk** — the same rule the PSK follows.
+- The helper is inert without `OXUTRM_ASKPASS_SOCK`: run by hand it fails rather
+  than prompting, so it can never become a way to phish a passphrase from a
+  terminal the user did not expect it on.
+
+### 5.6 Reading the user's ssh configuration
+
+**oxutrm still never parses `~/.ssh/config`** (`src/main.rs:12`). Where it needs
+resolved configuration — naming the real host in a notice, and later the session
+picker — it asks OpenSSH: `ssh -G <target>` prints the fully resolved
+configuration, including `Match` blocks, `Include`, and canonicalization, and
+**does not connect**.
+
+Replacing the `ssh` subprocess with a Rust SSH client was considered and
+rejected. It would make oxutrm the owner of host-key verification and
+`known_hosts` semantics — hashed hostnames, `@cert-authority`, `@revoked`, CA
+certificates — which is a **new trust root**, and design spec §1.1 rules exactly
+that out. It would also silently drop ProxyJump, ProxyCommand, `IdentityAgent`,
+`sk-*` FIDO keys, PKCS#11 and GSSAPI, so a target where plain `ssh` works would
+stop working under oxutrm: the worst failure mode available to a tool people
+point at infrastructure they already have.
+
 ---
 
 ## 6. Takeover, symmetric
@@ -430,7 +483,8 @@ remote shell. That distinction is the entire content of the sentence.
 | `src/session.rs` | the state machine, liveness clock, heartbeat, held input, key prefix, link swap; the two `eprintln!` sites become notices |
 | `src/connect.rs` | L4–L10 extracted as a reusable handshake; the rebuild loop |
 | `src/serve.rs` | R4–R11 made generic over the signalling stream; the `UnixListener` |
-| `src/main.rs` | `--attach` wired; the help text it currently contradicts |
+| `src/main.rs` | `--attach` wired; the new `askpass` subcommand; the help text it currently contradicts |
+| `src/askpass.rs` | new — the `SSH_ASKPASS` helper and its socket protocol |
 | `crates/oxutrm-host/src/attach.rs` | the stdio relay |
 
 ---
@@ -459,6 +513,9 @@ test**, and **a test that passes against the injected bug is not a guard**.
   counters reset and the first datagram is a full state; the displaced
   connection closes with the takeover reason.
 - **Take-it-back**: attaching again from the displaced client wins.
+- **Askpass**: the helper relays a prompt and returns a reply; it fails rather
+  than prompting when `OXUTRM_ASKPASS_SOCK` is unset; a non-zero exit aborts the
+  attempt; the reply never reaches disk.
 - **End to end**, on loopback: interrupt the path, assert the notice appears,
   restore it, assert the session resumes without a rebuild.
 
@@ -499,10 +556,11 @@ picker (queue item 3).
 - **The route probe is unproven under a VPN.** Binding and connecting a scratch
   socket reports what the kernel would do; whether that tracks a tunnel coming
   and going needs measuring on a real VPN, not asserting.
-- **The rebuild path can stall on ssh.** `ssh` may prompt for a passphrase, and
-  during a rebuild there is no terminal to prompt on — raw mode is held and the
-  screen belongs to the renderer. Tier A exists partly so this is the uncommon
-  path, but the failure needs a notice of its own rather than a hang.
+- **`SSH_ASKPASS_REQUIRE=force` needs OpenSSH 8.4+** (§5.5). Older clients
+  ignore it and prompt on the tty, which during a rebuild means fighting the
+  renderer for the screen. The version is knowable — `ssh -V` — so this
+  degrades to a notice saying reconnection needs a terminal, rather than to a
+  corrupted screen. It must degrade deliberately and be tested that way.
 - **ratatui is a new dependency in a deliberately lean crate.**
   `crates/oxutrm-client/Cargo.toml` carries a comment listing what must not be
   dragged in and why. `ratatui-core` and `ratatui-widgets` without a backend are
@@ -538,3 +596,6 @@ From the interface contract and the accumulated record, all still normative:
   ratatui enters as a layout and widget library only; `Renderer` remains the
   only thing in the tree that writes to the user's terminal.
 - **`IDLE_POLL` is not to be reintroduced as a pace.**
+- **oxutrm never parses `~/.ssh/config`, and never becomes an SSH
+  implementation.** `ssh -G` asks OpenSSH; that is the only sanctioned way to
+  learn anything about the user's ssh configuration.
