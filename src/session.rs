@@ -838,15 +838,11 @@ impl ClientSession {
         match self.link_state.evaluate(now, owed) {
             Phase::Live => None,
             Phase::Silent { since } => {
-                // Rounded to the nearest second rather than truncated. The
-                // clock runs from the last frame that ARRIVED, which is
-                // always a little after the moment the user would call the
-                // start of the silence, and truncation turns that fraction
-                // into a whole second of under-reporting: a link quiet for
-                // 5.99 s reads as "5s". Half a second of over-reporting at
-                // worst is the smaller lie, and it is the one the counter is
-                // asked for.
-                let quiet = (now.duration_since(since).as_millis() + 500) / 1000;
+                // Truncated, which reads as "at least this long" — the same
+                // thing every stopwatch and `uptime` says. A rounded counter
+                // would show "6s" from 5.5 s onward, and for a fault the user
+                // may act on, overstating an outage is the worse error.
+                let quiet = now.duration_since(since).as_secs();
                 let stats = self.link.sink.connection().stats();
                 let mut body = vec![format!(
                     "silent for {quiet}s - sent {} - lost {}",
@@ -896,6 +892,25 @@ impl ClientSession {
         }
         self.renderer.resize(size);
         self.size = size;
+
+        // Layer 1 was laid out for the screen that just went away. Nothing
+        // else will notice: the loop rebuilds the overlay only when the
+        // notice's CONTENT changes, and a resize does not change a word of it,
+        // so a `Confirming` notice — the one the user sits and reads, because
+        // it is asking them a question — would keep the old geometry until
+        // they pressed a key.
+        //
+        // The same content, laid out again, rather than `self.shown = None`:
+        // `shown` has to keep mirroring what the overlay actually is. Clearing
+        // it would leave the renderer holding a box that `shown` says is not
+        // there, and on any lap where `notice_at` also returns `None` the
+        // loop's `notice != self.shown` test reads `None != None` — false — so
+        // `set_overlay(None)` never runs and the box is stranded on the screen
+        // for the rest of the session.
+        if let Some(n) = self.shown.as_ref() {
+            self.renderer.set_overlay(Some(layout_notice(n, size)));
+        }
+
         // Carried on the next diff, and worth going immediately: the shell is
         // drawing at the wrong width until it lands.
         let next = self.input_tx.current().append(&[], size);
@@ -2659,6 +2674,13 @@ mod tests {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
 
+        // `t` is captured before `pair` performs a real QUIC handshake, so the
+        // session's own `last_heard` — set in `ClientSession::new` — is
+        // strictly later than `t` by however long that took. Saying we heard
+        // from the host AT `t` moves the origin back onto the test's clock, so
+        // the elapsed times below are exactly what they say and not a
+        // handshake shorter.
+        session.note_heard(t);
         session.note_sent(t);
         assert!(session.notice_at(t + Duration::from_secs(1)).is_none());
 
@@ -2674,6 +2696,8 @@ mod tests {
     async fn the_notice_names_the_counters_it_can_actually_observe() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
+        // The clock's origin, pinned to the test's: see the test above.
+        session.note_heard(t);
         session.note_sent(t);
 
         let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
@@ -2687,6 +2711,55 @@ mod tests {
         assert!(
             !body.to_lowercase().contains("retry") && !body.to_lowercase().contains("reconnect"),
             "phase 1 promised a reconnection that does not exist: {body}"
+        );
+    }
+
+    /// The loop rebuilds layer 1 only when the notice's CONTENT changes, and a
+    /// resize changes not one word of it. So the resize itself has to lay the
+    /// box out again, or a `Confirming` notice — the one the user sits and
+    /// reads, because it is asking them a question — keeps the geometry of a
+    /// screen that is gone until they press a key.
+    #[tokio::test]
+    async fn a_resize_lays_the_notice_out_again_for_the_new_screen() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+
+        // Raise a notice and paint it, exactly as `run_on` does.
+        let notice = session.notice_at(t + Duration::from_secs(3)).unwrap();
+        session
+            .renderer
+            .set_overlay(Some(layout_notice(&notice, session.size)));
+        session.shown = Some(notice.clone());
+        let mut painted = Vec::new();
+        session
+            .renderer
+            .render(&mut painted, session.screen_rx.state())
+            .unwrap();
+
+        let small = TermSize { cols: 24, rows: 8 };
+        session.resize(small);
+        let mut after = Vec::new();
+        session
+            .renderer
+            .render(&mut after, session.screen_rx.state())
+            .unwrap();
+
+        // What a renderer that never saw the old screen paints, for the same
+        // content and the same state. Equality is the assertion: the box is
+        // where the NEW screen puts it, and not where the old one did.
+        let mut fresh = Renderer::new(small, caps());
+        fresh.set_overlay(Some(layout_notice(&notice, small)));
+        let mut expected = Vec::new();
+        fresh
+            .render(&mut expected, session.screen_rx.state())
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&after),
+            String::from_utf8_lossy(&expected),
+            "the notice kept the geometry of the screen that went away"
         );
     }
 }
