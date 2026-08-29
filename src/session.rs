@@ -929,7 +929,13 @@ impl ClientSession {
                     body.push("The buffer is full; later keys were not kept.".to_string());
                 }
                 Some(Notice {
-                    headline: "reconnected - deliver what you typed?".to_string(),
+                    // What was observed, which is a frame arriving. Nothing
+                    // reconnected: the QUIC connection never dropped, it went
+                    // quiet and recovered inside the idle timeout, and phase 1
+                    // has no reconnection machinery for a headline to imply.
+                    // "reconnected" -- which this used to say -- named a
+                    // mechanism oxutrm does not yet have.
+                    headline: "the host is answering again - deliver what you typed?".to_string(),
                     body,
                     keys: vec![
                         ("Ctrl-\\ s".to_string(), "send it to the shell".to_string()),
@@ -2735,19 +2741,65 @@ mod tests {
         session.note_sent(t);
 
         let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
-        // Every word the notice puts on the screen, and not just its body.
-        // The headline and the key list are painted in the same box, so a
-        // claim the client cannot support is exactly as wrong in one of them
-        // as in another -- and a guard that reads only the body is how one
-        // came to sit in the key list unnoticed.
-        let shown = std::iter::once(n.headline.clone())
+        let shown = painted_words(&n);
+
+        assert!(shown.contains("6s"), "no silence duration: {shown}");
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// The other notice, and the one that went unguarded: the check above
+    /// reads only the `Silent` box, which is how "reconnected" survived in a
+    /// phase where nothing reconnects.
+    ///
+    /// Reached without sleeping, along the path the loop actually takes: a
+    /// notice is up, something is typed into it, and then the host answers.
+    #[tokio::test]
+    async fn the_confirming_notice_states_only_what_the_client_can_observe() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        // A frame arrives. That the host is answering again is the whole of
+        // what the client learns from it -- not that anything reconnected,
+        // because the connection never dropped, and not that the shell is
+        // well, which no frame can say.
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+
+        let n = session
+            .notice_at(now)
+            .expect("the host answered with input held, and nothing was asked");
+        let shown = painted_words(&n);
+
+        assert!(
+            shown.contains("10 bytes"),
+            "this is not the notice that asks about the held input: {shown}"
+        );
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// Every word a notice puts on the screen: headline, body and key list.
+    /// A guard that reads only the body is how a claim came to sit in a key
+    /// list unnoticed, and reading only the `Silent` notice is how another
+    /// came to sit in a headline.
+    fn painted_words(n: &Notice) -> String {
+        std::iter::once(n.headline.clone())
             .chain(n.body.iter().cloned())
             .chain(n.keys.iter().flat_map(|(k, d)| [k.clone(), d.clone()]))
             .collect::<Vec<_>>()
-            .join(" ");
-        let lower = shown.to_lowercase();
+            .join(" ")
+    }
 
-        assert!(shown.contains("6s"), "no silence duration: {shown}");
+    /// What phase 1 forbids layer 1 to say, wherever in the box it says it.
+    ///
+    /// Nothing reconnects yet, so the notice may not name a mechanism oxutrm
+    /// does not have. And from here a dead network and a crashed host are
+    /// indistinguishable, so it may not vouch for the far end at all -- not
+    /// even hedged. The hedge belongs in the exit message, which is read once
+    /// the session has ended and can point at `oxutrm host --list`; the box
+    /// has room to say what a key DOES, and that stays true either way.
+    fn assert_claims_nothing_it_cannot_see(shown: &str) {
+        let lower = shown.to_lowercase();
         assert!(
             !lower.contains("safe"),
             "claimed the session is safe, which the client cannot know: {shown}"
@@ -2756,12 +2808,6 @@ mod tests {
             !lower.contains("retry") && !lower.contains("reconnect"),
             "phase 1 promised a reconnection that does not exist: {shown}"
         );
-        // The stricter half of the same rule. A crashed host is one of the
-        // plausible causes of the very silence being reported, so the box may
-        // not assert what is happening over there AT ALL -- not even hedged.
-        // The hedge belongs in the exit message, which is read after the
-        // session has ended and can point at `oxutrm host --list`; the box has
-        // room to say what a key DOES, and that stays true either way.
         for claim in ["keeps running", "still running", "is running"] {
             assert!(
                 !lower.contains(claim),
