@@ -4,6 +4,14 @@
 
 ### New
 
+### Changed
+
+### Fixed
+
+## 0.1.0 - 2026-08-29
+
+### New
+
 - `oxutrm <ssh-target>` connects. The local half drives ssh, exchanges
   candidates, races the connection ladder as the controlling side, brings up
   QUIC on the nominated path and hands over to the session loop.
