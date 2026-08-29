@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget as _, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget as _, Wrap};
 
 use crate::overlay::{Overlay, overlay_from_buffer};
 
@@ -39,19 +39,30 @@ pub fn layout_notice(n: &Notice, size: TermSize) -> Overlay {
     }
 
     let lines = notice_lines(n);
-    // Two columns of border plus two of padding.
+    // Two columns of border plus two of horizontal padding.
     let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
     let cols = widest.saturating_add(4).clamp(MIN_BOX.cols, size.cols);
-    // Two rows of border.
-    let rows = (lines.len() as u16).saturating_add(2).clamp(3, size.rows);
-
-    let area = Rect::new(0, 0, cols, rows);
-    let mut buf = Buffer::empty(area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
         .title(" oxutrm ");
+
+    // The row count cannot be read off `lines.len()`: `Wrap { trim: false }`
+    // can turn one long line into several rendered rows, and a screen with
+    // room to spare should grow the box to fit that rather than silently
+    // clip it. Measuring the wrap by rendering it -- rather than
+    // reimplementing word-wrap -- keeps this in agreement with what
+    // actually gets painted, in every corner ratatui's own wrapper handles.
+    let inner_width = block.inner(Rect::new(0, 0, cols, size.rows)).width;
+    let wrapped = wrapped_row_count(&lines, inner_width, size.rows);
+    // Two rows of border.
+    let rows = wrapped.saturating_add(2).clamp(3, size.rows);
+
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+
     let inner = block.inner(area);
     block.render(area, &mut buf);
     Paragraph::new(lines)
@@ -59,6 +70,36 @@ pub fn layout_notice(n: &Notice, size: TermSize) -> Overlay {
         .render(inner, &mut buf);
 
     overlay_from_buffer(&buf, (size.rows - rows) / 2, (size.cols - cols) / 2)
+}
+
+/// How many rows `lines` needs when wrapped at `width`, capped at `height`.
+///
+/// `Paragraph::line_count` would answer this directly, but sits behind
+/// ratatui's `unstable-rendered-line-info` feature, and enabling an
+/// unstable feature to size a box is a worse trade than this: render the
+/// same wrap into a scratch buffer and read back the last row it touched.
+/// That is slightly blunt, but by construction it cannot disagree with
+/// ratatui's own wrapping -- it *is* ratatui's own wrapping.
+///
+/// A run of untouched rows at the bottom unambiguously means "wrapping
+/// stopped here": `notice_lines` never puts a blank separator line last, so
+/// any blank row this function could see is sandwiched between two rows
+/// that do have content, and is counted along with them.
+fn wrapped_row_count(lines: &[Line<'static>], width: u16, height: u16) -> u16 {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buf);
+
+    (0..height)
+        .rev()
+        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
+        .map_or(0, |y| y + 1)
 }
 
 /// Headline, blank, body, blank, keys -- with the blanks dropped when the part
@@ -185,5 +226,27 @@ mod tests {
     fn a_one_by_one_screen_does_not_panic() {
         let o = layout_notice(&notice(), TermSize { cols: 1, rows: 1 });
         assert_eq!(o.cells.len(), o.rows as usize * o.cols as usize);
+    }
+
+    /// On a 30-column screen the key line ("Ctrl-\ q  close oxutrm here; the
+    /// shell keeps running") is wider than the inner box and wraps across
+    /// three rows. A box height read off the unwrapped line count budgets
+    /// only one of those and silently clips the rest of the sentence saying
+    /// the remote shell keeps running -- the one sentence Phase 1 most needs
+    /// the user to read.
+    #[test]
+    fn a_wrapped_key_line_still_fits_in_the_box() {
+        let o = layout_notice(&notice(), TermSize { cols: 30, rows: 24 });
+        let text = text_of(&o);
+
+        // Not a plain `contains("the shell keeps running")`: at this width
+        // the sentence itself wraps across a row boundary (legitimately --
+        // that row boundary is not the bug), so the words land on separate
+        // lines. What the pre-fix code drops is not a word boundary but an
+        // entire row, so checking that both halves of the sentence survived
+        // -- rather than that they are adjacent -- is what actually detects
+        // a dropped row instead of an ordinary wrap point.
+        assert!(text.contains("the shell keeps"), "{text}");
+        assert!(text.contains("running"), "{text}");
     }
 }
