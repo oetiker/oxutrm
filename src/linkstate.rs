@@ -19,11 +19,63 @@ pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 /// client, so it has no heartbeat and its idle cost is unchanged.
 pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(5);
 
+/// `Ctrl-\`. A prefix rather than a bare key, and live only while a notice is
+/// showing: while the link is healthy every byte belongs to the host, which is
+/// what keeps oxutrm out of the escape-character collisions Mosh must live
+/// with.
+const PREFIX: u8 = 0x1c;
+
+/// How much blind typing is kept. Beyond this the buffer STOPS ACCEPTING; it
+/// does not drop the oldest bytes, because the oldest are the command and the
+/// newest are the newline, and discarding from the front is exactly how a
+/// truncated command still runs.
+pub const MAX_HELD: usize = 64 * 1024;
+
+/// How much of the held input is shown before it is summarised.
+const HELD_SHOWN: usize = 200;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Live,
     Silent { since: Instant },
     Confirming,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Command {
+    Quit,
+    SendHeld,
+    DropHeld,
+}
+
+/// Held input as something safe to put in a box.
+///
+/// Control bytes become readable rather than being emitted: the notice is
+/// painted through the renderer, and a raw `\r` in a cell would be a control
+/// scalar the receiver's validation rejects.
+pub fn render_held(bytes: &[u8]) -> String {
+    let shown = &bytes[..bytes.len().min(HELD_SHOWN)];
+    let mut out = String::with_capacity(shown.len() + 16);
+
+    for &b in shown {
+        match b {
+            b'\r' | b'\n' => out.push('\u{21b5}'),
+            0x00..=0x1f => {
+                out.push('^');
+                out.push((b + b'@') as char);
+            }
+            0x7f => out.push_str("^?"),
+            _ => out.push(b as char),
+        }
+    }
+
+    if bytes.len() > shown.len() {
+        out.push_str(&format!(
+            "  ...and {} more bytes",
+            bytes.len() - shown.len()
+        ));
+    }
+    out
 }
 
 /// What the client believes about the link, and why.
@@ -33,6 +85,10 @@ pub struct LinkState {
     last_heard: Instant,
     /// The last time we said anything, so a quiet link can be prodded.
     last_sent: Instant,
+    /// Typed while not `Live`, and not delivered to anyone yet.
+    held: Vec<u8>,
+    /// The prefix arrived at the end of a read and its letter has not.
+    prefix_pending: bool,
 }
 
 impl LinkState {
@@ -41,6 +97,8 @@ impl LinkState {
             phase: Phase::Live,
             last_heard: now,
             last_sent: now,
+            held: Vec::new(),
+            prefix_pending: false,
         }
     }
 
@@ -51,7 +109,14 @@ impl LinkState {
     /// A frame arrived. Whatever we believed, the host is answering.
     pub fn heard(&mut self, now: Instant) {
         self.last_heard = now;
-        self.phase = Phase::Live;
+        // Coming back with something typed blind is a question, not a
+        // resumption. Delivering it silently would replay it against a screen
+        // that moved while the user could not watch.
+        self.phase = if self.held.is_empty() {
+            Phase::Live
+        } else {
+            Phase::Confirming
+        };
     }
 
     /// We sent something, so a reply is owed from here.
@@ -93,6 +158,71 @@ impl LinkState {
             };
         }
         self.phase
+    }
+
+    pub fn held(&self) -> &[u8] {
+        &self.held
+    }
+
+    pub fn held_is_full(&self) -> bool {
+        self.held.len() >= MAX_HELD
+    }
+
+    /// Deliver the held input, emptying the buffer.
+    pub fn take_held(&mut self) -> Vec<u8> {
+        self.phase = Phase::Live;
+        std::mem::take(&mut self.held)
+    }
+
+    /// Discard the held input.
+    pub fn drop_held(&mut self) {
+        self.held.clear();
+        self.phase = Phase::Live;
+    }
+
+    /// Feed keystrokes typed while a notice is showing.
+    ///
+    /// Returns the command the user asked for, if any; everything else is
+    /// added to the held buffer. The prefix may arrive at the end of one read
+    /// and its letter at the start of the next, which is why the pending flag
+    /// outlives the call: a parser that only looked within one buffer would
+    /// swallow the command and hold two stray bytes.
+    pub fn hold_keys(&mut self, bytes: &[u8]) -> Option<Command> {
+        for &b in bytes.iter() {
+            if self.prefix_pending {
+                self.prefix_pending = false;
+                let command = match b {
+                    b'q' => Some(Command::Quit),
+                    b's' => Some(Command::SendHeld),
+                    b'd' => Some(Command::DropHeld),
+                    // Not a command, so the user meant to type both bytes.
+                    _ => {
+                        self.push_held(PREFIX);
+                        self.push_held(b);
+                        None
+                    }
+                };
+                if command.is_some() {
+                    // Anything after a command in the same read belongs to
+                    // whatever the command leads to, not to the old buffer.
+                    return command;
+                }
+                continue;
+            }
+
+            if b == PREFIX {
+                self.prefix_pending = true;
+                continue;
+            }
+            self.push_held(b);
+        }
+        None
+    }
+
+    fn push_held(&mut self, b: u8) {
+        if self.held.len() < MAX_HELD {
+            self.held.push(b);
+        }
     }
 }
 
@@ -218,5 +348,144 @@ mod tests {
             s.evaluate(t + Duration::from_secs(9), true),
             Phase::Silent { .. }
         ));
+    }
+
+    #[test]
+    fn keys_typed_offline_are_held_not_delivered() {
+        let mut s = LinkState::new(t0());
+
+        assert_eq!(s.hold_keys(b"make test"), None);
+        assert_eq!(s.held(), b"make test");
+    }
+
+    #[test]
+    fn the_prefix_and_a_letter_are_a_command_and_are_not_held() {
+        let mut s = LinkState::new(t0());
+
+        assert_eq!(s.hold_keys(b"ab\x1cq"), Some(Command::Quit));
+        assert_eq!(
+            s.held(),
+            b"ab",
+            "the prefix or the command leaked into the buffer"
+        );
+    }
+
+    #[test]
+    fn every_command_key_is_recognised() {
+        for (byte, want) in [
+            (b'q', Command::Quit),
+            (b's', Command::SendHeld),
+            (b'd', Command::DropHeld),
+        ] {
+            let mut s = LinkState::new(t0());
+            assert_eq!(
+                s.hold_keys(&[0x1c, byte]),
+                Some(want),
+                "for {}",
+                byte as char
+            );
+        }
+    }
+
+    /// The prefix can be the last byte of one read and the letter the first of
+    /// the next. A parser that only looked within one buffer would drop the
+    /// command and hold two stray bytes.
+    #[test]
+    fn a_prefix_split_across_two_reads_still_commands() {
+        let mut s = LinkState::new(t0());
+
+        assert_eq!(s.hold_keys(b"x\x1c"), None);
+        assert_eq!(s.hold_keys(b"q"), Some(Command::Quit));
+        assert_eq!(s.held(), b"x");
+    }
+
+    /// An unknown letter after the prefix is ordinary typing, and both bytes
+    /// are kept: the user meant to type them.
+    #[test]
+    fn an_unknown_key_after_the_prefix_is_held_with_the_prefix() {
+        let mut s = LinkState::new(t0());
+
+        assert_eq!(s.hold_keys(b"\x1cz"), None);
+        assert_eq!(s.held(), b"\x1cz");
+    }
+
+    /// The cap stops accepting rather than dropping the oldest bytes: the
+    /// oldest are the command and the newest are the newline, so discarding
+    /// from the front is how a truncated command still runs.
+    #[test]
+    fn a_full_buffer_stops_accepting_rather_than_dropping_the_oldest() {
+        let mut s = LinkState::new(t0());
+        s.hold_keys(&vec![b'a'; MAX_HELD]);
+
+        assert!(s.held_is_full());
+        s.hold_keys(b"zzz");
+        assert_eq!(s.held().len(), MAX_HELD);
+        assert_eq!(s.held()[0], b'a', "the oldest bytes were dropped");
+        assert!(!s.held().contains(&b'z'), "accepted past the cap");
+    }
+
+    #[test]
+    fn taking_the_held_input_empties_the_buffer() {
+        let mut s = LinkState::new(t0());
+        s.hold_keys(b"hello");
+
+        assert_eq!(s.take_held(), b"hello");
+        assert!(s.held().is_empty());
+    }
+
+    /// Hearing from the host with something held is what raises the question,
+    /// and the question is the `Confirming` phase.
+    #[test]
+    fn coming_back_with_held_input_asks_instead_of_going_live() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+        s.hold_keys(b"make test\r");
+
+        s.heard(t + Duration::from_secs(9));
+        assert_eq!(s.phase(), Phase::Confirming);
+    }
+
+    #[test]
+    fn coming_back_with_nothing_held_goes_straight_to_live() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        s.heard(t + Duration::from_secs(9));
+        assert_eq!(s.phase(), Phase::Live);
+    }
+
+    #[test]
+    fn resolving_the_held_input_returns_to_live() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+        s.hold_keys(b"x");
+        s.heard(t);
+        assert_eq!(s.phase(), Phase::Confirming);
+
+        s.drop_held();
+        assert_eq!(s.phase(), Phase::Live);
+        assert!(s.held().is_empty());
+    }
+
+    #[test]
+    fn control_bytes_render_readably_rather_than_as_themselves() {
+        assert_eq!(render_held(b"make test\r"), "make test\u{21b5}");
+        assert_eq!(render_held(b"a\x03b"), "a^Cb");
+        assert_eq!(render_held(b"\t"), "^I");
+    }
+
+    /// A paste can be enormous, and a box cannot hold it. Summarising beats
+    /// truncating silently, which would show a command that is not the command
+    /// about to run.
+    #[test]
+    fn a_long_buffer_is_summarised_rather_than_dumped() {
+        let long = vec![b'x'; 5000];
+        let shown = render_held(&long);
+
+        assert!(shown.len() < 500, "not summarised: {} chars", shown.len());
+        assert!(
+            shown.contains("more"),
+            "no indication of what was elided: {shown}"
+        );
     }
 }
