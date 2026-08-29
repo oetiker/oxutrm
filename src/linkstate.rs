@@ -236,11 +236,23 @@ impl LinkState {
             // because it is the kind of thing that gets rediscovered as a bug:
             // `ClientSession::take_frames` applies a frame the pacing tick
             // scavenged out of the channel without telling this module, so
-            // `last_heard` does not move for it. That cannot raise a FALSE
-            // notice -- the ack such a frame carries clears `owed_since` on
-            // the same lap, which is the whole point of measuring the owing
-            // instead of the silence -- but it can leave the counter in a real
-            // outage reading higher than the truth.
+            // `last_heard` does not move for it and the counter in a real
+            // outage can read higher than the truth.
+            //
+            // What keeps that from becoming a FALSE notice is `note_heard` on
+            // the loop's frame arm, which clears `owed_since` unconditionally
+            // whenever a frame wakes the loop. Not the ack the scavenged frame
+            // carries: that clears the owing only when nothing was appended in
+            // the same turn, and `turn_with` appends input BEFORE it takes
+            // frames, so on a lap that started with a keystroke the sequence
+            // has already moved past the ack and a reply is still owed.
+            //
+            // So the bad case needs every inbound frame across a full
+            // `SILENT_AFTER` window to be scavenged by a pacing, keyboard or
+            // resize lap rather than the frame arm, with the user typing
+            // steadily enough throughout that a reply is never not owed. That
+            // is a race repeated for two seconds rather than a path, and the
+            // next frame that wakes the loop ends it.
             self.phase = Phase::Silent {
                 since: self.last_heard,
             };
