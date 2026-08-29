@@ -45,12 +45,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Renderer, status_line, terminal_size_of};
+use oxutrm_client::{Notice, Renderer, layout_notice, status_line, terminal_size_of};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
-use oxutrm_sync::{InputState, Receiver, Sender};
+use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::link::{Link, SendOutcome};
+use crate::linkstate::{Command, LinkState, Phase};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -577,6 +578,11 @@ fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
             "the host closed the session without the shell exiting: {}",
             String::from_utf8_lossy(&closed.reason)
         )),
+        quinn::ConnectionError::TimedOut => Err(anyhow::anyhow!(
+            "the host stopped answering and the link timed out after 30s. Your \
+             shell may still be running there; `oxutrm host --list` on the host \
+             will say. Reattaching is not implemented yet."
+        )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
         )),
@@ -594,6 +600,18 @@ pub struct ClientSession {
     /// The path last announced, so a change can be spotted and silence can be
     /// the default.
     announced: Option<PathDescription>,
+    /// Whether the host is still answering, and what the user is told.
+    link_state: LinkState,
+    /// Frames that arrived and could not be applied, for the notice.
+    ///
+    /// This used to be an `eprintln!`, which was a bug rather than a
+    /// diagnostic: the client's stderr IS the terminal it is painting, so the
+    /// message desynchronised the renderer's model and nothing repainted it on
+    /// a quiet session.
+    rejected_total: u64,
+    /// What is currently drawn as layer 1, so an unchanged notice does not
+    /// rebuild an overlay every tick.
+    shown: Option<Notice>,
 }
 
 impl ClientSession {
@@ -612,6 +630,9 @@ impl ClientSession {
             size,
             last_send: None,
             announced: None,
+            link_state: LinkState::new(Instant::now()),
+            rejected_total: 0,
+            shown: None,
         })
     }
 
@@ -724,9 +745,13 @@ impl ClientSession {
                 Ok(false) => {}
                 // See the host's copy of this arm: a silently swallowed
                 // BaseMismatch is a frozen screen that looks like a slow one.
-                Err(e) => {
+                Err(_) => {
                     turn.rejected += 1;
-                    eprintln!("oxutrm: client dropped an unapplicable screen frame: {e}");
+                    // NOT `eprintln!`: the client's stderr is the terminal it
+                    // is painting, so a message here desynchronises the
+                    // renderer's model and nothing repaints it on a quiet
+                    // session. The count reaches the user through the notice.
+                    self.rejected_total = self.rejected_total.saturating_add(1);
                 }
             }
         }
@@ -789,6 +814,77 @@ impl ClientSession {
         match self.last_send {
             None => true,
             Some(t) => t.elapsed() >= self.link.sink.pacing_interval(),
+        }
+    }
+
+    /// For tests and for the notice.
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_total
+    }
+
+    /// The clock is a parameter so the loop's behaviour can be tested without
+    /// sleeping, exactly as `LinkState` is.
+    fn note_heard(&mut self, now: Instant) {
+        self.link_state.heard(now);
+    }
+
+    fn note_sent(&mut self, now: Instant) {
+        self.link_state.sent(now);
+    }
+
+    /// What layer 1 should be showing at `now`, if anything.
+    fn notice_at(&mut self, now: Instant) -> Option<Notice> {
+        let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
+        match self.link_state.evaluate(now, owed) {
+            Phase::Live => None,
+            Phase::Silent { since } => {
+                // Rounded to the nearest second rather than truncated. The
+                // clock runs from the last frame that ARRIVED, which is
+                // always a little after the moment the user would call the
+                // start of the silence, and truncation turns that fraction
+                // into a whole second of under-reporting: a link quiet for
+                // 5.99 s reads as "5s". Half a second of over-reporting at
+                // worst is the smaller lie, and it is the one the counter is
+                // asked for.
+                let quiet = (now.duration_since(since).as_millis() + 500) / 1000;
+                let stats = self.link.sink.connection().stats();
+                let mut body = vec![format!(
+                    "silent for {quiet}s - sent {} - lost {}",
+                    stats.path.sent_packets, stats.path.lost_packets
+                )];
+                if self.rejected_total() > 0 {
+                    body.push(format!("screen frames rejected: {}", self.rejected_total()));
+                }
+                Some(Notice {
+                    headline: "no reply from host".to_string(),
+                    body,
+                    keys: vec![(
+                        "Ctrl-\\ q".to_string(),
+                        "close oxutrm here; your shell keeps running on the host".to_string(),
+                    )],
+                })
+            }
+            Phase::Confirming => {
+                let held = crate::linkstate::render_held(self.link_state.held());
+                let mut body = vec![
+                    format!(
+                        "You typed {} bytes while offline:",
+                        self.link_state.held().len()
+                    ),
+                    held,
+                ];
+                if self.link_state.held_is_full() {
+                    body.push("The buffer is full; later keys were not kept.".to_string());
+                }
+                Some(Notice {
+                    headline: "reconnected - deliver what you typed?".to_string(),
+                    body,
+                    keys: vec![
+                        ("Ctrl-\\ s".to_string(), "send it to the shell".to_string()),
+                        ("Ctrl-\\ d".to_string(), "drop it".to_string()),
+                    ],
+                })
+            }
         }
     }
 
@@ -930,9 +1026,6 @@ impl ClientSession {
                 .context("watching for window size changes")?;
 
         let mut buf = [0u8; 8192];
-        // Whether the "cannot read the window size" note has been printed.
-        // See the `Winch` arm.
-        let mut warned_size = false;
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
         // carries our ack of zero (R5).
@@ -986,9 +1079,25 @@ impl ClientSession {
                     continue;
                 }
                 Wake::Keys(n) => {
-                    self.turn(&buf[..n], out)?;
+                    // While a notice is showing the keyboard belongs to layer 1
+                    // -- and only then. A healthy session passes every byte to
+                    // the host untouched.
+                    if self.shown.is_some() {
+                        match self.link_state.hold_keys(&buf[..n]) {
+                            Some(Command::Quit) => return Ok(0),
+                            Some(Command::SendHeld) => {
+                                let held = self.link_state.take_held();
+                                self.turn(&held, out)?;
+                            }
+                            Some(Command::DropHeld) => self.link_state.drop_held(),
+                            None => {}
+                        }
+                    } else {
+                        self.turn(&buf[..n], out)?;
+                    }
                 }
                 Wake::Frame(frame) => {
+                    self.note_heard(Instant::now());
                     self.turn_with(&[], Some(frame), out)?;
                 }
                 // A window that cannot be measured is not a reason to end a
@@ -1006,20 +1115,11 @@ impl ClientSession {
                 // detach. In both cases the size we already have is the last
                 // thing that was true, and the next resize corrects it.
                 Wake::Winch => {
-                    match terminal_size_of(&window) {
-                        Ok(size) => self.resize(size),
-                        // Once. The condition lasts as long as the descriptor
-                        // does, so repeating it would bury everything else —
-                        // and this is stderr, which shares the user's screen.
-                        Err(e) if !warned_size => {
-                            warned_size = true;
-                            eprintln!(
-                                "oxutrm: cannot read the window size ({e:#}); keeping \
-                                 {}x{}. The session is unaffected.",
-                                self.size.cols, self.size.rows
-                            );
-                        }
-                        Err(_) => {}
+                    // A failure is ignored, and silently. Same reasoning as
+                    // the rejected-frame arm: this used to print onto the
+                    // screen it was describing.
+                    if let Ok(size) = terminal_size_of(&window) {
+                        self.resize(size);
                     }
                     self.turn(&[], out)?;
                 }
@@ -1033,6 +1133,31 @@ impl ClientSession {
                     self.drain(out).await?;
                     return exit_code(&reason);
                 }
+            }
+
+            // Layer 1. Rebuilt only when the content actually changed, so a
+            // steady notice costs one comparison per lap rather than a layout.
+            let now = Instant::now();
+            let notice = self.notice_at(now);
+            if notice != self.shown {
+                self.renderer
+                    .set_overlay(notice.as_ref().map(|n| layout_notice(n, self.size)));
+                self.shown = notice;
+                self.renderer
+                    .render(out, self.screen_rx.state())
+                    .context("painting the notice")?;
+                out.flush().context("flushing the terminal")?;
+            }
+
+            // A heartbeat exists to be answered: without one, an idle session
+            // cannot tell an outage from calm. `append(&[], size)` bumps the
+            // sequence exactly as `resize` does, which makes `state_moved` true
+            // and obliges the host to reply.
+            if self.link_state.heartbeat_due(now) {
+                let next = self.input_tx.current().append(&[], self.size);
+                self.input_tx.update(next);
+                self.last_send = None;
+                self.note_sent(now);
             }
 
             // The next WAKE-UP, which is a different thing from `due()`, and
@@ -1051,7 +1176,15 @@ impl ClientSession {
             // interval when there is nothing to say, and nothing at all when
             // there is — typing and resizing both clear `last_send` and send
             // inside the very `turn` above.
-            deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
+            //
+            // The tick that refreshes the counters, and ONLY while something is
+            // shown: a healthy session gains no wakeups from any of this.
+            deadline = tokio::time::Instant::now()
+                + if self.shown.is_some() {
+                    Duration::from_secs(1).min(self.link.sink.pacing_interval())
+                } else {
+                    self.link.sink.pacing_interval()
+                };
         }
     }
 
@@ -2492,6 +2625,68 @@ mod tests {
             "the idle loop burned {spent} ms of CPU across {} ms of wall clock: \
              that is a spin, not a pace",
             idle.as_millis()
+        );
+    }
+
+    /// Frames the receiver cannot apply used to go to stderr, which IS the
+    /// terminal being painted: the message desynchronised the renderer's model
+    /// and nothing repainted it on a quiet session. They are diagnostics about
+    /// the link, so they belong in the link's own notice.
+    #[tokio::test]
+    async fn a_rejected_frame_is_counted_rather_than_printed() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let bad = Frame {
+            my_state: 9,
+            from_state: 7,
+            ack_state: 0,
+            flags: 0,
+            payload: vec![0xff, 0xff, 0xff],
+        };
+
+        let mut out = Vec::new();
+        let turn = session.turn_with(&[], Some(bad), &mut out).unwrap();
+
+        assert_eq!(turn.rejected, 1);
+        assert_eq!(
+            session.rejected_total(),
+            1,
+            "the count did not reach the notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_raises_a_notice_and_a_frame_clears_it() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+
+        session.note_sent(t);
+        assert!(session.notice_at(t + Duration::from_secs(1)).is_none());
+
+        let notice = session.notice_at(t + Duration::from_secs(3));
+        assert!(notice.is_some(), "no notice after three seconds of silence");
+        assert!(notice.unwrap().headline.contains("no reply"));
+
+        session.note_heard(t + Duration::from_secs(4));
+        assert!(session.notice_at(t + Duration::from_secs(4)).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_notice_names_the_counters_it_can_actually_observe() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_sent(t);
+
+        let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
+        let body = n.body.join(" ");
+
+        assert!(body.contains("6s"), "no silence duration: {body}");
+        assert!(
+            !body.to_lowercase().contains("safe"),
+            "claimed the session is safe, which the client cannot know: {body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("retry") && !body.to_lowercase().contains("reconnect"),
+            "phase 1 promised a reconnection that does not exist: {body}"
         );
     }
 }

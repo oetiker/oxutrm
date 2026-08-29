@@ -131,6 +131,14 @@ impl LinkState {
         }
     }
 
+    /// For this module's own tests, and only for them.
+    ///
+    /// The loop never asks: `evaluate` already returns the phase it decided,
+    /// so a caller that asked separately would be reading a value one lap
+    /// stale. `#[cfg(test)]` rather than `#[allow(dead_code)]` because that is
+    /// the truth about it — a later phase that genuinely needs to read the
+    /// state without advancing it can lift the attribute back off.
+    #[cfg(test)]
     pub fn phase(&self) -> Phase {
         self.phase
     }
