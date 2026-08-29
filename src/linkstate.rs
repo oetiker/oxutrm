@@ -260,15 +260,31 @@ impl LinkState {
     /// and its letter at the start of the next, which is why the pending flag
     /// outlives the call: a parser that only looked within one buffer would
     /// swallow the command and hold two stray bytes.
+    ///
+    /// **Which keys are commands depends on the phase**, because it depends on
+    /// which box the user is reading. The gate lives here rather than in the
+    /// caller so that a letter that is not a command in this phase falls into
+    /// the ordinary "the user meant to type both bytes" arm below -- keeping
+    /// the two bytes, in order, along with whatever else was in the same read.
+    /// A caller that filtered the returned `Command` instead would lose the
+    /// rest of the read, because a command ends the loop.
     pub fn hold_keys(&mut self, bytes: &[u8]) -> Option<Command> {
         for &b in bytes.iter() {
             if self.prefix_pending {
                 self.prefix_pending = false;
                 let command = match b {
+                    // Offered by every notice. Closing oxutrm is always
+                    // available and never touches the host.
                     b'q' => Some(Command::Quit),
-                    b's' => Some(Command::SendHeld),
-                    b'd' => Some(Command::DropHeld),
-                    // Not a command, so the user meant to type both bytes.
+                    // Offered ONLY by the `Confirming` box, because only that
+                    // box asks the question they answer. Under `Silent` an `s`
+                    // would throw the buffer at a link the user has just been
+                    // told is not answering -- and empty it, so the review
+                    // that is the whole point of holding never happens -- and
+                    // a `d` would discard it with no confirmation at all.
+                    b's' if self.phase == Phase::Confirming => Some(Command::SendHeld),
+                    b'd' if self.phase == Phase::Confirming => Some(Command::DropHeld),
+                    // Not a command here, so the user meant to type both bytes.
                     _ => {
                         self.push_held(PREFIX);
                         self.push_held(b);
@@ -513,12 +529,77 @@ mod tests {
             (b's', Command::SendHeld),
             (b'd', Command::DropHeld),
         ] {
-            let mut s = LinkState::new(t0());
+            let t = t0();
+            let mut s = LinkState::new(t);
+            // `s` and `d` are offered by the `Confirming` box alone, so that
+            // is the phase they have to be asked in. Something held and the
+            // host answering is exactly what raises it.
+            s.hold_keys(b"x");
+            s.heard(t);
+            assert_eq!(s.phase(), Phase::Confirming);
+
             assert_eq!(
                 s.hold_keys(&[0x1c, byte]),
                 Some(want),
                 "for {}",
                 byte as char
+            );
+        }
+    }
+
+    /// A box the user is reading offers `Ctrl-\ q` and, only when it is
+    /// asking about held input, `s` and `d`. Honouring `s` under `Silent`
+    /// throws the buffer at a link the client has just told the user is not
+    /// answering, and empties it, so the review that is the entire point of
+    /// holding never happens. `d` discards it with no confirmation at all.
+    #[test]
+    fn send_and_drop_are_not_commands_under_the_silent_notice() {
+        for byte in [b's', b'd'] {
+            let t = t0();
+            let mut s = LinkState::new(t);
+            s.hold_keys(b"make test");
+            s.evaluate(t, true);
+            assert!(matches!(
+                s.evaluate(t + Duration::from_secs(3), true),
+                Phase::Silent { .. }
+            ));
+
+            assert_eq!(
+                s.hold_keys(&[0x1c, byte]),
+                None,
+                "`Ctrl-\\ {}` was honoured under a notice that does not offer it",
+                byte as char
+            );
+            assert_eq!(
+                s.held(),
+                [b"make test".as_slice(), &[0x1c, byte]].concat(),
+                "the keystroke was neither a command nor kept"
+            );
+        }
+    }
+
+    /// The one key every box offers. Closing oxutrm is always available, and
+    /// it never touches the host either way.
+    #[test]
+    fn quit_is_offered_in_every_phase() {
+        let t = t0();
+        for phase in ["live", "silent", "confirming"] {
+            let mut s = LinkState::new(t);
+            match phase {
+                "silent" => {
+                    s.evaluate(t, true);
+                    s.evaluate(t + Duration::from_secs(3), true);
+                }
+                "confirming" => {
+                    s.hold_keys(b"x");
+                    s.heard(t);
+                }
+                _ => {}
+            }
+            assert_eq!(
+                s.hold_keys(&[0x1c, b'q']),
+                Some(Command::Quit),
+                "under {phase}"
             );
         }
     }

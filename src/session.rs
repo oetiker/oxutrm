@@ -837,6 +837,10 @@ impl ClientSession {
     /// While a notice is showing the keyboard belongs to layer 1 -- and only
     /// then. A healthy session passes every byte to the host untouched.
     ///
+    /// Which keys are commands is decided in [`LinkState::hold_keys`], from
+    /// the phase, because it is decided by which box the user is reading:
+    /// `Ctrl-\ q` under all of them, `s` and `d` only under `Confirming`.
+    ///
     /// `Some(code)` means the user asked to close oxutrm, which is the one
     /// answer that ends the loop. A method rather than the body of the
     /// `Wake::Keys` arm because holding someone's typing through an outage and
@@ -2842,6 +2846,22 @@ mod tests {
         (host, session)
     }
 
+    /// A client sitting in the `Confirming` box with `held` typed blind: a
+    /// notice went up, the user typed into it, and the host started answering
+    /// again. The only phase that offers `Ctrl-\ s` and `Ctrl-\ d`.
+    async fn with_confirming_notice(held: &[u8]) -> (HostSession, ClientSession) {
+        let (host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(held, &mut out).expect("hold the typing");
+
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+        let notice = session.notice_at(now);
+        assert!(notice.is_some(), "the fixture asked the user nothing");
+        session.shown = notice;
+        (host, session)
+    }
+
     /// Everything the client has said to the host this session. Input is
     /// cumulative -- the host tracks how much of it has been written to the
     /// shell -- so this is where a keystroke lands if it was passed through.
@@ -2912,9 +2932,8 @@ mod tests {
     /// order, once the user has looked at the screen and said so.
     #[tokio::test]
     async fn the_send_key_delivers_what_was_typed_blind() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
         let mut out = Vec::new();
-        session.route_keys(b"make test\r", &mut out).unwrap();
 
         let answer = session
             .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
@@ -2936,9 +2955,8 @@ mod tests {
     /// would deliver the discarded keys at the next `s`.
     #[tokio::test]
     async fn the_drop_key_throws_the_blind_typing_away() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
         let mut out = Vec::new();
-        session.route_keys(b"make test\r", &mut out).unwrap();
         let before = spoken(&session);
 
         let answer = session
@@ -2948,6 +2966,62 @@ mod tests {
         assert_eq!(answer, None, "dropping the held input ended the session");
         assert!(session.link_state.held().is_empty(), "the drop kept it");
         assert_eq!(spoken(&session), before, "the drop sent it instead");
+    }
+
+    /// The `Silent` box lists exactly one key, and the two it does not list
+    /// must not work.
+    ///
+    /// `Ctrl-\ s` there would throw the held bytes at a link the client has
+    /// just told the user is not answering -- and empty the buffer, so the
+    /// `Confirming` review that is the entire point of holding never happens.
+    /// `Ctrl-\ d` would discard someone's typing with no confirmation at all.
+    /// Both are kept as typing instead, which is what the user meant by
+    /// pressing keys into a box that does not offer them.
+    #[tokio::test]
+    async fn the_silent_notice_does_not_honour_the_keys_it_does_not_offer() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        let before = spoken(&session);
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            spoken(&session),
+            before,
+            "the held input was delivered to a host the box says is not answering"
+        );
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
+                .unwrap(),
+            None
+        );
+        assert!(
+            session.link_state.held().starts_with(b"make test\r"),
+            "someone's blind typing was discarded by a key the box never \
+             offered: {:?}",
+            session.link_state.held()
+        );
+    }
+
+    /// And `Ctrl-\ q` is the key every box does offer, in every phase.
+    #[tokio::test]
+    async fn the_quit_key_works_under_the_confirming_notice_too() {
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let mut out = Vec::new();
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
+                .unwrap(),
+            Some(0),
+        );
     }
 
     /// Without a heartbeat an idle session cannot tell an outage from calm,
