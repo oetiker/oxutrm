@@ -2068,7 +2068,6 @@ mod tests {
         let _ = host_loop.await;
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_keyboard_at_end_of_file_neither_ends_the_session_nor_spins() {
         // Two failures, one test, because they are the two halves of the same
@@ -2161,29 +2160,48 @@ mod tests {
         }
     }
 
+    /// Does the CPU clock this file's two spin guards depend on actually
+    /// measure CPU on THIS platform? Ported off `/proc`, and a guard whose
+    /// instrument reads zero passes every time while proving nothing.
+    #[test]
+    fn the_cpu_clock_measures_work_and_not_wall_time() {
+        let a = thread_cpu_millis();
+        std::thread::sleep(Duration::from_millis(300));
+        let slept = thread_cpu_millis() - a;
+
+        let b = thread_cpu_millis();
+        let start = Instant::now();
+        let mut x: u64 = 0;
+        while start.elapsed() < Duration::from_millis(300) {
+            x = x.wrapping_add(1);
+        }
+        let spun = thread_cpu_millis() - b;
+
+        assert!(x > 0, "the spin was optimised away");
+        assert!(slept < 50, "sleeping cost {slept} ms of CPU");
+        assert!(
+            spun > 200,
+            "spinning for 300 ms measured only {spun} ms of CPU"
+        );
+    }
+
     /// This THREAD's CPU time, in milliseconds.
     ///
     /// Per-thread and not per-process: the test binary runs several tests at
     /// once, and a process-wide figure would be measuring them instead.
     /// `#[tokio::test]` with no flavor is a current-thread runtime, so the
     /// loop under test and every task it spawns stay on this one thread.
-    #[cfg(target_os = "linux")]
+    ///
+    /// `CLOCK_THREAD_CPUTIME_ID` rather than `/proc/thread-self/stat`, which
+    /// is what this used to read: the `/proc` version made both spin guards
+    /// Linux-only, so the platform the CPU work was about to happen on had no
+    /// spin guard at all. It is also finer — `/proc` quantises to USER_HZ,
+    /// which is 10 ms, while this is nanoseconds.
     fn thread_cpu_millis() -> u64 {
-        let stat =
-            std::fs::read_to_string("/proc/thread-self/stat").expect("/proc/thread-self/stat");
-        // The comm field can hold spaces and brackets, so the fields are taken
-        // from after the LAST ')' rather than by splitting the whole line.
-        let tail = &stat[stat.rfind(')').expect("a comm field") + 1..];
-        let fields: Vec<&str> = tail.split_whitespace().collect();
-        // utime and stime are fields 14 and 15 of the line, so 11 and 12 of
-        // what is left. USER_HZ is 100, and has been for this interface's
-        // whole life.
-        let ticks: u64 =
-            fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
-        ticks * 10
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        t.tv_sec as u64 * 1_000 + t.tv_nsec as u64 / 1_000_000
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_idle_loop_does_not_spin() {
         // THE test for the pacing deadline, and it has to measure CPU because
@@ -2220,6 +2238,7 @@ mod tests {
             .expect("the client loop failed");
         let spent = thread_cpu_millis() - before;
         let _host = host_loop.await.expect("host task");
+        eprintln!("MEASURED spent={spent} ms");
 
         assert_eq!(code, 0);
         // A spinning loop spends the whole wall-clock window on a core; a

@@ -20,9 +20,22 @@ mutation happens after the select expression ends, which is when the losing
 futures drop. Clone the `quinn::Connection` out of `self` first — it is `Clone`
 — so the `closed()` arm borrows a local.
 
-**C2 — `next_due()` is a 100% busy loop. Do not build it.** This is the most
+**C2 — `next_due()` over-wakes by ~3.6x. Do not build it.** This is the most
 important correction here, and it invalidates the doc's *argument*, not just its
-snippet. `offer_frame` (`src/session.rs:374-394`) sets `last_send` **only when
+snippet.
+
+> **Corrected 2026-08-29, by measurement.** This entry used to say "a 100%
+> busy loop", and §2 used to say it "gives a detached session 100% of a core".
+> Both are wrong, in the same direction and by roughly the same factor as the
+> 30x CPU overstatement recorded in the handoff. Reintroducing the regression
+> deliberately — deadline set to `now` every lap — costs **50-70 ms of CPU on
+> macOS and 97 ms on Linux across a 2 s window, against 19-35 ms healthy**, at
+> ~900 Hz (1794 laps counted). `tokio` rounds an elapsed deadline up to its
+> next 1 ms timer tick, so `sleep_until` does **not** return instantly for
+> ever; the timer floor is what bounds it. The conclusion below is unchanged —
+> waking 3.6x more often than the pace, for nothing, is still strictly worse
+> than the 4 ms poll it would replace — but the reason is a pacing
+> degradation, not a spin. Do not repeat the "burns a core" figure. `offer_frame` (`src/session.rs:374-394`) sets `last_send` **only when
 `make_frame` returned a frame**, and `make_frame` returns `Ok(None)` when
 `!state_moved && !ack_owed` (`crates/oxutrm-sync/src/channel.rs:104-111`) —
 true whenever both ends are quiet. So `last_send` stays stale, `due()` stays
@@ -124,8 +137,9 @@ deliberately.** `IDLE_POLL` (`src/session.rs:58`) adds up to 4 ms to every
 keystroke on the half a human is watching, and all five client sources are
 pollable. The host is *not* a rider on this: there is no `impl AsFd` for `Pty`
 or `HostTerm` today (`controller` is private with no accessor). And C2 applies
-with full force: converting the host with `next_due()` gives a detached session
-100% of a core.
+with full force: converting the host with `next_due()` makes a detached session
+wake ~3.6x more often than its own pace, for nothing (see the correction in
+C2 — this used to read "100% of a core", which measurement refuted).
 
 ### The child's exit IS pollable — DECIDED: a per-child exit descriptor
 
