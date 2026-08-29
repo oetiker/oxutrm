@@ -67,6 +67,20 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// its connection cannot hold a person's terminal hostage.
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
 
+/// How often the numbers inside a notice already on the screen are allowed to
+/// change.
+///
+/// The counters in the `Silent` box move on nearly every lap: the client keeps
+/// retransmitting during an outage, so `sent_packets` climbs at the pacing
+/// rate, which is as often as 125 times a second. That is both expensive --
+/// each change is two `Paragraph` renders, a clone of the whole cell grid, a
+/// diff and a flush -- and useless, because a number churning that fast cannot
+/// be read, in a box whose entire job is to be read.
+///
+/// It bounds the REFRESH only. A change of phase is what the box exists to
+/// announce and is never held back; see [`ClientSession::notice_at`].
+const NOTICE_REFRESH: Duration = Duration::from_secs(1);
+
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
 #[derive(Clone, Debug, Default)]
@@ -612,6 +626,11 @@ pub struct ClientSession {
     /// What is currently drawn as layer 1, so an unchanged notice does not
     /// rebuild an overlay every tick.
     shown: Option<Notice>,
+    /// The phase [`ClientSession::shown`] was built for, and when.
+    ///
+    /// Both halves are needed: the instant paces the refresh, and the phase is
+    /// what tells a refresh apart from a transition, which is never paced.
+    built: Option<(Phase, Instant)>,
 }
 
 impl ClientSession {
@@ -633,6 +652,7 @@ impl ClientSession {
             link_state: LinkState::new(Instant::now()),
             rejected_total: 0,
             shown: None,
+            built: None,
         })
     }
 
@@ -886,9 +906,32 @@ impl ClientSession {
     }
 
     /// What layer 1 should be showing at `now`, if anything.
+    ///
+    /// The text of a box already on the screen is refreshed at most once per
+    /// [`NOTICE_REFRESH`]; a box that is not there yet, or that belongs to a
+    /// different phase, is built at once. So the numbers settle down to
+    /// something readable while the thing the numbers are ABOUT is still
+    /// reported the instant it changes.
     fn notice_at(&mut self, now: Instant) -> Option<Notice> {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
-        match self.link_state.evaluate(now, owed) {
+        let phase = self.link_state.evaluate(now, owed);
+
+        // Only `Silent` carries numbers that move on their own. `Confirming`
+        // shows the held buffer, which changes only when the user types --
+        // and when they do, they should see it.
+        if let Phase::Silent { .. } = phase {
+            if let (Some((built_for, built_at)), Some(shown)) = (self.built, self.shown.as_ref()) {
+                // Not merely "a box is up": it has to be THIS phase's box, or
+                // the transition into `Silent` would itself be delayed by
+                // whenever the previous one happened to be built.
+                if built_for == phase && now.duration_since(built_at) < NOTICE_REFRESH {
+                    return Some(shown.clone());
+                }
+            }
+        }
+        self.built = Some((phase, now));
+
+        match phase {
             Phase::Live => None,
             Phase::Silent { since } => {
                 // Truncated, which reads as "at least this long" — the same
@@ -1236,14 +1279,16 @@ impl ClientSession {
             // there is — typing and resizing both clear `last_send` and send
             // inside the very `turn` above.
             //
-            // The tick that refreshes the counters, and ONLY while something is
-            // shown: a healthy session gains no wakeups from any of this.
-            deadline = tokio::time::Instant::now()
-                + if self.shown.is_some() {
-                    Duration::from_secs(1).min(self.link.sink.pacing_interval())
-                } else {
-                    self.link.sink.pacing_interval()
-                };
+            // The pacing interval, unconditionally. There used to be a second
+            // arm here for "the tick that refreshes the counters", taking
+            // `Duration::from_secs(1).min(pacing_interval)` whenever a notice
+            // was up. `pacing_interval` is `clamp(rtt/2, 8ms, 100ms)`, so that
+            // `min` is always the pacing interval and both arms were the same
+            // expression, below a comment describing a one-second tick that
+            // did not exist. Nothing is lost by dropping it: the loop already
+            // wakes at least ten times a second, which is ten times as often
+            // as `NOTICE_REFRESH` lets the counters move.
+            deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
         }
     }
 
@@ -2751,6 +2796,85 @@ mod tests {
 
         assert!(shown.contains("6s"), "no silence duration: {shown}");
         assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// During an outage the client keeps retransmitting, so `sent_packets`
+    /// climbs at the pacing rate -- as often as 125 times a second. Rebuilding
+    /// the box on each change costs two `Paragraph` renders, a clone of the
+    /// whole cell grid, a diff and a flush every time, and puts a number in
+    /// front of the user that churns far too fast to read, inside a box whose
+    /// entire job is to be read.
+    #[tokio::test]
+    async fn the_silence_counters_are_rebuilt_at_most_once_a_second() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+
+        let first = session
+            .notice_at(t + Duration::from_secs(3))
+            .expect("no notice after three seconds of silence");
+        session.shown = Some(first.clone());
+
+        // Something the box reports moves. In a live outage this is the
+        // retransmit counters; here it is a number a test can set.
+        session.rejected_total = 1;
+
+        assert_eq!(
+            session.notice_at(t + Duration::from_millis(3_400)),
+            Some(first.clone()),
+            "the box was rebuilt 400 ms after the last one"
+        );
+        let later = session
+            .notice_at(t + Duration::from_millis(4_100))
+            .expect("the notice vanished instead of refreshing");
+        assert_ne!(later, first, "the counters never refreshed at all");
+        assert!(
+            painted_words(&later).contains("rejected: 1"),
+            "{}",
+            painted_words(&later)
+        );
+    }
+
+    /// Only the refresh is paced. A change of phase is the thing the box
+    /// exists to announce, and waiting up to a second to announce it would
+    /// leave the user typing into a screen whose box is a second out of date.
+    #[tokio::test]
+    async fn a_change_of_phase_repaints_at_once_however_recent_the_refresh() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        // A hundred milliseconds after the silence box was last built, the
+        // host answers.
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+        let n = session
+            .notice_at(now)
+            .expect("the question about the held input never appeared");
+
+        assert!(
+            n.headline.contains("answering again"),
+            "the box still reports the outage the host has already ended: {}",
+            n.headline
+        );
+    }
+
+    /// And the transition out of a notice altogether is just as immediate:
+    /// a healthy session must not keep a stale box for up to a second.
+    #[tokio::test]
+    async fn returning_to_live_clears_the_box_at_once() {
+        let (_host, mut session) = with_notice().await;
+
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+
+        assert_eq!(
+            session.notice_at(now),
+            None,
+            "a box outlived the silence it was reporting"
+        );
     }
 
     /// The other notice, and the one that went unguarded: the check above
