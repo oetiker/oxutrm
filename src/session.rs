@@ -89,6 +89,11 @@ pub struct Turn {
     /// is invisible to any assertion about the screen.
     pub rejected: usize,
     pub exited: Option<i32>,
+    /// No peer was listening this turn, so the send-side work was skipped.
+    ///
+    /// Reported rather than inferred: "no frame was sent" is also what a
+    /// paced turn looks like, and the two are not the same thing.
+    pub detached: bool,
 }
 
 /// The remote half: owns the PTY and the authoritative screen.
@@ -102,6 +107,10 @@ pub struct HostSession {
     /// How much of the receiver's pending input has already gone to the PTY.
     /// See [`HostSession::drain_input`].
     written: usize,
+    /// The emulator moved while nobody was attached, so the snapshot the
+    /// sender holds is older than the screen. Forces one snapshot on the
+    /// turn a peer comes back, whether or not the pty moved on that turn.
+    screen_stale: bool,
 }
 
 impl HostSession {
@@ -138,6 +147,7 @@ impl HostSession {
             size,
             last_send: None,
             written: 0,
+            screen_stale: false,
         })
     }
 
@@ -176,16 +186,43 @@ impl HostSession {
             self.resize(wanted)?;
         }
 
+        // ---- is anyone listening? -------------------------------------------
+        // A detached session must keep DRAINING the pty below - a child whose
+        // output nobody reads fills the buffer and blocks forever - and must
+        // keep feeding the emulator, because the whole point of a detachable
+        // session is that the screen is current when you come back. But
+        // everything after that exists only to build a frame for a peer, and
+        // there is no peer.
+        //
+        // Measured: a detached session whose child was writing five lines a
+        // second burned 17-20% of a core doing exactly that, for a screen
+        // nobody would ever see. Quiet ones cost 1.2%, which is why this hid.
+        //
+        // `close_reason` and not "did a frame arrive recently": during a
+        // network blip the connection is still open and we WANT the work to
+        // continue, so the session resumes instantly when the peer comes back.
+        // This turns off only once quinn has given the connection up.
+        let attached = self.link.sink.connection().close_reason().is_none();
+        turn.detached = !attached;
+
         // ---- the terminal --------------------------------------------------
-        if self.term.poll().context("draining the pty")? {
-            // The sequence number is a placeholder; `update` mints the real
-            // one, keeping numbering in exactly one place.
-            let snapshot = self.term.snapshot(1);
-            self.screen_tx.update(snapshot);
+        let moved = self.term.poll().context("draining the pty")?;
+        if attached {
+            if moved || self.screen_stale {
+                // The sequence number is a placeholder; `update` mints the real
+                // one, keeping numbering in exactly one place.
+                let snapshot = self.term.snapshot(1);
+                self.screen_tx.update(snapshot);
+                self.screen_stale = false;
+            }
+        } else if moved {
+            self.screen_stale = true;
         }
 
         // ---- outbound: the screen ------------------------------------------
-        turn.sent = self.offer_frame();
+        if attached {
+            turn.sent = self.offer_frame();
+        }
         turn.exited = self.term.child_exited();
         Ok(turn)
     }
@@ -1472,6 +1509,80 @@ mod tests {
             text(client.screen())
         );
         assert_eq!(client.screen().validate(), Ok(()));
+    }
+
+    /// A detached session must stop working for a screen nobody will see -
+    /// **and must keep draining the pty anyway**.
+    ///
+    /// Both halves matter, and the second is the one that bites. Skipping the
+    /// drain is the obvious way to make a detached session cheap, and it
+    /// deadlocks the child: a pty whose output nobody reads fills its buffer
+    /// and the writer blocks forever. So the child here writes far more than
+    /// the buffer holds and then exits, and the test waits for that exit. If
+    /// the drain ever stops, the child never exits and this fails on its
+    /// bound rather than hanging.
+    ///
+    /// Measured before the fix: a detached session whose child wrote five
+    /// lines a second cost 17-20% of a core, indefinitely, with no way to
+    /// reclaim it. A quiet one cost 1.2%, which is why it went unnoticed for
+    /// so long - the cost is proportional to output, not to the poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_session_stops_building_frames_but_keeps_draining() {
+        let (mut host, client) = pair("printf 'before\\r\\n'; seq 1 20000; exit 0\n").await;
+
+        // Up first, so we are measuring a detach and not a session that never
+        // started.
+        let mut out = Vec::new();
+        let mut c = client;
+        assert!(
+            drive(
+                &mut host,
+                &mut c,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| { text(c.screen()).contains("before") }
+            )
+            .await,
+            "the session was not up before detaching"
+        );
+
+        // The client goes away without a graceful shutdown of the session.
+        c.link.sink.connection().close(0u32.into(), b"gone");
+        drop(c);
+
+        // Wait for quinn to give the connection up, then drive the host alone.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_detached = false;
+        let mut exited = None;
+        let mut frames_after_detach = 0usize;
+        while Instant::now() < deadline {
+            let turn = host.turn().expect("turn");
+            if turn.detached {
+                saw_detached = true;
+                if turn.sent.is_some() {
+                    frames_after_detach += 1;
+                }
+            }
+            if let Some(code) = turn.exited {
+                exited = Some(code);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert!(saw_detached, "the host never noticed the client was gone");
+        assert_eq!(
+            frames_after_detach, 0,
+            "the host built frames for a peer that was gone"
+        );
+        // The child wrote ~100 KiB, far past any pty buffer, and then exited.
+        // Reaching its exit is the proof that the drain never stopped.
+        assert_eq!(
+            exited,
+            Some(0),
+            "the child never exited, so the pty stopped being drained and it \
+             blocked on a full buffer"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
