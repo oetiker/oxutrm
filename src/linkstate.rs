@@ -112,6 +112,13 @@ pub struct LinkState {
     phase: Phase,
     /// The last time anything at all arrived from the host.
     last_heard: Instant,
+    /// When the currently outstanding reply started being owed, if one is.
+    ///
+    /// The grace period is measured from HERE and not from `last_heard`.
+    /// `last_heard` only advances when something arrives, so on a quiet
+    /// session it is arbitrarily old and every first lap with a reply owed
+    /// looks like a two-second outage. See `evaluate`.
+    owed_since: Option<Instant>,
     /// The last time we said anything, so a quiet link can be prodded.
     last_sent: Instant,
     /// Typed while not `Live`, and not delivered to anyone yet.
@@ -125,6 +132,7 @@ impl LinkState {
         LinkState {
             phase: Phase::Live,
             last_heard: now,
+            owed_since: None,
             last_sent: now,
             held: Vec::new(),
             prefix_pending: false,
@@ -146,6 +154,10 @@ impl LinkState {
     /// A frame arrived. Whatever we believed, the host is answering.
     pub fn heard(&mut self, now: Instant) {
         self.last_heard = now;
+        // Whatever was owed has been answered. Anything owed from here starts
+        // its own clock, or the grace period would be measured from a moment
+        // the host has already replied to.
+        self.owed_since = None;
         // Coming back with something typed blind is a question, not a
         // resumption. Delivering it silently would replay it against a screen
         // that moved while the user could not watch.
@@ -187,9 +199,33 @@ impl LinkState {
             return self.phase;
         }
 
-        if reply_owed && now.duration_since(self.last_heard) >= SILENT_AFTER {
+        // When the owing STARTED, which is the thing the grace period is
+        // about. `last_heard` cannot stand in for it: nothing arrives on a
+        // quiet session, so `last_heard` is arbitrarily old and the first lap
+        // after a keystroke would read as a two-second outage. Worse, the
+        // heartbeat owes a reply every `HEARTBEAT_IDLE`, which is longer than
+        // `SILENT_AFTER`, so every idle session would raise the notice every
+        // five seconds for ever.
+        match (reply_owed, self.owed_since) {
+            (true, None) => self.owed_since = Some(now),
+            // Answered. The next owing starts its own clock.
+            (false, _) => self.owed_since = None,
+            (true, Some(_)) => {}
+        }
+
+        if self
+            .owed_since
+            .is_some_and(|since| now.duration_since(since) >= SILENT_AFTER)
+        {
             // `last_heard` and not `now`: the counter must report how long the
             // host has been quiet, not how long since we worked it out.
+            //
+            // It is deliberately NOT `owed_since` either, which would be a
+            // different and smaller number -- the reply may have started being
+            // owed long after the host went quiet. The consequence is that the
+            // displayed figure can OVERSTATE the silence, by at most
+            // `HEARTBEAT_IDLE`: `last_heard` is only as stale as the heartbeat
+            // lets it get, because a heartbeat that is answered refreshes it.
             self.phase = Phase::Silent {
                 since: self.last_heard,
             };
@@ -281,6 +317,9 @@ mod tests {
         let t = t0();
         let mut s = LinkState::new(t);
 
+        // The lap the owing begins on. The grace period runs from here, so it
+        // has to be on the clock for the two below to mean what they say.
+        assert_eq!(s.evaluate(t, true), Phase::Live);
         assert_eq!(
             s.evaluate(t + Duration::from_millis(1900), true),
             Phase::Live
@@ -289,6 +328,56 @@ mod tests {
             s.evaluate(t + Duration::from_millis(2100), true),
             Phase::Silent { .. }
         ));
+    }
+
+    /// The grace period measures the OWING, not the calm before it.
+    ///
+    /// This is the defect the whole clock is shaped around. `evaluate` used to
+    /// compare `now` with `last_heard`, and on a quiet session `last_heard` is
+    /// arbitrarily old -- nothing arrives when nothing is happening. So the
+    /// first lap after a keystroke found `now - last_heard` already past
+    /// `SILENT_AFTER` and painted "no reply from host" for a reply that had
+    /// been owed for zero milliseconds, on a link that was about to answer it.
+    ///
+    /// Spec 2: `Silent` is entered on "`SILENT_AFTER` with a reply owed and
+    /// none arriving", and "a blip that resolves in 400 ms must never paint
+    /// anything, or the indicator becomes the noise it was built to remove".
+    #[test]
+    fn a_reply_owed_for_a_moment_after_a_long_calm_stays_live() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        // Ten seconds of calm. Nothing is owed, so nothing is knowable, and
+        // `last_heard` is now ten seconds stale.
+        assert_eq!(s.evaluate(t + Duration::from_secs(10), false), Phase::Live);
+
+        // A key is pressed, and a hundred milliseconds later the answer has
+        // not come back yet. That is a healthy link, not an outage.
+        assert_eq!(
+            s.evaluate(t + Duration::from_millis(10_100), true),
+            Phase::Live,
+            "the notice painted for a reply owed for 100 ms: the grace period \
+             is measuring the calm before the owing instead of the owing"
+        );
+    }
+
+    /// An answered reply ends the owing, so the next one starts its own
+    /// clock. Carrying the old start forward would make a link that answers
+    /// everything promptly go `Silent` after two seconds of ordinary traffic.
+    #[test]
+    fn an_answered_reply_restarts_the_grace_period() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        s.evaluate(t, true);
+        s.evaluate(t + Duration::from_secs(1), false);
+
+        assert_eq!(
+            s.evaluate(t + Duration::from_millis(2500), true),
+            Phase::Live,
+            "the grace period carried over from an owing the host had already \
+             answered"
+        );
     }
 
     /// Nothing owed means nothing is knowable. Without the heartbeat of Task 6
@@ -305,7 +394,11 @@ mod tests {
     fn hearing_from_the_host_returns_to_live() {
         let t = t0();
         let mut s = LinkState::new(t);
-        s.evaluate(t + Duration::from_secs(3), true);
+        s.evaluate(t, true);
+        assert!(matches!(
+            s.evaluate(t + Duration::from_secs(3), true),
+            Phase::Silent { .. }
+        ));
 
         s.heard(t + Duration::from_secs(4));
         assert_eq!(s.phase(), Phase::Live);
@@ -319,6 +412,7 @@ mod tests {
         let t = t0();
         let mut s = LinkState::new(t);
         s.heard(t);
+        s.evaluate(t, true);
 
         let Phase::Silent { since } = s.evaluate(t + Duration::from_secs(5), true) else {
             panic!("expected Silent");
@@ -333,6 +427,7 @@ mod tests {
     fn silence_persists_across_laps_without_restarting_the_clock() {
         let t = t0();
         let mut s = LinkState::new(t);
+        s.evaluate(t, true);
 
         let first = s.evaluate(t + Duration::from_secs(3), true);
         let later = s.evaluate(t + Duration::from_secs(9), true);
@@ -379,8 +474,12 @@ mod tests {
         assert_eq!(s.evaluate(t + Duration::from_secs(6), false), Phase::Live);
         assert!(s.heartbeat_due(t + Duration::from_secs(6)));
 
-        // The caller sends the heartbeat; from here a reply is owed.
+        // The caller sends the heartbeat; from here a reply is owed, and the
+        // grace period runs from here rather than from the six quiet seconds
+        // that preceded it -- which is why the lap at six seconds is still
+        // `Live` and only the one at nine is not.
         s.sent(t + Duration::from_secs(6));
+        assert_eq!(s.evaluate(t + Duration::from_secs(6), true), Phase::Live);
         assert!(matches!(
             s.evaluate(t + Duration::from_secs(9), true),
             Phase::Silent { .. }

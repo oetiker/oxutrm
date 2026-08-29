@@ -2739,6 +2739,8 @@ mod tests {
         // The clock's origin, pinned to the test's: see the test above.
         session.note_heard(t);
         session.note_sent(t);
+        // And the lap the owing begins on, which the grace period runs from.
+        assert!(session.notice_at(t).is_none());
 
         let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
         let shown = painted_words(&n);
@@ -2829,6 +2831,11 @@ mod tests {
         let (host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
+        // The lap the owing begins on, and it is not decoration: the grace
+        // period is measured from when the reply started being owed, so a
+        // fixture that jumped straight to three seconds would be asking about
+        // an owing three seconds long that had only just started.
+        assert!(session.notice_at(t).is_none());
         let notice = session.notice_at(t + Duration::from_secs(3));
         assert!(notice.is_some(), "the fixture raised no notice");
         session.shown = notice;
@@ -2980,6 +2987,130 @@ mod tests {
         assert!(!session.heartbeat(t + Duration::from_secs(6)));
     }
 
+    /// The caller's half of `notice_at`'s question: have we said something the
+    /// host has not acknowledged? Reading it lets a test wait for a REAL ack
+    /// rather than assume one, which is the difference between exercising the
+    /// clock and exercising a fixture.
+    fn reply_owed(c: &ClientSession) -> bool {
+        c.input_tx.current().seq() != c.screen_rx.peer_ack()
+    }
+
+    /// A session that heartbeats and is answered never leaves `Live`.
+    ///
+    /// The composed defect, and the one no per-task test could see because
+    /// each of them holds the clock still around a single transition. The
+    /// heartbeat bumps the sequence every `HEARTBEAT_IDLE` (5 s), so a reply is
+    /// owed from that instant; if the grace period is measured from the last
+    /// thing we HEARD rather than from when the owing began, then five seconds
+    /// of perfectly healthy calm are already past `SILENT_AFTER` (2 s) and the
+    /// very next lap paints "no reply from host". Every idle session, every
+    /// five seconds, for ever -- and while it is up, `route_keys` diverts the
+    /// keyboard into the held buffer.
+    ///
+    /// Two full cycles, with the host really answering in between, and the
+    /// clock supplied rather than slept through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_heartbeating_session_that_is_answered_never_raises_a_notice() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        // Settle first: the fake clock below is only honest if it starts from
+        // a state where the host has acked everything the client has said.
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| !reply_owed(c)
+            )
+            .await,
+            "the host never acked the client, so nothing below is about the clock"
+        );
+
+        let mut now = std::time::Instant::now();
+        client.note_heard(now);
+        client.note_sent(now);
+
+        for cycle in 1..=2u32 {
+            now += crate::linkstate::HEARTBEAT_IDLE;
+            assert!(
+                client.heartbeat(now),
+                "cycle {cycle}: no heartbeat was due after five quiet seconds"
+            );
+            assert_eq!(
+                client.notice_at(now),
+                None,
+                "cycle {cycle}: a notice was raised on the very lap the heartbeat \
+                 went out, for a reply owed for zero milliseconds. Every idle \
+                 session would flash this every {} seconds",
+                crate::linkstate::HEARTBEAT_IDLE.as_secs()
+            );
+
+            // The host answers, as a healthy one does.
+            assert!(
+                drive(
+                    &mut host,
+                    &mut client,
+                    &mut out,
+                    Duration::from_secs(20),
+                    |_, c| !reply_owed(c)
+                )
+                .await,
+                "cycle {cycle}: the heartbeat was never answered"
+            );
+            now += Duration::from_millis(120);
+            client.note_heard(now);
+            assert_eq!(
+                client.notice_at(now),
+                None,
+                "cycle {cycle}: a notice survived the host answering"
+            );
+        }
+    }
+
+    /// A healthy session, through the REAL loop, for longer than the
+    /// heartbeat: no notice may ever be painted.
+    ///
+    /// Both idle-CPU guards run for two seconds, which is below
+    /// `HEARTBEAT_IDLE`, so what the heartbeat does *inside* the loop was
+    /// entirely unpinned -- and nothing anywhere asserted the composed
+    /// property that a working session shows nothing at all. That is how C1
+    /// shipped: every one of its parts passed its own review.
+    ///
+    /// The assertion reads the bytes that went to the terminal, because that
+    /// is what the user sees. The headline is one uniformly styled span, so if
+    /// it is ever painted its bytes appear in `out` contiguously.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_healthy_session_paints_no_notice_across_several_heartbeats() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        // Longer than two heartbeats, and quiet throughout: the client says
+        // nothing, the shell prints nothing, and the only traffic is the
+        // heartbeat and the host's answer to it.
+        typing.write_all(b"sleep 12\nexit 0\n").expect("type");
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(60), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+        let _ = host_loop.await;
+
+        assert_eq!(code, 0);
+        let painted = String::from_utf8_lossy(&out);
+        assert!(
+            !painted.contains("reply from host"),
+            "a healthy session told the user the host had stopped answering"
+        );
+        assert!(
+            client.shown.is_none(),
+            "the session ended with a notice still up"
+        );
+    }
+
     /// The loop rebuilds layer 1 only when the notice's CONTENT changes, and a
     /// resize changes not one word of it. So the resize itself has to lay the
     /// box out again, or a `Confirming` notice — the one the user sits and
@@ -2992,7 +3123,9 @@ mod tests {
         session.note_heard(t);
         session.note_sent(t);
 
-        // Raise a notice and paint it, exactly as `run_on` does.
+        // Raise a notice and paint it, exactly as `run_on` does -- including
+        // the earlier lap on which the reply started being owed.
+        assert!(session.notice_at(t).is_none());
         let notice = session.notice_at(t + Duration::from_secs(3)).unwrap();
         session
             .renderer
