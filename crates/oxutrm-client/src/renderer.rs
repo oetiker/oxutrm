@@ -140,6 +140,24 @@ impl Renderer {
             out.push(0x07);
         }
 
+        // Synchronized output. The terminal shows the whole repaint at once
+        // instead of mid-tear, which matters most where layer 1 paints a box
+        // over live content.
+        //
+        // Unconditional, and that is not laziness: a conforming terminal
+        // ignores a private mode it does not know, so there is nothing to
+        // detect, nothing to negotiate and no capability to carry. Guarded only
+        // on emptiness, because a render that changes nothing must write
+        // nothing -- otherwise every quiet pacing tick costs two escape
+        // sequences.
+        if !out.is_empty() {
+            let mut wrapped = Vec::with_capacity(out.len() + 16);
+            wrapped.extend_from_slice(b"\x1b[?2026h");
+            wrapped.append(&mut out);
+            wrapped.extend_from_slice(b"\x1b[?2026l");
+            out = wrapped;
+        }
+
         // Only a write that completed makes the model true. Committing it
         // before the bytes are out would leave every later diff computed
         // against a screen that was never painted, with no way back — and a
@@ -546,7 +564,10 @@ mod tests {
         next.seq = 2;
         next.cells[6] = cell("X"); // row 1, col 1
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[2;2H\u{1b}[0mX\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[2;2H\u{1b}[0mX\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -567,7 +588,10 @@ mod tests {
         next.cells[2] = cell("b");
         next.cells[3] = cell("c");
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[1;2H\u{1b}[0mabc\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[1;2H\u{1b}[0mabc\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -587,7 +611,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;1;4mab\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;1;4mab\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -610,7 +634,10 @@ mod tests {
         // as (255,85,85), a salmon that is further from (255,0,0) than
         // (170,0,0) is. Nearest-in-sRGB is the rule, and this is where the
         // rule leads — a surprise worth recording rather than special-casing.
-        assert_eq!(out, "\u{1b}[1;1H\u{1b}[0;31;44mR\u{1b}[0m\u{1b}[1;1H");
+        assert_eq!(
+            out,
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;31;44mR\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
+        );
         assert!(
             !out.contains("38;2"),
             "truecolor leaked to a 16-colour terminal"
@@ -632,7 +659,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;38;2;255;0;0mR\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;38;2;255;0;0mR\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -652,7 +679,7 @@ mod tests {
         // Bold, then base red (31) — never 91, which this terminal cannot show.
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;1;31mB\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;1;31mB\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -672,7 +699,10 @@ mod tests {
         next.cells[2] = cell("!");
 
         let out = render(&mut r, &next);
-        assert_eq!(out, "\u{1b}[1;1H\u{1b}[0m世!\u{1b}[1;1H");
+        assert_eq!(
+            out,
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0m世!\u{1b}[1;1H\u{1b}[?2026l"
+        );
         assert_eq!(
             out.matches('世').count(),
             1,
@@ -704,7 +734,7 @@ mod tests {
 
         let out = render(&mut r, &next);
         assert!(
-            out.starts_with("\u{1b}[1;1H"),
+            out.starts_with("\u{1b}[?2026h\u{1b}[1;1H"),
             "run did not reach back: {out:?}"
         );
         assert!(out.contains('世'), "the glyph was not redrawn: {out:?}");
@@ -720,7 +750,10 @@ mod tests {
         next.cursor.row = 1;
         next.cursor.col = 3;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[2;4H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[2;4H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -732,7 +765,10 @@ mod tests {
         next.seq = 2;
         next.cursor.visible = false;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[?25l");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[?25l\u{1b}[?2026l"
+        );
         // And it is not repeated when nothing changes again.
         let mut again = next.clone();
         again.seq = 3;
@@ -748,7 +784,10 @@ mod tests {
         next.seq = 2;
         next.cursor.shape = CursorShape::Bar;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[6 q\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[6 q\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -772,7 +811,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &third),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -786,7 +825,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &s),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -800,7 +839,10 @@ mod tests {
         let mut next = base.clone();
         next.seq = 2;
         let out = render(&mut r, &next);
-        assert!(out.starts_with(MODES_ALL_OFF), "{out:?}");
+        assert!(
+            out.starts_with(&format!("\u{1b}[?2026h{MODES_ALL_OFF}")),
+            "{out:?}"
+        );
         assert!(out.contains("\u{1b}[H\u{1b}[2J"), "{out:?}");
     }
 
@@ -818,7 +860,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &wider),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
         assert_eq!(r.size(), TermSize { cols: 8, rows: 3 });
@@ -835,7 +877,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}]0;vim README.md\u{07}\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}]0;vim README.md\u{07}\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -851,7 +893,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[?2004h\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1002h\u{1b}[?1006h\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[?2004h\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1002h\u{1b}[?1006h\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -888,7 +930,7 @@ mod tests {
         let mut next = base.clone();
         next.seq = 2;
         next.bell = 1;
-        assert_eq!(render(&mut r, &next), "\u{07}");
+        assert_eq!(render(&mut r, &next), "\u{1b}[?2026h\u{07}\u{1b}[?2026l");
 
         // Same count: silence.
         let mut same = next.clone();
@@ -1200,6 +1242,39 @@ mod tests {
         assert!(
             !painted.contains("ABC"),
             "painted past the screen: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_repaint_is_wrapped_in_synchronized_output() {
+        let mut r = Renderer::new(TermSize { cols: 4, rows: 1 }, caps(16_777_216));
+        let mut screen = ScreenState::blank(1, 4).unwrap();
+        screen.cells[0].text = oxutrm_proto::CellText::new("x");
+
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        let painted = String::from_utf8_lossy(&out).to_string();
+
+        assert!(painted.starts_with("\x1b[?2026h"), "no begin: {painted:?}");
+        assert!(painted.ends_with("\x1b[?2026l"), "no end: {painted:?}");
+    }
+
+    /// A render that changes nothing must write nothing at all. Bracketing an
+    /// empty payload would turn every quiet pacing tick into two escape
+    /// sequences on the wire to the user's terminal.
+    #[test]
+    fn a_render_that_paints_nothing_writes_nothing() {
+        let mut r = Renderer::new(TermSize { cols: 4, rows: 1 }, caps(16_777_216));
+        let screen = ScreenState::blank(1, 4).unwrap();
+
+        r.render(&mut Vec::new(), &screen).unwrap();
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+
+        assert!(
+            out.is_empty(),
+            "wrote {:?} for an unchanged screen",
+            String::from_utf8_lossy(&out)
         );
     }
 }
