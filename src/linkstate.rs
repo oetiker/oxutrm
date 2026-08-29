@@ -158,6 +158,11 @@ impl LinkState {
         // its own clock, or the grace period would be measured from a moment
         // the host has already replied to.
         self.owed_since = None;
+        // A `Ctrl-\` whose letter never came belongs to the box that was up
+        // when it was typed. Carrying it into the next one lets it eat the
+        // first byte typed there -- and if that byte is `s`, the `Confirming`
+        // box answers its own question and delivers typing nobody confirmed.
+        self.prefix_pending = false;
         // Coming back with something typed blind is a question, not a
         // resumption. Delivering it silently would replay it against a screen
         // that moved while the user could not watch.
@@ -242,15 +247,21 @@ impl LinkState {
     }
 
     /// Deliver the held input, emptying the buffer.
+    ///
+    /// A half-typed prefix goes with it: the box it was typed into is gone,
+    /// and a `Ctrl-\` left pending would consume the first byte of whatever
+    /// the user types at the shell next.
     pub fn take_held(&mut self) -> Vec<u8> {
         self.phase = Phase::Live;
+        self.prefix_pending = false;
         std::mem::take(&mut self.held)
     }
 
-    /// Discard the held input.
+    /// Discard the held input, half-typed prefix and all.
     pub fn drop_held(&mut self) {
         self.held.clear();
         self.phase = Phase::Live;
+        self.prefix_pending = false;
     }
 
     /// Feed keystrokes typed while a notice is showing.
@@ -639,6 +650,55 @@ mod tests {
         assert_eq!(s.held().len(), MAX_HELD);
         assert_eq!(s.held()[0], b'a', "the oldest bytes were dropped");
         assert!(!s.held().contains(&b'z'), "accepted past the cap");
+    }
+
+    /// A `Ctrl-\` whose letter never came belongs to the box that was up when
+    /// it was typed. Left pending, it eats the first byte typed under the NEXT
+    /// box -- and the `Confirming` box's first key is the answer to a question
+    /// about somebody's shell.
+    #[test]
+    fn a_half_typed_prefix_does_not_survive_the_notice_it_was_typed_into() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+        // Typed blind at a silent link, ending on a prefix with no letter.
+        s.hold_keys(b"make test\r\x1c");
+
+        // The host answers, and the box asks whether to deliver that.
+        s.heard(t);
+        assert_eq!(s.phase(), Phase::Confirming);
+
+        assert_eq!(
+            s.hold_keys(b"send it"),
+            None,
+            "a prefix left over from the previous box answered the new box's \
+             question, and delivered typing nobody confirmed"
+        );
+        assert!(
+            s.held().ends_with(b"send it"),
+            "the leading byte was eaten by a stale prefix: {:?}",
+            s.held()
+        );
+    }
+
+    /// The same, for the two ways the user ends a box by their own hand. The
+    /// bytes that follow go to the shell, so a stale prefix eats a keystroke
+    /// out of a command line.
+    #[test]
+    fn resolving_the_buffer_drops_a_half_typed_prefix_with_it() {
+        for resolve in [
+            (|s: &mut LinkState| {
+                s.take_held();
+            }) as fn(&mut LinkState),
+            |s: &mut LinkState| s.drop_held(),
+        ] {
+            let mut s = LinkState::new(t0());
+            s.hold_keys(b"x\x1c");
+
+            resolve(&mut s);
+
+            assert_eq!(s.hold_keys(b"day"), None, "a stale prefix commanded");
+            assert_eq!(s.held(), b"day", "the leading byte was eaten");
+        }
     }
 
     #[test]
