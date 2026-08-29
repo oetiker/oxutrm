@@ -664,11 +664,65 @@ impl ClientSession {
         // Opening the terminal afresh gives a description of our own to
         // spoil. It is the same terminal and the same input queue, so not a
         // keystroke is lost.
-        let tty = std::fs::File::options()
-            .read(true)
-            .open("/dev/tty")
-            .context("opening the terminal to read the keyboard")?;
+        let tty = Self::open_keyboard().context("opening the terminal to read the keyboard")?;
         self.run_on(tty, out).await
+    }
+
+    /// Open the controlling terminal, by a path `kqueue` will accept.
+    ///
+    /// **Not `/dev/tty`**, even though that is precisely the name for this.
+    /// macOS refuses to register `/dev/tty` with `kqueue`: `EVFILT_READ` on it
+    /// fails with `EINVAL` whichever mode it was opened in, so `AsyncFd`
+    /// cannot watch it and the client dies the instant it tries — which is
+    /// exactly what it did on the first two-machine run, immediately after ICE
+    /// had punched and QUIC was up.
+    ///
+    /// `ttyname` of a descriptor that IS a terminal gives the device's own
+    /// path (`/dev/ttys010`), and `kqueue` accepts that. Measured, both ways,
+    /// inside a real tty; Linux accepts either.
+    ///
+    /// This keeps the property the fresh open exists for. `AsyncFd` requires a
+    /// non-blocking descriptor, and `O_NONBLOCK` lives on the open file
+    /// DESCRIPTION, which a `dup` shares: making a duplicate of fd 0
+    /// non-blocking would make the user's shell's stdin non-blocking too, for
+    /// the rest of that shell's life, with nothing left to restore it
+    /// (`RawGuard` restores termios, which is a different thing entirely).
+    /// Opening the device path afresh gives a description of our own to spoil.
+    /// Same terminal, same input queue, not a keystroke lost.
+    ///
+    /// `/dev/tty` stays as the last candidate rather than disappearing: where
+    /// none of 0/1/2 is a terminal but a controlling terminal exists, it is
+    /// the only way to reach one, and on Linux it registers fine. A candidate
+    /// list and not a `cfg`, so both platforms walk the same code.
+    fn open_keyboard() -> std::io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // `rustix::stdio` and not `BorrowedFd::borrow_raw`: `src/main.rs` is
+        // `forbid(unsafe_code)`, and these are the same three descriptors
+        // without the unsafe block.
+        let standard = [
+            rustix::stdio::stdin(),
+            rustix::stdio::stdout(),
+            rustix::stdio::stderr(),
+        ];
+        for fd in standard {
+            if !rustix::termios::isatty(fd) {
+                continue;
+            }
+            let Ok(name) = rustix::termios::ttyname(fd, Vec::new()) else {
+                continue;
+            };
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+            if let Ok(file) = std::fs::File::options().read(true).open(path) {
+                // It named a terminal a moment ago; confirm what we actually
+                // opened is one, rather than trusting the name.
+                if rustix::termios::isatty(file.as_fd()) {
+                    return Ok(file);
+                }
+            }
+        }
+        std::fs::File::options().read(true).open("/dev/tty")
     }
 
     /// [`ClientSession::run`], reading keystrokes from `keys`.
