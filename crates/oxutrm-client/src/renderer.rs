@@ -17,6 +17,7 @@ use oxutrm_proto::{
 };
 
 use crate::color::down_convert;
+use crate::overlay::Overlay;
 
 /// What the terminal is believed to be showing right now.
 struct Painted {
@@ -33,6 +34,13 @@ pub struct Renderer {
     /// `None` means nothing is known about the terminal, so the next render
     /// repaints everything.
     painted: Option<Painted>,
+    /// Layer 1: locally drawn UI composited over the remote framebuffer.
+    ///
+    /// Held here rather than passed to `render` so that setting it is what a
+    /// caller does, and painting stays one call. It is composited into a local
+    /// cell buffer and **never** into a `ScreenState`: the authoritative state
+    /// is what the sync engine acks and diffs, and layer 1 must not reach it.
+    overlay: Option<Overlay>,
 }
 
 impl Renderer {
@@ -41,6 +49,7 @@ impl Renderer {
             size,
             caps,
             painted: None,
+            overlay: None,
         }
     }
 
@@ -54,6 +63,17 @@ impl Renderer {
     /// Forget what is painted; the next render repaints everything.
     pub fn invalidate(&mut self) {
         self.painted = None;
+    }
+
+    /// Put local UI over the screen, or take it away.
+    ///
+    /// Deliberately **not** paired with `invalidate`. Both painting and
+    /// removing the overlay are ordinary diffs against the model, which is the
+    /// whole reason layer 1 goes through the renderer instead of being written
+    /// to the terminal directly -- see `ClientSession::announce`, which has to
+    /// invalidate precisely because it writes outside the model.
+    pub fn set_overlay(&mut self, overlay: Option<Overlay>) {
+        self.overlay = overlay;
     }
 
     pub fn size(&self) -> TermSize {
@@ -100,10 +120,42 @@ impl Renderer {
         }
 
         self.write_title(&mut out, s, full);
-        self.write_cells(&mut out, s, full);
-        self.write_cursor(&mut out, s, full);
+
+        // Layer 1 is stamped into a copy of the cells, and the cursor is
+        // hidden under it: a caret sitting inside a drawn box reads as a bug.
+        // `Cow` so a session with no overlay -- which is every healthy session
+        // -- clones nothing.
+        let cells = self.composite(s);
+        let cursor = match self.overlay {
+            None => s.cursor,
+            Some(_) => Cursor {
+                visible: false,
+                ..s.cursor
+            },
+        };
+
+        self.write_cells(&mut out, &cells, s.rows, s.cols, full);
+        self.write_cursor(&mut out, cursor, full);
         if ring {
             out.push(0x07);
+        }
+
+        // Synchronized output. The terminal shows the whole repaint at once
+        // instead of mid-tear, which matters most where layer 1 paints a box
+        // over live content.
+        //
+        // Unconditional, and that is not laziness: a conforming terminal
+        // ignores a private mode it does not know, so there is nothing to
+        // detect, nothing to negotiate and no capability to carry. Guarded only
+        // on emptiness, because a render that changes nothing must write
+        // nothing -- otherwise every quiet pacing tick costs two escape
+        // sequences.
+        if !out.is_empty() {
+            let mut wrapped = Vec::with_capacity(out.len() + 16);
+            wrapped.extend_from_slice(b"\x1b[?2026h");
+            wrapped.append(&mut out);
+            wrapped.extend_from_slice(b"\x1b[?2026l");
+            out = wrapped;
         }
 
         // Only a write that completed makes the model true. Committing it
@@ -113,8 +165,8 @@ impl Renderer {
         match w.write_all(&out) {
             Ok(()) => {
                 self.painted = Some(Painted {
-                    cells: s.cells.clone(),
-                    cursor: s.cursor,
+                    cells: cells.into_owned(),
+                    cursor,
                     modes: s.modes,
                     title: s.title.clone(),
                     bell: s.bell,
@@ -126,6 +178,37 @@ impl Renderer {
                 Err(e)
             }
         }
+    }
+
+    /// The screen with layer 1 stamped on top, clipped to the screen.
+    ///
+    /// Clipping rather than asserting: a window can shrink between a notice
+    /// being laid out and being painted, and a resize is not a reason to panic
+    /// in the middle of a repaint.
+    fn composite<'a>(&self, s: &'a ScreenState) -> std::borrow::Cow<'a, [Cell]> {
+        let Some(o) = self.overlay.as_ref() else {
+            return std::borrow::Cow::Borrowed(&s.cells);
+        };
+
+        let mut cells = s.cells.clone();
+        let cols = s.cols as usize;
+        for r in 0..o.rows {
+            let screen_row = o.row.saturating_add(r);
+            if screen_row >= s.rows {
+                break;
+            }
+            for c in 0..o.cols {
+                let screen_col = o.col.saturating_add(c);
+                if screen_col >= s.cols {
+                    break;
+                }
+                let from = r as usize * o.cols as usize + c as usize;
+                let to = screen_row as usize * cols + screen_col as usize;
+                cells[to] = o.cells[from].clone();
+            }
+            repair_wide_pairs(&mut cells, cols, screen_row as usize);
+        }
+        std::borrow::Cow::Owned(cells)
     }
 
     // ---- modes -------------------------------------------------------------
@@ -213,22 +296,22 @@ impl Renderer {
 
     // ---- cells -------------------------------------------------------------
 
-    fn write_cells(&self, out: &mut Vec<u8>, s: &ScreenState, full: bool) {
+    fn write_cells(&self, out: &mut Vec<u8>, cells: &[Cell], rows: u16, cols: u16, full: bool) {
         if full {
             out.extend_from_slice(b"\x1b[H\x1b[2J");
         }
 
-        let cols = s.cols as usize;
+        let cols = cols as usize;
         // The pen is tracked across the whole pass but never across passes: a
         // terminal we have not written to since is not a terminal whose SGR
         // state we can still vouch for.
         let mut pen: Option<Vec<u8>> = None;
 
-        for row in 0..s.rows {
+        for row in 0..rows {
             let base = row as usize * cols;
-            let desired = &s.cells[base..base + cols];
+            let desired = &cells[base..base + cols];
             let previous = self.painted.as_ref().and_then(|p| {
-                if p.cells.len() == s.cells.len() {
+                if p.cells.len() == cells.len() {
                     Some(&p.cells[base..base + cols])
                 } else {
                     None
@@ -315,11 +398,11 @@ impl Renderer {
 
     // ---- cursor and bell ---------------------------------------------------
 
-    fn write_cursor(&self, out: &mut Vec<u8>, s: &ScreenState, full: bool) {
+    fn write_cursor(&self, out: &mut Vec<u8>, cursor: Cursor, full: bool) {
         let before = self.painted.as_ref().map(|p| p.cursor).filter(|_| !full);
 
-        if before.map(|b| b.shape) != Some(s.cursor.shape) {
-            let n = match s.cursor.shape {
+        if before.map(|b| b.shape) != Some(cursor.shape) {
+            let n = match cursor.shape {
                 CursorShape::Block => 2,
                 CursorShape::Underline => 4,
                 CursorShape::Bar => 6,
@@ -329,15 +412,15 @@ impl Renderer {
 
         // Position is written whenever anything was painted, because painting
         // left the caret wherever the last glyph ended.
-        let moved = before.map(|b| (b.row, b.col)) != Some((s.cursor.row, s.cursor.col));
+        let moved = before.map(|b| (b.row, b.col)) != Some((cursor.row, cursor.col));
         if moved || !out.is_empty() {
             out.extend_from_slice(
-                format!("\x1b[{};{}H", s.cursor.row + 1, s.cursor.col + 1).as_bytes(),
+                format!("\x1b[{};{}H", cursor.row + 1, cursor.col + 1).as_bytes(),
             );
         }
 
-        if before.map(|b| b.visible) != Some(s.cursor.visible) {
-            out.extend_from_slice(if s.cursor.visible {
+        if before.map(|b| b.visible) != Some(cursor.visible) {
+            out.extend_from_slice(if cursor.visible {
                 b"\x1b[?25h"
             } else {
                 b"\x1b[?25l"
@@ -382,6 +465,63 @@ fn push_color(p: &mut String, c: Color, foreground: bool, colors: u32) {
         Color::Rgb(r, g, b) => {
             let base = if foreground { 38 } else { 48 };
             p.push_str(&format!(";{base};2;{r};{g};{b}"));
+        }
+    }
+}
+
+/// Is this the left half of a double-width glyph?
+///
+/// Measured from the text, not asserted from a flag: `WIDE_CONT` marks the
+/// right half and nothing marks the left, because nothing needed to until the
+/// overlay arrived and started landing between the two.
+fn is_wide_lead(cell: &Cell) -> bool {
+    use unicode_width::UnicodeWidthStr as _;
+    !cell.attrs.contains(Attrs::WIDE_CONT) && cell.text.width() == 2
+}
+
+/// Put back the invariant the overlay can break: a double-width glyph occupies
+/// exactly two columns, the second of them a `WIDE_CONT`.
+///
+/// The overlay is a rectangle and a wide glyph is two columns, so either edge
+/// of the box can land in the middle of one. Both halves of that are a stray
+/// half-glyph at the box edge, on any CJK-heavy screen:
+///
+/// - The **left** edge can land on the continuation of a remote glyph whose
+///   lead is outside the box. The lead survives, still two columns wide, so
+///   the terminal paints it over the box's first column and shifts the rest
+///   of the row right by one.
+/// - The **right** edge can overwrite a lead whose continuation is outside the
+///   box -- and so can the screen's own right edge, clipping the box's last
+///   column. `write_cells` skips a `WIDE_CONT`, so nothing is ever painted
+///   over that column and the right half of the old glyph stays there.
+///
+/// Both are the same broken pair seen from opposite sides, so the repair is
+/// symmetrical: a continuation whose predecessor is not a wide lead becomes a
+/// blank, and a wide lead whose continuation is gone becomes a blank. The
+/// cell's own colours are kept, so a blank inside the box still wears the
+/// box's background.
+///
+/// The whole row is scanned rather than just the two edge columns. It is one
+/// pass over a row of a grid that has just been cloned wholesale, and on a
+/// well-formed screen it changes nothing outside the damage.
+fn repair_wide_pairs(cells: &mut [Cell], cols: usize, row: usize) {
+    let base = row * cols;
+    for c in 0..cols {
+        let i = base + c;
+        let broken = if cells[i].attrs.contains(Attrs::WIDE_CONT) {
+            c == 0 || !is_wide_lead(&cells[i - 1])
+        } else if is_wide_lead(&cells[i]) {
+            c + 1 >= cols || !cells[base + c + 1].attrs.contains(Attrs::WIDE_CONT)
+        } else {
+            continue;
+        };
+
+        if broken {
+            // A space and not empty text: `write_cells` emits a cell's text
+            // verbatim, so an empty one would write nothing at all and shift
+            // every column after it -- the very fault being repaired.
+            cells[i].text = oxutrm_proto::CellText::const_new(" ");
+            cells[i].attrs = Attrs::empty();
         }
     }
 }
@@ -482,7 +622,10 @@ mod tests {
         next.seq = 2;
         next.cells[6] = cell("X"); // row 1, col 1
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[2;2H\u{1b}[0mX\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[2;2H\u{1b}[0mX\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -503,7 +646,10 @@ mod tests {
         next.cells[2] = cell("b");
         next.cells[3] = cell("c");
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[1;2H\u{1b}[0mabc\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[1;2H\u{1b}[0mabc\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -523,7 +669,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;1;4mab\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;1;4mab\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -546,7 +692,10 @@ mod tests {
         // as (255,85,85), a salmon that is further from (255,0,0) than
         // (170,0,0) is. Nearest-in-sRGB is the rule, and this is where the
         // rule leads — a surprise worth recording rather than special-casing.
-        assert_eq!(out, "\u{1b}[1;1H\u{1b}[0;31;44mR\u{1b}[0m\u{1b}[1;1H");
+        assert_eq!(
+            out,
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;31;44mR\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
+        );
         assert!(
             !out.contains("38;2"),
             "truecolor leaked to a 16-colour terminal"
@@ -568,7 +717,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;38;2;255;0;0mR\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;38;2;255;0;0mR\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -588,7 +737,7 @@ mod tests {
         // Bold, then base red (31) — never 91, which this terminal cannot show.
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[1;1H\u{1b}[0;1;31mB\u{1b}[0m\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0;1;31mB\u{1b}[0m\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -608,7 +757,10 @@ mod tests {
         next.cells[2] = cell("!");
 
         let out = render(&mut r, &next);
-        assert_eq!(out, "\u{1b}[1;1H\u{1b}[0m世!\u{1b}[1;1H");
+        assert_eq!(
+            out,
+            "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0m世!\u{1b}[1;1H\u{1b}[?2026l"
+        );
         assert_eq!(
             out.matches('世').count(),
             1,
@@ -640,7 +792,7 @@ mod tests {
 
         let out = render(&mut r, &next);
         assert!(
-            out.starts_with("\u{1b}[1;1H"),
+            out.starts_with("\u{1b}[?2026h\u{1b}[1;1H"),
             "run did not reach back: {out:?}"
         );
         assert!(out.contains('世'), "the glyph was not redrawn: {out:?}");
@@ -656,7 +808,10 @@ mod tests {
         next.cursor.row = 1;
         next.cursor.col = 3;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[2;4H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[2;4H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -668,7 +823,10 @@ mod tests {
         next.seq = 2;
         next.cursor.visible = false;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[?25l");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[?25l\u{1b}[?2026l"
+        );
         // And it is not repeated when nothing changes again.
         let mut again = next.clone();
         again.seq = 3;
@@ -684,7 +842,10 @@ mod tests {
         next.seq = 2;
         next.cursor.shape = CursorShape::Bar;
 
-        assert_eq!(render(&mut r, &next), "\u{1b}[6 q\u{1b}[1;1H");
+        assert_eq!(
+            render(&mut r, &next),
+            "\u{1b}[?2026h\u{1b}[6 q\u{1b}[1;1H\u{1b}[?2026l"
+        );
     }
 
     #[test]
@@ -708,7 +869,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &third),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -722,7 +883,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &s),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -736,7 +897,10 @@ mod tests {
         let mut next = base.clone();
         next.seq = 2;
         let out = render(&mut r, &next);
-        assert!(out.starts_with(MODES_ALL_OFF), "{out:?}");
+        assert!(
+            out.starts_with(&format!("\u{1b}[?2026h{MODES_ALL_OFF}")),
+            "{out:?}"
+        );
         assert!(out.contains("\u{1b}[H\u{1b}[2J"), "{out:?}");
     }
 
@@ -754,7 +918,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &wider),
             format!(
-                "{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
         assert_eq!(r.size(), TermSize { cols: 8, rows: 3 });
@@ -771,7 +935,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}]0;vim README.md\u{07}\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}]0;vim README.md\u{07}\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -787,7 +951,7 @@ mod tests {
 
         assert_eq!(
             render(&mut r, &next),
-            "\u{1b}[?2004h\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1002h\u{1b}[?1006h\u{1b}[1;1H"
+            "\u{1b}[?2026h\u{1b}[?2004h\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1002h\u{1b}[?1006h\u{1b}[1;1H\u{1b}[?2026l"
         );
     }
 
@@ -824,7 +988,7 @@ mod tests {
         let mut next = base.clone();
         next.seq = 2;
         next.bell = 1;
-        assert_eq!(render(&mut r, &next), "\u{07}");
+        assert_eq!(render(&mut r, &next), "\u{1b}[?2026h\u{07}\u{1b}[?2026l");
 
         // Same count: silence.
         let mut same = next.clone();
@@ -1016,5 +1180,254 @@ mod tests {
         for style in ["4:1", "4:2", "4:3", "4:4", "4:5", "21m"] {
             assert!(!out.contains(style), "emitted an underline style: {out:?}");
         }
+    }
+
+    /// A 3x1 red overlay at row 1, col 2 of an 8x3 screen.
+    fn test_overlay(row: u16, col: u16, text: &str) -> crate::Overlay {
+        let cells = text
+            .chars()
+            .map(|c| Cell {
+                text: oxutrm_proto::CellText::new(c.to_string()),
+                fg: Color::Idx(1),
+                bg: Color::Default,
+                attrs: Attrs::empty(),
+            })
+            .collect::<Vec<_>>();
+        crate::Overlay {
+            row,
+            col,
+            rows: 1,
+            cols: cells.len() as u16,
+            cells,
+        }
+    }
+
+    #[test]
+    fn an_overlay_paints_over_the_screen_beneath_it() {
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        let mut screen = ScreenState::blank(3, 8).unwrap();
+        for (i, c) in "abcdefgh".chars().enumerate() {
+            screen.cells[8 + i].text = oxutrm_proto::CellText::new(c.to_string());
+        }
+
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+
+        r.set_overlay(Some(test_overlay(1, 2, "XYZ")));
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        let painted = String::from_utf8_lossy(&out).to_string();
+
+        assert!(
+            painted.contains("XYZ"),
+            "the overlay was not painted: {painted:?}"
+        );
+        assert!(
+            !painted.contains("abcdefgh"),
+            "the whole row was repainted, not just the covered columns: {painted:?}"
+        );
+    }
+
+    /// The property the whole approach rests on: removing the overlay is an
+    /// ordinary diff back to the authoritative screen. No repaint, no
+    /// `invalidate`, and the cells underneath come back exactly.
+    #[test]
+    fn removing_an_overlay_restores_the_cells_beneath_it() {
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        let mut screen = ScreenState::blank(3, 8).unwrap();
+        for (i, c) in "abcdefgh".chars().enumerate() {
+            screen.cells[8 + i].text = oxutrm_proto::CellText::new(c.to_string());
+        }
+
+        r.render(&mut Vec::new(), &screen).unwrap();
+        r.set_overlay(Some(test_overlay(1, 2, "XYZ")));
+        r.render(&mut Vec::new(), &screen).unwrap();
+
+        r.set_overlay(None);
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        let painted = String::from_utf8_lossy(&out).to_string();
+
+        assert!(
+            painted.contains("cde"),
+            "the covered cells were not restored: {painted:?}"
+        );
+        assert!(
+            !painted.contains("\x1b[2J"),
+            "restoring should be a diff, not a full repaint: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_hides_the_cursor_and_restoring_brings_it_back() {
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        let mut screen = ScreenState::blank(3, 8).unwrap();
+        screen.cursor.visible = true;
+
+        r.render(&mut Vec::new(), &screen).unwrap();
+
+        r.set_overlay(Some(test_overlay(1, 2, "XYZ")));
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[?25l"),
+            "the cursor was not hidden under the overlay"
+        );
+
+        r.set_overlay(None);
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[?25h"),
+            "the cursor did not come back"
+        );
+    }
+
+    /// An overlay wider or taller than the screen must clip, not panic and not
+    /// write past the row. A window can shrink between the notice being built
+    /// and being painted.
+    #[test]
+    fn an_overlay_larger_than_the_screen_is_clipped() {
+        let mut r = Renderer::new(TermSize { cols: 4, rows: 2 }, caps(16_777_216));
+        let screen = ScreenState::blank(2, 4).unwrap();
+
+        r.set_overlay(Some(test_overlay(1, 2, "XYZABC")));
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+
+        let painted = String::from_utf8_lossy(&out).to_string();
+        assert!(painted.contains("XY"), "nothing was painted: {painted:?}");
+        assert!(
+            !painted.contains("ABC"),
+            "painted past the screen: {painted:?}"
+        );
+    }
+
+    /// A screen whose row 1 holds `text` starting at `col`, as a double-width
+    /// glyph and its continuation.
+    fn screen_with_wide_glyph_at(col: usize) -> ScreenState {
+        let mut screen = ScreenState::blank(3, 8).expect("3x8 is a valid screen");
+        screen.cells[8 + col] = Cell {
+            text: CellText::new("世"),
+            ..Cell::blank()
+        };
+        screen.cells[8 + col + 1] = Cell {
+            text: CellText::const_new(""),
+            attrs: Attrs::WIDE_CONT,
+            ..Cell::blank()
+        };
+        screen
+    }
+
+    fn composited(screen: &ScreenState, o: crate::Overlay) -> Vec<Cell> {
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        r.set_overlay(Some(o));
+        r.composite(screen).into_owned()
+    }
+
+    /// The box's left edge landing on the second column of a remote glyph.
+    ///
+    /// The left half is outside the box and survives, still two columns wide,
+    /// so the terminal paints it over the box's first column and shifts the
+    /// whole row right by one -- on any CJK-heavy screen, at the edge of the
+    /// box the user is being asked to read.
+    #[test]
+    fn an_overlay_edge_on_a_glyphs_second_column_removes_the_orphaned_left_half() {
+        let screen = screen_with_wide_glyph_at(0);
+        let cells = composited(&screen, test_overlay(1, 1, "XYZ"));
+
+        assert!(
+            !is_wide_lead(&cells[8]),
+            "half a glyph was left beside the box, and it is two columns wide: \
+             {:?}",
+            cells[8].text
+        );
+        assert_eq!(cells[8].text.as_str(), " ");
+        assert_eq!(cells[9].text.as_str(), "X", "the box moved");
+    }
+
+    /// And the other side of the same broken pair: the box overwrites the
+    /// left half and the continuation is left behind. `write_cells` skips a
+    /// `WIDE_CONT`, so nothing ever repaints that column and the right half of
+    /// the old glyph stays on the screen for the life of the box.
+    #[test]
+    fn an_overlay_edge_on_a_glyphs_first_column_removes_the_orphaned_right_half() {
+        let screen = screen_with_wide_glyph_at(4);
+        // Columns 2, 3 and 4 -- so the glyph's lead at 4 goes and its
+        // continuation at 5 does not.
+        let cells = composited(&screen, test_overlay(1, 2, "XYZ"));
+
+        assert!(
+            !cells[8 + 5].attrs.contains(Attrs::WIDE_CONT),
+            "a continuation cell was left with nothing in front of it, so the \
+             column it occupies can never be repainted"
+        );
+        assert_eq!(cells[8 + 5].text.as_str(), " ");
+    }
+
+    /// The box's own wide glyph, with its continuation clipped away by the
+    /// screen's right edge. Painting the lead alone puts two columns of glyph
+    /// into one column of screen.
+    #[test]
+    fn a_wide_glyph_clipped_by_the_screen_edge_is_not_left_half_painted() {
+        let screen = ScreenState::blank(3, 8).unwrap();
+        // The overlay's last cell lands in column 7, the last one there is.
+        let cells = composited(&screen, test_overlay(1, 6, "X\u{4e16}"));
+
+        assert!(
+            !is_wide_lead(&cells[8 + 7]),
+            "a double-width glyph was left in the last column with its other \
+             half off the screen: {:?}",
+            cells[8 + 7].text
+        );
+    }
+
+    /// And a pair the box does not touch is left exactly as the host sent it.
+    /// A repair that blanked working glyphs would be the same bug with a
+    /// different sign.
+    #[test]
+    fn a_wide_pair_the_overlay_does_not_touch_survives() {
+        let screen = screen_with_wide_glyph_at(6);
+        let cells = composited(&screen, test_overlay(1, 1, "XYZ"));
+
+        assert_eq!(
+            cells[8 + 6].text.as_str(),
+            "世",
+            "a glyph the box never reached was blanked"
+        );
+        assert!(cells[8 + 7].attrs.contains(Attrs::WIDE_CONT));
+    }
+
+    #[test]
+    fn a_repaint_is_wrapped_in_synchronized_output() {
+        let mut r = Renderer::new(TermSize { cols: 4, rows: 1 }, caps(16_777_216));
+        let mut screen = ScreenState::blank(1, 4).unwrap();
+        screen.cells[0].text = oxutrm_proto::CellText::new("x");
+
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+        let painted = String::from_utf8_lossy(&out).to_string();
+
+        assert!(painted.starts_with("\x1b[?2026h"), "no begin: {painted:?}");
+        assert!(painted.ends_with("\x1b[?2026l"), "no end: {painted:?}");
+    }
+
+    /// A render that changes nothing must write nothing at all. Bracketing an
+    /// empty payload would turn every quiet pacing tick into two escape
+    /// sequences on the wire to the user's terminal.
+    #[test]
+    fn a_render_that_paints_nothing_writes_nothing() {
+        let mut r = Renderer::new(TermSize { cols: 4, rows: 1 }, caps(16_777_216));
+        let screen = ScreenState::blank(1, 4).unwrap();
+
+        r.render(&mut Vec::new(), &screen).unwrap();
+        let mut out = Vec::new();
+        r.render(&mut out, &screen).unwrap();
+
+        assert!(
+            out.is_empty(),
+            "wrote {:?} for an unchanged screen",
+            String::from_utf8_lossy(&out)
+        );
     }
 }

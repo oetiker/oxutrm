@@ -45,12 +45,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Renderer, status_line, terminal_size_of};
+use oxutrm_client::{Notice, Renderer, layout_notice, status_line, terminal_size_of};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
-use oxutrm_sync::{InputState, Receiver, Sender};
+use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::link::{Link, SendOutcome};
+use crate::linkstate::{Command, LinkState, Phase};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -65,6 +66,20 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// reached in practice. It exists so that a reader task which somehow outlives
 /// its connection cannot hold a person's terminal hostage.
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
+
+/// How often the numbers inside a notice already on the screen are allowed to
+/// change.
+///
+/// The counters in the `Silent` box move on nearly every lap: the client keeps
+/// retransmitting during an outage, so `sent_packets` climbs at the pacing
+/// rate, which is as often as 125 times a second. That is both expensive --
+/// each change is two `Paragraph` renders, a clone of the whole cell grid, a
+/// diff and a flush -- and useless, because a number churning that fast cannot
+/// be read, in a box whose entire job is to be read.
+///
+/// It bounds the REFRESH only. A change of phase is what the box exists to
+/// announce and is never held back; see [`ClientSession::notice_at`].
+const NOTICE_REFRESH: Duration = Duration::from_secs(1);
 
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
@@ -577,6 +592,11 @@ fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
             "the host closed the session without the shell exiting: {}",
             String::from_utf8_lossy(&closed.reason)
         )),
+        quinn::ConnectionError::TimedOut => Err(anyhow::anyhow!(
+            "the host stopped answering and the link timed out after 30s. Your \
+             shell may still be running there; `oxutrm host --list` on the host \
+             will say. Reattaching is not implemented yet."
+        )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
         )),
@@ -594,6 +614,23 @@ pub struct ClientSession {
     /// The path last announced, so a change can be spotted and silence can be
     /// the default.
     announced: Option<PathDescription>,
+    /// Whether the host is still answering, and what the user is told.
+    link_state: LinkState,
+    /// Frames that arrived and could not be applied, for the notice.
+    ///
+    /// This used to be an `eprintln!`, which was a bug rather than a
+    /// diagnostic: the client's stderr IS the terminal it is painting, so the
+    /// message desynchronised the renderer's model and nothing repainted it on
+    /// a quiet session.
+    rejected_total: u64,
+    /// What is currently drawn as layer 1, so an unchanged notice does not
+    /// rebuild an overlay every tick.
+    shown: Option<Notice>,
+    /// The phase [`ClientSession::shown`] was built for, and when.
+    ///
+    /// Both halves are needed: the instant paces the refresh, and the phase is
+    /// what tells a refresh apart from a transition, which is never paced.
+    built: Option<(Phase, Instant)>,
 }
 
 impl ClientSession {
@@ -612,6 +649,10 @@ impl ClientSession {
             size,
             last_send: None,
             announced: None,
+            link_state: LinkState::new(Instant::now()),
+            rejected_total: 0,
+            shown: None,
+            built: None,
         })
     }
 
@@ -724,9 +765,13 @@ impl ClientSession {
                 Ok(false) => {}
                 // See the host's copy of this arm: a silently swallowed
                 // BaseMismatch is a frozen screen that looks like a slow one.
-                Err(e) => {
+                Err(_) => {
                     turn.rejected += 1;
-                    eprintln!("oxutrm: client dropped an unapplicable screen frame: {e}");
+                    // NOT `eprintln!`: the client's stderr is the terminal it
+                    // is painting, so a message here desynchronises the
+                    // renderer's model and nothing repaints it on a quiet
+                    // session. The count reaches the user through the notice.
+                    self.rejected_total = self.rejected_total.saturating_add(1);
                 }
             }
         }
@@ -792,6 +837,179 @@ impl ClientSession {
         }
     }
 
+    /// For tests and for the notice.
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_total
+    }
+
+    /// The clock is a parameter so the loop's behaviour can be tested without
+    /// sleeping, exactly as `LinkState` is.
+    fn note_heard(&mut self, now: Instant) {
+        self.link_state.heard(now);
+    }
+
+    fn note_sent(&mut self, now: Instant) {
+        self.link_state.sent(now);
+    }
+
+    /// One read from the keyboard, sent wherever it belongs.
+    ///
+    /// While a notice is showing the keyboard belongs to layer 1 -- and only
+    /// then. A healthy session passes every byte to the host untouched.
+    ///
+    /// Which keys are commands is decided in [`LinkState::hold_keys`], from
+    /// the phase, because it is decided by which box the user is reading:
+    /// `Ctrl-\ q` under all of them, `s` and `d` only under `Confirming`.
+    ///
+    /// `Some(code)` means the user asked to close oxutrm, which is the one
+    /// answer that ends the loop. A method rather than the body of the
+    /// `Wake::Keys` arm because holding someone's typing through an outage and
+    /// giving it back afterwards is the whole user-visible payload of this
+    /// phase, and the arm itself cannot be reached from a test without a real
+    /// terminal and a real two-second silence. The arm is left as a single
+    /// call to this, so what is tested is what ships.
+    fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>> {
+        if self.shown.is_none() {
+            self.turn(keys, out)?;
+            return Ok(None);
+        }
+        match self.link_state.hold_keys(keys) {
+            Some(Command::Quit) => return Ok(Some(0)),
+            Some(Command::SendHeld) => {
+                let held = self.link_state.take_held();
+                self.turn(&held, out)?;
+            }
+            Some(Command::DropHeld) => self.link_state.drop_held(),
+            None => {}
+        }
+        Ok(None)
+    }
+
+    /// Say something, purely so that an answer is owed.
+    ///
+    /// A heartbeat exists to be answered: without one, an idle session cannot
+    /// tell an outage from calm. `append(&[], size)` bumps the sequence
+    /// exactly as `resize` does, which makes `state_moved` true and obliges
+    /// the host to reply.
+    ///
+    /// Reports whether one went out, which is what lets a test hold the clock
+    /// still and ask.
+    fn heartbeat(&mut self, now: Instant) -> bool {
+        if !self.link_state.heartbeat_due(now) {
+            return false;
+        }
+        let next = self.input_tx.current().append(&[], self.size);
+        self.input_tx.update(next);
+        self.last_send = None;
+        self.note_sent(now);
+        true
+    }
+
+    /// What layer 1 should be showing at `now`, if anything.
+    ///
+    /// The text of a box already on the screen is refreshed at most once per
+    /// [`NOTICE_REFRESH`]; a box that is not there yet, or that belongs to a
+    /// different phase, is built at once. So the numbers settle down to
+    /// something readable while the thing the numbers are ABOUT is still
+    /// reported the instant it changes.
+    fn notice_at(&mut self, now: Instant) -> Option<Notice> {
+        let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
+        let phase = self.link_state.evaluate(now, owed);
+
+        // Only `Silent` carries numbers that move on their own. `Confirming`
+        // shows the held buffer, which changes only when the user types --
+        // and when they do, they should see it.
+        //
+        // `built_for == phase` and not merely "a box is up": the box already
+        // there has to be THIS phase's, or entering `Silent` would itself be
+        // delayed by whenever the previous box happened to be built.
+        if let Phase::Silent { .. } = phase
+            && let Some((built_for, built_at)) = self.built
+            && let Some(shown) = self.shown.as_ref()
+            && built_for == phase
+            && now.duration_since(built_at) < NOTICE_REFRESH
+        {
+            return Some(shown.clone());
+        }
+        self.built = Some((phase, now));
+
+        match phase {
+            Phase::Live => None,
+            Phase::Silent { since } => {
+                // Truncated, which reads as "at least this long" — the same
+                // thing every stopwatch and `uptime` says. A rounded counter
+                // would show "6s" from 5.5 s onward, and for a fault the user
+                // may act on, overstating an outage is the worse error.
+                let quiet = now.duration_since(since).as_secs();
+                let stats = self.link.sink.connection().stats();
+                let mut body = vec![format!(
+                    "silent for {quiet}s - sent {} - lost {}",
+                    stats.path.sent_packets, stats.path.lost_packets
+                )];
+                if self.rejected_total() > 0 {
+                    body.push(format!("screen frames rejected: {}", self.rejected_total()));
+                }
+                // Someone typing into a dead screen cannot tell "kept" from
+                // "discarded" until the `Confirming` box appears -- and if
+                // they press `Ctrl-\ q` before it does, they will leave
+                // assuming their typing was thrown away. This is the only
+                // place that can tell them while it still matters.
+                let held = self.link_state.held().len();
+                if held > 0 {
+                    body.push(format!("{held} bytes typed since - kept, not sent"));
+                    // Present tense, and here rather than only in the box that
+                    // comes afterwards: a cap the user is told about after the
+                    // fact is a cap they could not have done anything about.
+                    if self.link_state.held_is_full() {
+                        body.push("The buffer is full; later keys are not being kept.".to_string());
+                    }
+                }
+                Some(Notice {
+                    headline: "no reply from host".to_string(),
+                    body,
+                    keys: vec![(
+                        "Ctrl-\\ q".to_string(),
+                        // What the key DOES, not what the host is doing. The
+                        // silence being reported has a crashed host among its
+                        // plausible causes, so "your shell keeps running on
+                        // the host" -- which this used to say -- was the one
+                        // claim the client is in no position to make. A
+                        // description of the local action stays true either
+                        // way.
+                        "closes oxutrm here; it does not touch the host".to_string(),
+                    )],
+                })
+            }
+            Phase::Confirming => {
+                let held = crate::linkstate::render_held(self.link_state.held());
+                let mut body = vec![
+                    format!(
+                        "You typed {} bytes while offline:",
+                        self.link_state.held().len()
+                    ),
+                    held,
+                ];
+                if self.link_state.held_is_full() {
+                    body.push("The buffer is full; later keys were not kept.".to_string());
+                }
+                Some(Notice {
+                    // What was observed, which is a frame arriving. Nothing
+                    // reconnected: the QUIC connection never dropped, it went
+                    // quiet and recovered inside the idle timeout, and phase 1
+                    // has no reconnection machinery for a headline to imply.
+                    // "reconnected" -- which this used to say -- named a
+                    // mechanism oxutrm does not yet have.
+                    headline: "the host is answering again - deliver what you typed?".to_string(),
+                    body,
+                    keys: vec![
+                        ("Ctrl-\\ s".to_string(), "send it to the shell".to_string()),
+                        ("Ctrl-\\ d".to_string(), "drop it".to_string()),
+                    ],
+                })
+            }
+        }
+    }
+
     /// The window changed size. The renderer forgets what is painted and the
     /// next input diff tells the host.
     pub fn resize(&mut self, size: TermSize) {
@@ -800,6 +1018,25 @@ impl ClientSession {
         }
         self.renderer.resize(size);
         self.size = size;
+
+        // Layer 1 was laid out for the screen that just went away. Nothing
+        // else will notice: the loop rebuilds the overlay only when the
+        // notice's CONTENT changes, and a resize does not change a word of it,
+        // so a `Confirming` notice — the one the user sits and reads, because
+        // it is asking them a question — would keep the old geometry until
+        // they pressed a key.
+        //
+        // The same content, laid out again, rather than `self.shown = None`:
+        // `shown` has to keep mirroring what the overlay actually is. Clearing
+        // it would leave the renderer holding a box that `shown` says is not
+        // there, and on any lap where `notice_at` also returns `None` the
+        // loop's `notice != self.shown` test reads `None != None` — false — so
+        // `set_overlay(None)` never runs and the box is stranded on the screen
+        // for the rest of the session.
+        if let Some(n) = self.shown.as_ref() {
+            self.renderer.set_overlay(Some(layout_notice(n, size)));
+        }
+
         // Carried on the next diff, and worth going immediately: the shell is
         // drawing at the wrong width until it lands.
         let next = self.input_tx.current().append(&[], size);
@@ -930,9 +1167,6 @@ impl ClientSession {
                 .context("watching for window size changes")?;
 
         let mut buf = [0u8; 8192];
-        // Whether the "cannot read the window size" note has been printed.
-        // See the `Winch` arm.
-        let mut warned_size = false;
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
         // carries our ack of zero (R5).
@@ -986,9 +1220,12 @@ impl ClientSession {
                     continue;
                 }
                 Wake::Keys(n) => {
-                    self.turn(&buf[..n], out)?;
+                    if let Some(code) = self.route_keys(&buf[..n], out)? {
+                        return Ok(code);
+                    }
                 }
                 Wake::Frame(frame) => {
+                    self.note_heard(Instant::now());
                     self.turn_with(&[], Some(frame), out)?;
                 }
                 // A window that cannot be measured is not a reason to end a
@@ -1006,20 +1243,11 @@ impl ClientSession {
                 // detach. In both cases the size we already have is the last
                 // thing that was true, and the next resize corrects it.
                 Wake::Winch => {
-                    match terminal_size_of(&window) {
-                        Ok(size) => self.resize(size),
-                        // Once. The condition lasts as long as the descriptor
-                        // does, so repeating it would bury everything else —
-                        // and this is stderr, which shares the user's screen.
-                        Err(e) if !warned_size => {
-                            warned_size = true;
-                            eprintln!(
-                                "oxutrm: cannot read the window size ({e:#}); keeping \
-                                 {}x{}. The session is unaffected.",
-                                self.size.cols, self.size.rows
-                            );
-                        }
-                        Err(_) => {}
+                    // A failure is ignored, and silently. Same reasoning as
+                    // the rejected-frame arm: this used to print onto the
+                    // screen it was describing.
+                    if let Ok(size) = terminal_size_of(&window) {
+                        self.resize(size);
                     }
                     self.turn(&[], out)?;
                 }
@@ -1034,6 +1262,25 @@ impl ClientSession {
                     return exit_code(&reason);
                 }
             }
+
+            // Layer 1. Rebuilt only when the content actually changed, so a
+            // steady notice costs one comparison per lap rather than a layout.
+            let now = Instant::now();
+            let notice = self.notice_at(now);
+            if notice != self.shown {
+                self.renderer
+                    .set_overlay(notice.as_ref().map(|n| layout_notice(n, self.size)));
+                self.shown = notice;
+                self.renderer
+                    .render(out, self.screen_rx.state())
+                    .context("painting the notice")?;
+                out.flush().context("flushing the terminal")?;
+            }
+
+            // The `bool` is for the tests, which hold the clock still and ask
+            // whether a prod was due. The loop does not care: it prods or it
+            // does not, and either way the next lap is the same.
+            let _ = self.heartbeat(now);
 
             // The next WAKE-UP, which is a different thing from `due()`, and
             // conflating the two is a busy loop rather than an optimisation.
@@ -1051,6 +1298,16 @@ impl ClientSession {
             // interval when there is nothing to say, and nothing at all when
             // there is — typing and resizing both clear `last_send` and send
             // inside the very `turn` above.
+            //
+            // The pacing interval, unconditionally. There used to be a second
+            // arm here for "the tick that refreshes the counters", taking
+            // `Duration::from_secs(1).min(pacing_interval)` whenever a notice
+            // was up. `pacing_interval` is `clamp(rtt/2, 8ms, 100ms)`, so that
+            // `min` is always the pacing interval and both arms were the same
+            // expression, below a comment describing a one-second tick that
+            // did not exist. Nothing is lost by dropping it: the loop already
+            // wakes at least ten times a second, which is ten times as often
+            // as `NOTICE_REFRESH` lets the counters move.
             deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
         }
     }
@@ -2492,6 +2749,706 @@ mod tests {
             "the idle loop burned {spent} ms of CPU across {} ms of wall clock: \
              that is a spin, not a pace",
             idle.as_millis()
+        );
+    }
+
+    /// Frames the receiver cannot apply used to go to stderr, which IS the
+    /// terminal being painted: the message desynchronised the renderer's model
+    /// and nothing repainted it on a quiet session. They are diagnostics about
+    /// the link, so they belong in the link's own notice.
+    #[tokio::test]
+    async fn a_rejected_frame_is_counted_rather_than_printed() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let bad = Frame {
+            my_state: 9,
+            from_state: 7,
+            ack_state: 0,
+            flags: 0,
+            payload: vec![0xff, 0xff, 0xff],
+        };
+
+        let mut out = Vec::new();
+        let turn = session.turn_with(&[], Some(bad), &mut out).unwrap();
+
+        assert_eq!(turn.rejected, 1);
+        assert_eq!(
+            session.rejected_total(),
+            1,
+            "the count did not reach the notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_raises_a_notice_and_a_frame_clears_it() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+
+        // `t` is captured before `pair` performs a real QUIC handshake, so the
+        // session's own `last_heard` — set in `ClientSession::new` — is
+        // strictly later than `t` by however long that took. Saying we heard
+        // from the host AT `t` moves the origin back onto the test's clock, so
+        // the elapsed times below are exactly what they say and not a
+        // handshake shorter.
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t + Duration::from_secs(1)).is_none());
+
+        let notice = session.notice_at(t + Duration::from_secs(3));
+        assert!(notice.is_some(), "no notice after three seconds of silence");
+        assert!(notice.unwrap().headline.contains("no reply"));
+
+        session.note_heard(t + Duration::from_secs(4));
+        assert!(session.notice_at(t + Duration::from_secs(4)).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_notice_names_the_counters_it_can_actually_observe() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        // The clock's origin, pinned to the test's: see the test above.
+        session.note_heard(t);
+        session.note_sent(t);
+        // And the lap the owing begins on, which the grace period runs from.
+        assert!(session.notice_at(t).is_none());
+
+        let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
+        let shown = painted_words(&n);
+
+        assert!(shown.contains("6s"), "no silence duration: {shown}");
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// A user typing into a dead screen cannot tell "kept" from "discarded"
+    /// until the `Confirming` box appears -- and `Ctrl-\ q`, which the silence
+    /// box does offer, ends the session before it ever does. Somebody who quit
+    /// there would leave believing their typing had been thrown away.
+    #[tokio::test]
+    async fn the_silent_notice_says_that_blind_typing_is_being_kept() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+
+        let bare = session
+            .notice_at(t + Duration::from_secs(3))
+            .expect("no notice after three seconds of silence");
+        session.shown = Some(bare.clone());
+        assert!(
+            !painted_words(&bare).contains("kept"),
+            "the box talks about a buffer before anything was typed: {}",
+            painted_words(&bare)
+        );
+
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        let shown = painted_words(
+            &session
+                .notice_at(t + Duration::from_secs(5))
+                .expect("the notice vanished"),
+        );
+        assert!(
+            shown.contains("10 bytes"),
+            "the box does not say how much is being kept: {shown}"
+        );
+        assert!(
+            shown.contains("kept"),
+            "someone typing blind is never told their keys are being kept: {shown}"
+        );
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// And the cap is reported while it is still costing keystrokes, not
+    /// afterwards in a box that reviews what survived. A limit someone is told
+    /// about after the fact is a limit they could not have acted on.
+    #[tokio::test]
+    async fn a_full_buffer_is_reported_while_it_is_still_filling() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+        session.shown = session.notice_at(t + Duration::from_secs(3));
+        assert!(session.shown.is_some());
+
+        let mut out = Vec::new();
+        session
+            .route_keys(&vec![b'x'; crate::linkstate::MAX_HELD], &mut out)
+            .unwrap();
+
+        let shown = painted_words(
+            &session
+                .notice_at(t + Duration::from_secs(5))
+                .expect("the notice vanished"),
+        );
+        assert!(
+            shown.contains("full"),
+            "the buffer stopped accepting keystrokes and the box did not say \
+             so: {shown}"
+        );
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// During an outage the client keeps retransmitting, so `sent_packets`
+    /// climbs at the pacing rate -- as often as 125 times a second. Rebuilding
+    /// the box on each change costs two `Paragraph` renders, a clone of the
+    /// whole cell grid, a diff and a flush every time, and puts a number in
+    /// front of the user that churns far too fast to read, inside a box whose
+    /// entire job is to be read.
+    #[tokio::test]
+    async fn the_silence_counters_are_rebuilt_at_most_once_a_second() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+
+        let first = session
+            .notice_at(t + Duration::from_secs(3))
+            .expect("no notice after three seconds of silence");
+        session.shown = Some(first.clone());
+
+        // Something the box reports moves. In a live outage this is the
+        // retransmit counters; here it is a number a test can set.
+        session.rejected_total = 1;
+
+        assert_eq!(
+            session.notice_at(t + Duration::from_millis(3_400)),
+            Some(first.clone()),
+            "the box was rebuilt 400 ms after the last one"
+        );
+        let later = session
+            .notice_at(t + Duration::from_millis(4_100))
+            .expect("the notice vanished instead of refreshing");
+        assert_ne!(later, first, "the counters never refreshed at all");
+        assert!(
+            painted_words(&later).contains("rejected: 1"),
+            "{}",
+            painted_words(&later)
+        );
+    }
+
+    /// Only the refresh is paced. A change of phase is the thing the box
+    /// exists to announce, and waiting up to a second to announce it would
+    /// leave the user typing into a screen whose box is a second out of date.
+    #[tokio::test]
+    async fn a_change_of_phase_repaints_at_once_however_recent_the_refresh() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        // A hundred milliseconds after the silence box was last built, the
+        // host answers.
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+        let n = session
+            .notice_at(now)
+            .expect("the question about the held input never appeared");
+
+        assert!(
+            n.headline.contains("answering again"),
+            "the box still reports the outage the host has already ended: {}",
+            n.headline
+        );
+    }
+
+    /// And the transition out of a notice altogether is just as immediate:
+    /// a healthy session must not keep a stale box for up to a second.
+    #[tokio::test]
+    async fn returning_to_live_clears_the_box_at_once() {
+        let (_host, mut session) = with_notice().await;
+
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+
+        assert_eq!(
+            session.notice_at(now),
+            None,
+            "a box outlived the silence it was reporting"
+        );
+    }
+
+    /// The other notice, and the one that went unguarded: the check above
+    /// reads only the `Silent` box, which is how "reconnected" survived in a
+    /// phase where nothing reconnects.
+    ///
+    /// Reached without sleeping, along the path the loop actually takes: a
+    /// notice is up, something is typed into it, and then the host answers.
+    #[tokio::test]
+    async fn the_confirming_notice_states_only_what_the_client_can_observe() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        // A frame arrives. That the host is answering again is the whole of
+        // what the client learns from it -- not that anything reconnected,
+        // because the connection never dropped, and not that the shell is
+        // well, which no frame can say.
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+
+        let n = session
+            .notice_at(now)
+            .expect("the host answered with input held, and nothing was asked");
+        let shown = painted_words(&n);
+
+        assert!(
+            shown.contains("10 bytes"),
+            "this is not the notice that asks about the held input: {shown}"
+        );
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// Every word a notice puts on the screen: headline, body and key list.
+    /// A guard that reads only the body is how a claim came to sit in a key
+    /// list unnoticed, and reading only the `Silent` notice is how another
+    /// came to sit in a headline.
+    fn painted_words(n: &Notice) -> String {
+        std::iter::once(n.headline.clone())
+            .chain(n.body.iter().cloned())
+            .chain(n.keys.iter().flat_map(|(k, d)| [k.clone(), d.clone()]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// What phase 1 forbids layer 1 to say, wherever in the box it says it.
+    ///
+    /// Nothing reconnects yet, so the notice may not name a mechanism oxutrm
+    /// does not have. And from here a dead network and a crashed host are
+    /// indistinguishable, so it may not vouch for the far end at all -- not
+    /// even hedged. The hedge belongs in the exit message, which is read once
+    /// the session has ended and can point at `oxutrm host --list`; the box
+    /// has room to say what a key DOES, and that stays true either way.
+    fn assert_claims_nothing_it_cannot_see(shown: &str) {
+        let lower = shown.to_lowercase();
+        assert!(
+            !lower.contains("safe"),
+            "claimed the session is safe, which the client cannot know: {shown}"
+        );
+        assert!(
+            !lower.contains("retry") && !lower.contains("reconnect"),
+            "phase 1 promised a reconnection that does not exist: {shown}"
+        );
+        for claim in ["keeps running", "still running", "is running"] {
+            assert!(
+                !lower.contains(claim),
+                "asserted the shell's state, which the client cannot see: {shown}"
+            );
+        }
+    }
+
+    /// Ctrl-\, the prefix layer 1 listens for. `linkstate`'s own copy is
+    /// private to that module, and a test that reached for it would be
+    /// asserting the constant rather than the keystroke.
+    const CTRL_BACKSLASH: u8 = 0x1c;
+
+    /// A client with a real `Silent` notice showing, left exactly as the loop
+    /// leaves it: the phase decided by `notice_at`, and `shown` mirroring what
+    /// the overlay is.
+    async fn with_notice() -> (HostSession, ClientSession) {
+        let t = std::time::Instant::now();
+        let (host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        // The lap the owing begins on, and it is not decoration: the grace
+        // period is measured from when the reply started being owed, so a
+        // fixture that jumped straight to three seconds would be asking about
+        // an owing three seconds long that had only just started.
+        assert!(session.notice_at(t).is_none());
+        let notice = session.notice_at(t + Duration::from_secs(3));
+        assert!(notice.is_some(), "the fixture raised no notice");
+        session.shown = notice;
+        (host, session)
+    }
+
+    /// A client sitting in the `Confirming` box with `held` typed blind: a
+    /// notice went up, the user typed into it, and the host started answering
+    /// again. The only phase that offers `Ctrl-\ s` and `Ctrl-\ d`.
+    async fn with_confirming_notice(held: &[u8]) -> (HostSession, ClientSession) {
+        let (host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(held, &mut out).expect("hold the typing");
+
+        let now = std::time::Instant::now();
+        session.note_heard(now);
+        let notice = session.notice_at(now);
+        assert!(notice.is_some(), "the fixture asked the user nothing");
+        session.shown = notice;
+        (host, session)
+    }
+
+    /// Everything the client has said to the host this session. Input is
+    /// cumulative -- the host tracks how much of it has been written to the
+    /// shell -- so this is where a keystroke lands if it was passed through.
+    fn spoken(session: &ClientSession) -> Vec<u8> {
+        session.input_tx.current().pending.clone()
+    }
+
+    /// The healthy path, and the one a regression would break silently: with
+    /// nothing showing, every byte belongs to the host and nothing is held.
+    #[tokio::test]
+    async fn keys_reach_the_host_untouched_while_nothing_is_showing() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(b"ls -l\r", &mut out).unwrap(), None);
+
+        assert!(
+            spoken(&session).ends_with(b"ls -l\r"),
+            "typing did not reach the host: {:?}",
+            spoken(&session)
+        );
+        assert!(
+            session.link_state.held().is_empty(),
+            "typing was held while the session was healthy"
+        );
+    }
+
+    /// The payload of the phase: what is typed at a dead link is kept rather
+    /// than thrown at a host that cannot hear it.
+    #[tokio::test]
+    async fn typing_into_a_notice_is_held_and_not_sent() {
+        let (_host, mut session) = with_notice().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(b"rm -rf /", &mut out).unwrap(), None);
+
+        assert_eq!(
+            session.link_state.held(),
+            b"rm -rf /",
+            "blind typing was not kept"
+        );
+        assert_eq!(
+            spoken(&session),
+            before,
+            "blind typing was sent at a host that is not answering"
+        );
+    }
+
+    /// `Ctrl-\ q` is the notice's own key, so it must not reach the shell as
+    /// two stray bytes, and it must end the client with a status of its own
+    /// rather than one invented for a shell that never exited.
+    #[tokio::test]
+    async fn the_quit_key_ends_the_client_with_a_status_of_zero() {
+        let (_host, mut session) = with_notice().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, Some(0), "the quit key did not end the client");
+        assert_eq!(spoken(&session), before, "the command reached the shell");
+    }
+
+    /// The other half of holding it: giving it back, in one piece and in
+    /// order, once the user has looked at the screen and said so.
+    #[tokio::test]
+    async fn the_send_key_delivers_what_was_typed_blind() {
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let mut out = Vec::new();
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, None, "sending the held input ended the session");
+        assert!(
+            spoken(&session).ends_with(b"make test\r"),
+            "the held input was not delivered: {:?}",
+            spoken(&session)
+        );
+        assert!(
+            session.link_state.held().is_empty(),
+            "the held input was delivered and kept, so it can arrive twice"
+        );
+    }
+
+    /// And dropping it must actually drop it: a `d` that left the buffer full
+    /// would deliver the discarded keys at the next `s`.
+    #[tokio::test]
+    async fn the_drop_key_throws_the_blind_typing_away() {
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let mut out = Vec::new();
+        let before = spoken(&session);
+
+        let answer = session
+            .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
+            .unwrap();
+
+        assert_eq!(answer, None, "dropping the held input ended the session");
+        assert!(session.link_state.held().is_empty(), "the drop kept it");
+        assert_eq!(spoken(&session), before, "the drop sent it instead");
+    }
+
+    /// The `Silent` box lists exactly one key, and the two it does not list
+    /// must not work.
+    ///
+    /// `Ctrl-\ s` there would throw the held bytes at a link the client has
+    /// just told the user is not answering -- and empty the buffer, so the
+    /// `Confirming` review that is the entire point of holding never happens.
+    /// `Ctrl-\ d` would discard someone's typing with no confirmation at all.
+    /// Both are kept as typing instead, which is what the user meant by
+    /// pressing keys into a box that does not offer them.
+    #[tokio::test]
+    async fn the_silent_notice_does_not_honour_the_keys_it_does_not_offer() {
+        let (_host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        let before = spoken(&session);
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            spoken(&session),
+            before,
+            "the held input was delivered to a host the box says is not answering"
+        );
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
+                .unwrap(),
+            None
+        );
+        assert!(
+            session.link_state.held().starts_with(b"make test\r"),
+            "someone's blind typing was discarded by a key the box never \
+             offered: {:?}",
+            session.link_state.held()
+        );
+    }
+
+    /// And `Ctrl-\ q` is the key every box does offer, in every phase.
+    #[tokio::test]
+    async fn the_quit_key_works_under_the_confirming_notice_too() {
+        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let mut out = Vec::new();
+
+        assert_eq!(
+            session
+                .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
+                .unwrap(),
+            Some(0),
+        );
+    }
+
+    /// Without a heartbeat an idle session cannot tell an outage from calm,
+    /// and the user finds out by typing into a screen that died ten minutes
+    /// ago. With one, a reply is owed and the silence becomes visible.
+    ///
+    /// The clock is a parameter, so this asks the question at five seconds
+    /// without waiting five seconds.
+    #[tokio::test]
+    async fn an_idle_session_prods_the_host_after_five_quiet_seconds() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        let before = session.input_tx.current().seq();
+
+        assert!(
+            !session.heartbeat(t + Duration::from_secs(4)),
+            "prodded a session that had only been quiet for four seconds"
+        );
+        assert_eq!(session.input_tx.current().seq(), before);
+
+        assert!(session.heartbeat(t + Duration::from_secs(5)));
+        assert_eq!(
+            session.input_tx.current().seq(),
+            before + 1,
+            "the heartbeat did not move the sequence, so the host owes no reply \
+             and the silence stays invisible"
+        );
+        assert!(
+            session.last_send.is_none(),
+            "the heartbeat waits for the pacing interval it exists to pre-empt"
+        );
+
+        // And not again until another five quiet seconds have passed: the
+        // heartbeat is 0.2 Hz, not a poll.
+        assert!(!session.heartbeat(t + Duration::from_secs(6)));
+    }
+
+    /// The caller's half of `notice_at`'s question: have we said something the
+    /// host has not acknowledged? Reading it lets a test wait for a REAL ack
+    /// rather than assume one, which is the difference between exercising the
+    /// clock and exercising a fixture.
+    fn reply_owed(c: &ClientSession) -> bool {
+        c.input_tx.current().seq() != c.screen_rx.peer_ack()
+    }
+
+    /// A session that heartbeats and is answered never leaves `Live`.
+    ///
+    /// The composed defect, and the one no per-task test could see because
+    /// each of them holds the clock still around a single transition. The
+    /// heartbeat bumps the sequence every `HEARTBEAT_IDLE` (5 s), so a reply is
+    /// owed from that instant; if the grace period is measured from the last
+    /// thing we HEARD rather than from when the owing began, then five seconds
+    /// of perfectly healthy calm are already past `SILENT_AFTER` (2 s) and the
+    /// very next lap paints "no reply from host". Every idle session, every
+    /// five seconds, for ever -- and while it is up, `route_keys` diverts the
+    /// keyboard into the held buffer.
+    ///
+    /// Two full cycles, with the host really answering in between, and the
+    /// clock supplied rather than slept through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_heartbeating_session_that_is_answered_never_raises_a_notice() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        // Settle first: the fake clock below is only honest if it starts from
+        // a state where the host has acked everything the client has said.
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| !reply_owed(c)
+            )
+            .await,
+            "the host never acked the client, so nothing below is about the clock"
+        );
+
+        let mut now = std::time::Instant::now();
+        client.note_heard(now);
+        client.note_sent(now);
+
+        for cycle in 1..=2u32 {
+            now += crate::linkstate::HEARTBEAT_IDLE;
+            assert!(
+                client.heartbeat(now),
+                "cycle {cycle}: no heartbeat was due after five quiet seconds"
+            );
+            assert_eq!(
+                client.notice_at(now),
+                None,
+                "cycle {cycle}: a notice was raised on the very lap the heartbeat \
+                 went out, for a reply owed for zero milliseconds. Every idle \
+                 session would flash this every {} seconds",
+                crate::linkstate::HEARTBEAT_IDLE.as_secs()
+            );
+
+            // The host answers, as a healthy one does.
+            assert!(
+                drive(
+                    &mut host,
+                    &mut client,
+                    &mut out,
+                    Duration::from_secs(20),
+                    |_, c| !reply_owed(c)
+                )
+                .await,
+                "cycle {cycle}: the heartbeat was never answered"
+            );
+            now += Duration::from_millis(120);
+            client.note_heard(now);
+            assert_eq!(
+                client.notice_at(now),
+                None,
+                "cycle {cycle}: a notice survived the host answering"
+            );
+        }
+    }
+
+    /// A healthy session, through the REAL loop, for longer than the
+    /// heartbeat: no notice may ever be painted.
+    ///
+    /// Both idle-CPU guards run for two seconds, which is below
+    /// `HEARTBEAT_IDLE`, so what the heartbeat does *inside* the loop was
+    /// entirely unpinned -- and nothing anywhere asserted the composed
+    /// property that a working session shows nothing at all. That is how C1
+    /// shipped: every one of its parts passed its own review.
+    ///
+    /// The assertion reads the bytes that went to the terminal, because that
+    /// is what the user sees. The headline is one uniformly styled span, so if
+    /// it is ever painted its bytes appear in `out` contiguously.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_healthy_session_paints_no_notice_across_several_heartbeats() {
+        let (mut host, mut client) = pair("").await;
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+
+        // Longer than two heartbeats, and quiet throughout: the client says
+        // nothing, the shell prints nothing, and the only traffic is the
+        // heartbeat and the host's answer to it.
+        typing.write_all(b"sleep 12\nexit 0\n").expect("type");
+
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(60), client.run_on(keys, &mut out))
+            .await
+            .expect("the client loop never finished")
+            .expect("the client loop failed");
+        let _ = host_loop.await;
+
+        assert_eq!(code, 0);
+        let painted = String::from_utf8_lossy(&out);
+        assert!(
+            !painted.contains("reply from host"),
+            "a healthy session told the user the host had stopped answering"
+        );
+        assert!(
+            client.shown.is_none(),
+            "the session ended with a notice still up"
+        );
+    }
+
+    /// The loop rebuilds layer 1 only when the notice's CONTENT changes, and a
+    /// resize changes not one word of it. So the resize itself has to lay the
+    /// box out again, or a `Confirming` notice — the one the user sits and
+    /// reads, because it is asking them a question — keeps the geometry of a
+    /// screen that is gone until they press a key.
+    #[tokio::test]
+    async fn a_resize_lays_the_notice_out_again_for_the_new_screen() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+
+        // Raise a notice and paint it, exactly as `run_on` does -- including
+        // the earlier lap on which the reply started being owed.
+        assert!(session.notice_at(t).is_none());
+        let notice = session.notice_at(t + Duration::from_secs(3)).unwrap();
+        session
+            .renderer
+            .set_overlay(Some(layout_notice(&notice, session.size)));
+        session.shown = Some(notice.clone());
+        let mut painted = Vec::new();
+        session
+            .renderer
+            .render(&mut painted, session.screen_rx.state())
+            .unwrap();
+
+        let small = TermSize { cols: 24, rows: 8 };
+        session.resize(small);
+        let mut after = Vec::new();
+        session
+            .renderer
+            .render(&mut after, session.screen_rx.state())
+            .unwrap();
+
+        // What a renderer that never saw the old screen paints, for the same
+        // content and the same state. Equality is the assertion: the box is
+        // where the NEW screen puts it, and not where the old one did.
+        let mut fresh = Renderer::new(small, caps());
+        fresh.set_overlay(Some(layout_notice(&notice, small)));
+        let mut expected = Vec::new();
+        fresh
+            .render(&mut expected, session.screen_rx.state())
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&after),
+            String::from_utf8_lossy(&expected),
+            "the notice kept the geometry of the screen that went away"
         );
     }
 }

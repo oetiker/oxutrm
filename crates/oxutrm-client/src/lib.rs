@@ -28,11 +28,15 @@
 
 pub mod color;
 pub mod guard;
+pub mod notice;
+pub mod overlay;
 pub mod renderer;
 pub mod status;
 
 pub use color::down_convert;
 pub use guard::{RawGuard, TERMINAL_RESTORE};
+pub use notice::{Notice, layout_notice};
+pub use overlay::{Overlay, overlay_from_buffer};
 pub use renderer::Renderer;
 pub use status::{rung_label, status_line};
 

@@ -87,6 +87,14 @@ unicode-width = "0.2"
 # `String` would produce - which is what makes the alias swappable.
 compact_str = { version = "0.10", features = ["serde"] }
 proptest = "1"
+# `std` alone. `all-widgets` and `layout-cache` were here and were not used:
+# layer 1 draws with `Block` and `Paragraph`, which `std` already provides,
+# and nothing calls `Layout::split`, which is the only thing the cache caches.
+# Measured rather than assumed: dropping both takes exactly one crate --
+# `critical-section`, which `layout-cache` needs -- out of the graph. The point
+# is not the crate count but that two feature flags no longer claim the client
+# uses machinery it does not.
+ratatui = { version = "0.30", default-features = false, features = ["std"] }
 insta = "1"
 
 # Not in the contract's table; required by the M4 integration plan and declared

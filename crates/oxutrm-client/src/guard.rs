@@ -83,7 +83,8 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGH
 ///
 /// | Bytes | Undoes |
 /// |---|---|
-/// | `\x1b[?1049l` | the alternate screen buffer — FIRST, so everything after it lands on the screen the user keeps |
+/// | `\x1b[?2026l` | an unfinished synchronized update — FIRST, so nothing after it is held back |
+/// | `\x1b[?1049l` | the alternate screen buffer — before the modes, so everything after it lands on the screen the user keeps |
 /// | `\x1b[?1003l` | any-motion mouse tracking |
 /// | `\x1b[?1002l` | button-motion mouse tracking |
 /// | `\x1b[?1000l` | press/release mouse tracking |
@@ -94,7 +95,17 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGH
 ///
 /// The three mouse tracking modes are separate switches rather than one, so all
 /// three are cleared; `Renderer::write_modes` turns them on the same way.
-pub const TERMINAL_RESTORE: &[u8] = b"\x1b[?1049l\
+///
+/// `\x1b[?2026l` is the odd one out, and it is not a mode a hostile host turns
+/// on: `Renderer::render` wraps every paint in `\x1b[?2026h` … `\x1b[?2026l`
+/// so the user never sees a half-drawn screen. A process killed between the
+/// two leaves the update open, and the terminal then holds its display until
+/// its own timeout expires — which is to say the restore below would be
+/// correct and invisible. Ending the update first is what makes the rest of
+/// this sequence take effect when it is written rather than whenever the
+/// emulator gives up waiting.
+pub const TERMINAL_RESTORE: &[u8] = b"\x1b[?2026l\
+                                      \x1b[?1049l\
                                       \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\
                                       \x1b[?2004l\
                                       \x1b[?25h\
@@ -682,7 +693,8 @@ mod tests {
     #[test]
     fn the_restore_sequence_covers_every_mode_i8_names() {
         for (undoes, bytes) in [
-            ("the alternate screen buffer", &b"\x1b[?1049l"[..]),
+            ("an unfinished synchronized update", &b"\x1b[?2026l"[..]),
+            ("the alternate screen buffer", b"\x1b[?1049l"),
             ("any-motion mouse tracking", b"\x1b[?1003l"),
             ("button-motion mouse tracking", b"\x1b[?1002l"),
             ("press/release mouse tracking", b"\x1b[?1000l"),
@@ -696,11 +708,16 @@ mod tests {
                 "nothing in the restore sequence undoes {undoes}"
             );
         }
-        // Leaving the alternate buffer must come first and the attribute reset
-        // last, or both land on a screen the user is about to stop looking at.
+        // Closing an open synchronized update must come first, or everything
+        // after it is held back until the emulator's own timeout and the
+        // restore is correct but invisible. Leaving the alternate buffer comes
+        // next, and the attribute reset last, or both land on a screen the
+        // user is about to stop looking at.
         assert!(
-            TERMINAL_RESTORE.starts_with(b"\x1b[?1049l"),
-            "the alternate screen is left after other modes were restored on it"
+            TERMINAL_RESTORE.starts_with(b"\x1b[?2026l\x1b[?1049l"),
+            "the restore can be buffered inside an update the renderer left \
+             open, or the alternate screen is left after other modes were \
+             restored on it"
         );
         assert!(
             TERMINAL_RESTORE.ends_with(b"\x1b[0m"),
