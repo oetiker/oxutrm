@@ -74,8 +74,9 @@ fn run_host(args: &[String]) -> Result<()> {
         Some("--list") => run_host_list(),
         Some("--serve") => serve::run_host_serve(),
         Some("--attach") => Err(anyhow::anyhow!(
-            "`oxutrm host --attach` is not wired up yet, for the same reason as \
-             --serve: there is no live session to attach to until serving works."
+            "`oxutrm host --attach` is not wired up yet. Serving and connecting \
+             both work, so the sessions are real and `--list` shows them - what \
+             is missing is relaying a second attach into a running one."
         )),
         Some(other) => {
             eprintln!("oxutrm host: unknown option {other:?}\nTry `oxutrm host --help`.");
@@ -282,9 +283,9 @@ USAGE
   oxutrm host --serve         Create a session and hand it to a client.
   oxutrm host --attach <id>   Relay a new attach into a running session.
 
---attach does not work yet and says so when you run it. --serve creates the
-session, but the local half that connects to it is still being wired, so a
-session it starts has nobody to paint for.
+--attach does not work yet and says so when you run it. --serve is complete:
+it creates the session and hands it to a client, which connects, paints and
+carries the shell's exit code back.
 
 A session that reached the far end over an ssh tunnel (rung 4) is listed as
 NOT detachable: it carries its data inside that ssh connection, so it dies
@@ -312,17 +313,18 @@ and NAT on both ends.
 
 USAGE
   oxutrm <ssh-target> [command ...]
-      Connect, or reattach to a session already running there.
+      Start a session there and connect to it. Each connection starts a
+      fresh session; reattaching to an existing one is not implemented.
 
   oxutrm host --serve
       Run the remote half. Spawned over SSH; not normally typed by hand.
-      The local half that drives it is still being wired.
 
   oxutrm host --list
       List sessions on this machine, pruning any whose process is gone.
 
   oxutrm host --attach <session-id>
-      Reattach to a running session.
+      Reattach to a running session. NOT IMPLEMENTED yet; it exits with an
+      error saying so.
 
   oxutrm loopback
       Run both halves in one process, with no network in between.
@@ -335,6 +337,49 @@ OPTIONS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The help text and the code must agree about what works.
+    ///
+    /// Both help strings spent this project's whole life so far saying the
+    /// local half "is still being wired" — true when written, false since the
+    /// first two-machine run, and the first thing a new user reads. This
+    /// pins the pair together so the next feature to land cannot quietly
+    /// leave the documentation behind: `--attach` is the one subcommand that
+    /// really is unimplemented, and the day it works, this fails.
+    #[test]
+    fn the_help_text_agrees_with_what_is_actually_implemented() {
+        let attach_works = run_host(&["--attach".to_owned(), "id".to_owned()]).is_ok();
+        assert!(
+            !attach_works,
+            "`host --attach` works now — say so in USAGE and HOST_USAGE, and \
+             delete this half of the test"
+        );
+        assert!(
+            HOST_USAGE.contains("--attach does not work yet"),
+            "attach is unimplemented and the host help no longer says so"
+        );
+
+        // The half that WAS wrong. `run_connect` drives a real session, and
+        // has done since the first macOS-to-Linux run.
+        for (name, text) in [("USAGE", USAGE), ("HOST_USAGE", HOST_USAGE)] {
+            assert!(
+                !text.contains("still being wired"),
+                "{name} still claims the local half is unwired; it connects, \
+                 paints and carries an exit code"
+            );
+            assert!(
+                !text.contains("nobody to paint for"),
+                "{name} still claims a served session has nobody to paint for"
+            );
+            // Reattach is the same unimplemented thing as `--attach`, and the
+            // top line of the usage was promising it.
+            assert!(
+                !text.contains("or reattach to a session already running"),
+                "{name} promises reattach, which is the one thing that does \
+                 not work; a second connection starts a fresh session"
+            );
+        }
+    }
 
     #[test]
     fn help_is_the_default_and_names_every_subcommand() {
