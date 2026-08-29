@@ -156,13 +156,19 @@ fn single_line(n: &Notice, size: TermSize) -> Overlay {
 mod tests {
     use super::*;
 
+    /// The words the client actually ships, and deliberately so. This fixture
+    /// used to say "close oxutrm here; the shell keeps running" -- the exact
+    /// claim the session's own guard now forbids, because a dead network and a
+    /// crashed host are indistinguishable from here. It never reached a
+    /// screen, being a test fixture, but it sat in the tree as a ready-made
+    /// copy of the bug for anyone laying out a new box to paste.
     fn notice() -> Notice {
         Notice {
             headline: "no reply from host".to_string(),
             body: vec!["silent for 6s".to_string(), "sent 14 - lost 9".to_string()],
             keys: vec![(
                 "Ctrl-\\ q".to_string(),
-                "close oxutrm here; the shell keeps running".to_string(),
+                "closes oxutrm here; it does not touch the host".to_string(),
             )],
         }
     }
@@ -206,7 +212,7 @@ mod tests {
 
         assert!(text.contains("no reply from host"), "{text}");
         assert!(text.contains("Ctrl-\\ q"), "{text}");
-        assert!(text.contains("the shell keeps running"), "{text}");
+        assert!(text.contains("it does not touch the host"), "{text}");
     }
 
     /// A box that does not fit is worse than a line that does.
@@ -228,25 +234,24 @@ mod tests {
         assert_eq!(o.cells.len(), o.rows as usize * o.cols as usize);
     }
 
-    /// On a 30-column screen the key line ("Ctrl-\ q  close oxutrm here; the
-    /// shell keeps running") is wider than the inner box and wraps across
+    /// On a 30-column screen the key line ("Ctrl-\ q  closes oxutrm here; it
+    /// does not touch the host") is wider than the inner box and wraps across
     /// three rows. A box height read off the unwrapped line count budgets
     /// only one of those and silently clips the rest of the sentence saying
-    /// the remote shell keeps running -- the one sentence Phase 1 most needs
-    /// the user to read.
+    /// what the key does -- which is the whole of what the box is offering.
     #[test]
     fn a_wrapped_key_line_still_fits_in_the_box() {
         let o = layout_notice(&notice(), TermSize { cols: 30, rows: 24 });
         let text = text_of(&o);
 
-        // Not a plain `contains("the shell keeps running")`: at this width
-        // the sentence itself wraps across a row boundary (legitimately --
-        // that row boundary is not the bug), so the words land on separate
-        // lines. What the pre-fix code drops is not a word boundary but an
-        // entire row, so checking that both halves of the sentence survived
-        // -- rather than that they are adjacent -- is what actually detects
-        // a dropped row instead of an ordinary wrap point.
-        assert!(text.contains("the shell keeps"), "{text}");
-        assert!(text.contains("running"), "{text}");
+        // Not a plain `contains` of the whole sentence: at this width it wraps
+        // across a row boundary (legitimately -- that row boundary is not the
+        // bug), so the words land on separate lines. What the pre-fix code
+        // drops is not a word boundary but an entire row, so checking that
+        // both ends of the sentence survived -- rather than that they are
+        // adjacent -- is what actually detects a dropped row instead of an
+        // ordinary wrap point.
+        assert!(text.contains("closes oxutrm"), "{text}");
+        assert!(text.contains("the host"), "{text}");
     }
 }
