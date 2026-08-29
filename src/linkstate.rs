@@ -11,6 +11,14 @@ use std::time::{Duration, Instant};
 /// the noise it was built to remove.
 pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 
+/// How long a session may be completely quiet before the client says something
+/// merely to see whether anyone is still there.
+///
+/// **0.2 Hz.** Set that against the 250 Hz poll removed in `19cc001`, and note
+/// that it applies only to an ATTACHED client: a detached host session has no
+/// client, so it has no heartbeat and its idle cost is unchanged.
+pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Live,
@@ -23,6 +31,8 @@ pub struct LinkState {
     phase: Phase,
     /// The last time anything at all arrived from the host.
     last_heard: Instant,
+    /// The last time we said anything, so a quiet link can be prodded.
+    last_sent: Instant,
 }
 
 impl LinkState {
@@ -30,6 +40,7 @@ impl LinkState {
         LinkState {
             phase: Phase::Live,
             last_heard: now,
+            last_sent: now,
         }
     }
 
@@ -41,6 +52,22 @@ impl LinkState {
     pub fn heard(&mut self, now: Instant) {
         self.last_heard = now;
         self.phase = Phase::Live;
+    }
+
+    /// We sent something, so a reply is owed from here.
+    pub fn sent(&mut self, now: Instant) {
+        self.last_sent = now;
+    }
+
+    /// Nothing has been said in either direction for long enough that the
+    /// caller should say something, purely so that an answer is owed.
+    ///
+    /// Without this an idle session cannot tell an outage from calm, and the
+    /// user would find out by pressing a key into a screen that had been dead
+    /// for ten minutes.
+    pub fn heartbeat_due(&self, now: Instant) -> bool {
+        let quiet_since = self.last_heard.max(self.last_sent);
+        now.duration_since(quiet_since) >= HEARTBEAT_IDLE
     }
 
     /// One lap's worth of judgement.
@@ -144,5 +171,52 @@ mod tests {
         let later = s.evaluate(t + Duration::from_secs(9), true);
 
         assert_eq!(first, later, "the clock restarted mid-outage");
+    }
+
+    #[test]
+    fn a_quiet_link_wants_a_heartbeat_after_the_idle_period() {
+        let t = t0();
+        let s = LinkState::new(t);
+
+        assert!(!s.heartbeat_due(t + Duration::from_secs(4)));
+        assert!(s.heartbeat_due(t + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn sending_postpones_the_heartbeat() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        s.sent(t + Duration::from_secs(4));
+        assert!(!s.heartbeat_due(t + Duration::from_secs(6)));
+        assert!(s.heartbeat_due(t + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn hearing_postpones_the_heartbeat() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        s.heard(t + Duration::from_secs(4));
+        assert!(!s.heartbeat_due(t + Duration::from_secs(6)));
+    }
+
+    /// The heartbeat exists to make an idle session detectable. Without it,
+    /// `evaluate` can never see a reply owed, so an outage on a session nobody
+    /// is typing into would go unreported until the user pressed a key.
+    #[test]
+    fn a_heartbeat_makes_an_idle_outage_visible() {
+        let t = t0();
+        let mut s = LinkState::new(t);
+
+        assert_eq!(s.evaluate(t + Duration::from_secs(6), false), Phase::Live);
+        assert!(s.heartbeat_due(t + Duration::from_secs(6)));
+
+        // The caller sends the heartbeat; from here a reply is owed.
+        s.sent(t + Duration::from_secs(6));
+        assert!(matches!(
+            s.evaluate(t + Duration::from_secs(9), true),
+            Phase::Silent { .. }
+        ));
     }
 }
