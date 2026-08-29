@@ -947,6 +947,21 @@ impl ClientSession {
                 if self.rejected_total() > 0 {
                     body.push(format!("screen frames rejected: {}", self.rejected_total()));
                 }
+                // Someone typing into a dead screen cannot tell "kept" from
+                // "discarded" until the `Confirming` box appears -- and if
+                // they press `Ctrl-\ q` before it does, they will leave
+                // assuming their typing was thrown away. This is the only
+                // place that can tell them while it still matters.
+                let held = self.link_state.held().len();
+                if held > 0 {
+                    body.push(format!("{held} bytes typed since - kept, not sent"));
+                    // Present tense, and here rather than only in the box that
+                    // comes afterwards: a cap the user is told about after the
+                    // fact is a cap they could not have done anything about.
+                    if self.link_state.held_is_full() {
+                        body.push("The buffer is full; later keys are not being kept.".to_string());
+                    }
+                }
                 Some(Notice {
                     headline: "no reply from host".to_string(),
                     body,
@@ -2795,6 +2810,78 @@ mod tests {
         let shown = painted_words(&n);
 
         assert!(shown.contains("6s"), "no silence duration: {shown}");
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// A user typing into a dead screen cannot tell "kept" from "discarded"
+    /// until the `Confirming` box appears -- and `Ctrl-\ q`, which the silence
+    /// box does offer, ends the session before it ever does. Somebody who quit
+    /// there would leave believing their typing had been thrown away.
+    #[tokio::test]
+    async fn the_silent_notice_says_that_blind_typing_is_being_kept() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+
+        let bare = session
+            .notice_at(t + Duration::from_secs(3))
+            .expect("no notice after three seconds of silence");
+        session.shown = Some(bare.clone());
+        assert!(
+            !painted_words(&bare).contains("kept"),
+            "the box talks about a buffer before anything was typed: {}",
+            painted_words(&bare)
+        );
+
+        let mut out = Vec::new();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        let shown = painted_words(
+            &session
+                .notice_at(t + Duration::from_secs(5))
+                .expect("the notice vanished"),
+        );
+        assert!(
+            shown.contains("10 bytes"),
+            "the box does not say how much is being kept: {shown}"
+        );
+        assert!(
+            shown.contains("kept"),
+            "someone typing blind is never told their keys are being kept: {shown}"
+        );
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// And the cap is reported while it is still costing keystrokes, not
+    /// afterwards in a box that reviews what survived. A limit someone is told
+    /// about after the fact is a limit they could not have acted on.
+    #[tokio::test]
+    async fn a_full_buffer_is_reported_while_it_is_still_filling() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+        session.shown = session.notice_at(t + Duration::from_secs(3));
+        assert!(session.shown.is_some());
+
+        let mut out = Vec::new();
+        session
+            .route_keys(&vec![b'x'; crate::linkstate::MAX_HELD], &mut out)
+            .unwrap();
+
+        let shown = painted_words(
+            &session
+                .notice_at(t + Duration::from_secs(5))
+                .expect("the notice vanished"),
+        );
+        assert!(
+            shown.contains("full"),
+            "the buffer stopped accepting keystrokes and the box did not say \
+             so: {shown}"
+        );
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
