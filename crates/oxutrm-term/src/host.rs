@@ -240,6 +240,13 @@ impl HostTerm {
         out
     }
 
+    /// A descriptor that becomes readable when the child exits, so a session
+    /// loop can wait for it instead of polling. See [`crate::ExitWake`] -
+    /// readability is a hint and `child_exited` remains the authority.
+    pub fn exit_wake(&self) -> &crate::ExitWake {
+        self.pty.exit_wake()
+    }
+
     pub fn child_exited(&mut self) -> Option<i32> {
         if self.exited.is_none() {
             self.exited = self.pty.child_exited();
@@ -567,6 +574,39 @@ mod tests {
             200,
         )
         .expect("spawn")
+    }
+
+    /// The session loop reaches the child through `HostTerm`, not `Pty`, so
+    /// the wake has to be reachable from here or it cannot be waited on.
+    #[test]
+    fn a_host_terminal_exposes_a_wake_for_its_child() {
+        let mut t = sh("sleep 0.3; exit 4", TermSize { cols: 20, rows: 5 });
+        let fd = t
+            .exit_wake()
+            .as_fd()
+            .expect("a live child must be watchable");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut woke = false;
+        while Instant::now() < deadline {
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            let timeout = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 20_000_000,
+            };
+            if rustix::event::poll(&mut fds, Some(&timeout)).expect("poll") > 0 {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "the wake never fired through HostTerm");
+        assert_eq!(
+            t.child_exited(),
+            Some(4),
+            "child_exited stays the authority"
+        );
     }
 
     /// **I7 on the host side, which is the side that matters.**

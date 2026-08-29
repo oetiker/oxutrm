@@ -25,6 +25,8 @@ use rustix::termios::Winsize;
 
 use oxutrm_proto::TermSize;
 
+use crate::exit_wake::ExitWake;
+
 /// How long `Pty::drop` will drain and re-check before giving up on reaping.
 ///
 /// Generous for what it does - the child is reaped on the first turn in
@@ -37,6 +39,7 @@ pub struct Pty {
     /// Our end: reads what the child wrote, writes what the user typed.
     controller: File,
     child: Child,
+    exit_wake: ExitWake,
 }
 
 impl Pty {
@@ -101,9 +104,11 @@ impl Pty {
         rustix::io::ioctl_fionbio(pty.controller.as_fd(), true)
             .context("making the pty non-blocking")?;
 
+        let exit_wake = crate::exit_wake::watch(child.id())?;
         Ok(Pty {
             controller: File::from(pty.controller),
             child,
+            exit_wake,
         })
     }
 
@@ -125,6 +130,11 @@ impl Pty {
             Err(e) if e.raw_os_error() == Some(libc_eio()) => Ok(0),
             Err(e) => Err(anyhow::Error::new(e).context("reading from the pty")),
         }
+    }
+
+    /// A descriptor that becomes readable when the child exits.
+    pub fn exit_wake(&self) -> &ExitWake {
+        &self.exit_wake
     }
 
     /// Tell the child its terminal changed size, so it redraws.
@@ -278,6 +288,116 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Is `fd` readable within `budget`? The wake's whole contract is "this
+    /// descriptor becomes readable", so the tests ask the kernel that
+    /// question directly rather than through an async runtime.
+    fn readable_within(wake: &ExitWake, budget: Duration) -> bool {
+        let Some(fd) = wake.as_fd() else {
+            return false;
+        };
+        let deadline = Instant::now() + budget;
+        loop {
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            let timeout = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 20_000_000,
+            };
+            if rustix::event::poll(&mut fds, Some(&timeout)).expect("poll") > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    fn sh(script: &str) -> Pty {
+        Pty::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script.to_owned()],
+            &[],
+            size(),
+        )
+        .expect("spawn")
+    }
+
+    #[test]
+    fn a_running_child_offers_a_wake_that_stays_quiet() {
+        let mut pty = sh("sleep 5");
+        assert!(
+            pty.exit_wake().as_fd().is_some(),
+            "a live child must be watchable on both platforms"
+        );
+        assert!(
+            !readable_within(pty.exit_wake(), Duration::from_millis(300)),
+            "the wake fired while the child was still running"
+        );
+        assert_eq!(pty.child_exited(), None, "try_wait agrees it is alive");
+    }
+
+    #[test]
+    fn the_wake_becomes_readable_when_the_child_exits() {
+        let mut pty = sh("sleep 0.3; exit 7");
+        assert!(
+            readable_within(pty.exit_wake(), Duration::from_secs(10)),
+            "the wake never fired for a child that exited"
+        );
+        // Readability is only the hint; `child_exited` is the authority.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(code) = pty.child_exited() {
+                assert_eq!(code, 7);
+                break;
+            }
+            assert!(Instant::now() < deadline, "woke but the child never reaped");
+        }
+    }
+
+    /// The registration races the child: it can be gone before we watch it.
+    /// Asserted on the OUTCOME, because the two platforms answer differently
+    /// and neither answer is wrong.
+    #[test]
+    fn a_child_that_exits_before_it_is_watched_is_still_reported() {
+        let mut pty = sh("exit 5");
+        std::thread::sleep(Duration::from_millis(500));
+        let wake = crate::exit_wake::watch(pty.child_pid()).expect("watching must not fail");
+        assert!(
+            wake.as_fd().is_none() || readable_within(&wake, Duration::from_secs(5)),
+            "an armed wake for an already-exited child must be readable at once"
+        );
+        assert_eq!(
+            pty.child_exited(),
+            Some(5),
+            "whatever the wake says, try_wait is the authority"
+        );
+    }
+
+    /// The reason this exists at all rather than watching the PTY for EOF.
+    /// A child that closes its terminal and keeps running gives EOF on the
+    /// controller on Linux - permanently - while it is still very much alive.
+    #[test]
+    fn a_child_that_closes_its_terminal_is_not_reported_as_exited() {
+        let mut pty = sh("exec 0<&- 1>&- 2>&-; sleep 3; exit 9");
+        // Without this the test would pass against a wake that is never armed
+        // at all, which is not what it claims to check.
+        assert!(
+            pty.exit_wake().as_fd().is_some(),
+            "the child must be watched"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        // Drain whatever the controller has to say; on Linux this is EOF.
+        let mut buf = [0u8; 4096];
+        while matches!(pty.read_ready(&mut buf), Ok(n) if n > 0) {}
+        assert_eq!(pty.child_exited(), None, "the child is still running");
+        assert!(
+            !readable_within(pty.exit_wake(), Duration::from_millis(400)),
+            "the wake fired for a child that had only closed its terminal"
+        );
     }
 
     #[test]

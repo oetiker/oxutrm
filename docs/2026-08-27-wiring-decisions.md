@@ -123,14 +123,66 @@ would become many `write(2)` calls. `turn` already flushes explicitly
 deliberately.** `IDLE_POLL` (`src/session.rs:58`) adds up to 4 ms to every
 keystroke on the half a human is watching, and all five client sources are
 pollable. The host is *not* a rider on this: there is no `impl AsFd` for `Pty`
-or `HostTerm` today (`controller` is private with no accessor), and **the
-child's exit is not pollable** — `Pty` holds a `std::process::Child` and
-`child_exited` is `try_wait()` (`crates/oxutrm-term/src/pty.rs:132-140`), a
-synchronous poll with no future. An event-driven host needs SIGCHLD, or
-`tokio::process` in a crate that deliberately has no tokio, or a decision to
-treat PTY EOF as the exit signal (usually right, not always — a child can close
-its tty and live). And C2 applies with full force: converting the host with
-`next_due()` gives a detached session 100% of a core.
+or `HostTerm` today (`controller` is private with no accessor). And C2 applies
+with full force: converting the host with `next_due()` gives a detached session
+100% of a core.
+
+### The child's exit IS pollable — DECIDED: a per-child exit descriptor
+
+> Added 2026-08-29 against `95f453d`, not the `a0bd05c` pass the rest of this
+> file was verified at. Line citations in this subsection are to `95f453d`.
+
+This supersedes the open question this section used to carry ("SIGCHLD, or
+`tokio::process` in a crate that deliberately has no tokio, or treat PTY EOF as
+the exit signal — usually right, not always"). PTY EOF is **closed out**, and
+the "usually right" framing was too generous to it.
+
+**The decision:** `crate::ExitWake` in `oxutrm-term` — `pidfd_open` on Linux,
+a `kqueue` holding one `EVFILT_PROC`/`NOTE_EXIT` registration on macOS —
+reachable as `HostTerm::exit_wake()`. Both are in the rustix already in the
+lockfile, need no new dependency, no tokio in `oxutrm-term`, and no
+process-global signal state. `tokio`'s `AsyncFd` watches either, the kqueue fd
+included; that was measured before the module was written, not assumed.
+
+**Readability is a hint; `child_exited()` remains the authority.** That split
+is what makes the whole question small: a spurious wake costs one turn, a
+missed wake hangs a session. Wait for readability, ask `child_exited`, stop
+watching. Nothing needs draining and nothing re-arms.
+
+**Why not PTY EOF.** Measured on both platforms against real children on real
+PTYs, and the results were not what this document predicted:
+
+- The predicted failure — `sleep 30 & exit 3` leaving the controller open via a
+  grandchild, so EOF misses the exit — **did not happen on either platform**.
+  Both kernels hang up the controlling terminal when the session leader exits.
+  That argument was a hypothesis and it is dead.
+- The failure that *does* happen: on Linux, `exec 0<&- 1>&- 2>&-; sleep 3`
+  gives EOF on the controller **while the shell is alive**. As an exit signal
+  that tears down a live session, which is the one thing this project exists to
+  avoid — the same rule already written down for the keyboard in §2.
+- **That EOF is permanent: 200 of 200 polls reported it.** So as an `AsyncFd`
+  arm it fires forever at full CPU, and would not even remove the busy loop it
+  was proposed to remove.
+- `Pty::read_ready` also collapses `EIO` into `Ok(0)`
+  (`crates/oxutrm-term/src/pty.rs:126-130`), deliberately, so EOF is currently
+  indistinguishable from "quiet" at that layer anyway.
+
+**Two constraints the implementation must keep.**
+
+1. **`NOTE_EXIT` cannot be registered on a zombie.** macOS answers `ESRCH` for
+   an exited-but-unreaped child; Linux's `pidfd_open` succeeds and is readable
+   at once. The platforms differ exactly at the spawn→register race, so a
+   refusal is **"already exited, ask `child_exited`"**, never an error — which
+   is why `ExitWake::as_fd()` returns an `Option` rather than a descriptor.
+   Do not "simplify" that `Option` away.
+2. **`pidfd_open` is safe; `kevent` is `unsafe`.** The macOS half is the second
+   documented `unsafe` exemption in `oxutrm-term`, and the crate header names
+   both. Its safety clause (the descriptors an `Event` names must outlive the
+   kqueue) is vacuous there: the event names a PID and no descriptor.
+
+**What this does NOT do.** It supplies one of the two halves an event-driven
+host needs. The other — a pollable PTY — is still missing, and `IDLE_POLL`
+remains 4 ms. Nothing in the session loop consumes `exit_wake()` yet.
 
 ## 3. QUIC client authentication
 

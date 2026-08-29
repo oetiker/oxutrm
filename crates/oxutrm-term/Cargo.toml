@@ -8,7 +8,7 @@ description = "oxutrm terminal emulation, PTY supervision and screen state"
 
 [dependencies]
 alacritty_terminal.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["event"] }
 rustix-openpty.workspace = true
 serde.workspace = true
 unicode-width.workspace = true

@@ -1,8 +1,12 @@
-// One exemption, in `pty.rs`: making the child a session leader with the PTY
-// as its controlling terminal needs `CommandExt::pre_exec`, which std exposes
-// only as an `unsafe fn`. Without it a shell has no job control - no ^C, no
-// ^Z, no SIGWINCH - which is most of what a terminal is for. `deny` rather
-// than `forbid` so that one call site can be allowed and documented.
+// Two exemptions, each one call site, each documented where it sits.
+// `pty.rs`: making the child a session leader with the PTY as its controlling
+// terminal needs `CommandExt::pre_exec`, which std exposes only as an
+// `unsafe fn`. Without it a shell has no job control - no ^C, no ^Z, no
+// SIGWINCH - which is most of what a terminal is for.
+// `exit_wake.rs`, macOS only: `kevent` is an `unsafe fn` because the
+// descriptors an `Event` names must outlive the kqueue; that call names a PID
+// and no descriptor. `deny` rather than `forbid` so both can be allowed and
+// documented.
 #![deny(unsafe_code)]
 
 //! The terminal itself: a PTY, an `alacritty_terminal` emulator driving it,
@@ -42,6 +46,7 @@
 
 mod blink;
 mod caps;
+mod exit_wake;
 mod grid;
 mod host;
 mod listener;
@@ -54,6 +59,7 @@ mod golden;
 mod testing;
 
 pub use caps::{detect_caps, negotiate_term};
+pub use exit_wake::ExitWake;
 pub use grid::GridSize;
 pub use host::HostTerm;
 pub use listener::{EventSink, Signals};
