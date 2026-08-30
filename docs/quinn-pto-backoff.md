@@ -44,6 +44,19 @@ backlog and recovery is instant. A 60 s `SIGSTOP` "outage" recovers in 0 s.
 | 15 s | 2.13 s | **0.55 s** |
 | 60 s | 10.19 s | **0.55 s** |
 | 150 s | 106.65 s | **1.24 s** |
+| 300 s | not measured | **0.49 s** |
+
+A second run of the whole curve through oxutrm's own `transport_config()`
+rather than a hardcoded constant gave 0.90 s / 1.80 s / 1.72 s / **0.49 s** for
+the same four rungs. Recovery is flat in the length of the outage, which is the
+property that matters: five minutes dark, back in half a second.
+
+**The 300 s cell in the default column is empty because it was never run, not
+because it succeeded.** That baseline run was stopped once the first three
+rungs had established the shape — at 150 s it was already 106.65 s and the
+growth was superlinear, so the rung would have cost another ten minutes to
+confirm something the trend had settled. Extrapolating it as a number would be
+inventing a measurement.
 
 Two cheaper fixes were tried first and **both are refuted**, which is why this
 patch exists rather than one of them:
