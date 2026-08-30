@@ -449,9 +449,8 @@ impl FrameSource {
 pub struct Link {
     pub sink: FrameSink,
     pub source: FrameSource,
-    /// Kept so the session can rebind it while roaming.
-    /// Read by [`Link::rebind`], which `run_connect` will call.
-    #[allow(dead_code)]
+    /// The endpoint quinn owns. Rebound while roaming, so a local address
+    /// change does not cost the connection.
     pub endpoint: quinn::Endpoint,
     /// The socket the ladder punched. Held because ICE keepalives send on it
     /// directly, alongside QUIC.
@@ -479,12 +478,12 @@ impl Link {
     /// `quinn`, to repoint an established connection at a different *remote*
     /// address — so a better path discovered later is lost for this attach and
     /// picked up on the next one.
-    /// **No caller: roaming is not wired.** Only the client may change its
-    /// local address, and nothing in `run_connect` yet notices that it has --
-    /// there is no watcher on the host's routes and no trigger to rebind from.
-    /// The mechanism is here and tested; what is missing is whatever decides
-    /// when to use it.
-    #[allow(dead_code)]
+    ///
+    /// Called by `ClientSession::follow_route` when the route probe says this
+    /// machine's source address for the peer has changed. Only ever while
+    /// `Silent`: this moves our source port and invalidates a punched NAT
+    /// hole, so doing it to a working path would break the path in order to
+    /// test it.
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> anyhow::Result<()> {
         let (demux, _stun) = oxutrm_net::StunDemuxSocket::new(&socket)?;
         self.endpoint.rebind_abstract(demux)?;

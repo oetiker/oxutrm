@@ -681,6 +681,12 @@ pub struct ClientSession {
     /// Both halves are needed: the instant paces the refresh, and the phase is
     /// what tells a refresh apart from a transition, which is never paced.
     built: Option<(Phase, Instant)>,
+    /// The source address the link was working from, so a moved route can be
+    /// spotted. See [`crate::roam`].
+    route: crate::roam::RouteWatch,
+    /// When the route was last probed, so `Silent` does not probe on every
+    /// lap of a loop that wakes up to 125 times a second.
+    probed_at: Option<Instant>,
 }
 
 impl ClientSession {
@@ -703,6 +709,12 @@ impl ClientSession {
             rejected_total: 0,
             shown: None,
             built: None,
+            // No baseline: the first probe of an outage takes one and the
+            // second can act on it. Probing while healthy would cost a syscall
+            // pair a second for the life of every session, to detect something
+            // that cannot have broken anything yet.
+            route: crate::roam::RouteWatch::new(None),
+            probed_at: None,
         })
     }
 
@@ -1335,6 +1347,18 @@ impl ClientSession {
                 out.flush().context("flushing the terminal")?;
             }
 
+            // Follow the route if it moved. Inside the loop rather than on a
+            // timer of its own: `follow_route` is gated on `Silent` and paced
+            // by `ROUTE_PROBE_EVERY`, so a healthy session reaches this line
+            // ten times a second and does nothing but one `matches!`.
+            //
+            // After the notice, so the box describing the silence is already
+            // on the screen before anything is done about it -- and the user
+            // is told nothing about the rebind, because a rebind that has not
+            // restored contact yet is not something the client can honestly
+            // report.
+            let _ = self.follow_route(now);
+
             // The `bool` is for the tests, which hold the clock still and ask
             // whether a prod was due. The loop does not care: it prods or it
             // does not, and either way the next lap is the same.
@@ -1370,12 +1394,76 @@ impl ClientSession {
         }
     }
 
+    /// Follow this machine's route to the host, if it moved.
+    ///
+    /// Returns whether the session socket was actually swapped.
+    ///
+    /// **Only while `Silent`**, per design spec 4.2: a rebind moves our source
+    /// port, which invalidates a punched NAT hole, so doing it to a working
+    /// path breaks the path in order to test it. `Silent` means a reply has
+    /// been owed for `SILENT_AFTER` with none arriving -- the path is already
+    /// not working, so there is nothing left to break.
+    ///
+    /// Nothing here may end the session. A machine in the middle of an outage
+    /// is exactly where `connect` fails with `ENETUNREACH` and where binding a
+    /// fresh socket fails, and this runs during precisely that. Every failure
+    /// is "no answer this time"; the next probe asks again. Same rule as "a
+    /// send failure must never end a session", applied to the thing most
+    /// likely to fail.
+    fn follow_route(&mut self, now: Instant) -> bool {
+        if !matches!(self.link_state.phase_now(), Phase::Silent { .. }) {
+            return false;
+        }
+        if self
+            .probed_at
+            .is_some_and(|last| now.duration_since(last) < crate::roam::ROUTE_PROBE_EVERY)
+        {
+            return false;
+        }
+        self.probed_at = Some(now);
+
+        let peer = self.link.sink.connection().remote_address();
+        let Ok(seen) = crate::roam::route_source(peer) else {
+            // Unroutable right now, which is an ordinary reading mid-outage
+            // and not a fault. The baseline is left alone: a route we cannot
+            // see is not a route that moved.
+            return false;
+        };
+
+        if !self.route.moved(seen) {
+            // Either nothing changed, or this is the first reading of the
+            // outage and there is nothing to compare it with. Adopting it as
+            // the baseline is what makes the NEXT probe able to act.
+            self.route.settle(seen);
+            return false;
+        }
+
+        // The route moved. Bind a fresh socket the same way the ladder bound
+        // the first one -- wildcard, preferring 443 -- and hand it to the live
+        // connection. QUIC is identified by connection IDs, not addresses, so
+        // the connection itself does not notice.
+        let cfg = oxutrm_net::NetConfig::default();
+        let Ok(bound) = oxutrm_net::bind_socket(&cfg) else {
+            return false;
+        };
+        let Ok(socket) = crate::ladder::adopt(bound) else {
+            return false;
+        };
+        if self.rebind(socket).is_err() {
+            // The old socket is still in place and still the one quinn holds:
+            // `Link::rebind` only assigns after `rebind_abstract` succeeded.
+            return false;
+        }
+
+        // Only now, so a failed rebind leaves the old baseline and the next
+        // probe tries again rather than believing it has already moved.
+        self.route.settle(seen);
+        true
+    }
+
     /// Move to a new local socket without dropping the connection.
     ///
-    /// **No caller: roaming is not wired.** The mechanism is here and tested;
-    /// what is missing is whatever notices that this machine's address changed
-    /// and decides to use it. See [`Link::rebind`].
-    #[allow(dead_code)]
+    /// Called by [`ClientSession::follow_route`]. See [`Link::rebind`].
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> Result<()> {
         self.link.rebind(socket)?;
         // The path changed; what is on the terminal is still correct, so
@@ -1410,6 +1498,9 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `use super::*` reaches the session module's own imports, not `crate`'s
+    // other modules, so the route pace has to be named explicitly.
+    use crate::roam::ROUTE_PROBE_EVERY;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
     use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
 
@@ -3239,9 +3330,9 @@ mod tests {
         session.turn(&[], &mut out).expect("a pacing lap");
 
         assert!(
-            matches!(session.link_state.phase(), Phase::Live),
+            matches!(session.link_state.phase_now(), Phase::Live),
             "a frame was applied and the client still believes the host is silent: {:?}",
-            session.link_state.phase()
+            session.link_state.phase_now()
         );
     }
 
@@ -3660,6 +3751,80 @@ mod tests {
             String::from_utf8_lossy(&after),
             String::from_utf8_lossy(&expected),
             "the notice kept the geometry of the screen that went away"
+        );
+    }
+
+    /// The rule from spec 4.2, and the one that costs something to get wrong:
+    /// a rebind moves our source port and invalidates a punched NAT hole, so
+    /// doing it to a link that is working breaks the path in order to test it.
+    #[tokio::test]
+    async fn a_healthy_session_never_probes_the_route() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let t = Instant::now();
+        session.note_heard(t);
+
+        assert!(
+            !session.follow_route(t),
+            "probed a healthy link; a rebind on a working path breaks it"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "a healthy link cost a probe syscall"
+        );
+        assert!(
+            !session.follow_route(t + ROUTE_PROBE_EVERY * 5),
+            "probed a healthy link after several intervals"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "a healthy link cost a probe syscall after several intervals"
+        );
+    }
+
+    /// Probing is gated even inside `Silent`: the loop wakes every 8-100ms and
+    /// a bind/connect pair on every lap is up to 125 a second.
+    #[tokio::test]
+    async fn probing_is_paced_while_silent() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+
+        session.follow_route(t);
+        let after_first = session.probed_at;
+        assert!(
+            after_first.is_some(),
+            "the first probe in Silent did not run"
+        );
+
+        session.follow_route(t + ROUTE_PROBE_EVERY / 2);
+        assert_eq!(
+            session.probed_at, after_first,
+            "probed twice inside one ROUTE_PROBE_EVERY"
+        );
+
+        session.follow_route(t + ROUTE_PROBE_EVERY * 2);
+        assert_ne!(
+            session.probed_at, after_first,
+            "the probe never resumed after its interval"
+        );
+    }
+
+    /// The first probe of an outage has no baseline and must not rebind on it.
+    /// A rebind costs a punched NAT hole; spending one to learn nothing is
+    /// strictly worse than waiting a second for a second reading.
+    #[tokio::test]
+    async fn the_first_probe_of_an_outage_does_not_rebind() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+        let before = session.link.socket.local_addr().expect("a bound socket");
+
+        assert!(
+            !session.follow_route(t),
+            "rebound with no baseline to compare"
+        );
+        assert_eq!(
+            session.link.socket.local_addr().expect("a bound socket"),
+            before,
+            "the session socket was swapped on the first probe"
         );
     }
 }

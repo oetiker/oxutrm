@@ -139,15 +139,15 @@ impl LinkState {
         }
     }
 
-    /// For this module's own tests, and only for them.
+    /// The phase, without advancing anything.
     ///
-    /// The loop never asks: `evaluate` already returns the phase it decided,
-    /// so a caller that asked separately would be reading a value one lap
-    /// stale. `#[cfg(test)]` rather than `#[allow(dead_code)]` because that is
-    /// the truth about it — a later phase that genuinely needs to read the
-    /// state without advancing it can lift the attribute back off.
-    #[cfg(test)]
-    pub fn phase(&self) -> Phase {
+    /// `evaluate` returns the phase it decided, so the loop reads it from
+    /// there rather than asking twice. This exists for the callers that need
+    /// to know what is already true without deciding anything: phase 2's route
+    /// probe runs only while `Silent`, and asking `evaluate` would both
+    /// require a `reply_owed` it has no business computing and advance a state
+    /// machine it only wants to read.
+    pub fn phase_now(&self) -> Phase {
         self.phase
     }
 
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn a_fresh_link_is_live() {
-        assert_eq!(LinkState::new(t0()).phase(), Phase::Live);
+        assert_eq!(LinkState::new(t0()).phase_now(), Phase::Live);
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         ));
 
         s.heard(t + Duration::from_secs(4));
-        assert_eq!(s.phase(), Phase::Live);
+        assert_eq!(s.phase_now(), Phase::Live);
     }
 
     /// The `since` is the moment the host went quiet, not the moment we
@@ -562,7 +562,7 @@ mod tests {
             // host answering is exactly what raises it.
             s.hold_keys(b"x");
             s.heard(t);
-            assert_eq!(s.phase(), Phase::Confirming);
+            assert_eq!(s.phase_now(), Phase::Confirming);
 
             assert_eq!(
                 s.hold_keys(&[0x1c, byte]),
@@ -680,7 +680,7 @@ mod tests {
 
         // The host answers, and the box asks whether to deliver that.
         s.heard(t);
-        assert_eq!(s.phase(), Phase::Confirming);
+        assert_eq!(s.phase_now(), Phase::Confirming);
 
         assert_eq!(
             s.hold_keys(b"send it"),
@@ -734,7 +734,7 @@ mod tests {
         s.hold_keys(b"make test\r");
 
         s.heard(t + Duration::from_secs(9));
-        assert_eq!(s.phase(), Phase::Confirming);
+        assert_eq!(s.phase_now(), Phase::Confirming);
     }
 
     #[test]
@@ -743,7 +743,7 @@ mod tests {
         let mut s = LinkState::new(t);
 
         s.heard(t + Duration::from_secs(9));
-        assert_eq!(s.phase(), Phase::Live);
+        assert_eq!(s.phase_now(), Phase::Live);
     }
 
     #[test]
@@ -752,10 +752,10 @@ mod tests {
         let mut s = LinkState::new(t);
         s.hold_keys(b"x");
         s.heard(t);
-        assert_eq!(s.phase(), Phase::Confirming);
+        assert_eq!(s.phase_now(), Phase::Confirming);
 
         s.drop_held();
-        assert_eq!(s.phase(), Phase::Live);
+        assert_eq!(s.phase_now(), Phase::Live);
         assert!(s.held().is_empty());
     }
 

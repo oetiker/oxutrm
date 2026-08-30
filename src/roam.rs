@@ -50,9 +50,8 @@ use std::time::Duration;
 /// probe syscalls at all. This is emphatically not `IDLE_POLL` coming back as
 /// a pace.
 ///
-/// **No caller yet: wiring the probe into the session loop is the next
-/// task's job**, same as `Link::rebind` before it.
-#[allow(dead_code)]
+/// Read by `ClientSession::follow_route`, which is where the gate on `Silent`
+/// lives.
 pub const ROUTE_PROBE_EVERY: Duration = Duration::from_secs(1);
 
 /// The local address the kernel would use to reach `peer`, right now.
@@ -61,8 +60,8 @@ pub const ROUTE_PROBE_EVERY: Duration = Duration::from_secs(1);
 /// thing for a machine in the middle of the outage this runs during -- the
 /// caller must treat an error as "no answer this time" and never as fatal.
 ///
-/// **No caller yet**: see [`ROUTE_PROBE_EVERY`].
-#[allow(dead_code)]
+/// Called by `ClientSession::follow_route`, once per [`ROUTE_PROBE_EVERY`]
+/// while the link is `Silent`.
 pub fn route_source(peer: SocketAddr) -> std::io::Result<IpAddr> {
     // Unmapped first, so the throwaway socket can be bound in the peer's own
     // family and `connect` needs no mapping of its own. `oxutrm_net`'s own doc
@@ -81,13 +80,12 @@ pub fn route_source(peer: SocketAddr) -> std::io::Result<IpAddr> {
 
 /// The source address that was true when the link last worked.
 ///
-/// **No caller yet**: see [`ROUTE_PROBE_EVERY`].
-#[allow(dead_code)]
+/// Held by `ClientSession` for the life of the session and read by its
+/// `follow_route`.
 pub struct RouteWatch {
     baseline: Option<IpAddr>,
 }
 
-#[allow(dead_code)]
 impl RouteWatch {
     /// `baseline` is what a probe said while the link was known good. `None`
     /// when no probe has succeeded yet.
