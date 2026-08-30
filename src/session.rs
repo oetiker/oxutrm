@@ -593,9 +593,9 @@ fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
             String::from_utf8_lossy(&closed.reason)
         )),
         quinn::ConnectionError::TimedOut => Err(anyhow::anyhow!(
-            "the host stopped answering and the link timed out after 30s. Your \
-             shell may still be running there; `oxutrm host --list` on the host \
-             will say. Reattaching is not implemented yet."
+            "the link to the host timed out. Silence alone no longer ends a \
+             session, so this is the transport giving up rather than the host \
+             going quiet."
         )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
@@ -1003,10 +1003,10 @@ impl ClientSession {
                 Some(Notice {
                     // What was observed, which is a frame arriving. Nothing
                     // reconnected: the QUIC connection never dropped, it went
-                    // quiet and recovered inside the idle timeout, and phase 1
-                    // has no reconnection machinery for a headline to imply.
-                    // "reconnected" -- which this used to say -- named a
-                    // mechanism oxutrm does not yet have.
+                    // quiet and came back, and phase 1 has no reconnection
+                    // machinery for a headline to imply. "reconnected" -- which
+                    // this used to say -- named a mechanism oxutrm does not yet
+                    // have.
                     headline: "the host is answering again - deliver what you typed?".to_string(),
                     body,
                     keys: vec![
@@ -2664,8 +2664,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         // The client goes away without a graceful shutdown, as a dropped
-        // network does. A bare `drop` is not enough: quinn would keep the
-        // connection alive until its idle timeout.
+        // network does. A bare `drop` is not enough: with no idle timeout,
+        // quinn would keep the connection alive indefinitely rather than
+        // ever noticing on its own.
         client.link.sink.connection().close(0u32.into(), b"gone");
         drop(client);
         // quinn needs a moment to decide the connection is gone.

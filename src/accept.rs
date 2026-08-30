@@ -50,18 +50,25 @@ use oxutrm_net::AcceptPermit;
 /// Nothing else in the attach path can notice, because from the accept's point
 /// of view "silent" and "still coming" are the same thing.
 ///
-/// Thirty seconds, matching the `max_idle_timeout` `oxutrm_net` already sets on
-/// the transport. That number is chosen against what quinn itself will do, not
-/// picked for feel: a handshake still unfinished after thirty idle seconds is
-/// one quinn is about to abandon anyway, so this deadline cuts nothing short
-/// that would have succeeded. What it bounds is the case quinn cannot see at
-/// all — no handshake to time out, because no peer ever spoke.
+/// Thirty seconds, and the number now stands on its own. It used to be
+/// justified by matching the transport's `max_idle_timeout`: a handshake still
+/// unfinished after thirty idle seconds was one quinn was about to abandon
+/// anyway, so the deadline cut nothing short. Phase 2 set that timeout to
+/// `None`, so there is no longer anything to match and quinn will abandon
+/// nothing.
 ///
-/// It is generous for the case that matters. ICE has already completed
+/// That makes this deadline MORE load-bearing, not less. It is now the only
+/// bound on the case it always described -- no peer ever spoke, so there is no
+/// connection and nothing for a transport timeout to fire on. Without it
+/// `--serve` parks on `Endpoint::accept()` for ever, holding a registered
+/// session, a punched socket and a shell nobody can reach; and reattach does
+/// not exist yet, so such a session cannot be reclaimed, only killed by PID.
+///
+/// It stays generous for the case that matters. ICE has already completed
 /// connectivity checks over this very path by the time anything here runs, so
-/// the client is known to be reachable and its `ClientHello` is one round trip
-/// away; the address-validation `retry()` below costs one more. Thirty seconds
-/// is tens of round trips on a link bad enough to be worth keeping.
+/// the client is known reachable and its `ClientHello` is one round trip away;
+/// the address-validation `retry()` below costs one more. Thirty seconds is
+/// tens of round trips on a link bad enough to be worth keeping.
 pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wait for the one connection this attach expects.

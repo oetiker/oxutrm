@@ -46,9 +46,29 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.datagram_send_buffer_size(DATAGRAM_BUFFER);
     t.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
-    t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is representable"),
-    ));
+    // No idle timeout, deliberately, and `None` rather than a deleted line:
+    // quinn's DEFAULT is 30s, so removing the setter restores exactly what
+    // this is here to remove.
+    //
+    // The transport must not adjudicate liveness. It has no idea what the
+    // user is looking at, so all it can do about silence is kill a connection
+    // that was about to recover -- which is what it did, at ~33s, for the
+    // whole of phase 1. `LinkState` owns that verdict now: it raises a notice
+    // at 2s, holds what is typed blind, and offers `Ctrl-\ q`. quinn warns
+    // that an infinite timeout can hang a future for ever; the notice is the
+    // answer to that, and it says more than a dead connection ever did.
+    //
+    // Consequence, stated because it is easy to miss: `conn.closed()` now
+    // fires only on an explicit close or a transport error, never on silence.
+    // Nothing may be built on it firing for a quiet peer -- see
+    // `HostSession::attached`, which used to rely on exactly that.
+    t.max_idle_timeout(None);
+    // NOT redundant with the client's 0.2 Hz heartbeat, and it does not go
+    // with the timeout above. The heartbeat exists so an answer is *owed*, on
+    // the QUIC stream, where `LinkState` can see it. Keep-alive is what holds
+    // a punched NAT binding open, which rungs 2 and 3 depend on for the whole
+    // life of the connection -- and with no idle timeout, a connection can now
+    // outlive a binding by a very long way.
     t.keep_alive_interval(Some(Duration::from_secs(10)));
     Arc::new(t)
 }
@@ -315,6 +335,31 @@ mod tests {
     use crate::tls::generate_cert;
     use std::time::Duration;
     use tokio::net::UdpSocket;
+
+    /// The transport must not adjudicate liveness. quinn's DEFAULT is 30s, so
+    /// deleting the setter would silently restore exactly what this removes --
+    /// this asserts the negotiated value, not the absence of a line of code.
+    #[test]
+    fn the_transport_imposes_no_idle_timeout() {
+        let cfg = transport_config();
+        assert_eq!(
+            format!("{cfg:?}").contains("max_idle_timeout: Some"),
+            false,
+            "an idle timeout is still set; the client will still die on silence: {cfg:?}"
+        );
+    }
+
+    /// Keep-alive is NOT redundant with the client's heartbeat: it is what
+    /// holds a punched NAT binding open, which rungs 2 and 3 depend on for the
+    /// life of the connection. Removing the idle timeout must not take it too.
+    #[test]
+    fn keep_alive_survives_the_idle_timeout_going() {
+        let cfg = transport_config();
+        assert!(
+            format!("{cfg:?}").contains("keep_alive_interval: Some"),
+            "keep-alive went with the idle timeout; punched NAT bindings will lapse: {cfg:?}"
+        );
+    }
 
     async fn socket() -> Arc<UdpSocket> {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
