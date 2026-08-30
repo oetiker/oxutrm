@@ -378,9 +378,8 @@ mod tests {
     #[test]
     fn the_transport_imposes_no_idle_timeout() {
         let cfg = transport_config();
-        assert_eq!(
-            format!("{cfg:?}").contains("max_idle_timeout: Some"),
-            false,
+        assert!(
+            !format!("{cfg:?}").contains("max_idle_timeout: Some"),
             "an idle timeout is still set; the client will still die on silence: {cfg:?}"
         );
     }
@@ -430,9 +429,8 @@ mod tests {
         let (cert, key, fingerprint) = generate_cert().unwrap();
         let cfg = server_config(cert, key, ClientSpki::new(fingerprint))
             .expect("a server config with a self-signed cert and key");
-        assert_eq!(
-            format!("{:?}", cfg.transport).contains("max_idle_timeout: Some"),
-            false,
+        assert!(
+            !format!("{:?}", cfg.transport).contains("max_idle_timeout: Some"),
             "server_config() built a ServerConfig whose WIRED transport still \
              carries an idle timeout, even though transport_config() itself \
              does not -- the wiring line was dropped: {:?}",
@@ -451,9 +449,8 @@ mod tests {
         let (cert, key, fingerprint) = generate_cert().unwrap();
         let cfg = client_config(HostSpki::new(fingerprint), cert, key)
             .expect("a client config with a self-signed cert and key");
-        assert_eq!(
-            format!("{cfg:?}").contains("max_idle_timeout: Some"),
-            false,
+        assert!(
+            !format!("{cfg:?}").contains("max_idle_timeout: Some"),
             "client_config() built a ClientConfig whose WIRED transport \
              still carries an idle timeout, even though transport_config() \
              itself does not -- the wiring line was dropped: {cfg:?}"
