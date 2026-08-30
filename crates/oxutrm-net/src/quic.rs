@@ -95,6 +95,32 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     // life of the connection -- and with no idle timeout, a connection can now
     // outlive a binding by a very long way.
     t.keep_alive_interval(Some(Duration::from_secs(10)));
+    // The other half of `max_idle_timeout(None)`, and the half that was
+    // missed. Removing the idle timeout removed the death sentence it was
+    // removed for -- and, unnoticed, the only thing bounding quinn's
+    // exponential PTO backoff. The probe interval is
+    // `pto_base * 2^min(pto_count, MAX_BACKOFF_EXPONENT)`, and quinn's
+    // default exponent is 16: on an ordinary path that is a probe timer
+    // which grows to over twenty minutes while a peer is away. Normally the
+    // idle timeout kills such a connection long first. Here nothing did, so
+    // a session whose path came back sat waiting on a timer that had doubled
+    // its way into the minutes -- both ends alive, path perfect, terminal
+    // dead.
+    //
+    // Measured against a UDP relay that really drops packets
+    // (`session::tests::blackout_recovery_curve`): a 150 s blackout took
+    // **106.65 s** to recover at the default 16 and **1.24 s** at 6, with 60 s
+    // going 10.19 s -> 0.55 s. Six means the probe interval tops out at 64x
+    // the base -- a few seconds on a real path -- so a returning path is
+    // noticed in about that long, for ever, however long the outage was.
+    //
+    // It costs probe packets during an outage and NOTHING on a healthy
+    // connection, where `pto_count` is zero: 441 packets across a 150 s
+    // blackout against 313 at the default, which is ~3 a second to keep a
+    // session recoverable.
+    //
+    // `max_backoff_exponent` is not in released quinn. See `docs/quinn-pto-backoff.md`.
+    t.max_backoff_exponent(6);
     Arc::new(t)
 }
 
@@ -381,6 +407,24 @@ mod tests {
         assert!(
             !format!("{cfg:?}").contains("max_idle_timeout: Some"),
             "an idle timeout is still set; the client will still die on silence: {cfg:?}"
+        );
+    }
+
+    /// The other half of the no-idle-timeout decision.
+    ///
+    /// With `max_idle_timeout(None)` there is nothing else bounding quinn's
+    /// exponential PTO backoff, and at the default exponent of 16 a session
+    /// whose path returns waits on a probe timer that grew to minutes. This
+    /// asserts the WIRING, the same way the two guards around it do -- read
+    /// off the built config's `Debug`, so deleting the setter fails here.
+    #[test]
+    fn the_probe_backoff_is_bounded_now_that_nothing_else_bounds_it() {
+        let cfg = transport_config();
+        assert!(
+            format!("{cfg:?}").contains("max_backoff_exponent: 6"),
+            "the PTO backoff is unbounded again; a session whose path comes \
+             back will wait minutes for a probe timer that doubled while it \
+             was away: {cfg:?}"
         );
     }
 

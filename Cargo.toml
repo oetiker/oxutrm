@@ -207,3 +207,8 @@ alacritty_terminal.workspace = true
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+
+[patch.crates-io]
+# See docs/quinn-pto-backoff.md. One field on TransportConfig, defaulted to
+# quinn's own value; load-bearing until it is upstreamed.
+quinn-proto = { path = "vendor/quinn-proto" }
