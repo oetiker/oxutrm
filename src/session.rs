@@ -81,6 +81,26 @@ const FINAL_DRAIN: Duration = Duration::from_secs(2);
 /// announce and is never held back; see [`ClientSession::notice_at`].
 const NOTICE_REFRESH: Duration = Duration::from_secs(1);
 
+/// How long the host keeps building frames for a client it has not heard from.
+///
+/// **This is the guarantee quinn used to provide and no longer does.** Until
+/// phase 2 the host asked `close_reason()`, which answered once the transport's
+/// 30 s idle timeout had fired. `max_idle_timeout` is `None` now, so
+/// `close_reason()` stays `None` for ever on a silent peer and the question has
+/// to be answered from a clock of our own.
+///
+/// Thirty seconds, so the behaviour is unchanged by construction: it is exactly
+/// what quinn enforced before. Six times `HEARTBEAT_IDLE`, so an attached
+/// client that is merely quiet is nowhere near it -- it heartbeats at 0.2 Hz and
+/// every heartbeat is a frame.
+///
+/// Detaching closes nothing. It stops snapshotting and stops offering frames;
+/// the pty is still drained and the emulator still fed, because the screen being
+/// current on reattach is the whole reason a detached session keeps emulating.
+/// A peer that comes back is heard on its first frame and `screen_stale` forces
+/// the snapshot.
+pub const DETACH_AFTER: Duration = Duration::from_secs(30);
+
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
 #[derive(Clone, Debug, Default)]
@@ -126,6 +146,10 @@ pub struct HostSession {
     /// sender holds is older than the screen. Forces one snapshot on the
     /// turn a peer comes back, whether or not the pty moved on that turn.
     screen_stale: bool,
+    /// The last time anything arrived from the client. The host's own liveness
+    /// clock, because `close_reason()` stopped being one when the transport's
+    /// idle timeout went. See [`DETACH_AFTER`].
+    last_heard: Instant,
 }
 
 impl HostSession {
@@ -163,12 +187,15 @@ impl HostSession {
             last_send: None,
             written: 0,
             screen_stale: false,
+            // An attach has just completed and R5 obliges the client to send
+            // immediately, so "now" is true rather than optimistic.
+            last_heard: Instant::now(),
         })
     }
 
     /// One turn: apply whatever arrived, drain the PTY, offer a frame.
     pub fn turn(&mut self) -> Result<Turn> {
-        self.turn_with(None)
+        self.turn_at(Instant::now(), None)
     }
 
     /// [`HostSession::turn`], plus a frame the caller has already taken off
@@ -177,13 +204,27 @@ impl HostSession {
     /// `run`'s select has to *receive* a frame to know one arrived, so it
     /// arrives holding one; `try_recv` below would never see it and the
     /// keystrokes in it would be silently dropped.
-    pub fn turn_with(&mut self, mut first: Option<Frame>) -> Result<Turn> {
+    pub fn turn_with(&mut self, first: Option<Frame>) -> Result<Turn> {
+        self.turn_at(Instant::now(), first)
+    }
+
+    /// [`HostSession::turn_with`], with the clock injected.
+    ///
+    /// The clock is a parameter for the same reason it is one throughout
+    /// `LinkState` and `ClientSession::note_heard`: [`DETACH_AFTER`] is thirty
+    /// seconds, and a threshold that can only be tested by sleeping thirty
+    /// seconds is a threshold nobody tests.
+    pub fn turn_at(&mut self, now: Instant, mut first: Option<Frame>) -> Result<Turn> {
         let mut turn = Turn::default();
 
         // ---- inbound: the client's keystrokes ------------------------------
         // (the size the client wants rides on the same diff, and is applied
         // below once the frames have been taken in)
         while let Some(frame) = first.take().or_else(|| self.link.source.try_recv()) {
+            // Any frame at all is evidence of a peer, including one `on_frame`
+            // rejects: a stale sequence number says the client is behind, not
+            // that it is gone.
+            self.last_heard = now;
             // A rejected frame is not a disconnection: the state and the ack
             // are both untouched, and the peer's next diff will apply.
             match self.input_rx.on_frame(&frame) {
@@ -223,11 +264,20 @@ impl HostSession {
         // second burned 17-20% of a core doing exactly that, for a screen
         // nobody would ever see. Quiet ones cost 1.2%, which is why this hid.
         //
-        // `close_reason` and not "did a frame arrive recently": during a
-        // network blip the connection is still open and we WANT the work to
+        // Two questions, and since phase 2 they have different answers.
+        // `close_reason` still catches a peer that closed properly or a
+        // transport error -- both are immediate and certain. What it no longer
+        // catches is silence: `max_idle_timeout` is `None`, so quinn will hold
+        // a connection to a peer that vanished for ever, and this used to read
+        // "turns off only once quinn has given the connection up".
+        //
+        // So the recency window is what answers it now. Generous on purpose:
+        // during a blip the connection is open and we WANT the work to
         // continue, so the session resumes instantly when the peer comes back.
-        // This turns off only once quinn has given the connection up.
-        let attached = self.link.sink.connection().close_reason().is_none();
+        // `DETACH_AFTER` is six times the client's heartbeat interval.
+        let closed = self.link.sink.connection().close_reason().is_some();
+        let quiet_too_long = now.duration_since(self.last_heard) >= DETACH_AFTER;
+        let attached = !closed && !quiet_too_long;
         turn.detached = !attached;
 
         // ---- the terminal --------------------------------------------------
@@ -1982,6 +2032,81 @@ mod tests {
             Some(0),
             "the child never exited, so the pty stopped being drained and it \
              blocked on a full buffer"
+        );
+    }
+
+    /// One frame from the client, as the host's select would receive it.
+    async fn client_frame(host: &mut HostSession) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), host.link.source.recv())
+            .await
+            .expect("the client's frame never arrived")
+            .expect("the source closed")
+    }
+
+    /// The property Task 2 takes away from quinn and this task gives back.
+    /// A host whose client stopped speaking must stop building frames for it,
+    /// or an abandoned session burns a core for ever on a screen nobody will
+    /// see. Measured at 17-20% of a core for a child writing five lines a
+    /// second, which is why this is not a micro-optimisation.
+    #[tokio::test]
+    async fn a_host_whose_client_went_quiet_detaches_on_its_own_clock() {
+        let (mut host, _client) = pair("/bin/sh").await;
+        let t = Instant::now();
+
+        let turn = host.turn_at(t, None).expect("a turn while attached");
+        assert!(
+            !turn.detached,
+            "detached while the client was still speaking"
+        );
+
+        let turn = host
+            .turn_at(t + DETACH_AFTER + Duration::from_secs(1), None)
+            .expect("a turn after the client went quiet");
+        assert!(
+            turn.detached,
+            "the host is still building frames for a client that stopped \
+             answering {DETACH_AFTER:?} ago"
+        );
+    }
+
+    /// Detaching must not be a one-way door: the whole point of holding the
+    /// connection open is that a peer coming back is heard instantly.
+    #[tokio::test]
+    async fn a_returning_client_reattaches_the_host() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let t = Instant::now();
+        let late = t + DETACH_AFTER + Duration::from_secs(1);
+
+        assert!(host.turn_at(late, None).expect("a turn").detached);
+
+        // The client speaks again. Any frame is evidence of a peer.
+        let mut out = Vec::new();
+        client.turn(b"x", &mut out).expect("the client types");
+        let frame = client_frame(&mut host).await;
+
+        let turn = host
+            .turn_at(late + Duration::from_millis(1), Some(frame))
+            .expect("a turn with the client back");
+        assert!(
+            !turn.detached,
+            "a client that came back was not heard; the screen would stay frozen"
+        );
+    }
+
+    /// A blip is not a departure. HEARTBEAT_IDLE is 5s and DETACH_AFTER is 30s,
+    /// and the gap between them is what stops an ordinary quiet moment from
+    /// freezing the emulator behind the child.
+    #[tokio::test]
+    async fn an_ordinary_quiet_moment_does_not_detach_the_host() {
+        let (mut host, _client) = pair("/bin/sh").await;
+        let t = Instant::now();
+
+        let turn = host
+            .turn_at(t + crate::linkstate::HEARTBEAT_IDLE * 2, None)
+            .expect("a turn a couple of heartbeats in");
+        assert!(
+            !turn.detached,
+            "detached after two heartbeats; a quiet session is not an absent one"
         );
     }
 

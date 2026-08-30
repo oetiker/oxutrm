@@ -60,8 +60,9 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     //
     // Consequence, stated because it is easy to miss: `conn.closed()` now
     // fires only on an explicit close or a transport error, never on silence.
-    // Nothing may be built on it firing for a quiet peer -- see
-    // `HostSession::attached`, which used to rely on exactly that.
+    // Nothing may be built on it firing for a quiet peer -- see the `attached`
+    // computation in `HostSession::turn_at`, `src/session.rs`, which used to
+    // rely on exactly that.
     t.max_idle_timeout(None);
     // NOT redundant with the client's 0.2 Hz heartbeat, and it does not go
     // with the timeout above. The heartbeat exists so an answer is *owed*, on
