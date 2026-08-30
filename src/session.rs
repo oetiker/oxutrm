@@ -848,19 +848,37 @@ impl ClientSession {
             // Streams can complete out of order. `on_frame` answers that from
             // the frame's own sequence numbers: an older one is Ok(false).
             match self.screen_rx.on_frame(&frame) {
-                Ok(true) => {
-                    turn.applied += 1;
-                    painted = true;
-                    // Wherever a frame is applied, the host was heard. The
-                    // loop's `Wake::Frame` arm is not the only path here:
+                Ok(applied) => {
+                    if applied {
+                        turn.applied += 1;
+                        painted = true;
+                    }
+                    // The host was heard, whether or not the frame changed
+                    // anything. `Ok(false)` is what an ACK-ONLY frame reports
+                    // -- the answer a host with an unmoved screen gives a
+                    // heartbeat, repeating its own state number so there is
+                    // nothing to apply -- and on an idle session it is the
+                    // only proof of life there will ever be until somebody
+                    // types. Tying this to `Ok(true)` left the box saying
+                    // nobody was answering up for ever on exactly the session
+                    // that had just recovered, with nothing owed any more:
+                    // `evaluate` returns early while `Silent` so the counter
+                    // does not restart, and only `heard` can leave it.
+                    //
+                    // `Err` is deliberately NOT heard. A frame the receiver
+                    // could not apply leaves the screen frozen, and the
+                    // `Silent` box is the only place the rejected count is
+                    // reported -- going back to `Live` there would take the
+                    // one explanation away and leave a stale screen with none.
+                    //
+                    // The loop's `Wake::Frame` arm is not the only path here:
                     // `try_recv` below scavenges frames on pacing, keyboard
-                    // and resize laps, and a frame applied on one of those
-                    // used to repaint the screen underneath a box still
-                    // saying nobody was answering. It also moves `last_heard`,
-                    // which is what the `silent for Ns` counter is built from.
+                    // and resize laps, and a frame that landed on one of those
+                    // used to repaint the screen underneath a box still saying
+                    // nobody was answering. It also moves `last_heard`, which
+                    // is what the `silent for Ns` counter is built from.
                     self.note_heard(Instant::now());
                 }
-                Ok(false) => {}
                 // See the host's copy of this arm: a silently swallowed
                 // BaseMismatch is a frozen screen that looks like a slow one.
                 Err(_) => {
@@ -4292,15 +4310,159 @@ mod tests {
 
         // The host answers again; the notice must clear through the same
         // scavenging path Task 1 fixed.
-        host.turn().expect("the host answers at last");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        client
-            .turn(&[], &mut out)
-            .expect("a lap that scavenges the frame");
+        //
+        // BOTH sides turn, and the wait is for the notice to go rather than
+        // for a fixed sleep to elapse. One `host.turn()` after a 200 ms sleep
+        // failed intermittently, and not for the reason a sleep usually fails:
+        // nine seconds of laps against a host that never turned fill
+        // `FrameSource`'s 64-frame channel on the host side, whose reader task
+        // then blocks in `send().await` and stops calling `read_datagram`, so
+        // everything the client sent afterwards -- the heartbeat that made the
+        // reply owed included -- was dropped before the host could see it. The
+        // single turn then drained sixty-odd frames from seconds ago, had
+        // nothing newer to acknowledge, and correctly sent nothing at all: the
+        // notice stayed up because the round trip really was incomplete. That
+        // is the fixture, not the behaviour -- a real host turns every lap and
+        // never lets a backlog build -- so the wait drives both ends until the
+        // client's current sequence number reaches the host.
+        //
+        // `applied` is carried into the message because it separates the two
+        // failures worth telling apart: nothing ever arrived (the fixture
+        // wedged again), or a frame landed and the notice stayed up anyway --
+        // the defect this test exists for. Diagnosing the CI failure took one
+        // run of this message and no reproduction.
+        let mut applied = 0;
+        let clear_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < clear_by {
+            host.turn().expect("the host answers at last");
+            applied += client
+                .turn(&[], &mut out)
+                .expect("a lap that scavenges the frame")
+                .applied;
+            if client.notice_at(Instant::now()).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         assert!(
             client.notice_at(Instant::now()).is_none(),
-            "the host answered and the notice stayed up"
+            "the host answered and the notice stayed up through 20s of \
+             scavenging laps, {applied} frames applied"
+        );
+    }
+
+    /// The answer an IDLE session gets back is an ack and nothing else.
+    ///
+    /// A host whose screen has not moved answers a heartbeat with an ACK-ONLY
+    /// frame, which by construction repeats its own state number --
+    /// `Receiver::on_frame` records the ack from it and reports `Ok(false)`,
+    /// because there is nothing to apply and applying a duplicate would be
+    /// wrong. That frame is still proof the host is alive, and on a session
+    /// where nobody is typing it is the ONLY proof there will ever be:
+    /// nothing else is coming until the screen changes.
+    ///
+    /// `LinkState::heard` is documented as "a frame arrived", and only it can
+    /// leave `Silent` -- `evaluate` returns early there so the counter does
+    /// not restart every lap. So a client that calls it only for frames that
+    /// APPLY sits under "no reply from host" for ever on exactly the session
+    /// that has recovered, with `owed` false and the box still up.
+    ///
+    /// Found through the real-clock test above, which failed intermittently on
+    /// this and almost always on CI: it passes only when the shell's echo is
+    /// still in flight and the answer happens to carry a diff.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_that_applies_nothing_still_clears_the_notice() {
+        // No script: the shell's own prompt is then the last thing that
+        // changes the screen, and the session settles for good.
+        let (mut host, mut client) = pair("").await;
+        let mut out = Vec::new();
+
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains('$')
+            )
+            .await,
+            "the client never saw the shell's prompt, so nothing has settled"
+        );
+
+        // Settled means the host has run out of things to say: the prompt has
+        // been acknowledged and the acknowledgement itself carried across. Two
+        // consecutive quiet laps, not one, because the first quiet lap can be
+        // followed by the frame that carries the client's ack of it. The laps
+        // are 150 ms apart, comfortably past `pacing_interval`'s 100 ms
+        // ceiling, so "sent nothing" means "had nothing to send" rather than
+        // "was asked too early". Without this the answer below would carry a
+        // diff and the test would guard the applied path it exists to avoid.
+        let mut quiet = 0;
+        let settled_by = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < settled_by && quiet < 2 {
+            if host.turn().expect("a host lap").sent.is_none() {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            client.turn(&[], &mut out).expect("a client lap");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert_eq!(
+            quiet, 2,
+            "the host never ran out of diffs; its answer would not be ack-only"
+        );
+
+        // A heartbeat moves the client's sequence number, so an answer is owed
+        // -- and nothing on the host's screen will change to carry it.
+        let t = Instant::now();
+        client.note_heard(t);
+        client.note_sent(t);
+        assert!(
+            client.heartbeat(t + crate::linkstate::HEARTBEAT_IDLE),
+            "no heartbeat went out, so nothing is owed and this proves nothing"
+        );
+        client
+            .turn(&[], &mut out)
+            .expect("the lap that sends the heartbeat");
+
+        // The lap the owing begins on: the grace period is measured from when
+        // the reply started being owed, so a fixture that jumped straight to
+        // `SILENT_AFTER` would be asking about an owing that had only just
+        // started.
+        let sent_at = t + crate::linkstate::HEARTBEAT_IDLE;
+        assert!(
+            client.notice_at(sent_at).is_none(),
+            "the notice went up the instant the heartbeat did, before the grace period"
+        );
+        let raised = sent_at + crate::linkstate::SILENT_AFTER;
+        assert!(
+            client.notice_at(raised).is_some(),
+            "the fixture raised no notice"
+        );
+
+        let mut applied = 0;
+        let mut answers = 0;
+        let clear_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < clear_by {
+            if host.turn().expect("a host lap").sent.is_some() {
+                answers += 1;
+            }
+            applied += client
+                .turn(&[], &mut out)
+                .expect("a lap that scavenges the answer")
+                .applied;
+            if client.notice_at(raised).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            client.notice_at(raised).is_none(),
+            "the host sent {answers} answers and the notice stayed up; \
+             {applied} of them applied"
         );
     }
 }
