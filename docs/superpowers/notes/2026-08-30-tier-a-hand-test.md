@@ -428,9 +428,19 @@ deliberately rather than silently.
 The original `*:443` socket (`fd 9`) is **never released**. It is still open
 at the end of the session, after two rebinds, while the intermediate rebound
 sockets (`*:51710`, `*:53884`) were properly closed as each was superseded.
-Either it is a second socket that is not the session's (the ladder's, say) and
-this is nothing, or a rebind leaks its first socket. Not chased here; cheap to
-settle by reading what `fd 9` is bound for.
+Followed up in the code, and it is **not** a per-rebind leak. `Link::rebind`
+does `self.socket = socket`, dropping the old `Arc`, and the trace bears that
+out: each superseded socket went from two fds to one to none as quinn let go
+of its in-flight state (`*:51710` and `*:53884` both drained away completely).
+`ladder::adopt` does not dup either — it moves the std socket into tokio.
+
+What is left is **one descriptor, from the connection-setup path, retained for
+the life of the session**: the original socket started with two fds (9 and
+16), rebind replaced the one quinn held, and fd 9 stayed open to the end. The
+rebound sockets never acquire that second holder because they skip the ladder,
+so the likeliest owner is something the ladder or the STUN demux keeps — note
+`serve.rs` binds its equivalent as `_stun_rx`. Bounded and constant, not
+growing. Worth a look when someone is next in `ladder.rs`, not worth a bug.
 
 ## Anomalies — seen once each, neither reproduced
 
