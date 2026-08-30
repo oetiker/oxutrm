@@ -4,6 +4,14 @@
 
 ### New
 
+### Changed
+
+### Fixed
+
+## 0.2.0 - 2026-08-30
+
+### New
+
 - **The session survives a network outage instead of dying at thirty seconds.**
   The QUIC transport no longer imposes an idle timeout, so silence stops ending
   a session: the client's own state machine decides the host has gone quiet,
