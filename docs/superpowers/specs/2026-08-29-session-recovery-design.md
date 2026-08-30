@@ -145,11 +145,23 @@ for. The host's own `eprintln!` is untouched — it goes up the ssh channel and
 
 ### 4.1 The idle timeout goes
 
-`max_idle_timeout` is removed from `transport_config()`
-(`crates/oxutrm-net/src/quic.rs:49`), along with the constant in
-`src/accept.rs:53` that exists specifically to match it. Both ends change: the
-value is negotiated to the minimum of the two, so a one-sided change would do
-nothing.
+`max_idle_timeout` is set to **`None`** in `transport_config()`
+(`crates/oxutrm-net/src/quic.rs`). Explicitly `None`, not a deleted line:
+quinn's default is `Some(30s)` (`quinn-proto` `TransportConfig::default`), so
+removing the setter restores exactly the timeout this removes. Both ends
+change together because `transport_config()` is shared, which is required
+rather than incidental — the effective timeout is the minimum of the two
+peers', so a one-sided change would do nothing.
+
+`ACCEPT_TIMEOUT` in `src/accept.rs` **stays.** An earlier draft of this
+section called for removing it as "the constant that exists specifically to
+match" the idle timeout; that was wrong twice over. `src/accept.rs:53` is a
+sentence inside the constant's doc comment justifying its *value*, not the
+constant. And the constant bounds a case `max_idle_timeout` never covered: no
+peer ever spoke, so there is no connection for a transport timeout to fire on.
+Removing it parks `--serve` on `Endpoint::accept()` for ever, holding a
+registered session and a punched socket. Its justification is rewritten; the
+number stands on its own.
 
 **quinn's keep-alive stays at 10 s.** It is not redundant with §3.2's
 heartbeat: keep-alive is what holds a punched NAT binding open, which rungs 2
@@ -158,6 +170,18 @@ and 3 depend on for the life of the connection.
 Consequence to be explicit about: `conn.closed()` now fires only on an explicit
 close or a transport error, never on silence. The client's own state machine is
 what notices silence, which is the point of §1.1.
+
+**The host needs its own detach clock.** `HostSession::turn` decided whether
+anyone was listening from `close_reason()`, which answered once the idle
+timeout had fired. With no idle timeout it never answers, so a session whose
+client vanished would build screens for it for ever — a measured 17-20% of a
+core for a child writing five lines a second. `DETACH_AFTER`, thirty seconds
+without a frame, restores the previous behaviour — with one difference worth
+naming: quinn's idle timer was reset by *any* transport activity, including
+the 10 s keep-alive, so a client whose quinn stack kept answering keep-alives
+while its application loop was wedged used to stay attached forever.
+`last_heard` moves only on an application frame, so that peer now detaches at
+thirty seconds instead — a stricter and more honest reading of "still there."
 
 ### 4.2 Following a local address change
 
@@ -170,15 +194,50 @@ what is missing is whatever notices that this machine's address changed."*
 **The trigger is evidence, not a platform API.** Bind a scratch UDP socket,
 connect it to the peer's address, and read its `local_addr()`: that is the
 address the kernel would use for this peer right now, obtained without sending
-a packet. Differs from the socket we hold → the route moved → rebind. No
-netlink, no route sockets, no `cfg`, and both platforms walk the same code —
-consistent with the existing rule that `FD_DIRS`, `open_keyboard` and
-`second_loopback_ip` use candidate lists rather than `cfg`.
+a packet. No netlink, no route sockets, no `cfg`, and both platforms walk the
+same code — consistent with the existing rule that `FD_DIRS`, `open_keyboard`
+and `second_loopback_ip` use candidate lists rather than `cfg`.
+
+Compare it against **the previous probe**, not against the socket we hold. An
+earlier draft said "differs from the socket we hold"; the session socket is
+bound wildcard, so its `local_addr()` is `[::]:port` and carries no route
+information at all — it can never equal a concrete source address, so that
+check would call every healthy link a moved route and rebind it, invalidating
+a punched NAT hole to repair a path that was working. Only the **IP** is
+compared: the probe socket's ephemeral port is its own and changes on every
+probe.
+
+**The baseline is seeded once, at session construction** (`ClientSession::new`),
+from the address the very first probe reads there — not "on the first probe of
+an outage," as an earlier draft of this section had it. That earlier plan is a
+defect, not a simplification: it makes the feature inert in its primary use
+case. Consider a laptop on Wi-Fi whose route flips to LTE at t=0. `SILENT_AFTER`
+(2 s) elapses, and *if the baseline is taken on the first probe of the outage*,
+that first probe reads the address the route has *already* moved to and adopts
+it as the baseline — so no rebind ever fires. Only a route that moved while
+already silent would be caught; the far more common case, a route that moved
+and *caused* the silence, never would be. Seeding at construction avoids this
+because the QUIC connection has just been established over the path at that
+moment, so the source address then is definitionally the address the link
+works from — there is no window in which the "baseline" could already be the
+post-move address.
+
+Seeding is not pacing, and does not weaken the `Silent`-only rule below: it is
+one reading, taken once, at a moment (connection establishment) that already
+does a `bind` and a `connect` for reasons unrelated to roaming, sends no
+packet, and has nothing to do with when the *rebind* is later allowed to run.
+The baseline is replaced after each successful rebind, so a session that has
+already recovered once is compared against where it ended up, not where it
+started.
 
 **Only ever attempted while already `Silent`.** A rebind moves our source port,
 which invalidates a punched NAT hole; doing it to a working path would break the
-path in order to test it. If the rebind does not restore contact, `REBUILD_AFTER`
-arrives and §6 re-punches properly.
+path in order to test it.
+
+Until phase 3 builds `REBUILD_AFTER` and §6's re-punch, a rebind that does not
+restore contact leaves the `Silent` notice up until the user presses
+`Ctrl-\ q`. The client no longer dies on its own, which is the point, and it
+does not pretend to be retrying.
 
 ---
 

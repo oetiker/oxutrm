@@ -34,6 +34,30 @@ pub const ALPN: &[u8] = b"oxutrm/1";
 /// absorb a burst.
 const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
+/// How long [`quic_client`] waits for its handshake to complete.
+///
+/// **Not a tuning knob — the alternative to it is a terminal that hangs.**
+/// `Connecting` resolves when the handshake finishes or when the connection
+/// fails, and with `max_idle_timeout` set to `None` above there is a third
+/// outcome: neither. quinn only arms an idle timer in `on_packet_authenticated`,
+/// so total silence never armed one and this future never resolved even before
+/// that change; what the change added is the host that answers the Initial and
+/// then dies mid-handshake, which used to fail at the default thirty seconds
+/// and now waits for ever.
+///
+/// What the user sees without this is the worst version of the failure. The
+/// client has already put the terminal in raw mode by the time it connects, so
+/// there is no output, no prompt and no Ctrl-C — an attach that will never
+/// finish and never say so.
+///
+/// Thirty seconds, matching the host's `ACCEPT_TIMEOUT` twin in
+/// `src/accept.rs`, and for the same reason: ICE has already completed
+/// connectivity checks over this very path, so the peer is known reachable and
+/// its half of the handshake is one round trip away. Thirty seconds is tens of
+/// round trips on a link bad enough to be worth keeping, and the two ends give
+/// up at about the same moment rather than one of them outliving the other.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The transport settings, with the one that fails silently.
 ///
 /// **Both datagram buffer sizes must be set.** Omit either and QUIC datagrams
@@ -46,9 +70,30 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.datagram_send_buffer_size(DATAGRAM_BUFFER);
     t.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
-    t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is representable"),
-    ));
+    // No idle timeout, deliberately, and `None` rather than a deleted line:
+    // quinn's DEFAULT is 30s, so removing the setter restores exactly what
+    // this is here to remove.
+    //
+    // The transport must not adjudicate liveness. It has no idea what the
+    // user is looking at, so all it can do about silence is kill a connection
+    // that was about to recover -- which is what it did, at ~33s, for the
+    // whole of phase 1. `LinkState` owns that verdict now: it raises a notice
+    // at 2s, holds what is typed blind, and offers `Ctrl-\ q`. quinn warns
+    // that an infinite timeout can hang a future for ever; the notice is the
+    // answer to that, and it says more than a dead connection ever did.
+    //
+    // Consequence, stated because it is easy to miss: `conn.closed()` now
+    // fires only on an explicit close or a transport error, never on silence.
+    // Nothing may be built on it firing for a quiet peer -- see the `attached`
+    // computation in `HostSession::turn_at`, `src/session.rs`, which used to
+    // rely on exactly that.
+    t.max_idle_timeout(None);
+    // NOT redundant with the client's 0.2 Hz heartbeat, and it does not go
+    // with the timeout above. The heartbeat exists so an answer is *owed*, on
+    // the QUIC stream, where `LinkState` can see it. Keep-alive is what holds
+    // a punched NAT binding open, which rungs 2 and 3 depend on for the whole
+    // life of the connection -- and with no idle timeout, a connection can now
+    // outlive a binding by a very long way.
     t.keep_alive_interval(Some(Duration::from_secs(10)));
     Arc::new(t)
 }
@@ -300,11 +345,22 @@ pub async fn quic_client(
         .local_addr()
         .context("reading the endpoint's local address")?;
     let peer = to_socket_family(&local, peer);
-    let connection = endpoint
+    let connecting = endpoint
         .connect(peer, CERT_NAME)
-        .context("starting the QUIC handshake")?
-        .await
-        .context("completing the QUIC handshake")?;
+        .context("starting the QUIC handshake")?;
+
+    // Bounded, because the un-bounded case is a client that hangs in raw mode
+    // with nothing on the terminal. See [`CONNECT_TIMEOUT`].
+    let connection = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Ok(result) => result.context("completing the QUIC handshake")?,
+        Err(_) => anyhow::bail!(
+            "no answer from the host at {peer}: the QUIC handshake did not \
+             complete within {}s. The network path to it was already working, \
+             so the host itself most likely went away mid-attach. Nothing was \
+             started; attaching again is safe.",
+            CONNECT_TIMEOUT.as_secs()
+        ),
+    };
 
     Ok((connection, endpoint, stun_rx))
 }
@@ -315,6 +371,94 @@ mod tests {
     use crate::tls::generate_cert;
     use std::time::Duration;
     use tokio::net::UdpSocket;
+
+    /// The transport must not adjudicate liveness. quinn's DEFAULT is 30s, so
+    /// deleting the setter would silently restore exactly what this removes --
+    /// this asserts the negotiated value, not the absence of a line of code.
+    #[test]
+    fn the_transport_imposes_no_idle_timeout() {
+        let cfg = transport_config();
+        assert_eq!(
+            format!("{cfg:?}").contains("max_idle_timeout: Some"),
+            false,
+            "an idle timeout is still set; the client will still die on silence: {cfg:?}"
+        );
+    }
+
+    /// Keep-alive is NOT redundant with the client's heartbeat: it is what
+    /// holds a punched NAT binding open, which rungs 2 and 3 depend on for the
+    /// life of the connection. Removing the idle timeout must not take it too.
+    #[test]
+    fn keep_alive_survives_the_idle_timeout_going() {
+        let cfg = transport_config();
+        assert!(
+            format!("{cfg:?}").contains("keep_alive_interval: Some"),
+            "keep-alive went with the idle timeout; punched NAT bindings will lapse: {cfg:?}"
+        );
+    }
+
+    /// `the_transport_imposes_no_idle_timeout` above asserts what
+    /// `transport_config()` RETURNS. It says nothing about whether
+    /// `server_config`/`client_config` actually WIRE it in: if
+    /// `cfg.transport_config(transport_config())` were ever dropped from
+    /// either function, that test would keep passing, quinn's built-in 30 s
+    /// default would silently come back for real connections, and nothing
+    /// else catches it -- the composed test in `src/session.rs` cannot see
+    /// it either (see its doc comment: two live, unsuspended quinn
+    /// endpoints on loopback never go idle regardless of `max_idle_timeout`,
+    /// because they keep ACKing and keep-aliving each other). This asserts
+    /// the WIRING directly: `quinn::ServerConfig::transport` is a public
+    /// field, so its `Debug` output is read straight off the built config.
+    ///
+    /// **Correction, caught in review:** an earlier version of this comment
+    /// claimed the client side of the same wiring had no equivalent and
+    /// could not, because `quinn::ClientConfig` derives no `Debug` and its
+    /// `transport` field is `pub(crate)` to quinn-proto. The first half of
+    /// that was true and the conclusion drawn from it was not: `ClientConfig`
+    /// has a **hand-written** `impl fmt::Debug` (quinn-proto 0.11.17,
+    /// `src/config/mod.rs:645-653`) that includes
+    /// `.field("transport", &self.transport)`, and `TransportConfig` itself
+    /// implements `Debug` too -- so the whole-struct `Debug` of a real
+    /// `client_config()` prints the wired transport in full, idle timeout
+    /// included. Found by actually compiling and printing it rather than
+    /// reasoning from the absence of a `#[derive(Debug)]` -- the same lesson
+    /// this project has recorded before: compiling a third-party API beats
+    /// recalling it. See `the_client_config_actually_wires_no_idle_timeout`
+    /// below for the client-side twin of this test.
+    #[test]
+    fn the_server_config_actually_wires_no_idle_timeout() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let cfg = server_config(cert, key, ClientSpki::new(fingerprint))
+            .expect("a server config with a self-signed cert and key");
+        assert_eq!(
+            format!("{:?}", cfg.transport).contains("max_idle_timeout: Some"),
+            false,
+            "server_config() built a ServerConfig whose WIRED transport still \
+             carries an idle timeout, even though transport_config() itself \
+             does not -- the wiring line was dropped: {:?}",
+            cfg.transport
+        );
+    }
+
+    /// The client-side twin of `the_server_config_actually_wires_no_idle_timeout`
+    /// above. `quinn::ClientConfig::transport` is `pub(crate)` to
+    /// quinn-proto, so unlike the server side this reads the WHOLE struct's
+    /// `Debug` output (its hand-written `impl fmt::Debug` includes the
+    /// `transport` field) rather than a single public field -- same
+    /// question, different door.
+    #[test]
+    fn the_client_config_actually_wires_no_idle_timeout() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let cfg = client_config(HostSpki::new(fingerprint), cert, key)
+            .expect("a client config with a self-signed cert and key");
+        assert_eq!(
+            format!("{cfg:?}").contains("max_idle_timeout: Some"),
+            false,
+            "client_config() built a ClientConfig whose WIRED transport \
+             still carries an idle timeout, even though transport_config() \
+             itself does not -- the wiring line was dropped: {cfg:?}"
+        );
+    }
 
     async fn socket() -> Arc<UdpSocket> {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
@@ -740,5 +884,65 @@ mod tests {
         );
         conn.close(0u32.into(), b"done");
         server.abort();
+    }
+
+    /// The client gives up on its own, and it does so at [`CONNECT_TIMEOUT`].
+    ///
+    /// The twin of `the_accept_gives_up_when_no_client_ever_arrives` in
+    /// `src/accept.rs`, and needed for the same reason: `Connecting` resolves
+    /// on success or on a connection failure, and silence is neither. quinn
+    /// arms its idle timer only once a packet has been authenticated, so this
+    /// case never had one — and with `max_idle_timeout` now `None`, neither
+    /// does a host that answers and then dies mid-handshake.
+    ///
+    /// The peer here is a bound UDP socket nothing is listening on, so the
+    /// datagrams are swallowed rather than refused: an unbound port would draw
+    /// an ICMP port-unreachable and could end the attempt without the deadline
+    /// ever being reached, which would make this a test of the kernel.
+    ///
+    /// The outer 120 s is the harness's own patience, not the thing under
+    /// test; the assertion on `elapsed` is what tells "gave up at its own
+    /// deadline" from "gave up for some other reason". `start_paused` makes the
+    /// clock jump to the next deadline whenever the runtime idles, so a
+    /// thirty-second wait costs no wall-clock seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_that_is_never_answered_fails_instead_of_hanging_for_ever() {
+        let (_cert, _key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
+        // Bound, and never read from: a black hole rather than a refusal.
+        let black_hole = socket().await;
+        let peer = black_hole.local_addr().unwrap();
+        let client_sock = socket().await;
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            quic_client(
+                &client_sock,
+                peer,
+                HostSpki::new(fingerprint),
+                me.cert,
+                me.key,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let failed = outcome
+            .unwrap_or_else(|_| {
+                panic!("the handshake never gave up: the client hangs in raw mode for ever")
+            })
+            .expect_err("a socket nobody is listening on completed a handshake");
+        assert!(
+            elapsed >= CONNECT_TIMEOUT,
+            "it gave up after {elapsed:?}, short of its own CONNECT_TIMEOUT"
+        );
+        // The user is looking at a terminal that has just come back out of raw
+        // mode. "deadline has elapsed" would tell them nothing.
+        let said = failed.to_string();
+        assert!(
+            said.contains(&peer.to_string()) && said.contains("30s"),
+            "the message names neither the host nor how long it waited: {said}"
+        );
     }
 }

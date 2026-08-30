@@ -4,9 +4,57 @@
 
 ### New
 
+- **The session survives a network outage instead of dying at thirty seconds.**
+  The QUIC transport no longer imposes an idle timeout, so silence stops ending
+  a session: the client's own state machine decides the host has gone quiet,
+  raises the notice at two seconds, holds what is typed blind, and keeps the
+  connection for whenever the network comes back.
+- **The client follows a local address change.** While the link is silent, a
+  route probe asks the routing table which source address it would now use for
+  the host — a throwaway UDP socket, `connect`ed, no packet sent. If it moved,
+  the session socket is swapped underneath the live connection, which QUIC
+  allows because it identifies a connection by connection IDs rather than by
+  addresses.
+
 ### Changed
 
+- The host now decides for itself when a client has gone away, after thirty
+  seconds without a frame, rather than waiting for the transport to give the
+  connection up — which it no longer does. Behaviour is unchanged; a session
+  whose client vanished still stops building screens nobody will see.
+
 ### Fixed
+
+- A frame arriving between `Ctrl-\` and its confirmation letter could make the
+  `Confirming` box eat its own confirmation key, silently swallowing `Ctrl-\ d`
+  or `Ctrl-\ s` and delivering the keystroke into the held buffer instead.
+  `LinkState::heard` cleared `prefix_pending` on every arriving frame; it now
+  clears it only when the frame actually changes the phase. Shipped in 0.1.0,
+  fixed here.
+- **An attach whose host never finishes the handshake now fails instead of
+  hanging.** The client's `connect` had no deadline of its own, and quinn arms
+  its idle timer only once a packet has been authenticated — so a host that
+  never answered left the client waiting for ever, with the terminal already in
+  raw mode and nothing on it: no output, no prompt, no `Ctrl-C`. It now gives up
+  after thirty seconds, the same deadline the host's accept uses, and says which
+  host it waited for and for how long. Shipped in 0.1.0, fixed here.
+
+### Compatibility
+
+- **Both ends must be on this version** for the idle timeout to be gone. QUIC
+  negotiates the effective timeout as the minimum of the two peers', so a new
+  client against an `0.1.0` host still dies at thirty seconds of silence.
+- Reattaching a session you were disconnected from is still not implemented;
+  `oxutrm host --attach` says so. That is the next phase.
+- **Not yet verified against a real, unreliable network.** The automated
+  suite covers this phase, including a real 35 s wall-clock outage test,
+  `a_session_outlives_a_silence_that_used_to_kill_it` — too slow for the
+  default suite, so it is `#[ignore]`d; run it explicitly with
+  `cargo test -j4 --bin oxutrm outlives_a_silence -- --nocapture --ignored --test-threads=1`.
+  A shorter sibling, `a_short_silence_raises_and_clears_the_notice_on_a_real_clock`,
+  covers the notice-raised-and-cleared half in every default run. What is not
+  yet done is a hand test against `thinlinc`'s real network; the method is
+  written down with every measurement marked NOT YET TAKEN.
 
 ## 0.1.0 - 2026-08-29
 

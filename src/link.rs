@@ -68,12 +68,24 @@ const SUPERSEDED: u32 = 1;
 /// wrong upstream — a 200x60 truecolor full state is well under a megabyte.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
-/// How long [`FrameSink::send_final`] waits for the peer to acknowledge the
-/// last frame of a session before giving up on it.
+/// How long each step of [`FrameSink::send_final`] waits on a peer that may
+/// already be gone: opening the stream, writing the frame, and having it
+/// acknowledged.
 ///
 /// Generous, because this is the screen the user is left looking at, and paid
 /// only once, at the very end. Bounded, because a host that hangs for ever
 /// waiting on a client that is already gone is worse than a lost last screen.
+///
+/// It bounds all three awaits rather than only the acknowledgement, so the
+/// worst case is three times this and not infinity. That distinction became
+/// load-bearing when the transport's `max_idle_timeout` went to `None`: a
+/// connection to a vanished peer is now kept alive by the client's own state
+/// machine and never dies of its own accord, so `open_uni` on a peer that has
+/// run out of stream credit — no acknowledgements are coming, so none is ever
+/// returned — and `write_all` against a stalled flow-control window both wait
+/// for ever unless something here says otherwise. Bounding only the last step
+/// would leave the two steps in front of it unbounded, which is precisely the
+/// process that never exits this constant exists to prevent.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(2);
 
 /// Why a frame did not go out. None of these end a session.
@@ -247,7 +259,7 @@ impl FrameSink {
             None => false,
         };
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let conn = self.conn.clone();
         let n = bytes.len();
         let done = Arc::new(AtomicBool::new(false));
@@ -259,11 +271,28 @@ impl FrameSink {
             // runtime that drops the future unpolled — the entry stops
             // counting as in flight.
             let _mark_done = mark_done;
-            let mut stream = match conn.open_uni().await {
-                Ok(s) => s,
-                // Out of stream credit or a closing connection. The next tick
-                // tries again — which it now can.
-                Err(_) => return,
+            // Cancellable, because `open_uni` is not a formality that resolves
+            // in a microsecond: it waits for stream credit the peer may never
+            // grant. A vanished client leaves the connection ALIVE — the
+            // transport's `max_idle_timeout` is `None`, so nothing times it
+            // out and the host keeps it until `DETACH_AFTER` — while its
+            // 100-stream credit stays spent, because credit is replenished by
+            // acknowledgements that are not coming. Waiting here and only
+            // *then* looking at `cancel_rx` would park one task per pacing
+            // lap, each pinning the frame it was carrying, for the whole
+            // detach window and beyond: superseding could not free any of
+            // them, because a frame that never reached a stream had nothing to
+            // reset.
+            let mut stream = tokio::select! {
+                opened = conn.open_uni() => match opened {
+                    Ok(s) => s,
+                    // Out of stream credit or a closing connection. The next
+                    // tick tries again — which it now can.
+                    Err(_) => return,
+                },
+                // Superseded before a stream ever existed. There is nothing to
+                // reset: dropping the `open_uni` future is the cancellation.
+                _ = &mut cancel_rx => return,
             };
             tokio::select! {
                 // The write finished, or failed. Either way we are done.
@@ -309,6 +338,12 @@ impl FrameSink {
     /// resolves once the peer has **acknowledged every byte**. Only after that
     /// is closing the connection safe.
     ///
+    /// Every one of those awaits is bounded by [`FINAL_ACK_WAIT`], and that is
+    /// not belt and braces: the peer this runs against is quite likely gone,
+    /// nothing times the connection out any more, and a step that waits for
+    /// ever in front of a bounded one bounds nothing. The whole call returns
+    /// within three times the constant, always.
+    ///
     /// It is still infallible outward: a peer that has already gone is not an
     /// error to report to a shell that has already exited.
     pub async fn send_final(&mut self, frame: &Frame) -> SendOutcome {
@@ -327,12 +362,34 @@ impl FrameSink {
         // ordinary supersede would, rather than leaving it to race the close.
         let superseded = self.in_flight.take().is_some_and(|old| !old.finished());
 
-        let mut stream = match self.conn.open_uni().await {
-            Ok(s) => s,
-            Err(e) => return SendOutcome::Dropped(format!("opening the final stream: {e}")),
+        // Every step from here is bounded by [`FINAL_ACK_WAIT`], not just the
+        // acknowledgement at the end. `open_uni` waits for stream credit and
+        // `write_all` waits for flow-control credit, and a peer that has
+        // vanished grants neither while leaving the connection open for ever —
+        // see the constant's own note. An unbounded step in front of a bounded
+        // one bounds nothing.
+        let mut stream = match tokio::time::timeout(FINAL_ACK_WAIT, self.conn.open_uni()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return SendOutcome::Dropped(format!("opening the final stream: {e}")),
+            Err(_) => {
+                return SendOutcome::Dropped(
+                    "the peer never granted a stream for the final frame".to_owned(),
+                );
+            }
         };
-        if let Err(e) = stream.write_all(&bytes).await {
-            return SendOutcome::Dropped(format!("writing the final frame: {e}"));
+        match tokio::time::timeout(FINAL_ACK_WAIT, stream.write_all(&bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return SendOutcome::Dropped(format!("writing the final frame: {e}")),
+            Err(_) => {
+                // Reset rather than let the drop `finish()` a half-written
+                // frame — the same rule the writer task follows, for the same
+                // reason. `SUPERSEDED` is the only code this protocol has for
+                // "this frame is not coming", which is exactly what happened.
+                let _ = stream.reset(SUPERSEDED.into());
+                return SendOutcome::Dropped(
+                    "the peer never accepted the whole final frame".to_owned(),
+                );
+            }
         }
         // `finish` only promises that no more data is coming; it does not wait
         // for what was already written. `stopped` is the part that makes the
@@ -449,9 +506,8 @@ impl FrameSource {
 pub struct Link {
     pub sink: FrameSink,
     pub source: FrameSource,
-    /// Kept so the session can rebind it while roaming.
-    /// Read by [`Link::rebind`], which `run_connect` will call.
-    #[allow(dead_code)]
+    /// The endpoint quinn owns. Rebound while roaming, so a local address
+    /// change does not cost the connection.
     pub endpoint: quinn::Endpoint,
     /// The socket the ladder punched. Held because ICE keepalives send on it
     /// directly, alongside QUIC.
@@ -479,12 +535,12 @@ impl Link {
     /// `quinn`, to repoint an established connection at a different *remote*
     /// address — so a better path discovered later is lost for this attach and
     /// picked up on the next one.
-    /// **No caller: roaming is not wired.** Only the client may change its
-    /// local address, and nothing in `run_connect` yet notices that it has --
-    /// there is no watcher on the host's routes and no trigger to rebind from.
-    /// The mechanism is here and tested; what is missing is whatever decides
-    /// when to use it.
-    #[allow(dead_code)]
+    ///
+    /// Called by `ClientSession::follow_route` when the route probe says this
+    /// machine's source address for the peer has changed. Only ever while
+    /// `Silent`: this moves our source port and invalidates a punched NAT
+    /// hole, so doing it to a working path would break the path in order to
+    /// test it.
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> anyhow::Result<()> {
         let (demux, _stun) = oxutrm_net::StunDemuxSocket::new(&socket)?;
         self.endpoint.rebind_abstract(demux)?;
@@ -509,18 +565,45 @@ mod tests {
 
     const BUFFER: usize = 1024 * 1024;
 
-    /// A transport config whose datagram support can be turned off.
-    ///
-    /// It is the RECEIVE buffer that decides what the peer sees: leaving it
-    /// unset is exactly how a peer "disables datagrams", and it is what makes
-    /// the far end's `max_datagram_size()` return `None`. That asymmetry is
-    /// documented in `oxutrm_net::quic` and is the failure this file has to
-    /// cope with.
-    fn transport(datagrams: bool) -> Arc<quinn::TransportConfig> {
+    /// What the far end advertises, which is what every stall in this file is
+    /// really about: the sender's awaits are governed by credit only the
+    /// receiver can grant.
+    #[derive(Clone, Copy)]
+    struct Peer {
+        /// It is the RECEIVE buffer that decides what the peer sees: leaving
+        /// it unset is exactly how a peer "disables datagrams", and it is what
+        /// makes the far end's `max_datagram_size()` return `None`. That
+        /// asymmetry is documented in `oxutrm_net::quic` and is the failure
+        /// this file has to cope with.
+        datagrams: bool,
+        /// Concurrent unidirectional streams this peer will grant. Zero makes
+        /// `open_uni` wait for credit that never arrives — what a peer that
+        /// has stopped acknowledging looks like from the sending side, now
+        /// that no idle timeout will end the connection for us.
+        uni_streams: u32,
+        /// The per-stream receive window. Smaller than a frame and nobody
+        /// draining the stream, and `write_all` blocks part-way through with
+        /// nothing left to unblock it.
+        stream_window: u32,
+    }
+
+    impl Peer {
+        /// A peer that can take anything: what the ordinary tests want.
+        fn healthy() -> Peer {
+            Peer {
+                datagrams: true,
+                uni_streams: 1024,
+                stream_window: BUFFER as u32,
+            }
+        }
+    }
+
+    fn transport(peer: Peer) -> Arc<quinn::TransportConfig> {
         let mut t = quinn::TransportConfig::default();
         t.datagram_send_buffer_size(BUFFER);
-        t.datagram_receive_buffer_size(datagrams.then_some(BUFFER));
-        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(1024));
+        t.datagram_receive_buffer_size(peer.datagrams.then_some(BUFFER));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(peer.uni_streams));
+        t.stream_receive_window(quinn::VarInt::from_u32(peer.stream_window));
         Arc::new(t)
     }
 
@@ -528,7 +611,7 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
         expect_client: ClientSpki,
-        datagrams: bool,
+        peer: Peer,
     ) -> quinn::ServerConfig {
         install_crypto_provider();
         let mut tls = rustls::ServerConfig::builder_with_provider(provider())
@@ -545,7 +628,7 @@ mod tests {
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
         let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        cfg.transport_config(transport(datagrams));
+        cfg.transport_config(transport(peer));
         cfg
     }
 
@@ -553,7 +636,6 @@ mod tests {
         fingerprint: [u8; 32],
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
-        datagrams: bool,
     ) -> quinn::ClientConfig {
         install_crypto_provider();
         let mut tls = rustls::ClientConfig::builder_with_provider(provider())
@@ -566,22 +648,26 @@ mod tests {
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
         let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
-        cfg.transport_config(transport(datagrams));
+        // The client's own limits govern what the SERVER may open, and nothing
+        // in this file opens a stream in that direction. It is the peer under
+        // test that varies.
+        cfg.transport_config(transport(Peer::healthy()));
         cfg
     }
 
-    /// A QUIC pair on loopback, with no ICE and no STUN demux in the way.
+    /// Both ends of a QUIC connection on loopback, with no ICE and no STUN
+    /// demux in the way, and nothing draining the server side.
     ///
-    /// `peer_datagrams` is what the SERVER advertises, so it decides what the
-    /// returned client-side [`FrameSink`] sees from `max_datagram_size()`.
-    /// The endpoints come back because dropping them closes the connection.
-    async fn pair(peer_datagrams: bool) -> (FrameSink, FrameSource, Vec<quinn::Endpoint>) {
+    /// `peer` is what the SERVER advertises, so it decides everything the
+    /// client-side [`FrameSink`] runs into. The endpoints come back because
+    /// dropping them closes the connection.
+    async fn connected(peer: Peer) -> (quinn::Connection, quinn::Connection, Vec<quinn::Endpoint>) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
         let (client_cert, client_key, client_fp) = generate_cert().unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let server_ep = quinn::Endpoint::server(
-            server_config(cert, key, ClientSpki::new(client_fp), peer_datagrams),
+            server_config(cert, key, ClientSpki::new(client_fp), peer),
             addr,
         )
         .unwrap();
@@ -592,12 +678,7 @@ mod tests {
         };
 
         let mut client_ep = quinn::Endpoint::client(addr).unwrap();
-        client_ep.set_default_client_config(client_config(
-            fingerprint,
-            client_cert,
-            client_key,
-            true,
-        ));
+        client_ep.set_default_client_config(client_config(fingerprint, client_cert, client_key));
         let client_conn = client_ep
             .connect(server_addr, CERT_NAME)
             .unwrap()
@@ -605,10 +686,23 @@ mod tests {
             .unwrap();
         let server_conn = accepting.await.unwrap();
 
+        (client_conn, server_conn, vec![client_ep, server_ep])
+    }
+
+    /// A sink and the source that drains it, for the tests about what arrives.
+    ///
+    /// `peer_datagrams` is what the SERVER advertises, so it decides what the
+    /// returned [`FrameSink`] sees from `max_datagram_size()`.
+    async fn pair(peer_datagrams: bool) -> (FrameSink, FrameSource, Vec<quinn::Endpoint>) {
+        let (client_conn, server_conn, eps) = connected(Peer {
+            datagrams: peer_datagrams,
+            ..Peer::healthy()
+        })
+        .await;
         (
             FrameSink::new(client_conn),
             FrameSource::new(server_conn),
-            vec![client_ep, server_ep],
+            eps,
         )
     }
 
@@ -749,6 +843,142 @@ mod tests {
             outcome,
             SendOutcome::DatagramsDisabled,
             "an oversized frame on a datagram-less path came back as {outcome:?}"
+        );
+    }
+
+    /// Whether a writer task has let go of its frame, within a budget.
+    ///
+    /// A deadline rather than a plain `await`, because the failure this guards
+    /// is a task that never finishes: a test that waited for the flag properly
+    /// would hang instead of failing, and a hanging test reports nothing.
+    async fn stopped_within(flag: &Arc<AtomicBool>, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if flag.load(Ordering::Acquire) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// The leak the removal of `max_idle_timeout` opened.
+    ///
+    /// A peer that vanished leaves the connection alive — nothing times it out
+    /// any more — with its stream credit spent and no acknowledgements coming
+    /// to replenish it. Every pacing lap then spawns a writer that parks in
+    /// `open_uni` for ever, each pinning the frame it was carrying, until the
+    /// host detaches. Superseding has to reach a frame that has not got a
+    /// stream yet, or it reaches almost none of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superseding_frees_a_frame_that_is_still_waiting_for_a_stream() {
+        // Zero stream credit, and the server end held but never drained: an
+        // `open_uni` here has nothing to wait for.
+        let (client_conn, _server_conn, _eps) = connected(Peer {
+            uni_streams: 0,
+            ..Peer::healthy()
+        })
+        .await;
+        let mut sink = FrameSink::new(client_conn);
+
+        assert!(matches!(sink.send(&big(1)), SendOutcome::Stream { .. }));
+        let stalled = Arc::clone(
+            &sink
+                .in_flight
+                .as_ref()
+                .expect("state 1 is not in flight at all")
+                .done,
+        );
+        assert!(
+            !stalled.load(Ordering::Acquire),
+            "the writer finished on a peer that grants no streams, so this \
+             test is not about a stalled `open_uni` at all"
+        );
+
+        // A newer state, which supersedes it.
+        assert!(matches!(
+            sink.send(&big(2)),
+            SendOutcome::Stream {
+                superseded: true,
+                ..
+            }
+        ));
+
+        assert!(
+            stopped_within(&stalled, Duration::from_secs(5)).await,
+            "a superseded frame is still parked in `open_uni` waiting for a \
+             stream that is never granted; one of these accumulates per pacing \
+             lap for the whole detach window"
+        );
+    }
+
+    /// The end of a session on a peer that has gone: no stream credit left and
+    /// nothing coming that would replenish it.
+    ///
+    /// `send_final` bounding only its acknowledgement would leave the host
+    /// parked in `open_uni` for ever — never exiting, never dropping its
+    /// registry guard, leaving a session directory that nothing can reattach
+    /// and only a kill by PID can clear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_final_frame_gives_up_when_no_stream_is_ever_granted() {
+        let (client_conn, _server_conn, _eps) = connected(Peer {
+            uni_streams: 0,
+            ..Peer::healthy()
+        })
+        .await;
+        let mut sink = FrameSink::new(client_conn);
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(FINAL_ACK_WAIT * 5, sink.send_final(&small(1)))
+            .await
+            .expect("`send_final` never returned: this is the host that never exits");
+
+        match outcome {
+            SendOutcome::Dropped(why) => assert!(
+                why.contains("never granted a stream"),
+                "it gave up for some other reason than the one under test: {why}"
+            ),
+            other => panic!("a peer that grants no stream somehow took a frame: {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= FINAL_ACK_WAIT,
+            "it returned in {:?}, so it never waited for the stream at all and \
+             the bound is not what ended it",
+            started.elapsed()
+        );
+    }
+
+    /// The same ending, one step further along: a stream is granted and then
+    /// the peer stops taking bytes. `write_all` waits on flow-control credit
+    /// exactly as `open_uni` waits on stream credit, and with no idle timeout
+    /// left to end the connection it waits for ever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_final_frame_gives_up_when_the_peer_stops_taking_bytes() {
+        // A window a fraction of the frame, and a server end that is held open
+        // but never reads a stream, so nothing ever moves the window on.
+        let (client_conn, _server_conn, _eps) = connected(Peer {
+            stream_window: 1024,
+            ..Peer::healthy()
+        })
+        .await;
+        let mut sink = FrameSink::new(client_conn);
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(FINAL_ACK_WAIT * 5, sink.send_final(&big(1)))
+            .await
+            .expect("`send_final` never returned: this is the host that never exits");
+
+        match outcome {
+            SendOutcome::Dropped(why) => assert!(
+                why.contains("whole final frame"),
+                "it gave up for some other reason than the one under test: {why}"
+            ),
+            other => panic!("a peer with a 1 KiB window took a 64 KiB frame: {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= FINAL_ACK_WAIT,
+            "it returned in {:?}, so the write was never actually stalled",
+            started.elapsed()
         );
     }
 }

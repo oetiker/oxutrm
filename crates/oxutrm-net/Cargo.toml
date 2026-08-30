@@ -34,3 +34,13 @@ oxutrm-proto.workspace = true
 # Exposes loopback test harnesses to integration tests in the workspace root
 # without shipping them in a release build.
 testkit = []
+
+[dev-dependencies]
+# `test-util` for `#[tokio::test(start_paused = true)]`: `CONNECT_TIMEOUT` is
+# thirty seconds, and a test that waited for it in wall clock would be the
+# slowest thing in the gate. Paused time makes the clock jump to the next
+# deadline whenever the runtime idles, so the assertion is on the SAME const
+# the code uses and costs no seconds. Under resolver 3 a dev-dependency feature
+# is not unified into the normal build, so `test-util` never reaches the
+# shipped binary.
+tokio = { workspace = true, features = ["test-util"] }

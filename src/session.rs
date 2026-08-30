@@ -81,6 +81,31 @@ const FINAL_DRAIN: Duration = Duration::from_secs(2);
 /// announce and is never held back; see [`ClientSession::notice_at`].
 const NOTICE_REFRESH: Duration = Duration::from_secs(1);
 
+/// How long the host keeps building frames for a client it has not heard from.
+///
+/// **This is the guarantee quinn used to provide and no longer does.** Until
+/// phase 2 the host asked `close_reason()`, which answered once the transport's
+/// 30 s idle timeout had fired. `max_idle_timeout` is `None` now, so
+/// `close_reason()` stays `None` for ever on a silent peer and the question has
+/// to be answered from a clock of our own.
+///
+/// Thirty seconds, so the behaviour is unchanged by construction: it is
+/// exactly what quinn enforced before -- with one difference. Quinn's idle
+/// timer was reset by *any* transport activity, including the 10 s
+/// keep-alive, so a client whose quinn stack kept answering keep-alives while
+/// its application loop was wedged used to stay attached for ever. `last_heard`
+/// moves only on an application frame, so that peer now detaches at 30 s
+/// instead -- a stricter and more honest reading of "still there". Six times
+/// `HEARTBEAT_IDLE`, so an attached client that is merely quiet is nowhere
+/// near it -- it heartbeats at 0.2 Hz and every heartbeat is a frame.
+///
+/// Detaching closes nothing. It stops snapshotting and stops offering frames;
+/// the pty is still drained and the emulator still fed, because the screen being
+/// current on reattach is the whole reason a detached session keeps emulating.
+/// A peer that comes back is heard on its first frame and `screen_stale` forces
+/// the snapshot.
+pub const DETACH_AFTER: Duration = Duration::from_secs(30);
+
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
 #[derive(Clone, Debug, Default)]
@@ -126,6 +151,10 @@ pub struct HostSession {
     /// sender holds is older than the screen. Forces one snapshot on the
     /// turn a peer comes back, whether or not the pty moved on that turn.
     screen_stale: bool,
+    /// The last time anything arrived from the client. The host's own liveness
+    /// clock, because `close_reason()` stopped being one when the transport's
+    /// idle timeout went. See [`DETACH_AFTER`].
+    last_heard: Instant,
 }
 
 impl HostSession {
@@ -163,12 +192,15 @@ impl HostSession {
             last_send: None,
             written: 0,
             screen_stale: false,
+            // An attach has just completed and R5 obliges the client to send
+            // immediately, so "now" is true rather than optimistic.
+            last_heard: Instant::now(),
         })
     }
 
     /// One turn: apply whatever arrived, drain the PTY, offer a frame.
     pub fn turn(&mut self) -> Result<Turn> {
-        self.turn_with(None)
+        self.turn_at(Instant::now(), None)
     }
 
     /// [`HostSession::turn`], plus a frame the caller has already taken off
@@ -177,13 +209,27 @@ impl HostSession {
     /// `run`'s select has to *receive* a frame to know one arrived, so it
     /// arrives holding one; `try_recv` below would never see it and the
     /// keystrokes in it would be silently dropped.
-    pub fn turn_with(&mut self, mut first: Option<Frame>) -> Result<Turn> {
+    pub fn turn_with(&mut self, first: Option<Frame>) -> Result<Turn> {
+        self.turn_at(Instant::now(), first)
+    }
+
+    /// [`HostSession::turn_with`], with the clock injected.
+    ///
+    /// The clock is a parameter for the same reason it is one throughout
+    /// `LinkState` and `ClientSession::note_heard`: [`DETACH_AFTER`] is thirty
+    /// seconds, and a threshold that can only be tested by sleeping thirty
+    /// seconds is a threshold nobody tests.
+    pub fn turn_at(&mut self, now: Instant, mut first: Option<Frame>) -> Result<Turn> {
         let mut turn = Turn::default();
 
         // ---- inbound: the client's keystrokes ------------------------------
         // (the size the client wants rides on the same diff, and is applied
         // below once the frames have been taken in)
         while let Some(frame) = first.take().or_else(|| self.link.source.try_recv()) {
+            // Any frame at all is evidence of a peer, including one `on_frame`
+            // rejects: a stale sequence number says the client is behind, not
+            // that it is gone.
+            self.last_heard = now;
             // A rejected frame is not a disconnection: the state and the ack
             // are both untouched, and the peer's next diff will apply.
             match self.input_rx.on_frame(&frame) {
@@ -223,11 +269,20 @@ impl HostSession {
         // second burned 17-20% of a core doing exactly that, for a screen
         // nobody would ever see. Quiet ones cost 1.2%, which is why this hid.
         //
-        // `close_reason` and not "did a frame arrive recently": during a
-        // network blip the connection is still open and we WANT the work to
+        // Two questions, and since phase 2 they have different answers.
+        // `close_reason` still catches a peer that closed properly or a
+        // transport error -- both are immediate and certain. What it no longer
+        // catches is silence: `max_idle_timeout` is `None`, so quinn will hold
+        // a connection to a peer that vanished for ever, and this used to read
+        // "turns off only once quinn has given the connection up".
+        //
+        // So the recency window is what answers it now. Generous on purpose:
+        // during a blip the connection is open and we WANT the work to
         // continue, so the session resumes instantly when the peer comes back.
-        // This turns off only once quinn has given the connection up.
-        let attached = self.link.sink.connection().close_reason().is_none();
+        // `DETACH_AFTER` is six times the client's heartbeat interval.
+        let closed = self.link.sink.connection().close_reason().is_some();
+        let quiet_too_long = now.duration_since(self.last_heard) >= DETACH_AFTER;
+        let attached = !closed && !quiet_too_long;
         turn.detached = !attached;
 
         // ---- the terminal --------------------------------------------------
@@ -593,9 +648,9 @@ fn exit_code(reason: &quinn::ConnectionError) -> Result<i32> {
             String::from_utf8_lossy(&closed.reason)
         )),
         quinn::ConnectionError::TimedOut => Err(anyhow::anyhow!(
-            "the host stopped answering and the link timed out after 30s. Your \
-             shell may still be running there; `oxutrm host --list` on the host \
-             will say. Reattaching is not implemented yet."
+            "the link to the host timed out. Silence alone no longer ends a \
+             session, so this is the transport giving up rather than the host \
+             going quiet."
         )),
         other => Err(anyhow::anyhow!(
             "the link to the host ended without the shell exiting: {other}"
@@ -631,6 +686,16 @@ pub struct ClientSession {
     /// Both halves are needed: the instant paces the refresh, and the phase is
     /// what tells a refresh apart from a transition, which is never paced.
     built: Option<(Phase, Instant)>,
+    /// The source address the link was working from, so a moved route can be
+    /// spotted. Seeded in [`ClientSession::new`] from the path the connection
+    /// came up over. See [`crate::roam`].
+    route: crate::roam::RouteWatch,
+    /// When the route was last probed, so `Silent` does not probe on every
+    /// lap of a loop that wakes up to 125 times a second.
+    ///
+    /// Cleared on any lap that is not `Silent`, so the pace belongs to one
+    /// outage rather than to the session: see [`ClientSession::follow_route`].
+    probed_at: Option<Instant>,
 }
 
 impl ClientSession {
@@ -641,6 +706,29 @@ impl ClientSession {
             pending: Vec::new(),
             size,
         };
+
+        // The address this machine reaches the host from, read once, here.
+        //
+        // Here and not on the first probe of an outage, because the outage is
+        // too late: `SILENT_AFTER` is two seconds, and walking out of Wi-Fi
+        // range moves the route BEFORE the silence is noticed. A baseline
+        // first taken inside `Silent` would read the address the machine had
+        // already moved to, agree with it for ever, and never rebind -- which
+        // is the whole case this exists for. At this moment the connection has
+        // just been established over this very path, so the source address for
+        // the peer is definitionally the address the link works from.
+        //
+        // One `bind`+`connect` pair per session, and `connect` sends no
+        // packet. That is not a pace and does not soften the `Silent` rule:
+        // the rule governs the REBIND, which `follow_route` still does only
+        // while `Silent`. Nothing probes on a `Live` lap.
+        //
+        // A probe that cannot answer is not a reason to refuse a session that
+        // has already connected. `None` is the old behaviour and stays safe:
+        // `RouteWatch::moved` is false without a baseline, so the first probe
+        // of an outage takes one instead.
+        let seed = crate::roam::route_source(link.sink.connection().remote_address()).ok();
+
         Ok(ClientSession {
             screen_rx: Receiver::new(blank),
             input_tx: Sender::new(empty),
@@ -653,6 +741,8 @@ impl ClientSession {
             rejected_total: 0,
             shown: None,
             built: None,
+            route: crate::roam::RouteWatch::new(seed),
+            probed_at: None,
         })
     }
 
@@ -761,6 +851,14 @@ impl ClientSession {
                 Ok(true) => {
                     turn.applied += 1;
                     painted = true;
+                    // Wherever a frame is applied, the host was heard. The
+                    // loop's `Wake::Frame` arm is not the only path here:
+                    // `try_recv` below scavenges frames on pacing, keyboard
+                    // and resize laps, and a frame applied on one of those
+                    // used to repaint the screen underneath a box still
+                    // saying nobody was answering. It also moves `last_heard`,
+                    // which is what the `silent for Ns` counter is built from.
+                    self.note_heard(Instant::now());
                 }
                 Ok(false) => {}
                 // See the host's copy of this arm: a silently swallowed
@@ -995,10 +1093,10 @@ impl ClientSession {
                 Some(Notice {
                     // What was observed, which is a frame arriving. Nothing
                     // reconnected: the QUIC connection never dropped, it went
-                    // quiet and recovered inside the idle timeout, and phase 1
-                    // has no reconnection machinery for a headline to imply.
-                    // "reconnected" -- which this used to say -- named a
-                    // mechanism oxutrm does not yet have.
+                    // quiet and came back, and phase 1 has no reconnection
+                    // machinery for a headline to imply. "reconnected" -- which
+                    // this used to say -- named a mechanism oxutrm does not yet
+                    // have.
                     headline: "the host is answering again - deliver what you typed?".to_string(),
                     body,
                     keys: vec![
@@ -1277,6 +1375,18 @@ impl ClientSession {
                 out.flush().context("flushing the terminal")?;
             }
 
+            // Follow the route if it moved. Inside the loop rather than on a
+            // timer of its own: `follow_route` is gated on `Silent` and paced
+            // by `ROUTE_PROBE_EVERY`, so a healthy session reaches this line
+            // ten times a second and does nothing but one `matches!`.
+            //
+            // After the notice, so the box describing the silence is already
+            // on the screen before anything is done about it -- and the user
+            // is told nothing about the rebind, because a rebind that has not
+            // restored contact yet is not something the client can honestly
+            // report.
+            let _ = self.follow_route(now);
+
             // The `bool` is for the tests, which hold the clock still and ask
             // whether a prod was due. The loop does not care: it prods or it
             // does not, and either way the next lap is the same.
@@ -1312,12 +1422,121 @@ impl ClientSession {
         }
     }
 
+    /// Follow this machine's route to the host, if it moved.
+    ///
+    /// Returns whether the session socket was actually swapped.
+    ///
+    /// **Only while `Silent`**, per design spec 4.2: a rebind moves our source
+    /// port, which invalidates a punched NAT hole, so doing it to a working
+    /// path breaks the path in order to test it. `Silent` means a reply has
+    /// been owed for `SILENT_AFTER` with none arriving -- the path is already
+    /// not working, so there is nothing left to break.
+    ///
+    /// Nothing here may end the session. A machine in the middle of an outage
+    /// is exactly where `connect` fails with `ENETUNREACH` and where binding a
+    /// fresh socket fails, and this runs during precisely that. Every failure
+    /// is "no answer this time"; the next probe asks again. Same rule as "a
+    /// send failure must never end a session", applied to the thing most
+    /// likely to fail.
+    ///
+    /// # What seeding the baseline at connection time costs
+    ///
+    /// The baseline is read once, in [`ClientSession::new`], and after that
+    /// only a probe taken while `Silent` can replace it. That is deliberate --
+    /// see the comment there for why reading it first inside the outage is
+    /// inert -- but it is not free, and the price is worth writing down rather
+    /// than rediscovering.
+    ///
+    /// A route may change perfectly benignly while the link is `Live`: a VPN
+    /// comes up, an interface metric shifts, the machine moves between two
+    /// networks that both reach the host. Nothing probes on a `Live` lap, so
+    /// the baseline is now stale, and it stays stale until an outage. If a
+    /// *transient* stall then raises `Silent` -- two seconds of host-side
+    /// hesitation, not a moved route -- the first probe of that outage
+    /// disagrees with the stale baseline, reads it as a move, and spends a
+    /// working NAT hole rebinding a path that was about to recover.
+    ///
+    /// Accepted, with the alternative stated so the trade is visible: the only
+    /// way to keep the baseline fresh is to probe on `Live` laps, which means
+    /// a bind/`connect` pair every second for the whole life of every healthy
+    /// session, for ever, to catch a case that costs one rebind. One rebind
+    /// costs a NAT hole that rungs 2 and 3 re-punch; it does not cost the
+    /// connection, because QUIC is identified by connection IDs and the
+    /// migration is exactly what this whole path is for. The rebind settles
+    /// the new address as the baseline, so the mistake is made once and not
+    /// once a second.
+    fn follow_route(&mut self, now: Instant) -> bool {
+        if !matches!(self.link_state.phase_now(), Phase::Silent { .. }) {
+            // The pace belongs to one outage, not to the session. Left set
+            // across a return to `Live`, `probed_at` would also swallow the
+            // FIRST probe of the next outage whenever that outage began within
+            // `ROUTE_PROBE_EVERY` of the previous probe -- and the first probe
+            // is the one that matters, because it is what notices a route that
+            // has just moved.
+            //
+            // Deliberate, and worth saying plainly: that skip is not reachable
+            // through today's constants. Leaving `Silent` resets the owing, so
+            // a second `Silent` costs another `SILENT_AFTER` (2 s), which is
+            // longer than `ROUTE_PROBE_EVERY` (1 s) -- the cooldown has always
+            // expired by the time the next outage exists. The clear is here so
+            // that stays true of the mechanism rather than of an accident of
+            // two numbers in different modules, either of which could move
+            // without anyone thinking about this line. It costs one store on a
+            // path that was already returning.
+            self.probed_at = None;
+            return false;
+        }
+        if self
+            .probed_at
+            .is_some_and(|last| now.duration_since(last) < crate::roam::ROUTE_PROBE_EVERY)
+        {
+            return false;
+        }
+        self.probed_at = Some(now);
+
+        let peer = self.link.sink.connection().remote_address();
+        let Ok(seen) = crate::roam::route_source(peer) else {
+            // Unroutable right now, which is an ordinary reading mid-outage
+            // and not a fault. The baseline is left alone: a route we cannot
+            // see is not a route that moved.
+            return false;
+        };
+
+        if !self.route.moved(seen) {
+            // Nothing changed against the baseline `ClientSession::new` seeded
+            // when the connection came up -- or that seeding probe failed and
+            // there is no baseline at all, in which case this reading becomes
+            // one and the NEXT probe can act on it.
+            self.route.settle(seen);
+            return false;
+        }
+
+        // The route moved. Bind a fresh socket the same way the ladder bound
+        // the first one -- wildcard, preferring 443 -- and hand it to the live
+        // connection. QUIC is identified by connection IDs, not addresses, so
+        // the connection itself does not notice.
+        let cfg = oxutrm_net::NetConfig::default();
+        let Ok(bound) = oxutrm_net::bind_socket(&cfg) else {
+            return false;
+        };
+        let Ok(socket) = crate::ladder::adopt(bound) else {
+            return false;
+        };
+        if self.rebind(socket).is_err() {
+            // The old socket is still in place and still the one quinn holds:
+            // `Link::rebind` only assigns after `rebind_abstract` succeeded.
+            return false;
+        }
+
+        // Only now, so a failed rebind leaves the old baseline and the next
+        // probe tries again rather than believing it has already moved.
+        self.route.settle(seen);
+        true
+    }
+
     /// Move to a new local socket without dropping the connection.
     ///
-    /// **No caller: roaming is not wired.** The mechanism is here and tested;
-    /// what is missing is whatever notices that this machine's address changed
-    /// and decides to use it. See [`Link::rebind`].
-    #[allow(dead_code)]
+    /// Called by [`ClientSession::follow_route`]. See [`Link::rebind`].
     pub fn rebind(&mut self, socket: Arc<tokio::net::UdpSocket>) -> Result<()> {
         self.link.rebind(socket)?;
         // The path changed; what is on the terminal is still correct, so
@@ -1352,6 +1571,9 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `use super::*` reaches the session module's own imports, not `crate`'s
+    // other modules, so the route pace has to be named explicitly.
+    use crate::roam::ROUTE_PROBE_EVERY;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
     use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
 
@@ -1974,6 +2196,159 @@ mod tests {
             Some(0),
             "the child never exited, so the pty stopped being drained and it \
              blocked on a full buffer"
+        );
+    }
+
+    /// One frame from the client, as the host's select would receive it.
+    async fn client_frame(host: &mut HostSession) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), host.link.source.recv())
+            .await
+            .expect("the client's frame never arrived")
+            .expect("the source closed")
+    }
+
+    /// The property Task 2 takes away from quinn and this task gives back.
+    /// A host whose client stopped speaking must stop building frames for it,
+    /// or an abandoned session burns a core for ever on a screen nobody will
+    /// see. Measured at 17-20% of a core for a child writing five lines a
+    /// second, which is why this is not a micro-optimisation.
+    #[tokio::test]
+    async fn a_host_whose_client_went_quiet_detaches_on_its_own_clock() {
+        let (mut host, _client) = pair("/bin/sh").await;
+        let t = Instant::now();
+
+        let turn = host.turn_at(t, None).expect("a turn while attached");
+        assert!(
+            !turn.detached,
+            "detached while the client was still speaking"
+        );
+
+        let turn = host
+            .turn_at(t + DETACH_AFTER + Duration::from_secs(1), None)
+            .expect("a turn after the client went quiet");
+        assert!(
+            turn.detached,
+            "the host is still building frames for a client that stopped \
+             answering {DETACH_AFTER:?} ago"
+        );
+    }
+
+    /// Detaching must not be a one-way door: the whole point of holding the
+    /// connection open is that a peer coming back is heard instantly.
+    ///
+    /// `!turn.detached` alone would still pass if the `screen_stale` catch-up
+    /// snapshot were dropped from `turn_at` -- undetached is not the same
+    /// claim as caught up, and this reattach path only became reachable in
+    /// this phase, so that gap is one this phase created. `turn.sent.is_some()`
+    /// alone is not enough either: the returning client's own keystroke owes
+    /// an ack, and an ack travels on a frame regardless of whether the screen
+    /// moved, so that frame would exist even with `screen_stale` dropped. The
+    /// only assertion that actually distinguishes the two is what the frame
+    /// *contains* once applied on the client: the "moved" text the child
+    /// wrote while nobody was attached.
+    #[tokio::test]
+    async fn a_returning_client_reattaches_the_host() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let t = Instant::now();
+        let late = t + DETACH_AFTER + Duration::from_secs(1);
+
+        assert!(host.turn_at(late, None).expect("a turn").detached);
+
+        // The screen moves while nobody is attached. A poll while still
+        // detached is what sets `screen_stale`, so the catch-up on reattach
+        // has something real to prove. Polled until the host's OWN terminal
+        // has actually rendered "moved" -- bounded by a timeout rather than a
+        // fixed lap count, so a loaded runner where `/bin/sh` takes longer
+        // than a guessed budget to echo does not false-fail this test. A few
+        // more laps once the marker first appears settle any trailing byte of
+        // shell prompt BEFORE the reattach turn -- otherwise a late byte
+        // landing exactly on the reattach turn's own poll would set `moved`
+        // there too, and the mutation this test guards against would go
+        // undetected for the wrong reason.
+        host.term.write_input(b"echo moved\n").unwrap();
+        let poll_budget = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut elapsed = Duration::ZERO;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < poll_budget,
+                "the child's \"moved\" output never reached the host's own \
+                 terminal within 10s of real polling"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            elapsed += Duration::from_millis(20);
+            host.turn_at(late + elapsed, None)
+                .expect("a turn while still detached");
+            if text(&host.term.snapshot(1)).contains("moved") {
+                break;
+            }
+        }
+        let mut still_away = None;
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            elapsed += Duration::from_millis(50);
+            still_away = Some(
+                host.turn_at(late + elapsed, None)
+                    .expect("a turn while still detached"),
+            );
+        }
+        assert!(
+            still_away.expect("polled at least once").detached,
+            "detached before the client had a chance to speak"
+        );
+
+        // The client speaks again. Any frame is evidence of a peer.
+        let mut out = Vec::new();
+        client.turn(b"x", &mut out).expect("the client types");
+        let frame = client_frame(&mut host).await;
+
+        let turn = host
+            .turn_at(late + elapsed + Duration::from_millis(100), Some(frame))
+            .expect("a turn with the client back");
+        assert!(
+            !turn.detached,
+            "a client that came back was not heard; the screen would stay frozen"
+        );
+        assert!(
+            turn.sent.is_some(),
+            "the returning turn built no frame; the screen the client moved while \
+             away would stay frozen even though `detached` cleared"
+        );
+
+        // The frame the reattach turn sent has to be RECEIVED and APPLIED to
+        // find out whether it is the catch-up or an empty ack-only diff of a
+        // stale base -- `turn.sent.is_some()` is true either way.
+        let reattach_frame =
+            tokio::time::timeout(Duration::from_secs(5), client.link.source.recv())
+                .await
+                .expect("the host's reattach frame never arrived")
+                .expect("the source closed");
+        client
+            .turn_with(&[], Some(reattach_frame), &mut out)
+            .expect("the client applies the reattach frame");
+        assert!(
+            text(client.screen()).contains("moved"),
+            "the returning turn did not carry the screen the child moved while \
+             nobody was attached -- an ack-only frame of a stale base would \
+             also satisfy `turn.sent.is_some()`, so this is the real guard\n\
+             --- client ---\n{}",
+            text(client.screen())
+        );
+    }
+
+    /// A blip is not a departure. HEARTBEAT_IDLE is 5s and DETACH_AFTER is 30s,
+    /// and the gap between them is what stops an ordinary quiet moment from
+    /// freezing the emulator behind the child.
+    #[tokio::test]
+    async fn an_ordinary_quiet_moment_does_not_detach_the_host() {
+        let (mut host, _client) = pair("/bin/sh").await;
+        let t = Instant::now();
+
+        let turn = host
+            .turn_at(t + crate::linkstate::HEARTBEAT_IDLE * 2, None)
+            .expect("a turn a couple of heartbeats in");
+        assert!(
+            !turn.detached,
+            "detached after two heartbeats; a quiet session is not an absent one"
         );
     }
 
@@ -2656,8 +3031,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         // The client goes away without a graceful shutdown, as a dropped
-        // network does. A bare `drop` is not enough: quinn would keep the
-        // connection alive until its idle timeout.
+        // network does. A bare `drop` is not enough: with no idle timeout,
+        // quinn would keep the connection alive indefinitely rather than
+        // ever noticing on its own.
         client.link.sink.connection().close(0u32.into(), b"gone");
         drop(client);
         // quinn needs a moment to decide the connection is gone.
@@ -3078,6 +3454,83 @@ mod tests {
         (host, session)
     }
 
+    /// Wait until a frame is sitting in the client's source, without applying
+    /// it. `try_recv` in the code under test is what must pick it up.
+    ///
+    /// `FrameSource` has no `has_frame` (or equivalent peek) to poll, so this
+    /// falls back to sleeping briefly and trusting `try_recv` inside `turn` to
+    /// find what arrived. That is a timing proxy, not a direct wait, and this
+    /// project has recorded that a timing proxy becomes a race when the thing
+    /// it proxied moves.
+    async fn wait_for_frame(_session: &mut ClientSession) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A frame that arrives on a pacing lap rather than through the frame arm
+    /// still counts as hearing from the host. Without this the picture comes
+    /// back to life underneath a box saying nobody is answering.
+    #[tokio::test]
+    async fn a_scavenged_frame_clears_the_notice() {
+        let (mut host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+
+        // The host answers. The frame lands in the channel, but nothing wakes
+        // the loop's frame arm -- this is the pacing lap that scavenges it.
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Live),
+            "a frame was applied and the client still believes the host is silent: {:?}",
+            session.link_state.phase_now()
+        );
+    }
+
+    /// The counter is built from `last_heard`, so a scavenged frame must move
+    /// it or the box overstates the outage for as long as the box is up.
+    #[tokio::test]
+    async fn a_scavenged_frame_takes_the_notice_down() {
+        let (mut host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+
+        assert!(
+            session.notice_at(Instant::now()).is_none(),
+            "the notice survived a frame that was applied"
+        );
+    }
+
+    /// `heard` clears a half-typed prefix, and this task makes `heard` run far
+    /// more often. A `Ctrl-\` and its letter genuinely arrive in two reads;
+    /// a frame landing between them must not eat the command.
+    #[tokio::test]
+    async fn a_frame_between_the_prefix_and_its_letter_does_not_eat_the_command() {
+        let (mut host, mut session) = with_confirming_notice(b"echo hi\r").await;
+        let mut out = Vec::new();
+
+        // The prefix arrives at the end of one read...
+        session
+            .route_keys(&[CTRL_BACKSLASH], &mut out)
+            .expect("the prefix is held");
+        // ...a frame is applied between the two reads...
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        // ...and the letter arrives in the next.
+        session
+            .route_keys(b"d", &mut out)
+            .expect("the letter lands");
+
+        assert!(
+            session.link_state.held().is_empty(),
+            "Ctrl-\\ d did not drop the held buffer: the frame ate the prefix"
+        );
+    }
+
     /// Everything the client has said to the host this session. Input is
     /// cumulative -- the host tracks how much of it has been written to the
     /// shell -- so this is where a keystroke lands if it was passed through.
@@ -3449,6 +3902,405 @@ mod tests {
             String::from_utf8_lossy(&after),
             String::from_utf8_lossy(&expected),
             "the notice kept the geometry of the screen that went away"
+        );
+    }
+
+    /// The rule from spec 4.2, and the one that costs something to get wrong:
+    /// a rebind moves our source port and invalidates a punched NAT hole, so
+    /// doing it to a link that is working breaks the path in order to test it.
+    #[tokio::test]
+    async fn a_healthy_session_never_probes_the_route() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let t = Instant::now();
+        session.note_heard(t);
+
+        assert!(
+            !session.follow_route(t),
+            "probed a healthy link; a rebind on a working path breaks it"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "a healthy link cost a probe syscall"
+        );
+        assert!(
+            !session.follow_route(t + ROUTE_PROBE_EVERY * 5),
+            "probed a healthy link after several intervals"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "a healthy link cost a probe syscall after several intervals"
+        );
+    }
+
+    /// Probing is gated even inside `Silent`: the loop wakes every 8-100ms and
+    /// a bind/connect pair on every lap is up to 125 a second.
+    #[tokio::test]
+    async fn probing_is_paced_while_silent() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+
+        session.follow_route(t);
+        let after_first = session.probed_at;
+        assert!(
+            after_first.is_some(),
+            "the first probe in Silent did not run"
+        );
+
+        session.follow_route(t + ROUTE_PROBE_EVERY / 2);
+        assert_eq!(
+            session.probed_at, after_first,
+            "probed twice inside one ROUTE_PROBE_EVERY"
+        );
+
+        session.follow_route(t + ROUTE_PROBE_EVERY * 2);
+        assert_ne!(
+            session.probed_at, after_first,
+            "the probe never resumed after its interval"
+        );
+    }
+
+    /// Silence is not evidence that the route moved. A host can go quiet with
+    /// this machine's address exactly where it was -- a crash, a wedged
+    /// process, congestion -- and a rebind costs a punched NAT hole, so it is
+    /// spent only on a reading that actually disagrees with the baseline.
+    ///
+    /// The fixture connects over loopback and stays there, so the probe agrees
+    /// with the baseline `ClientSession::new` seeded. `probed_at` is asserted
+    /// too: without it this passes just as well if a gate returns before
+    /// probing at all, which would make it a guard that cannot fail.
+    #[tokio::test]
+    async fn a_probe_that_finds_the_route_unchanged_does_not_rebind() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+        let before = session.link.socket.local_addr().expect("a bound socket");
+
+        assert!(
+            !session.follow_route(t),
+            "rebound on a route that had not moved"
+        );
+        assert!(
+            session.probed_at.is_some(),
+            "the probe never ran, so this asserts nothing about rebinding"
+        );
+        assert_eq!(
+            session.link.socket.local_addr().expect("a bound socket"),
+            before,
+            "the session socket was swapped though the route was unchanged"
+        );
+    }
+
+    /// The rebind itself, in process: bind, adopt, `rebind_abstract`, settle.
+    ///
+    /// `Link::rebind` has an end-to-end test of its own, but it self-skips on
+    /// macOS -- so on the machine this is developed on, nothing exercised the
+    /// branch `follow_route` takes when a route really has moved. Everything
+    /// here is real: a real quinn connection, a real socket bound the way the
+    /// ladder binds one, and a real `rebind_abstract` under it.
+    ///
+    /// The move is manufactured the only way loopback allows: the baseline is
+    /// set to an address this machine cannot be reached on, so the probe --
+    /// which genuinely asks the kernel, and genuinely gets `127.0.0.1` back --
+    /// disagrees with it. Nothing about `moved`, the bind or the rebind knows
+    /// the difference.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moved_route_swaps_the_socket_and_the_session_survives_it() {
+        let (mut host, mut session) = with_notice().await;
+        let before = session.link.socket.local_addr().expect("a bound socket");
+
+        // A baseline the loopback probe cannot agree with.
+        session.route =
+            crate::roam::RouteWatch::new(Some("10.46.18.101".parse().expect("a literal address")));
+
+        assert!(
+            session.follow_route(Instant::now()),
+            "a probe that disagreed with the baseline did not rebind"
+        );
+        let after = session.link.socket.local_addr().expect("a bound socket");
+        assert_ne!(
+            before, after,
+            "`follow_route` reported a rebind without swapping the socket"
+        );
+
+        // Settled, so the same reading does not ask again on the next probe.
+        assert!(
+            !session.follow_route(Instant::now() + ROUTE_PROBE_EVERY * 2),
+            "the same route change asked for a second rebind"
+        );
+
+        // And the session still works over the new socket. This is the half a
+        // socket-address assertion cannot reach: QUIC migration is what makes
+        // the swap survivable, so output produced after it has to arrive.
+        let mut out = Vec::new();
+        host.term
+            .write_input(b"printf 'after-the-rebind\\r\\n'\n")
+            .expect("write");
+        assert!(
+            drive(
+                &mut host,
+                &mut session,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("after-the-rebind")
+            )
+            .await,
+            "nothing arrived after the rebind: the connection did not migrate \
+             onto the new socket\n--- client ---\n{}",
+            text(session.screen())
+        );
+    }
+
+    /// The probe pace belongs to one outage, not to the session.
+    ///
+    /// `probed_at` is what keeps `Silent` from probing on every lap of a loop
+    /// that wakes 125 times a second. Left set across a return to `Live` it
+    /// would also swallow the FIRST probe of the next outage, whenever that
+    /// outage began within `ROUTE_PROBE_EVERY` of the previous probe -- and
+    /// the first probe is the one that matters, because it is what notices a
+    /// route that has just moved.
+    ///
+    /// The honest scope of this guard: that skip is not reachable through
+    /// today's constants, because a second `Silent` costs another
+    /// `SILENT_AFTER` (2 s) and the cooldown is `ROUTE_PROBE_EVERY` (1 s). So
+    /// this asserts the mechanism directly -- a lap that is not `Silent`
+    /// leaves no pace behind -- rather than staging a timeline that needs one
+    /// of those two constants, which live in different modules, to move first.
+    #[tokio::test]
+    async fn a_healthy_lap_leaves_no_probe_pace_behind_it() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+
+        session.follow_route(t);
+        assert!(
+            session.probed_at.is_some(),
+            "the outage never probed, so this asserts nothing about clearing"
+        );
+
+        // The host answers. The loop calls `follow_route` on healthy laps too,
+        // and this is the only thing it does on one.
+        session.note_heard(t);
+        assert!(
+            !session.follow_route(t),
+            "probed a healthy link; a rebind on a working path breaks it"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "the ended outage left its cooldown behind: the next outage would \
+             skip the first probe -- the one that notices a moved route -- if \
+             it began inside ROUTE_PROBE_EVERY"
+        );
+    }
+
+    /// The baseline is taken when the connection comes up, not on the first
+    /// probe of the outage. `SILENT_AFTER` is two seconds, so walking out of
+    /// Wi-Fi range moves the route BEFORE the silence is noticed: a baseline
+    /// first read inside `Silent` would read the address already moved to,
+    /// agree with it for ever, and never rebind -- inert for the one case this
+    /// whole phase exists for.
+    #[tokio::test]
+    async fn the_baseline_is_taken_when_the_connection_comes_up() {
+        let (_host, session) = pair("/bin/sh").await;
+        let elsewhere: std::net::IpAddr = "10.46.18.101".parse().expect("a literal address");
+
+        // A baseline is what makes a different address readable as a move.
+        // With none, `moved` is false for everything and no outage can ever
+        // reach the rebind.
+        assert!(
+            session.route.moved(elsewhere),
+            "a fresh session had no baseline; the first probe of an outage \
+             would adopt whatever it found and never rebind"
+        );
+        // And it was not taken by the loop: this is one reading at startup,
+        // not probing on `Live` laps.
+        assert!(
+            session.probed_at.is_none(),
+            "the seeding probe went through the loop's paced path"
+        );
+    }
+
+    /// The composed test for phase 2, and the reason there is one: phase 1's
+    /// Critical bug lived across a seam no single task owned, and every
+    /// per-task test holds the clock still. This one lets the real loop run.
+    ///
+    /// It asserts the phase's whole user-visible claim in one place: silence
+    /// raises a box, the session does NOT die under it -- which is the entire
+    /// change -- and the box comes down by itself when the host speaks again.
+    /// Before phase 2 the client exited at ~33 s with an error instead.
+    ///
+    /// Real elapsed time, not an injected clock: the thing under test is a
+    /// real quinn connection's own idle-timeout machinery, which an injected
+    /// clock cannot reach. That makes it too slow for the default suite, so
+    /// it is `#[ignore]`d. Run it explicitly with:
+    ///
+    /// ```text
+    /// cargo test -j4 --bin oxutrm outlives_a_silence -- --nocapture --ignored --test-threads=1
+    /// ```
+    ///
+    /// Do not shorten `outage` below 31 s: the whole assertion is that the
+    /// session outlives the 30 s `max_idle_timeout` that used to kill it, and
+    /// anything under that would prove nothing about the timeout either way.
+    ///
+    /// **`close_reason().is_none()` below is a sanity check, not a guard
+    /// against the timeout regression.** Restoring `max_idle_timeout(Some(30s))`
+    /// in `crates/oxutrm-net/src/quic.rs` and rerunning this test does NOT
+    /// make it fail -- verified, not assumed; see the task report. The client
+    /// keeps resending its unacknowledged input every pacing interval
+    /// throughout the "silence" (the host session never acks it), and
+    /// quinn's transport ACKs those packets, and answers keep-alives,
+    /// entirely at the connection's own background task -- work that runs
+    /// whether or not `HostSession::turn_at` is ever called. Two live,
+    /// unsuspended processes on loopback can therefore never reproduce the
+    /// failure this phase fixes, which was a HOST PROCESS suspended by
+    /// `SIGSTOP` and therefore unable to run that background task at all.
+    /// Only a real process being stopped -- the hand test -- exercises that.
+    /// The direct, mutation-sensitive guard on the config itself is
+    /// `the_transport_imposes_no_idle_timeout` in
+    /// `crates/oxutrm-net/src/quic.rs`. What THIS test's timing does prove,
+    /// and what failed before `notice_at` was moved inside the loop below: a
+    /// silence long enough to have been fatal raises the notice and the
+    /// notice comes down again on its own once the host answers.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "real 35s wall-clock outage; run explicitly, see doc comment"]
+    async fn a_session_outlives_a_silence_that_used_to_kill_it() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        let t = Instant::now();
+
+        client.note_heard(t);
+        client.note_sent(t);
+
+        // Long enough to have been fatal: the old max_idle_timeout was 30s and
+        // the client died at ~33s in the hand test. Real elapsed time, because
+        // the thing under test is a real quinn connection's own timers, and an
+        // injected clock cannot reach those.
+        let outage = Duration::from_secs(35);
+        let deadline = tokio::time::Instant::now() + outage;
+        while tokio::time::Instant::now() < deadline {
+            // The loop's own laps, with the host saying nothing at all.
+            client
+                .turn(&[], &mut out)
+                .expect("the session survives the lap");
+            // `run`'s own loop calls `notice_at` once per lap (see the
+            // `Wake::Due` arm above) -- that is what advances `LinkState`'s
+            // grace-period clock. `evaluate` is edge-triggered on being
+            // asked, not on wall-clock time passing underneath it, so a loop
+            // that never asks would still see `Live` on its first question
+            // 35s in and this composed test would prove nothing.
+            let _ = client.notice_at(Instant::now());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            client.notice_at(Instant::now()).is_some(),
+            "no notice after {outage:?} of silence"
+        );
+        // Sanity, not the regression guard -- see the doc comment above for
+        // why this cannot be made to fail by restoring the old timeout here.
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the connection died under the notice: {:?}",
+            client.link.sink.connection().close_reason()
+        );
+
+        // The host comes back. The notice must come down on its own -- through
+        // the scavenging path Task 1 fixed, since nothing here wakes a frame arm.
+        host.turn().expect("the host answers at last");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .turn(&[], &mut out)
+            .expect("a lap that scavenges the frame");
+
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "the host answered and the notice stayed up"
+        );
+    }
+
+    /// A short, **non-`#[ignore]`d** sibling of the test above, so CI runs
+    /// the real-clock half of the composed-test story on every default
+    /// `cargo test`, not only when someone remembers `--ignored`.
+    ///
+    /// Every other notice test in this file injects instants and holds the
+    /// clock still. This one and the 35s test above are the only two that
+    /// let `LinkState::evaluate`'s edge-triggered `owed_since` and the
+    /// scavenging clear path run against a real clock. This one starts from
+    /// a genuinely SYNCED session (the host acks the client's first input
+    /// before the silence begins), so the notice's later rise is driven by
+    /// `heartbeat_due` firing at `HEARTBEAT_IDLE` and then `SILENT_AFTER`
+    /// more before that owing is old enough to report -- roughly 7s in the
+    /// worst case -- rather than by the from-construction seq mismatch every
+    /// fresh `ClientSession` starts with, which is what the 35s test above
+    /// relies on instead (silence from the very first lap of the session,
+    /// a different and equally real case, but not one that exercises
+    /// `heartbeat_due` at all). 9s of real polling budgets both real timers
+    /// with margin for a loaded runner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_silence_raises_and_clears_the_notice_on_a_real_clock() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        // Get to a genuinely synced state before the silence starts: the
+        // client speaks once, the host applies it and answers, and the
+        // client applies that answer -- so `input_tx.current().seq() ==
+        // screen_rx.peer_ack()` and nothing is owed, exactly as a healthy
+        // attach looks. Without this the notice would rise from the same
+        // from-construction mismatch the 35s test above already covers, and
+        // this test would prove nothing extra about `HEARTBEAT_IDLE`.
+        client.turn(&[], &mut out).expect("the client's first lap");
+        let frame = client_frame(&mut host).await;
+        host.turn_with(Some(frame))
+            .expect("the host answers the first lap");
+        let reply = tokio::time::timeout(Duration::from_secs(5), client.link.source.recv())
+            .await
+            .expect("the host's first reply never arrived")
+            .expect("the source closed");
+        client
+            .turn_with(&[], Some(reply), &mut out)
+            .expect("the client applies the host's first ack");
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "not synced before the silence began; this test would prove \
+             nothing about HEARTBEAT_IDLE"
+        );
+
+        let t = Instant::now();
+        client.note_heard(t);
+        client.note_sent(t);
+
+        // HEARTBEAT_IDLE (5s) until the client's own heartbeat makes a reply
+        // owed, plus SILENT_AFTER (2s) more before that owing is old enough
+        // to raise the notice -- 9s of real polling budgets both with
+        // margin.
+        let outage = Duration::from_secs(9);
+        let deadline = tokio::time::Instant::now() + outage;
+        while tokio::time::Instant::now() < deadline {
+            client
+                .turn(&[], &mut out)
+                .expect("the session survives the lap");
+            // `run`'s own loop calls both of these every lap -- see its
+            // `Wake::Due` arm. The heartbeat is what actually generates the
+            // owed reply this time, since (unlike the 35s test) this one
+            // starts synced.
+            let _ = client.heartbeat(Instant::now());
+            let _ = client.notice_at(Instant::now());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            client.notice_at(Instant::now()).is_some(),
+            "no notice after {outage:?}, well past HEARTBEAT_IDLE + SILENT_AFTER"
+        );
+
+        // The host answers again; the notice must clear through the same
+        // scavenging path Task 1 fixed.
+        host.turn().expect("the host answers at last");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .turn(&[], &mut out)
+            .expect("a lap that scavenges the frame");
+
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "the host answered and the notice stayed up"
         );
     }
 }
