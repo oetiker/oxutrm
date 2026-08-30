@@ -89,10 +89,15 @@ const NOTICE_REFRESH: Duration = Duration::from_secs(1);
 /// `close_reason()` stays `None` for ever on a silent peer and the question has
 /// to be answered from a clock of our own.
 ///
-/// Thirty seconds, so the behaviour is unchanged by construction: it is exactly
-/// what quinn enforced before. Six times `HEARTBEAT_IDLE`, so an attached
-/// client that is merely quiet is nowhere near it -- it heartbeats at 0.2 Hz and
-/// every heartbeat is a frame.
+/// Thirty seconds, so the behaviour is unchanged by construction: it is
+/// exactly what quinn enforced before -- with one difference. Quinn's idle
+/// timer was reset by *any* transport activity, including the 10 s
+/// keep-alive, so a client whose quinn stack kept answering keep-alives while
+/// its application loop was wedged used to stay attached for ever. `last_heard`
+/// moves only on an application frame, so that peer now detaches at 30 s
+/// instead -- a stricter and more honest reading of "still there". Six times
+/// `HEARTBEAT_IDLE`, so an attached client that is merely quiet is nowhere
+/// near it -- it heartbeats at 0.2 Hz and every heartbeat is a frame.
 ///
 /// Detaching closes nothing. It stops snapshotting and stops offering frames;
 /// the pty is still drained and the emulator still fed, because the screen being
@@ -2183,6 +2188,17 @@ mod tests {
 
     /// Detaching must not be a one-way door: the whole point of holding the
     /// connection open is that a peer coming back is heard instantly.
+    ///
+    /// `!turn.detached` alone would still pass if the `screen_stale` catch-up
+    /// snapshot were dropped from `turn_at` -- undetached is not the same
+    /// claim as caught up, and this reattach path only became reachable in
+    /// this phase, so that gap is one this phase created. `turn.sent.is_some()`
+    /// alone is not enough either: the returning client's own keystroke owes
+    /// an ack, and an ack travels on a frame regardless of whether the screen
+    /// moved, so that frame would exist even with `screen_stale` dropped. The
+    /// only assertion that actually distinguishes the two is what the frame
+    /// *contains* once applied on the client: the "moved" text the child
+    /// wrote while nobody was attached.
     #[tokio::test]
     async fn a_returning_client_reattaches_the_host() {
         let (mut host, mut client) = pair("/bin/sh").await;
@@ -2191,17 +2207,63 @@ mod tests {
 
         assert!(host.turn_at(late, None).expect("a turn").detached);
 
+        // The screen moves while nobody is attached. A poll while still
+        // detached is what sets `screen_stale`, so the catch-up on reattach
+        // has something real to prove. Polled several times, spaced out, so
+        // the shell's own prompt has finished landing and drained BEFORE the
+        // reattach turn -- otherwise a late byte of prompt could set `moved`
+        // on the reattach turn itself and the assertion below would pass for
+        // the wrong reason, hiding a dropped `screen_stale` behind it.
+        host.term.write_input(b"echo moved\n").unwrap();
+        let mut still_away = None;
+        for step in 1..=5u32 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            still_away = Some(
+                host.turn_at(late + Duration::from_millis(100 * step as u64), None)
+                    .expect("a turn while still detached"),
+            );
+        }
+        assert!(
+            still_away.expect("polled at least once").detached,
+            "detached before the client had a chance to speak"
+        );
+
         // The client speaks again. Any frame is evidence of a peer.
         let mut out = Vec::new();
         client.turn(b"x", &mut out).expect("the client types");
         let frame = client_frame(&mut host).await;
 
         let turn = host
-            .turn_at(late + Duration::from_millis(1), Some(frame))
+            .turn_at(late + Duration::from_millis(600), Some(frame))
             .expect("a turn with the client back");
         assert!(
             !turn.detached,
             "a client that came back was not heard; the screen would stay frozen"
+        );
+        assert!(
+            turn.sent.is_some(),
+            "the returning turn built no frame; the screen the client moved while \
+             away would stay frozen even though `detached` cleared"
+        );
+
+        // The frame the reattach turn sent has to be RECEIVED and APPLIED to
+        // find out whether it is the catch-up or an empty ack-only diff of a
+        // stale base -- `turn.sent.is_some()` is true either way.
+        let reattach_frame =
+            tokio::time::timeout(Duration::from_secs(5), client.link.source.recv())
+                .await
+                .expect("the host's reattach frame never arrived")
+                .expect("the source closed");
+        client
+            .turn_with(&[], Some(reattach_frame), &mut out)
+            .expect("the client applies the reattach frame");
+        assert!(
+            text(client.screen()).contains("moved"),
+            "the returning turn did not carry the screen the child moved while \
+             nobody was attached -- an ack-only frame of a stale base would \
+             also satisfy `turn.sent.is_some()`, so this is the real guard\n\
+             --- client ---\n{}",
+            text(client.screen())
         );
     }
 
@@ -3883,6 +3945,104 @@ mod tests {
         assert!(
             session.probed_at.is_none(),
             "the seeding probe went through the loop's paced path"
+        );
+    }
+
+    /// The composed test for phase 2, and the reason there is one: phase 1's
+    /// Critical bug lived across a seam no single task owned, and every
+    /// per-task test holds the clock still. This one lets the real loop run.
+    ///
+    /// It asserts the phase's whole user-visible claim in one place: silence
+    /// raises a box, the session does NOT die under it -- which is the entire
+    /// change -- and the box comes down by itself when the host speaks again.
+    /// Before phase 2 the client exited at ~33 s with an error instead.
+    ///
+    /// Real elapsed time, not an injected clock: the thing under test is a
+    /// real quinn connection's own idle-timeout machinery, which an injected
+    /// clock cannot reach. That makes it too slow for the default suite, so
+    /// it is `#[ignore]`d. Run it explicitly with:
+    ///
+    /// ```text
+    /// cargo test -j4 --bin oxutrm outlives_a_silence -- --nocapture --ignored
+    /// ```
+    ///
+    /// Do not shorten `outage` below 31 s: the whole assertion is that the
+    /// session outlives the 30 s `max_idle_timeout` that used to kill it, and
+    /// anything under that would prove nothing about the timeout either way.
+    ///
+    /// **`close_reason().is_none()` below is a sanity check, not a guard
+    /// against the timeout regression.** Restoring `max_idle_timeout(Some(30s))`
+    /// in `crates/oxutrm-net/src/quic.rs` and rerunning this test does NOT
+    /// make it fail -- verified, not assumed; see the task report. The client
+    /// keeps resending its unacknowledged input every pacing interval
+    /// throughout the "silence" (the host session never acks it), and
+    /// quinn's transport ACKs those packets, and answers keep-alives,
+    /// entirely at the connection's own background task -- work that runs
+    /// whether or not `HostSession::turn_at` is ever called. Two live,
+    /// unsuspended processes on loopback can therefore never reproduce the
+    /// failure this phase fixes, which was a HOST PROCESS suspended by
+    /// `SIGSTOP` and therefore unable to run that background task at all.
+    /// Only a real process being stopped -- the hand test -- exercises that.
+    /// The direct, mutation-sensitive guard on the config itself is
+    /// `the_transport_imposes_no_idle_timeout` in
+    /// `crates/oxutrm-net/src/quic.rs`. What THIS test's timing does prove,
+    /// and what failed before `notice_at` was moved inside the loop below: a
+    /// silence long enough to have been fatal raises the notice and the
+    /// notice comes down again on its own once the host answers.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "real 35s wall-clock outage; run explicitly, see doc comment"]
+    async fn a_session_outlives_a_silence_that_used_to_kill_it() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        let t = Instant::now();
+
+        client.note_heard(t);
+        client.note_sent(t);
+
+        // Long enough to have been fatal: the old max_idle_timeout was 30s and
+        // the client died at ~33s in the hand test. Real elapsed time, because
+        // the thing under test is a real quinn connection's own timers, and an
+        // injected clock cannot reach those.
+        let outage = Duration::from_secs(35);
+        let deadline = tokio::time::Instant::now() + outage;
+        while tokio::time::Instant::now() < deadline {
+            // The loop's own laps, with the host saying nothing at all.
+            client
+                .turn(&[], &mut out)
+                .expect("the session survives the lap");
+            // `run`'s own loop calls `notice_at` once per lap (see the
+            // `Wake::Due` arm above) -- that is what advances `LinkState`'s
+            // grace-period clock. `evaluate` is edge-triggered on being
+            // asked, not on wall-clock time passing underneath it, so a loop
+            // that never asks would still see `Live` on its first question
+            // 35s in and this composed test would prove nothing.
+            let _ = client.notice_at(Instant::now());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            client.notice_at(Instant::now()).is_some(),
+            "no notice after {outage:?} of silence"
+        );
+        // Sanity, not the regression guard -- see the doc comment above for
+        // why this cannot be made to fail by restoring the old timeout here.
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the connection died under the notice: {:?}",
+            client.link.sink.connection().close_reason()
+        );
+
+        // The host comes back. The notice must come down on its own -- through
+        // the scavenging path Task 1 fixed, since nothing here wakes a frame arm.
+        host.turn().expect("the host answers at last");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .turn(&[], &mut out)
+            .expect("a lap that scavenges the frame");
+
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "the host answered and the notice stayed up"
         );
     }
 }
