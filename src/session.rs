@@ -692,6 +692,9 @@ pub struct ClientSession {
     route: crate::roam::RouteWatch,
     /// When the route was last probed, so `Silent` does not probe on every
     /// lap of a loop that wakes up to 125 times a second.
+    ///
+    /// Cleared on any lap that is not `Silent`, so the pace belongs to one
+    /// outage rather than to the session: see [`ClientSession::follow_route`].
     probed_at: Option<Instant>,
 }
 
@@ -1435,8 +1438,52 @@ impl ClientSession {
     /// is "no answer this time"; the next probe asks again. Same rule as "a
     /// send failure must never end a session", applied to the thing most
     /// likely to fail.
+    ///
+    /// # What seeding the baseline at connection time costs
+    ///
+    /// The baseline is read once, in [`ClientSession::new`], and after that
+    /// only a probe taken while `Silent` can replace it. That is deliberate --
+    /// see the comment there for why reading it first inside the outage is
+    /// inert -- but it is not free, and the price is worth writing down rather
+    /// than rediscovering.
+    ///
+    /// A route may change perfectly benignly while the link is `Live`: a VPN
+    /// comes up, an interface metric shifts, the machine moves between two
+    /// networks that both reach the host. Nothing probes on a `Live` lap, so
+    /// the baseline is now stale, and it stays stale until an outage. If a
+    /// *transient* stall then raises `Silent` -- two seconds of host-side
+    /// hesitation, not a moved route -- the first probe of that outage
+    /// disagrees with the stale baseline, reads it as a move, and spends a
+    /// working NAT hole rebinding a path that was about to recover.
+    ///
+    /// Accepted, with the alternative stated so the trade is visible: the only
+    /// way to keep the baseline fresh is to probe on `Live` laps, which means
+    /// a bind/`connect` pair every second for the whole life of every healthy
+    /// session, for ever, to catch a case that costs one rebind. One rebind
+    /// costs a NAT hole that rungs 2 and 3 re-punch; it does not cost the
+    /// connection, because QUIC is identified by connection IDs and the
+    /// migration is exactly what this whole path is for. The rebind settles
+    /// the new address as the baseline, so the mistake is made once and not
+    /// once a second.
     fn follow_route(&mut self, now: Instant) -> bool {
         if !matches!(self.link_state.phase_now(), Phase::Silent { .. }) {
+            // The pace belongs to one outage, not to the session. Left set
+            // across a return to `Live`, `probed_at` would also swallow the
+            // FIRST probe of the next outage whenever that outage began within
+            // `ROUTE_PROBE_EVERY` of the previous probe -- and the first probe
+            // is the one that matters, because it is what notices a route that
+            // has just moved.
+            //
+            // Deliberate, and worth saying plainly: that skip is not reachable
+            // through today's constants. Leaving `Silent` resets the owing, so
+            // a second `Silent` costs another `SILENT_AFTER` (2 s), which is
+            // longer than `ROUTE_PROBE_EVERY` (1 s) -- the cooldown has always
+            // expired by the time the next outage exists. The clear is here so
+            // that stays true of the mechanism rather than of an accident of
+            // two numbers in different modules, either of which could move
+            // without anyone thinking about this line. It costs one store on a
+            // path that was already returning.
+            self.probed_at = None;
             return false;
         }
         if self
@@ -3939,6 +3986,107 @@ mod tests {
             session.link.socket.local_addr().expect("a bound socket"),
             before,
             "the session socket was swapped though the route was unchanged"
+        );
+    }
+
+    /// The rebind itself, in process: bind, adopt, `rebind_abstract`, settle.
+    ///
+    /// `Link::rebind` has an end-to-end test of its own, but it self-skips on
+    /// macOS -- so on the machine this is developed on, nothing exercised the
+    /// branch `follow_route` takes when a route really has moved. Everything
+    /// here is real: a real quinn connection, a real socket bound the way the
+    /// ladder binds one, and a real `rebind_abstract` under it.
+    ///
+    /// The move is manufactured the only way loopback allows: the baseline is
+    /// set to an address this machine cannot be reached on, so the probe --
+    /// which genuinely asks the kernel, and genuinely gets `127.0.0.1` back --
+    /// disagrees with it. Nothing about `moved`, the bind or the rebind knows
+    /// the difference.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moved_route_swaps_the_socket_and_the_session_survives_it() {
+        let (mut host, mut session) = with_notice().await;
+        let before = session.link.socket.local_addr().expect("a bound socket");
+
+        // A baseline the loopback probe cannot agree with.
+        session.route =
+            crate::roam::RouteWatch::new(Some("10.46.18.101".parse().expect("a literal address")));
+
+        assert!(
+            session.follow_route(Instant::now()),
+            "a probe that disagreed with the baseline did not rebind"
+        );
+        let after = session.link.socket.local_addr().expect("a bound socket");
+        assert_ne!(
+            before, after,
+            "`follow_route` reported a rebind without swapping the socket"
+        );
+
+        // Settled, so the same reading does not ask again on the next probe.
+        assert!(
+            !session.follow_route(Instant::now() + ROUTE_PROBE_EVERY * 2),
+            "the same route change asked for a second rebind"
+        );
+
+        // And the session still works over the new socket. This is the half a
+        // socket-address assertion cannot reach: QUIC migration is what makes
+        // the swap survivable, so output produced after it has to arrive.
+        let mut out = Vec::new();
+        host.term
+            .write_input(b"printf 'after-the-rebind\\r\\n'\n")
+            .expect("write");
+        assert!(
+            drive(
+                &mut host,
+                &mut session,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("after-the-rebind")
+            )
+            .await,
+            "nothing arrived after the rebind: the connection did not migrate \
+             onto the new socket\n--- client ---\n{}",
+            text(session.screen())
+        );
+    }
+
+    /// The probe pace belongs to one outage, not to the session.
+    ///
+    /// `probed_at` is what keeps `Silent` from probing on every lap of a loop
+    /// that wakes 125 times a second. Left set across a return to `Live` it
+    /// would also swallow the FIRST probe of the next outage, whenever that
+    /// outage began within `ROUTE_PROBE_EVERY` of the previous probe -- and
+    /// the first probe is the one that matters, because it is what notices a
+    /// route that has just moved.
+    ///
+    /// The honest scope of this guard: that skip is not reachable through
+    /// today's constants, because a second `Silent` costs another
+    /// `SILENT_AFTER` (2 s) and the cooldown is `ROUTE_PROBE_EVERY` (1 s). So
+    /// this asserts the mechanism directly -- a lap that is not `Silent`
+    /// leaves no pace behind -- rather than staging a timeline that needs one
+    /// of those two constants, which live in different modules, to move first.
+    #[tokio::test]
+    async fn a_healthy_lap_leaves_no_probe_pace_behind_it() {
+        let (_host, mut session) = with_notice().await;
+        let t = Instant::now();
+
+        session.follow_route(t);
+        assert!(
+            session.probed_at.is_some(),
+            "the outage never probed, so this asserts nothing about clearing"
+        );
+
+        // The host answers. The loop calls `follow_route` on healthy laps too,
+        // and this is the only thing it does on one.
+        session.note_heard(t);
+        assert!(
+            !session.follow_route(t),
+            "probed a healthy link; a rebind on a working path breaks it"
+        );
+        assert!(
+            session.probed_at.is_none(),
+            "the ended outage left its cooldown behind: the next outage would \
+             skip the first probe -- the one that notices a moved route -- if \
+             it began inside ROUTE_PROBE_EVERY"
         );
     }
 
