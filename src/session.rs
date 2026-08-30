@@ -2209,17 +2209,38 @@ mod tests {
 
         // The screen moves while nobody is attached. A poll while still
         // detached is what sets `screen_stale`, so the catch-up on reattach
-        // has something real to prove. Polled several times, spaced out, so
-        // the shell's own prompt has finished landing and drained BEFORE the
-        // reattach turn -- otherwise a late byte of prompt could set `moved`
-        // on the reattach turn itself and the assertion below would pass for
-        // the wrong reason, hiding a dropped `screen_stale` behind it.
+        // has something real to prove. Polled until the host's OWN terminal
+        // has actually rendered "moved" -- bounded by a timeout rather than a
+        // fixed lap count, so a loaded runner where `/bin/sh` takes longer
+        // than a guessed budget to echo does not false-fail this test. A few
+        // more laps once the marker first appears settle any trailing byte of
+        // shell prompt BEFORE the reattach turn -- otherwise a late byte
+        // landing exactly on the reattach turn's own poll would set `moved`
+        // there too, and the mutation this test guards against would go
+        // undetected for the wrong reason.
         host.term.write_input(b"echo moved\n").unwrap();
+        let poll_budget = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut elapsed = Duration::ZERO;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < poll_budget,
+                "the child's \"moved\" output never reached the host's own \
+                 terminal within 10s of real polling"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            elapsed += Duration::from_millis(20);
+            host.turn_at(late + elapsed, None)
+                .expect("a turn while still detached");
+            if text(&host.term.snapshot(1)).contains("moved") {
+                break;
+            }
+        }
         let mut still_away = None;
-        for step in 1..=5u32 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            elapsed += Duration::from_millis(50);
             still_away = Some(
-                host.turn_at(late + Duration::from_millis(100 * step as u64), None)
+                host.turn_at(late + elapsed, None)
                     .expect("a turn while still detached"),
             );
         }
@@ -2234,7 +2255,7 @@ mod tests {
         let frame = client_frame(&mut host).await;
 
         let turn = host
-            .turn_at(late + Duration::from_millis(600), Some(frame))
+            .turn_at(late + elapsed + Duration::from_millis(100), Some(frame))
             .expect("a turn with the client back");
         assert!(
             !turn.detached,
@@ -3963,7 +3984,7 @@ mod tests {
     /// it is `#[ignore]`d. Run it explicitly with:
     ///
     /// ```text
-    /// cargo test -j4 --bin oxutrm outlives_a_silence -- --nocapture --ignored
+    /// cargo test -j4 --bin oxutrm outlives_a_silence -- --nocapture --ignored --test-threads=1
     /// ```
     ///
     /// Do not shorten `outage` below 31 s: the whole assertion is that the
@@ -4034,6 +4055,95 @@ mod tests {
 
         // The host comes back. The notice must come down on its own -- through
         // the scavenging path Task 1 fixed, since nothing here wakes a frame arm.
+        host.turn().expect("the host answers at last");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .turn(&[], &mut out)
+            .expect("a lap that scavenges the frame");
+
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "the host answered and the notice stayed up"
+        );
+    }
+
+    /// A short, **non-`#[ignore]`d** sibling of the test above, so CI runs
+    /// the real-clock half of the composed-test story on every default
+    /// `cargo test`, not only when someone remembers `--ignored`.
+    ///
+    /// Every other notice test in this file injects instants and holds the
+    /// clock still. This one and the 35s test above are the only two that
+    /// let `LinkState::evaluate`'s edge-triggered `owed_since` and the
+    /// scavenging clear path run against a real clock. This one starts from
+    /// a genuinely SYNCED session (the host acks the client's first input
+    /// before the silence begins), so the notice's later rise is driven by
+    /// `heartbeat_due` firing at `HEARTBEAT_IDLE` and then `SILENT_AFTER`
+    /// more before that owing is old enough to report -- roughly 7s in the
+    /// worst case -- rather than by the from-construction seq mismatch every
+    /// fresh `ClientSession` starts with, which is what the 35s test above
+    /// relies on instead (silence from the very first lap of the session,
+    /// a different and equally real case, but not one that exercises
+    /// `heartbeat_due` at all). 9s of real polling budgets both real timers
+    /// with margin for a loaded runner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_silence_raises_and_clears_the_notice_on_a_real_clock() {
+        let (mut host, mut client) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+
+        // Get to a genuinely synced state before the silence starts: the
+        // client speaks once, the host applies it and answers, and the
+        // client applies that answer -- so `input_tx.current().seq() ==
+        // screen_rx.peer_ack()` and nothing is owed, exactly as a healthy
+        // attach looks. Without this the notice would rise from the same
+        // from-construction mismatch the 35s test above already covers, and
+        // this test would prove nothing extra about `HEARTBEAT_IDLE`.
+        client.turn(&[], &mut out).expect("the client's first lap");
+        let frame = client_frame(&mut host).await;
+        host.turn_with(Some(frame))
+            .expect("the host answers the first lap");
+        let reply = tokio::time::timeout(Duration::from_secs(5), client.link.source.recv())
+            .await
+            .expect("the host's first reply never arrived")
+            .expect("the source closed");
+        client
+            .turn_with(&[], Some(reply), &mut out)
+            .expect("the client applies the host's first ack");
+        assert!(
+            client.notice_at(Instant::now()).is_none(),
+            "not synced before the silence began; this test would prove \
+             nothing about HEARTBEAT_IDLE"
+        );
+
+        let t = Instant::now();
+        client.note_heard(t);
+        client.note_sent(t);
+
+        // HEARTBEAT_IDLE (5s) until the client's own heartbeat makes a reply
+        // owed, plus SILENT_AFTER (2s) more before that owing is old enough
+        // to raise the notice -- 9s of real polling budgets both with
+        // margin.
+        let outage = Duration::from_secs(9);
+        let deadline = tokio::time::Instant::now() + outage;
+        while tokio::time::Instant::now() < deadline {
+            client
+                .turn(&[], &mut out)
+                .expect("the session survives the lap");
+            // `run`'s own loop calls both of these every lap -- see its
+            // `Wake::Due` arm. The heartbeat is what actually generates the
+            // owed reply this time, since (unlike the 35s test) this one
+            // starts synced.
+            let _ = client.heartbeat(Instant::now());
+            let _ = client.notice_at(Instant::now());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            client.notice_at(Instant::now()).is_some(),
+            "no notice after {outage:?}, well past HEARTBEAT_IDLE + SILENT_AFTER"
+        );
+
+        // The host answers again; the notice must clear through the same
+        // scavenging path Task 1 fixed.
         host.turn().expect("the host answers at last");
         tokio::time::sleep(Duration::from_millis(200)).await;
         client

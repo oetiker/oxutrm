@@ -362,6 +362,53 @@ mod tests {
         );
     }
 
+    /// `the_transport_imposes_no_idle_timeout` above asserts what
+    /// `transport_config()` RETURNS. It says nothing about whether
+    /// `server_config`/`client_config` actually WIRE it in: if
+    /// `cfg.transport_config(transport_config())` were ever dropped from
+    /// `server_config` (or from `client_config`), that test would keep
+    /// passing, quinn's built-in 30 s default would silently come back for
+    /// real connections, and nothing else catches it -- the composed test in
+    /// `src/session.rs` cannot see it either (see its doc comment: two live,
+    /// unsuspended quinn endpoints on loopback never go idle regardless of
+    /// `max_idle_timeout`, because they keep ACKing and keep-aliving each
+    /// other). This asserts the WIRING, on the server side, where it is
+    /// possible to: `quinn::ServerConfig::transport` is a public field.
+    ///
+    /// The client side of this same wiring (`client_config`'s
+    /// `cfg.transport_config(transport_config())` call) has no equivalent
+    /// test and, as far as I can tell, cannot: `quinn::ClientConfig` is
+    /// `quinn_proto::ClientConfig` re-exported as-is, its `transport` field
+    /// is `pub(crate)` to quinn-proto (not visible to us), it derives no
+    /// `Debug`, and neither quinn nor quinn-proto 0.11 expose a getter for a
+    /// connection's negotiated idle timeout either -- so there is no public
+    /// API, direct or behavioural, that reaches this specific line from
+    /// outside quinn-proto. A live-connection test would hit exactly the
+    /// same masking `src/session.rs`'s composed-test doc comment describes,
+    /// for the identical reason. In practice the client side of this regression is
+    /// not entirely unguarded: Test 1 of the hand-test note
+    /// (`docs/superpowers/notes/2026-08-30-tier-a-hand-test.md`) -- `SIGSTOP`
+    /// the host, confirm the client is alive at 60 s -- would also catch a
+    /// silently-broken `client_config` wiring, because a client whose own
+    /// idle timer reverted to 30 s would die at ~33 s against a host that
+    /// truly cannot answer, same as before phase 2. That is a real host
+    /// hand test standing in for a unit test, not a substitute for one, and
+    /// is recorded here so the gap is not silently assumed closed.
+    #[test]
+    fn the_server_config_actually_wires_no_idle_timeout() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let cfg = server_config(cert, key, ClientSpki::new(fingerprint))
+            .expect("a server config with a self-signed cert and key");
+        assert_eq!(
+            format!("{:?}", cfg.transport).contains("max_idle_timeout: Some"),
+            false,
+            "server_config() built a ServerConfig whose WIRED transport still \
+             carries an idle timeout, even though transport_config() itself \
+             does not -- the wiring line was dropped: {:?}",
+            cfg.transport
+        );
+    }
+
     async fn socket() -> Arc<UdpSocket> {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
     }

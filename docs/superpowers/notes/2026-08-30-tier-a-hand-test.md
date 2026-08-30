@@ -62,18 +62,40 @@ tmux new-session -d -s ox -x 100 -y 30 \
   Mac and on `thinlinc` immediately before and after each step below and
   record all four.
 
-### A `SIGSTOP`ped session ignores `SIGTERM` until continued
+### `kill -CONT` before `kill -TERM`, as a precaution — not a proven necessity
 
-Not in the original recipe, and worth stating plainly because it was
-observed for real on 2026-08-30: a session `SIGSTOP`ped during the previous
-phase's hand test was still in process state `T` ten hours later and did
-**not** die to a plain `SIGTERM`. A stopped process does not run its signal
-handlers — `SIGTERM`'s handler (if any) cannot run until the process is
-scheduled again, and `SIGSTOP`/`SIGCONT` bypass ordinary signal delivery
-entirely. **Cleanup must `kill -CONT <pid>` before `kill -TERM <pid>`,** or
-the stopped session survives the test and sits there consuming a PTY and a
-registration entry indefinitely. Check `oxutrm host --list` after cleanup to
-confirm nothing was left in that state.
+**Correction to an earlier draft of this note**, caught in review: a prior
+version of this section stated as an *observation* that a `SIGSTOP`ped
+session "ignores `SIGTERM` until continued." That overstated what was
+actually seen, and this document's whole rule is that nothing in it may be
+read as a finding until it was actually measured — so here is exactly what
+was, and was not, observed.
+
+**What was observed:** on 2026-08-30, `ps` showed PID `2685979` still in
+process state `Tl` (stopped) roughly ten hours after the previous phase's
+hand test had `SIGSTOP`ped it. **What was not observed:** whether a plain
+`SIGTERM` alone would have failed to kill it. Cleanup at the time sent
+`kill -CONT` and `kill -TERM` together, so the counterfactual — `SIGTERM`
+with no preceding `SIGCONT` — was never actually run.
+
+The mechanism as originally stated was also over-general: on Linux, a
+process with SIGTERM at its **default disposition** (not caught, not
+ignored) is killed by `SIGTERM` even while stopped — the kernel delivers
+default-action termination signals to a stopped process without requiring
+it to be scheduled first. The claim "a stopped process cannot see `SIGTERM`
+until resumed" is only true if the process has installed a *handler* for
+it, and whether `oxutrm host --serve` installs one for `SIGTERM` is
+**not verified** by anything in this note or its predecessor.
+
+**What to actually do:** send `kill -CONT <pid>` before `kill -TERM <pid>`
+during cleanup regardless. It is cheap, it is not wrong, and it removes the
+question entirely rather than depending on `oxutrm host --serve`'s signal
+disposition — which is untested here. But do not repeat the earlier
+overstatement: whether `SIGTERM` alone would have sufficed is **untested**,
+not disproven. If it matters later (e.g. some other tool sends `SIGTERM`
+without `SIGCONT`), that is a real open question, not a closed one. Check
+`oxutrm host --list` after cleanup either way, to confirm nothing was left
+registered in a stopped state.
 
 ## What to establish, in order
 
@@ -241,3 +263,16 @@ each other regardless of what the session-layer code does — the failure
 mode phase 2 fixes is specifically a **suspended host process**, which
 cannot be reproduced by two live, unsuspended tasks in the same test binary.
 Only `SIGSTOP` against a real process — Test 1 above — exercises that path.
+
+A second, **short and non-`#[ignore]`d** sibling,
+`session::tests::a_short_silence_raises_and_clears_the_notice_on_a_real_clock`,
+covers the same notice-raise/notice-clear round trip in ~9s of real time on
+every default `cargo test` run, so CI is not entirely without real-clock
+coverage of this behaviour between hand tests. It starts from a genuinely
+synced session and lets `HEARTBEAT_IDLE` (5s) and `SILENT_AFTER` (2s) fire
+for real, back to back, rather than shortening either threshold. Same
+caveat as the 35s test: it is a session-layer guard, not a transport-level
+one. It does not touch what Test 1 above or the config-wiring unit test
+(`the_server_config_actually_wires_no_idle_timeout` in
+`crates/oxutrm-net/src/quic.rs`, added in review to catch a dropped
+`cfg.transport_config(...)` call) cover.
