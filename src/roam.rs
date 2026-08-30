@@ -46,9 +46,14 @@ use std::time::Duration;
 /// could matter.
 ///
 /// It is a floor on probing while `Silent` and nothing else. A healthy session
-/// never reaches it: probing runs only in `Silent`, so a working link makes no
-/// probe syscalls at all. This is emphatically not `IDLE_POLL` coming back as
-/// a pace.
+/// never reaches it: `ClientSession` probes only in `Silent`, so a working link
+/// makes no probe syscalls on any lap of the loop. This is emphatically not
+/// `IDLE_POLL` coming back as a pace.
+///
+/// There is exactly one probe outside `Silent`, and it is not paced by
+/// anything: `ClientSession::new` reads the source address once, when the
+/// connection comes up, to seed the baseline. Taking that first reading inside
+/// the outage instead would read an address the machine had already moved to.
 ///
 /// Read by `ClientSession::follow_route`, which is where the gate on `Silent`
 /// lives.
@@ -112,7 +117,9 @@ impl RouteWatch {
     /// Adopt `seen` as the address the link now works from.
     ///
     /// Called after a successful rebind, so one route change asks for one
-    /// rebind rather than one per probe for the rest of the session.
+    /// rebind rather than one per probe for the rest of the session -- and on
+    /// any probe that already agreed with the baseline, which is how a session
+    /// whose seeding probe failed picks one up later.
     pub fn settle(&mut self, seen: IpAddr) {
         let seen = Self::normalise(seen);
         if !seen.is_unspecified() {

@@ -682,7 +682,8 @@ pub struct ClientSession {
     /// what tells a refresh apart from a transition, which is never paced.
     built: Option<(Phase, Instant)>,
     /// The source address the link was working from, so a moved route can be
-    /// spotted. See [`crate::roam`].
+    /// spotted. Seeded in [`ClientSession::new`] from the path the connection
+    /// came up over. See [`crate::roam`].
     route: crate::roam::RouteWatch,
     /// When the route was last probed, so `Silent` does not probe on every
     /// lap of a loop that wakes up to 125 times a second.
@@ -697,6 +698,29 @@ impl ClientSession {
             pending: Vec::new(),
             size,
         };
+
+        // The address this machine reaches the host from, read once, here.
+        //
+        // Here and not on the first probe of an outage, because the outage is
+        // too late: `SILENT_AFTER` is two seconds, and walking out of Wi-Fi
+        // range moves the route BEFORE the silence is noticed. A baseline
+        // first taken inside `Silent` would read the address the machine had
+        // already moved to, agree with it for ever, and never rebind -- which
+        // is the whole case this exists for. At this moment the connection has
+        // just been established over this very path, so the source address for
+        // the peer is definitionally the address the link works from.
+        //
+        // One `bind`+`connect` pair per session, and `connect` sends no
+        // packet. That is not a pace and does not soften the `Silent` rule:
+        // the rule governs the REBIND, which `follow_route` still does only
+        // while `Silent`. Nothing probes on a `Live` lap.
+        //
+        // A probe that cannot answer is not a reason to refuse a session that
+        // has already connected. `None` is the old behaviour and stays safe:
+        // `RouteWatch::moved` is false without a baseline, so the first probe
+        // of an outage takes one instead.
+        let seed = crate::roam::route_source(link.sink.connection().remote_address()).ok();
+
         Ok(ClientSession {
             screen_rx: Receiver::new(blank),
             input_tx: Sender::new(empty),
@@ -709,11 +733,7 @@ impl ClientSession {
             rejected_total: 0,
             shown: None,
             built: None,
-            // No baseline: the first probe of an outage takes one and the
-            // second can act on it. Probing while healthy would cost a syscall
-            // pair a second for the life of every session, to detect something
-            // that cannot have broken anything yet.
-            route: crate::roam::RouteWatch::new(None),
+            route: crate::roam::RouteWatch::new(seed),
             probed_at: None,
         })
     }
@@ -1431,9 +1451,10 @@ impl ClientSession {
         };
 
         if !self.route.moved(seen) {
-            // Either nothing changed, or this is the first reading of the
-            // outage and there is nothing to compare it with. Adopting it as
-            // the baseline is what makes the NEXT probe able to act.
+            // Nothing changed against the baseline `ClientSession::new` seeded
+            // when the connection came up -- or that seeding probe failed and
+            // there is no baseline at all, in which case this reading becomes
+            // one and the NEXT probe can act on it.
             self.route.settle(seen);
             return false;
         }
@@ -3808,23 +3829,60 @@ mod tests {
         );
     }
 
-    /// The first probe of an outage has no baseline and must not rebind on it.
-    /// A rebind costs a punched NAT hole; spending one to learn nothing is
-    /// strictly worse than waiting a second for a second reading.
+    /// Silence is not evidence that the route moved. A host can go quiet with
+    /// this machine's address exactly where it was -- a crash, a wedged
+    /// process, congestion -- and a rebind costs a punched NAT hole, so it is
+    /// spent only on a reading that actually disagrees with the baseline.
+    ///
+    /// The fixture connects over loopback and stays there, so the probe agrees
+    /// with the baseline `ClientSession::new` seeded. `probed_at` is asserted
+    /// too: without it this passes just as well if a gate returns before
+    /// probing at all, which would make it a guard that cannot fail.
     #[tokio::test]
-    async fn the_first_probe_of_an_outage_does_not_rebind() {
+    async fn a_probe_that_finds_the_route_unchanged_does_not_rebind() {
         let (_host, mut session) = with_notice().await;
         let t = Instant::now();
         let before = session.link.socket.local_addr().expect("a bound socket");
 
         assert!(
             !session.follow_route(t),
-            "rebound with no baseline to compare"
+            "rebound on a route that had not moved"
+        );
+        assert!(
+            session.probed_at.is_some(),
+            "the probe never ran, so this asserts nothing about rebinding"
         );
         assert_eq!(
             session.link.socket.local_addr().expect("a bound socket"),
             before,
-            "the session socket was swapped on the first probe"
+            "the session socket was swapped though the route was unchanged"
+        );
+    }
+
+    /// The baseline is taken when the connection comes up, not on the first
+    /// probe of the outage. `SILENT_AFTER` is two seconds, so walking out of
+    /// Wi-Fi range moves the route BEFORE the silence is noticed: a baseline
+    /// first read inside `Silent` would read the address already moved to,
+    /// agree with it for ever, and never rebind -- inert for the one case this
+    /// whole phase exists for.
+    #[tokio::test]
+    async fn the_baseline_is_taken_when_the_connection_comes_up() {
+        let (_host, session) = pair("/bin/sh").await;
+        let elsewhere: std::net::IpAddr = "10.46.18.101".parse().expect("a literal address");
+
+        // A baseline is what makes a different address readable as a move.
+        // With none, `moved` is false for everything and no outage can ever
+        // reach the rebind.
+        assert!(
+            session.route.moved(elsewhere),
+            "a fresh session had no baseline; the first probe of an outage \
+             would adopt whatever it found and never rebind"
+        );
+        // And it was not taken by the loop: this is one reading at startup,
+        // not probing on `Live` laps.
+        assert!(
+            session.probed_at.is_none(),
+            "the seeding probe went through the loop's paced path"
         );
     }
 }
