@@ -27,6 +27,7 @@ mod ladder;
 mod link;
 mod linkstate;
 mod loopback;
+mod roam;
 mod serve;
 mod session;
 
