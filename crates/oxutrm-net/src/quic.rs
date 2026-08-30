@@ -366,34 +366,30 @@ mod tests {
     /// `transport_config()` RETURNS. It says nothing about whether
     /// `server_config`/`client_config` actually WIRE it in: if
     /// `cfg.transport_config(transport_config())` were ever dropped from
-    /// `server_config` (or from `client_config`), that test would keep
-    /// passing, quinn's built-in 30 s default would silently come back for
-    /// real connections, and nothing else catches it -- the composed test in
-    /// `src/session.rs` cannot see it either (see its doc comment: two live,
-    /// unsuspended quinn endpoints on loopback never go idle regardless of
-    /// `max_idle_timeout`, because they keep ACKing and keep-aliving each
-    /// other). This asserts the WIRING, on the server side, where it is
-    /// possible to: `quinn::ServerConfig::transport` is a public field.
+    /// either function, that test would keep passing, quinn's built-in 30 s
+    /// default would silently come back for real connections, and nothing
+    /// else catches it -- the composed test in `src/session.rs` cannot see
+    /// it either (see its doc comment: two live, unsuspended quinn
+    /// endpoints on loopback never go idle regardless of `max_idle_timeout`,
+    /// because they keep ACKing and keep-aliving each other). This asserts
+    /// the WIRING directly: `quinn::ServerConfig::transport` is a public
+    /// field, so its `Debug` output is read straight off the built config.
     ///
-    /// The client side of this same wiring (`client_config`'s
-    /// `cfg.transport_config(transport_config())` call) has no equivalent
-    /// test and, as far as I can tell, cannot: `quinn::ClientConfig` is
-    /// `quinn_proto::ClientConfig` re-exported as-is, its `transport` field
-    /// is `pub(crate)` to quinn-proto (not visible to us), it derives no
-    /// `Debug`, and neither quinn nor quinn-proto 0.11 expose a getter for a
-    /// connection's negotiated idle timeout either -- so there is no public
-    /// API, direct or behavioural, that reaches this specific line from
-    /// outside quinn-proto. A live-connection test would hit exactly the
-    /// same masking `src/session.rs`'s composed-test doc comment describes,
-    /// for the identical reason. In practice the client side of this regression is
-    /// not entirely unguarded: Test 1 of the hand-test note
-    /// (`docs/superpowers/notes/2026-08-30-tier-a-hand-test.md`) -- `SIGSTOP`
-    /// the host, confirm the client is alive at 60 s -- would also catch a
-    /// silently-broken `client_config` wiring, because a client whose own
-    /// idle timer reverted to 30 s would die at ~33 s against a host that
-    /// truly cannot answer, same as before phase 2. That is a real host
-    /// hand test standing in for a unit test, not a substitute for one, and
-    /// is recorded here so the gap is not silently assumed closed.
+    /// **Correction, caught in review:** an earlier version of this comment
+    /// claimed the client side of the same wiring had no equivalent and
+    /// could not, because `quinn::ClientConfig` derives no `Debug` and its
+    /// `transport` field is `pub(crate)` to quinn-proto. The first half of
+    /// that was true and the conclusion drawn from it was not: `ClientConfig`
+    /// has a **hand-written** `impl fmt::Debug` (quinn-proto 0.11.17,
+    /// `src/config/mod.rs:645-653`) that includes
+    /// `.field("transport", &self.transport)`, and `TransportConfig` itself
+    /// implements `Debug` too -- so the whole-struct `Debug` of a real
+    /// `client_config()` prints the wired transport in full, idle timeout
+    /// included. Found by actually compiling and printing it rather than
+    /// reasoning from the absence of a `#[derive(Debug)]` -- the same lesson
+    /// this project has recorded before: compiling a third-party API beats
+    /// recalling it. See `the_client_config_actually_wires_no_idle_timeout`
+    /// below for the client-side twin of this test.
     #[test]
     fn the_server_config_actually_wires_no_idle_timeout() {
         let (cert, key, fingerprint) = generate_cert().unwrap();
@@ -406,6 +402,26 @@ mod tests {
              carries an idle timeout, even though transport_config() itself \
              does not -- the wiring line was dropped: {:?}",
             cfg.transport
+        );
+    }
+
+    /// The client-side twin of `the_server_config_actually_wires_no_idle_timeout`
+    /// above. `quinn::ClientConfig::transport` is `pub(crate)` to
+    /// quinn-proto, so unlike the server side this reads the WHOLE struct's
+    /// `Debug` output (its hand-written `impl fmt::Debug` includes the
+    /// `transport` field) rather than a single public field -- same
+    /// question, different door.
+    #[test]
+    fn the_client_config_actually_wires_no_idle_timeout() {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let cfg = client_config(HostSpki::new(fingerprint), cert, key)
+            .expect("a client config with a self-signed cert and key");
+        assert_eq!(
+            format!("{cfg:?}").contains("max_idle_timeout: Some"),
+            false,
+            "client_config() built a ClientConfig whose WIRED transport \
+             still carries an idle timeout, even though transport_config() \
+             itself does not -- the wiring line was dropped: {cfg:?}"
         );
     }
 
