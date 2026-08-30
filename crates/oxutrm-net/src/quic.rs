@@ -34,6 +34,30 @@ pub const ALPN: &[u8] = b"oxutrm/1";
 /// absorb a burst.
 const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
+/// How long [`quic_client`] waits for its handshake to complete.
+///
+/// **Not a tuning knob — the alternative to it is a terminal that hangs.**
+/// `Connecting` resolves when the handshake finishes or when the connection
+/// fails, and with `max_idle_timeout` set to `None` above there is a third
+/// outcome: neither. quinn only arms an idle timer in `on_packet_authenticated`,
+/// so total silence never armed one and this future never resolved even before
+/// that change; what the change added is the host that answers the Initial and
+/// then dies mid-handshake, which used to fail at the default thirty seconds
+/// and now waits for ever.
+///
+/// What the user sees without this is the worst version of the failure. The
+/// client has already put the terminal in raw mode by the time it connects, so
+/// there is no output, no prompt and no Ctrl-C — an attach that will never
+/// finish and never say so.
+///
+/// Thirty seconds, matching the host's `ACCEPT_TIMEOUT` twin in
+/// `src/accept.rs`, and for the same reason: ICE has already completed
+/// connectivity checks over this very path, so the peer is known reachable and
+/// its half of the handshake is one round trip away. Thirty seconds is tens of
+/// round trips on a link bad enough to be worth keeping, and the two ends give
+/// up at about the same moment rather than one of them outliving the other.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The transport settings, with the one that fails silently.
 ///
 /// **Both datagram buffer sizes must be set.** Omit either and QUIC datagrams
@@ -321,11 +345,22 @@ pub async fn quic_client(
         .local_addr()
         .context("reading the endpoint's local address")?;
     let peer = to_socket_family(&local, peer);
-    let connection = endpoint
+    let connecting = endpoint
         .connect(peer, CERT_NAME)
-        .context("starting the QUIC handshake")?
-        .await
-        .context("completing the QUIC handshake")?;
+        .context("starting the QUIC handshake")?;
+
+    // Bounded, because the un-bounded case is a client that hangs in raw mode
+    // with nothing on the terminal. See [`CONNECT_TIMEOUT`].
+    let connection = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Ok(result) => result.context("completing the QUIC handshake")?,
+        Err(_) => anyhow::bail!(
+            "no answer from the host at {peer}: the QUIC handshake did not \
+             complete within {}s. The network path to it was already working, \
+             so the host itself most likely went away mid-attach. Nothing was \
+             started; attaching again is safe.",
+            CONNECT_TIMEOUT.as_secs()
+        ),
+    };
 
     Ok((connection, endpoint, stun_rx))
 }
@@ -849,5 +884,65 @@ mod tests {
         );
         conn.close(0u32.into(), b"done");
         server.abort();
+    }
+
+    /// The client gives up on its own, and it does so at [`CONNECT_TIMEOUT`].
+    ///
+    /// The twin of `the_accept_gives_up_when_no_client_ever_arrives` in
+    /// `src/accept.rs`, and needed for the same reason: `Connecting` resolves
+    /// on success or on a connection failure, and silence is neither. quinn
+    /// arms its idle timer only once a packet has been authenticated, so this
+    /// case never had one — and with `max_idle_timeout` now `None`, neither
+    /// does a host that answers and then dies mid-handshake.
+    ///
+    /// The peer here is a bound UDP socket nothing is listening on, so the
+    /// datagrams are swallowed rather than refused: an unbound port would draw
+    /// an ICMP port-unreachable and could end the attempt without the deadline
+    /// ever being reached, which would make this a test of the kernel.
+    ///
+    /// The outer 120 s is the harness's own patience, not the thing under
+    /// test; the assertion on `elapsed` is what tells "gave up at its own
+    /// deadline" from "gave up for some other reason". `start_paused` makes the
+    /// clock jump to the next deadline whenever the runtime idles, so a
+    /// thirty-second wait costs no wall-clock seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_that_is_never_answered_fails_instead_of_hanging_for_ever() {
+        let (_cert, _key, fingerprint) = generate_cert().unwrap();
+        let me = client_id();
+        // Bound, and never read from: a black hole rather than a refusal.
+        let black_hole = socket().await;
+        let peer = black_hole.local_addr().unwrap();
+        let client_sock = socket().await;
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            quic_client(
+                &client_sock,
+                peer,
+                HostSpki::new(fingerprint),
+                me.cert,
+                me.key,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let failed = outcome
+            .unwrap_or_else(|_| {
+                panic!("the handshake never gave up: the client hangs in raw mode for ever")
+            })
+            .expect_err("a socket nobody is listening on completed a handshake");
+        assert!(
+            elapsed >= CONNECT_TIMEOUT,
+            "it gave up after {elapsed:?}, short of its own CONNECT_TIMEOUT"
+        );
+        // The user is looking at a terminal that has just come back out of raw
+        // mode. "deadline has elapsed" would tell them nothing.
+        let said = failed.to_string();
+        assert!(
+            said.contains(&peer.to_string()) && said.contains("30s"),
+            "the message names neither the host nor how long it waited: {said}"
+        );
     }
 }

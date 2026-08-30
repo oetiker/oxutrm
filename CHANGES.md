@@ -31,6 +31,13 @@
   `LinkState::heard` cleared `prefix_pending` on every arriving frame; it now
   clears it only when the frame actually changes the phase. Shipped in 0.1.0,
   fixed here.
+- **An attach whose host never finishes the handshake now fails instead of
+  hanging.** The client's `connect` had no deadline of its own, and quinn arms
+  its idle timer only once a packet has been authenticated — so a host that
+  never answered left the client waiting for ever, with the terminal already in
+  raw mode and nothing on it: no output, no prompt, no `Ctrl-C`. It now gives up
+  after thirty seconds, the same deadline the host's accept uses, and says which
+  host it waited for and for how long. Shipped in 0.1.0, fixed here.
 
 ### Compatibility
 
