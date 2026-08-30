@@ -1631,6 +1631,124 @@ mod tests {
         pair_on("127.0.0.1:0", shell).await
     }
 
+    /// A UDP relay the test can blackhole in both directions.
+    ///
+    /// The in-process pair cannot reproduce a path outage: two live quinn
+    /// endpoints on loopback keep ACKing each other whatever the session layer
+    /// does, and `SIGSTOP` against a real host does not do it either -- a
+    /// stopped process still has a kernel receiving into its socket buffer,
+    /// so on resume it drains the backlog and ACKs it, and the client
+    /// recovers instantly. Neither is an outage. **Packets have to actually
+    /// be dropped**, which is what this does.
+    struct Relay {
+        addr: std::net::SocketAddr,
+        blackhole: Arc<std::sync::atomic::AtomicBool>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Relay {
+        fn blackhole(&self, on: bool) {
+            self.blackhole
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Sit between the client and `host_addr`, forwarding both ways until
+    /// told to stop.
+    async fn relay_to(host_addr: std::net::SocketAddr) -> Relay {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&blackhole);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            // Learned from the first packet through, and kept across a
+            // blackhole: the client's address does not change just because
+            // the path did.
+            let mut client_addr: Option<std::net::SocketAddr> = None;
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                if from != host_addr {
+                    client_addr = Some(from);
+                }
+                // Dropped AFTER learning the address, so a blackhole that
+                // starts before the first packet still ends up able to
+                // forward once it lifts.
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let to = if from == host_addr {
+                    match client_addr {
+                        Some(a) => a,
+                        None => continue,
+                    }
+                } else {
+                    host_addr
+                };
+                let _ = sock.send_to(&buf[..n], to).await;
+            }
+        });
+        Relay {
+            addr,
+            blackhole,
+            _task: task,
+        }
+    }
+
+    /// `pair`, with a blackholeable relay in the middle.
+    async fn pair_through_relay(shell: &str) -> (HostSession, ClientSession, Relay) {
+        let (cert, key, fingerprint) = generate_cert().unwrap();
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
+
+        let host_sock = udp().await;
+        let host_addr = host_sock.local_addr().unwrap();
+        let (host_ep, _permit, _stun) =
+            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+                .await
+                .unwrap();
+
+        let relay = relay_to(host_addr).await;
+
+        let client_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let accepting = tokio::spawn(async move {
+            let incoming = host_ep.accept().await.expect("an inbound connection");
+            let conn = incoming.await.expect("a completed handshake");
+            (conn, host_ep)
+        });
+
+        // The client's peer is the RELAY, which is the whole point.
+        let (client_conn, client_ep, _cstun) = quic_client(
+            &client_sock,
+            relay.addr,
+            HostSpki::new(fingerprint),
+            client_cert,
+            client_key,
+        )
+        .await
+        .unwrap();
+        let (host_conn, host_ep) = accepting.await.unwrap();
+
+        let host = HostSession::spawn(
+            "/bin/sh",
+            size(),
+            200,
+            Link::new(host_conn, host_ep, host_sock),
+        )
+        .unwrap();
+        let client = ClientSession::new(
+            size(),
+            caps(),
+            Link::new(client_conn, client_ep, client_sock),
+        )
+        .unwrap();
+
+        let mut host = host;
+        host.term.write_input(shell.as_bytes()).unwrap();
+        (host, client, relay)
+    }
+
     async fn pair_on(client_bind: &str, shell: &str) -> (HostSession, ClientSession) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
         // The client now has an identity of its own, and the host has to be
@@ -1682,6 +1800,162 @@ mod tests {
         let mut host = host;
         host.term.write_input(shell.as_bytes()).unwrap();
         (host, client)
+    }
+
+    /// EXPERIMENT, not a guard: how long does recovery take after a real
+    /// blackout, as a function of how long the blackout lasted?
+    ///
+    /// Prints a table. Run it with
+    /// `cargo test -j4 --bin oxutrm blackout_recovery_curve -- --nocapture
+    /// --ignored --test-threads=1`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "experiment; minutes of real wall clock"]
+    async fn blackout_recovery_curve() {
+        for secs in [15u64, 60, 150, 300] {
+            let (mut host, mut client, relay) = pair_through_relay("/bin/sh").await;
+            let mut out = Vec::new();
+
+            // Get to a genuinely synced session first, or the outage starts
+            // from a state that was never healthy.
+            let warm = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < warm {
+                let _ = host.turn();
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                let _ = client.notice_at(Instant::now());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let before = client.link.sink.connection().stats().path.sent_packets;
+            // The session must be HEALTHY before the outage, or the rung
+            // measures a session that was never up.
+            let healthy_first = client.notice_at(Instant::now()).is_none();
+
+            relay.blackhole(true);
+            let dark = tokio::time::Instant::now() + Duration::from_secs(secs);
+            while tokio::time::Instant::now() < dark {
+                let _ = host.turn();
+                // `run_on` beats every lap; without this the client is never
+                // OWED an answer, never goes `Silent`, and the recovery check
+                // below passes against a notice that never appeared. That is
+                // exactly the "guard that cannot fail" this project keeps
+                // producing, and it produced one here.
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                let _ = client.notice_at(Instant::now());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let during = client.link.sink.connection().stats().path.sent_packets;
+            // The discriminating observable: was the box actually UP when the
+            // path came back? If not, this rung measured nothing.
+            let went_silent = client.notice_at(Instant::now()).is_some();
+
+            // The path is perfect again from this instant.
+            relay.blackhole(false);
+            let restored = tokio::time::Instant::now();
+            let give_up = restored + Duration::from_secs(400);
+            let mut recovered: Option<Duration> = None;
+            while tokio::time::Instant::now() < give_up {
+                let _ = host.turn();
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                if client.notice_at(Instant::now()).is_none() {
+                    recovered = Some(restored.elapsed());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let after = client.link.sink.connection().stats().path.sent_packets;
+
+            let verdict = match recovered {
+                Some(d) => format!("recovered in {:>7.2}s", d.as_secs_f64()),
+                None => "NO RECOVERY in 400s".to_string(),
+            };
+            println!(
+                "blackout {secs:>4}s -> {verdict} | healthy_first={healthy_first} \
+                 went_silent={went_silent} | quinn packets: {before} -> {during} \
+                 (dark) -> {after}"
+            );
+            assert!(
+                healthy_first && went_silent,
+                "rung {secs}s measured nothing: healthy_first={healthy_first} \
+                 went_silent={went_silent} -- the notice must be UP when the path \
+                 returns or the recovery check cannot fail"
+            );
+        }
+    }
+
+    /// Does a rebind rescue a backed-off connection?
+    ///
+    /// The candidate cheap fix for the blackout bug is "rebind while `Silent`,
+    /// not only when the route IP moved" -- the machinery already exists in
+    /// `follow_route`. This asks whether it would actually help, by rebinding
+    /// right when the path comes back and comparing against
+    /// `blackout_recovery_curve`'s number for the same blackout length.
+    ///
+    /// `cargo test -j4 --bin oxutrm does_a_rebind_rescue -- --nocapture
+    /// --ignored --test-threads=1`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "experiment; minutes of real wall clock"]
+    async fn does_a_rebind_rescue_a_backed_off_connection() {
+        for secs in [60u64, 150] {
+            let (mut host, mut client, relay) = pair_through_relay("/bin/sh").await;
+            let mut out = Vec::new();
+
+            let warm = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < warm {
+                let _ = host.turn();
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                let _ = client.notice_at(Instant::now());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let healthy_first = client.notice_at(Instant::now()).is_none();
+
+            relay.blackhole(true);
+            let dark = tokio::time::Instant::now() + Duration::from_secs(secs);
+            while tokio::time::Instant::now() < dark {
+                let _ = host.turn();
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                let _ = client.notice_at(Instant::now());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let went_silent = client.notice_at(Instant::now()).is_some();
+
+            relay.blackhole(false);
+            // THE INTERVENTION: a fresh socket, exactly as `follow_route`
+            // builds one, the moment the path is back.
+            let cfg = oxutrm_net::NetConfig::default();
+            let bound = oxutrm_net::bind_socket(&cfg).expect("a fresh socket");
+            let socket = crate::ladder::adopt(bound).expect("adopting it");
+            let rebound = client.rebind(socket).is_ok();
+
+            let restored = tokio::time::Instant::now();
+            let give_up = restored + Duration::from_secs(400);
+            let mut recovered: Option<Duration> = None;
+            while tokio::time::Instant::now() < give_up {
+                let _ = host.turn();
+                let _ = client.heartbeat(Instant::now());
+                let _ = client.turn(&[], &mut out);
+                if client.notice_at(Instant::now()).is_none() {
+                    recovered = Some(restored.elapsed());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let verdict = match recovered {
+                Some(d) => format!("recovered in {:>7.2}s", d.as_secs_f64()),
+                None => "NO RECOVERY in 400s".to_string(),
+            };
+            println!(
+                "REBIND blackout {secs:>4}s -> {verdict} | rebound={rebound} \
+                 healthy_first={healthy_first} went_silent={went_silent}"
+            );
+            assert!(
+                healthy_first && went_silent && rebound,
+                "rung {secs}s measured nothing"
+            );
+        }
     }
 
     /// The bug the loopback tests structurally could not catch.
