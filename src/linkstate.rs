@@ -158,19 +158,30 @@ impl LinkState {
         // its own clock, or the grace period would be measured from a moment
         // the host has already replied to.
         self.owed_since = None;
-        // A `Ctrl-\` whose letter never came belongs to the box that was up
-        // when it was typed. Carrying it into the next one lets it eat the
-        // first byte typed there -- and if that byte is `s`, the `Confirming`
-        // box answers its own question and delivers typing nobody confirmed.
-        self.prefix_pending = false;
         // Coming back with something typed blind is a question, not a
         // resumption. Delivering it silently would replay it against a screen
         // that moved while the user could not watch.
-        self.phase = if self.held.is_empty() {
+        let next = if self.held.is_empty() {
             Phase::Live
         } else {
             Phase::Confirming
         };
+        // A `Ctrl-\` whose letter never came belongs to the box that was up
+        // when it was typed. Carrying it into a DIFFERENT box lets it eat the
+        // first byte typed there -- and if that byte is `s`, the `Confirming`
+        // box answers its own question and delivers typing nobody confirmed.
+        //
+        // "Different" is the operative word: `take_frames` now calls `heard`
+        // on every frame it applies, including frames that land between the
+        // prefix and its letter, which genuinely arrive in two separate
+        // reads. When `next` is the SAME phase as the one already showing --
+        // the box the prefix was typed into is still up -- the reasoning
+        // above does not apply, and clearing the prefix would make the box
+        // eat its own confirmation key instead.
+        if next != self.phase {
+            self.prefix_pending = false;
+        }
+        self.phase = next;
     }
 
     /// We sent something, so a reply is owed from here.
@@ -228,31 +239,13 @@ impl LinkState {
             // It is deliberately NOT `owed_since` either, which would be a
             // different and smaller number -- the reply may have started being
             // owed long after the host went quiet. The consequence is that the
-            // displayed figure can OVERSTATE the silence. Ordinarily by at
-            // most `HEARTBEAT_IDLE`, because a heartbeat that is answered
-            // refreshes `last_heard`.
-            //
-            // Ordinarily, and not always, and the exception is written down
-            // because it is the kind of thing that gets rediscovered as a bug:
-            // `ClientSession::take_frames` applies a frame the pacing tick
-            // scavenged out of the channel without telling this module, so
-            // `last_heard` does not move for it and the counter in a real
-            // outage can read higher than the truth.
-            //
-            // What keeps that from becoming a FALSE notice is `note_heard` on
-            // the loop's frame arm, which clears `owed_since` unconditionally
-            // whenever a frame wakes the loop. Not the ack the scavenged frame
-            // carries: that clears the owing only when nothing was appended in
-            // the same turn, and `turn_with` appends input BEFORE it takes
-            // frames, so on a lap that started with a keystroke the sequence
-            // has already moved past the ack and a reply is still owed.
-            //
-            // So the bad case needs every inbound frame across a full
-            // `SILENT_AFTER` window to be scavenged by a pacing, keyboard or
-            // resize lap rather than the frame arm, with the user typing
-            // steadily enough throughout that a reply is never not owed. That
-            // is a race repeated for two seconds rather than a path, and the
-            // next frame that wakes the loop ends it.
+            // displayed figure can OVERSTATE the silence. By at most
+            // `HEARTBEAT_IDLE`, because a heartbeat that is answered refreshes
+            // `last_heard`, and nothing else lets it fall further behind:
+            // `ClientSession::take_frames` calls `note_heard` for every frame
+            // it applies, whichever lap -- pacing, keyboard, resize, or the
+            // loop's own frame arm -- scavenges it out of the channel, so
+            // `last_heard` moves the moment any frame lands.
             self.phase = Phase::Silent {
                 since: self.last_heard,
             };

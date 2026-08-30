@@ -761,6 +761,14 @@ impl ClientSession {
                 Ok(true) => {
                     turn.applied += 1;
                     painted = true;
+                    // Wherever a frame is applied, the host was heard. The
+                    // loop's `Wake::Frame` arm is not the only path here:
+                    // `try_recv` below scavenges frames on pacing, keyboard
+                    // and resize laps, and a frame applied on one of those
+                    // used to repaint the screen underneath a box still
+                    // saying nobody was answering. It also moves `last_heard`,
+                    // which is what the `silent for Ns` counter is built from.
+                    self.note_heard(Instant::now());
                 }
                 Ok(false) => {}
                 // See the host's copy of this arm: a silently swallowed
@@ -3076,6 +3084,83 @@ mod tests {
         assert!(notice.is_some(), "the fixture asked the user nothing");
         session.shown = notice;
         (host, session)
+    }
+
+    /// Wait until a frame is sitting in the client's source, without applying
+    /// it. `try_recv` in the code under test is what must pick it up.
+    ///
+    /// `FrameSource` has no `has_frame` (or equivalent peek) to poll, so this
+    /// falls back to sleeping briefly and trusting `try_recv` inside `turn` to
+    /// find what arrived. That is a timing proxy, not a direct wait, and this
+    /// project has recorded that a timing proxy becomes a race when the thing
+    /// it proxied moves.
+    async fn wait_for_frame(_session: &mut ClientSession) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A frame that arrives on a pacing lap rather than through the frame arm
+    /// still counts as hearing from the host. Without this the picture comes
+    /// back to life underneath a box saying nobody is answering.
+    #[tokio::test]
+    async fn a_scavenged_frame_clears_the_notice() {
+        let (mut host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+
+        // The host answers. The frame lands in the channel, but nothing wakes
+        // the loop's frame arm -- this is the pacing lap that scavenges it.
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+
+        assert!(
+            matches!(session.link_state.phase(), Phase::Live),
+            "a frame was applied and the client still believes the host is silent: {:?}",
+            session.link_state.phase()
+        );
+    }
+
+    /// The counter is built from `last_heard`, so a scavenged frame must move
+    /// it or the box overstates the outage for as long as the box is up.
+    #[tokio::test]
+    async fn a_scavenged_frame_takes_the_notice_down() {
+        let (mut host, mut session) = with_notice().await;
+        let mut out = Vec::new();
+
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+
+        assert!(
+            session.notice_at(Instant::now()).is_none(),
+            "the notice survived a frame that was applied"
+        );
+    }
+
+    /// `heard` clears a half-typed prefix, and this task makes `heard` run far
+    /// more often. A `Ctrl-\` and its letter genuinely arrive in two reads;
+    /// a frame landing between them must not eat the command.
+    #[tokio::test]
+    async fn a_frame_between_the_prefix_and_its_letter_does_not_eat_the_command() {
+        let (mut host, mut session) = with_confirming_notice(b"echo hi\r").await;
+        let mut out = Vec::new();
+
+        // The prefix arrives at the end of one read...
+        session
+            .route_keys(&[CTRL_BACKSLASH], &mut out)
+            .expect("the prefix is held");
+        // ...a frame is applied between the two reads...
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        // ...and the letter arrives in the next.
+        session
+            .route_keys(b"d", &mut out)
+            .expect("the letter lands");
+
+        assert!(
+            session.link_state.held().is_empty(),
+            "Ctrl-\\ d did not drop the held buffer: the frame ate the prefix"
+        );
     }
 
     /// Everything the client has said to the host this session. Input is
