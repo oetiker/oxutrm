@@ -8,6 +8,22 @@
 
 ### Fixed
 
+- **A session whose network came back stayed dead for minutes.** Removing the
+  idle timeout in 0.2.0 so a session could outlive an outage also removed,
+  unnoticed, the only thing bounding QUIC's exponential probe backoff: the
+  probe interval is `pto_base * 2^min(pto_count, 16)`, and normally the idle
+  timeout closes such a connection long before that matters. With no idle
+  timeout nothing did, so a session whose path had returned waited on a timer
+  that had doubled its way into the minutes — both ends alive, host merely
+  detached, path perfect, terminal dead. The backoff exponent is now capped at
+  6, so the probe interval tops out at 64x the base rather than 65536x. A
+  150-second blackout recovers in 1.24 s where it used to take 106.65 s; a
+  60-second one in 0.55 s where it took 10.19 s. This costs about three packets
+  per second while a path is out and nothing at all on a healthy connection,
+  where the probe counter is zero. The cap needs a knob `quinn-proto` does not
+  expose, so the build carries a patched copy under `vendor/`; see
+  `docs/quinn-pto-backoff.md`.
+
 ## 0.2.0 - 2026-08-30
 
 ### New
