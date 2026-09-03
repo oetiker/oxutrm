@@ -77,11 +77,13 @@ fn run_host(args: &[String]) -> Result<()> {
         // Works today: it needs the registry and nothing else.
         Some("--list") => run_host_list(),
         Some("--serve") => serve::run_host_serve(),
-        Some("--attach") => Err(anyhow::anyhow!(
-            "`oxutrm host --attach` is not wired up yet. Serving and connecting \
-             both work, so the sessions are real and `--list` shows them - what \
-             is missing is relaying a second attach into a running one."
-        )),
+        Some("--attach") => match args.get(1) {
+            Some(id) => run_host_attach(id),
+            None => Err(anyhow::anyhow!(
+                "`oxutrm host --attach` needs a session id. \
+                 `oxutrm host --list` shows them."
+            )),
+        },
         Some(other) => {
             eprintln!("oxutrm host: unknown option {other:?}\nTry `oxutrm host --help`.");
             std::process::exit(2);
@@ -110,6 +112,50 @@ fn run_host_list() -> Result<()> {
     let sessions = oxutrm_host::Registry::list().context("reading the session registry")?;
     print!("{}", oxutrm_host::attach::format_session_list(&sessions));
     Ok(())
+}
+
+/// `oxutrm host --attach <id>`: relay a second client into a running session.
+///
+/// `connect_to_session` checks the registry before touching the socket, so
+/// "no such session" and "the session is dead" are told apart; `relay_signals`
+/// decodes and re-encodes rather than copying bytes, so garbage typed at this
+/// terminal cannot be relayed into a running session. Both already existed and
+/// were already tested — this only wires them to stdin and stdout.
+fn run_host_attach(id: &str) -> Result<()> {
+    let root = oxutrm_host::resolve_registry_root()
+        .context("deciding where oxutrm records its sessions")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the runtime")?;
+    let outcome = runtime.block_on(async {
+        let stream =
+            oxutrm_host::attach::connect_to_session(&oxutrm_host::Registry::dir_at(&root.base), id)
+                .await?;
+        let (sr, mut sw) = stream.into_split();
+        let mut sr = tokio::io::BufReader::new(sr);
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut stdout = tokio::io::stdout();
+
+        // Both directions, concurrently, until either side finishes.
+        tokio::select! {
+            r = oxutrm_host::attach::relay_signals(&mut stdin, &mut sw) => { r?; }
+            r = oxutrm_host::attach::relay_signals(&mut sr, &mut stdout) => { r?; }
+        }
+        anyhow::Ok(())
+    });
+
+    // Do not wait for a stdin read that may still be parked in the blocking
+    // pool. `tokio::select!` above cancels whichever `relay_signals` branch
+    // lost, but a blocking read can't be cancelled, only abandoned — and
+    // `tokio::io::stdin()` is exactly that read. `serve.rs`'s R3 comment
+    // documents the same shape of bug, measured on the host's signalling
+    // pipe: a runtime dropped normally waits for that read and the process
+    // never returns until the terminal produces a byte. Shutting down in the
+    // background is the same fix, here for the terminal instead of ssh's
+    // pipe.
+    runtime.shutdown_background();
+    outcome
 }
 
 /// Both halves in one process over a channel, with no network in between.
@@ -287,9 +333,9 @@ USAGE
   oxutrm host --serve         Create a session and hand it to a client.
   oxutrm host --attach <id>   Relay a new attach into a running session.
 
---attach does not work yet and says so when you run it. --serve is complete:
-it creates the session and hands it to a client, which connects, paints and
-carries the shell's exit code back.
+--serve creates the session and hands it to the first client, which connects,
+paints and carries the shell's exit code back. --attach relays a second
+client's signalling into that same running session.
 
 A session that reached the far end over an ssh tunnel (rung 4) is listed as
 NOT detachable: it carries its data inside that ssh connection, so it dies
@@ -327,8 +373,7 @@ USAGE
       List sessions on this machine, pruning any whose process is gone.
 
   oxutrm host --attach <session-id>
-      Reattach to a running session. NOT IMPLEMENTED yet; it exits with an
-      error saying so.
+      Relay a new client into a running session.
 
   oxutrm loopback
       Run both halves in one process, with no network in between.
@@ -347,24 +392,16 @@ mod tests {
     /// Both help strings spent this project's whole life so far saying the
     /// local half "is still being wired" — true when written, false since the
     /// first two-machine run, and the first thing a new user reads. This
-    /// pins the pair together so the next feature to land cannot quietly
-    /// leave the documentation behind: `--attach` is the one subcommand that
-    /// really is unimplemented, and the day it works, this fails.
+    /// pins the pair together so a feature landing cannot quietly leave the
+    /// documentation behind.
+    ///
+    /// `--attach` was the same story: both usage strings called it
+    /// unimplemented, and the day it worked (this commit) that half of the
+    /// test was deleted rather than left asserting a now-false claim — see
+    /// `attach_without_an_id_says_where_to_find_one` and
+    /// `crates/oxutrm-host/tests/attach.rs` for what actually covers it now.
     #[test]
     fn the_help_text_agrees_with_what_is_actually_implemented() {
-        let attach_works = run_host(&["--attach".to_owned(), "id".to_owned()]).is_ok();
-        assert!(
-            !attach_works,
-            "`host --attach` works now — say so in USAGE and HOST_USAGE, and \
-             delete this half of the test"
-        );
-        assert!(
-            HOST_USAGE.contains("--attach does not work yet"),
-            "attach is unimplemented and the host help no longer says so"
-        );
-
-        // The half that WAS wrong. `run_connect` drives a real session, and
-        // has done since the first macOS-to-Linux run.
         for (name, text) in [("USAGE", USAGE), ("HOST_USAGE", HOST_USAGE)] {
             assert!(
                 !text.contains("still being wired"),
@@ -375,8 +412,14 @@ mod tests {
                 !text.contains("nobody to paint for"),
                 "{name} still claims a served session has nobody to paint for"
             );
-            // Reattach is the same unimplemented thing as `--attach`, and the
-            // top line of the usage was promising it.
+            assert!(
+                !text.contains("does not work yet") && !text.contains("NOT IMPLEMENTED"),
+                "{name} still claims --attach is unimplemented, which is no \
+                 longer true"
+            );
+            // Reattach via a bare `oxutrm <ssh-target>` is a *different*,
+            // still-unimplemented thing from `host --attach <id>` — see the
+            // top line of USAGE, which still says so on purpose.
             assert!(
                 !text.contains("or reattach to a session already running"),
                 "{name} promises reattach, which is the one thing that does \
@@ -404,6 +447,28 @@ mod tests {
         assert!(dispatch(&["--help".to_string()]).is_ok());
         assert!(dispatch(&["-h".to_string()]).is_ok());
         assert!(dispatch(&["help".to_string()]).is_ok());
+    }
+
+    /// `--attach` with no id is a usage error that points at `--list`, not a
+    /// panic on `args[1]`.
+    ///
+    /// Checking only for `"--list"` is not enough to prove this: the old
+    /// blanket "not wired up yet" error already mentioned `--list` in passing
+    /// (to say it *does* work), so that assertion alone passes whether or not
+    /// the no-id case is actually handled. `"needs a session id"` is the part
+    /// that only the real usage error says.
+    #[test]
+    fn attach_without_an_id_says_where_to_find_one() {
+        let err = run_host(&["--attach".to_owned()]).expect_err("no id given");
+        let text = err.to_string();
+        assert!(
+            text.contains("needs a session id"),
+            "the error does not say an id is required: {text}"
+        );
+        assert!(
+            text.contains("--list"),
+            "the error does not tell the user how to find a session id: {text}"
+        );
     }
 
     #[test]
