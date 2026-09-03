@@ -35,16 +35,6 @@ pub(crate) struct Attached {
     pub path: PathDescription,
     /// The client's terminal size, from its `ClientHello`.
     pub client_size: TermSize,
-    /// The generation this attach ran as. `SessionMeta::attach_id` after
-    /// `begin_attach` bumped it.
-    ///
-    /// `serve()` does not need this yet — it already has `meta.attach_id` --
-    /// but a reattach's caller reads `meta` through a lock a socket peer does
-    /// not otherwise hold, so the exchange hands the generation back directly
-    /// rather than making that caller re-derive it. Unused until that caller
-    /// exists.
-    #[allow(dead_code)]
-    pub attach_id: u64,
 }
 
 /// R4 to R10: a fresh certificate, the STUN/ICE ladder, the hello exchange and
@@ -180,7 +170,6 @@ where
         link: Link::new(connection, endpoint, nomination.socket),
         path,
         client_size: client.size,
-        attach_id: meta.attach_id,
     })
 }
 
@@ -346,8 +335,11 @@ mod tests {
     #[tokio::test]
     async fn the_exchange_never_settles_detachability() {
         let mut meta = fresh_meta("seam");
-        // The client hangs up immediately, so the exchange fails at R7. What
-        // it did to `meta` before failing is the point.
+        // The client hangs up immediately. Dropping one end of a duplex
+        // stream closes both directions, so it is the host's own `HostHello`
+        // write at R6 that fails first -- the exchange never reaches R7's
+        // read of the client's hello. What it did to `meta` before failing
+        // is the point.
         let (client, host) = tokio::io::duplex(64);
         drop(client);
         let (r, w) = tokio::io::split(host);
