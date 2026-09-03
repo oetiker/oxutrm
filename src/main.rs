@@ -21,6 +21,7 @@
 // every one of them must come off. An allow that cannot be removed then is a
 // piece of code with no caller on either side, which is worth knowing.
 mod accept;
+mod attach_exchange;
 mod candidates;
 mod connect;
 mod ladder;
