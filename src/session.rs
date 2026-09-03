@@ -390,17 +390,6 @@ impl HostSession {
 
     /// Run until the child exits, waiting on descriptors rather than polling.
     ///
-    /// Measured: the `IDLE_POLL` version this replaced cost 24-27 ms of CPU
-    /// across 2 s for a DETACHED session with nothing to do — the 1.2% of a
-    /// core the handoff recorded — against 0-1 ms for this one.
-    ///
-    /// The descriptors are duplicated out of the terminal before the loop so
-    /// the arms borrow locals rather than `self`, which is what lets the body
-    /// call `&mut self` methods afterwards (C1). A `dup` shares the file
-    /// description, harmless here in a way it is NOT for the client's
-    /// keyboard: this description is ours and we set its `O_NONBLOCK`
-    /// ourselves in `Pty::spawn`.
-    ///
     /// A thin wrapper over [`HostSession::run_with_attaches`], with a receiver
     /// whose sender has already been dropped. `Some(a) = attaches.recv()`
     /// makes a closed receiver disable that arm rather than make it hot — see
@@ -1042,7 +1031,15 @@ impl ClientSession {
     /// second, independent link for. Consumes the whole session rather than
     /// exposing the field as `pub`, because nothing else about a
     /// `ClientSession` whose link has been taken makes sense to keep using.
-    #[allow(dead_code)]
+    ///
+    /// `oxutrm` is a bin-only crate with no `[lib]` target, and the one
+    /// integration test (`tests/serve_exits.rs`) is a black-box subprocess
+    /// test that never links this module's internals — so the only caller is
+    /// the `#[cfg(test)] mod tests` block below. `#[cfg(test)]` here compiles
+    /// this only for that build, where it IS used, rather than suppressing a
+    /// dead-code warning on a method the production binary would otherwise
+    /// carry unused.
+    #[cfg(test)]
     pub(crate) fn link_take(self) -> Link {
         self.link
     }
