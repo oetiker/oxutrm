@@ -1447,6 +1447,8 @@ dependencies = [
  "oxutrm-term",
  "quinn",
  "rustix",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

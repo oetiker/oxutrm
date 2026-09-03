@@ -200,6 +200,13 @@ tokio = { workspace = true, features = ["test-util"] }
 # emulator and compares it with the host's screen. That is a stronger claim
 # than "the two states match", which the sync tests already prove.
 alacritty_terminal.workspace = true
+# src/listener.rs registers a `RegistryGuard` under a scratch directory rather
+# than the real registry root, so its tests cannot collide with a session
+# actually running on the machine that built them.
+tempfile = "3"
+# Read back by src/listener.rs's own tests, to check what actually landed on
+# disk rather than trusting the in-memory value the call under test also has.
+serde_json.workspace = true
 
 # This workspace grows large test binaries and shares a target directory with
 # other projects. Line tables are enough for a backtrace; full debug info is

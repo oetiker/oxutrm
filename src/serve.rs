@@ -97,9 +97,14 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     // R12. `None` is rung 4: its QUIC traffic runs inside the ssh connection,
     // so it keeps its pipes and its ssh for life. Anything else severs, ssh
     // sees EOF, and the user's prompt comes back.
-    match permit {
+    //
+    // The socket, below, follows the same arm: `permit` is consumed here, so
+    // it is `meta.detachable` -- the very fact `settle_detachability` just
+    // wrote -- that the listener setup reads to make the identical choice.
+    let sock = match permit {
         Some(permit) => {
             oxutrm_host::sever_from_ssh(detached, permit).context("severing from ssh")?;
+            true
         }
         // Rung 4. The fork already happened and is harmless; what must not
         // happen is the sever. The token simply goes unused, which is the
@@ -107,8 +112,9 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         // so there is no call to write.
         None => {
             let oxutrm_host::Detached { .. } = detached;
+            false
         }
-    }
+    };
 
     // R13. AFTER R12, or the socket path is closed a moment later:
     // `close_inherited_descriptors` closes by enumeration and keeps no list of
@@ -117,17 +123,54 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         oxutrm_host::RegistryGuard::register_in(&oxutrm_host::Registry::dir_at(&root.base), &meta)
             .context("recording the session in the registry")?;
 
+    // `RegistryGuard` becomes an `Arc` here because the listener task and this
+    // function both need it, and its `Drop` removes the session directory: the
+    // directory must outlive both, which is exactly what an `Arc` says.
+    let guard = std::sync::Arc::new(guard);
+    let shell = meta.shell.clone();
+    let meta = std::sync::Arc::new(tokio::sync::Mutex::new(meta));
+
+    // The socket path has always been computed and registered. Nothing has
+    // ever bound it until now -- and only when this session severed from ssh:
+    // rung 4 keeps `sock` false, because its QUIC traffic runs inside the ssh
+    // connection and a socket bound anyway would offer an attach that cannot
+    // outlive it.
+    let listening = if sock {
+        let path = guard.socket_path();
+        oxutrm_host::check_socket_path_length(&path)?;
+        let listener = tokio::net::UnixListener::bind(&path)
+            .with_context(|| format!("binding the session socket at {}", path.display()))?;
+
+        let (attach_tx, attach_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(crate::listener::serve_attaches(
+            listener,
+            std::sync::Arc::clone(&guard),
+            std::sync::Arc::clone(&meta),
+            cfg,
+            attach_tx,
+        ));
+        Some((task, attach_rx))
+    } else {
+        None
+    };
+
     // R14. `negotiate_term` takes no arguments: the child's TERM comes from
     // the emulator, never from the client, or a client narrower than the
     // emulator would bake degraded output into the authoritative screen for
     // the life of the session.
-    let mut session =
-        HostSession::spawn(&meta.shell, attached.client_size, SCROLLBACK, attached.link)
-            .context("starting the shell")?;
+    let mut session = HostSession::spawn(&shell, attached.client_size, SCROLLBACK, attached.link)
+        .context("starting the shell")?;
 
     // R15, then R16: dropping the guard takes the session directory with it,
     // so a session that exits cleanly leaves nothing for `--list` to prune.
-    let code = session.run().await;
+    let code = match listening {
+        Some((task, mut attach_rx)) => {
+            let code = session.run_with_attaches(&mut attach_rx).await;
+            task.abort();
+            code
+        }
+        None => session.run().await,
+    };
     drop(guard);
     code.map(|_| ())
 }
