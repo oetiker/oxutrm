@@ -400,7 +400,32 @@ impl HostSession {
     /// description, harmless here in a way it is NOT for the client's
     /// keyboard: this description is ours and we set its `O_NONBLOCK`
     /// ourselves in `Pty::spawn`.
+    ///
+    /// A thin wrapper over [`HostSession::run_with_attaches`], with a receiver
+    /// whose sender has already been dropped. `Some(a) = attaches.recv()`
+    /// makes a closed receiver disable that arm rather than make it hot — see
+    /// `run_with_attaches`' own note — so this costs nothing and every
+    /// existing caller and test is unchanged.
     pub async fn run(&mut self) -> Result<i32> {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.run_with_attaches(&mut rx).await
+    }
+
+    /// [`HostSession::run`], plus a second inbound connection completing an
+    /// attach exchange elsewhere in the process. Carries the whole
+    /// [`crate::attach_exchange::Attached`] rather than just the [`Link`],
+    /// because [`HostSession::adopt`] needs the size as well.
+    ///
+    /// The descriptors are duplicated out of the terminal before the loop so
+    /// the arms borrow locals rather than `self`, which is what lets the body
+    /// call `&mut self` methods afterwards (C1). A `dup` shares the file
+    /// description, harmless here in a way it is NOT for the client's
+    /// keyboard: this description is ours and we set its `O_NONBLOCK`
+    /// ourselves in `Pty::spawn`.
+    pub async fn run_with_attaches(
+        &mut self,
+        attaches: &mut tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
+    ) -> Result<i32> {
         let output = self.term.output_fd().try_clone_to_owned()?;
         let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
             .context("waiting on the pty")?;
@@ -490,12 +515,21 @@ impl HostSession {
                 Some(frame) = self.link.source.recv() => HostWake::Frame(frame),
                 () = async { tokio::time::sleep_until(deadline.expect("armed")).await },
                     if deadline.is_some() => HostWake::Due,
+                // A closed mpsc receiver (the `run()` wrapper's, forever)
+                // yields `None` immediately, and `Some(a) = ...` disables the
+                // arm rather than making it hot — the same reason there is no
+                // `conn.closed()` arm above.
+                Some(a) = attaches.recv() => HostWake::Attached(a),
             };
 
             match wake {
                 HostWake::Frame(frame) => pending = Some(frame),
                 HostWake::Exit => recheck_child = true,
                 HostWake::Pty | HostWake::Due => {}
+                HostWake::Attached(a) => {
+                    self.adopt(a.link, a.client_size)
+                        .context("adopting a second attach")?;
+                }
             }
         }
     }
@@ -560,6 +594,42 @@ impl HostSession {
     pub fn screen(&self) -> &ScreenState {
         self.screen_tx.current()
     }
+
+    /// Swap a freshly attached link in for the current one.
+    ///
+    /// Design spec §8.5: both sync channels restart at sequence 1 and the
+    /// first datagram of the new attach is a full state. `screen_stale` is
+    /// what forces that snapshot on the next turn.
+    pub fn adopt(&mut self, link: Link, size: TermSize) -> Result<()> {
+        // Close the displaced connection FIRST, and say why. A displaced
+        // client that is merely dropped reports silence, which is the one
+        // thing that did not happen.
+        self.link
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
+
+        self.link = link;
+        self.size = size;
+
+        // §8.5. New generation, so both channels restart at 1. The screen
+        // itself is NOT reset — the emulator kept running — so the base state
+        // is blank and `screen_stale` forces the snapshot that fills it.
+        let blank = ScreenState::blank(size.rows, size.cols)?;
+        self.screen_tx = oxutrm_sync::Sender::new(blank);
+        self.input_rx = Receiver::new(InputState {
+            seq: 1,
+            pending: Vec::new(),
+            size,
+        });
+        self.written = 0;
+        self.last_send = None;
+        self.screen_stale = true;
+        // An attach has just completed and the client sends immediately, so
+        // "now" is true rather than optimistic — the same reasoning as `spawn`.
+        self.last_heard = Instant::now();
+        Ok(())
+    }
 }
 
 /// What woke [`ClientSession::run_on`].
@@ -593,6 +663,9 @@ enum HostWake {
     Frame(Frame),
     /// A frame was owed but paced out, and the pace has come round.
     Due,
+    /// A second attach completed. Carries the whole thing, because the
+    /// session needs the size as well as the link.
+    Attached(crate::attach_exchange::Attached),
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -625,6 +698,12 @@ async fn keys_readable<K: AsRawFd>(
 /// on the wire. This is the only phrase [`exit_code`] accepts, and
 /// [`HostSession::close`] is the only place that sends it.
 pub const SHELL_EXITED: &[u8] = b"the shell exited";
+
+/// Why a link was closed because another one arrived.
+///
+/// Read by the displaced client so it can say it was taken over rather than
+/// reporting silence. Spec §6; the `Displaced` state itself is B4.
+pub const TAKEN_OVER: &[u8] = b"taken over by a newer attach";
 
 /// Why the session ended, as an exit status.
 ///
@@ -956,6 +1035,16 @@ impl ClientSession {
     /// For tests and for the notice.
     pub fn rejected_total(&self) -> u64 {
         self.rejected_total
+    }
+
+    /// For tests: hands a still-live `ClientSession`'s link to
+    /// [`HostSession::adopt`], which is what a Tier B reattach test needs a
+    /// second, independent link for. Consumes the whole session rather than
+    /// exposing the field as `pub`, because nothing else about a
+    /// `ClientSession` whose link has been taken makes sense to keep using.
+    #[allow(dead_code)]
+    pub(crate) fn link_take(self) -> Link {
+        self.link
     }
 
     /// The clock is a parameter so the loop's behaviour can be tested without
@@ -1800,6 +1889,123 @@ mod tests {
         let mut host = host;
         host.term.write_input(shell.as_bytes()).unwrap();
         (host, client)
+    }
+
+    /// The displaced connection is closed, and closed with a reason that says
+    /// what happened.
+    ///
+    /// Without the reason the displaced client reports "the host has stopped
+    /// answering", which is false: the host is answering, to somebody else.
+    #[tokio::test]
+    async fn adopting_a_link_closes_the_old_one_saying_it_was_taken_over() {
+        let (mut host, client) = pair("/bin/sh").await;
+        let (_host2, client2) = pair("/bin/sh").await;
+
+        let old = client.link.sink.connection().clone();
+        host.adopt(client2.link, TermSize { cols: 80, rows: 24 })
+            .expect("adopting a second attach");
+
+        let reason = old.closed().await;
+        let quinn::ConnectionError::ApplicationClosed(closed) = reason else {
+            panic!(
+                "the displaced connection ended with {reason:?}, not an \
+                    application close naming the takeover"
+            );
+        };
+        assert_eq!(
+            closed.reason.as_ref(),
+            TAKEN_OVER,
+            "displaced with the wrong reason; the client cannot tell a takeover \
+             from silence"
+        );
+    }
+
+    /// §8.5: the first frame of a new attach is a FULL state, not a diff against
+    /// a base the new client has never seen — and it has to carry the shell's
+    /// ACTUAL screen, not the blank one `adopt` installs as a placeholder.
+    ///
+    /// `Turn.sent` is a [`SendOutcome`], which reports how a frame went out but
+    /// not what was in it, so the frame is read back off the wire instead: the
+    /// newcomer's link is the client-side handle of the connection `pair`
+    /// built for `host2`, so whatever the host sends after adopting it arrives
+    /// at `host2`'s own [`crate::link::Link::source`], which has been
+    /// listening in the background since `pair` returned. That is "the frame
+    /// that actually arrives" — a side effect, not a return value.
+    #[tokio::test]
+    async fn the_first_frame_after_adopting_is_a_full_state() {
+        let (mut host, client) = pair("/bin/sh").await;
+        // Let the first client get a real screen, so the emulator is NOT blank
+        // and a diff-from-current would be visibly different from a full state.
+        host.turn_at(Instant::now(), None).expect("first turn");
+
+        // Settle the pty completely before adopting, polling it DIRECTLY
+        // rather than through `turn()` -- nothing is driving the first
+        // client's own loop here, so its ack never arrives and `turn()`
+        // would find something owed forever, which is a different kind of
+        // "not quiet" than the one this guards against. Two consecutive
+        // quiet polls, 50 ms apart. Without this, an async straggler from the
+        // shell's own startup could still land on the turn taken after
+        // adopting and make `moved` true on its own -- which would carry the
+        // real screen across whether or not `screen_stale` did its job, and
+        // the assertion below would pass for the wrong reason.
+        let mut quiet = 0;
+        let settled_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < settled_by && quiet < 2 {
+            if host.term.poll().expect("polling the pty") {
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            quiet, 2,
+            "the shell never went quiet; this test cannot tell \
+                    `screen_stale` apart from ordinary `moved` freshness"
+        );
+        drop(client);
+
+        let (mut host2, client2) = pair("/bin/sh").await;
+        let newcomer = client2;
+        host.adopt(newcomer.link_take(), TermSize { cols: 80, rows: 24 })
+            .expect("adopting");
+
+        let turn = host
+            .turn_at(Instant::now(), None)
+            .expect("turn after adopting");
+        assert!(
+            turn.sent.is_some(),
+            "a frame is owed to a client that just arrived"
+        );
+
+        let frame = host2.link.source.recv().await.expect(
+            "the frame the host just sent, arriving at the other end \
+                     of the connection adopt() installed",
+        );
+        assert_eq!(
+            frame.from_state, 0,
+            "the newcomer was sent a diff against state {} it has never seen; \
+             §8.5 requires a full state on the first datagram of an attach",
+            frame.from_state
+        );
+
+        // Not just full-state-SHAPED: a full state built from the still-blank
+        // placeholder `adopt` installs would satisfy the assertion above while
+        // shipping nothing real. This is exactly what `screen_stale` exists to
+        // prevent — see its doc comment.
+        let mut check = Receiver::new(ScreenState::blank(10, 40).expect("blank"));
+        check
+            .on_frame(&frame)
+            .expect("applying the newcomer's first frame");
+        assert_ne!(
+            check.state().cells,
+            ScreenState::blank(check.state().rows, check.state().cols)
+                .expect("blank")
+                .cells,
+            "the newcomer's first screen was blank; screen_stale should have \
+             forced a snapshot of the shell that kept running while nobody \
+             was attached"
+        );
     }
 
     /// EXPERIMENT, not a guard: how long does recovery take after a real
