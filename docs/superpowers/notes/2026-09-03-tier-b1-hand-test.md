@@ -88,8 +88,10 @@ re-check with the same `ssh <host> 'echo $PATH'` probe before trusting it
 there.) Given that fact, the shim does not need a separate earlier-in-`PATH`
 directory at all: it can replace `~/.local/bin/oxutrm` directly.
 
-1. Pick the session id to attach to (from `oxutrm host --list` on `thinlinc`,
-   after Test 1 below has left a detached session behind — see the recipe).
+1. Pick the session id to attach to. It comes from
+   `ssh thinlinc '/scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm host --list'`
+   at recipe step 2, once step 1 has a session running — **by absolute path,
+   and before the shim exists**, for the reason spelled out at step 3.
 2. `~/.local/bin/oxutrm` is currently a **symlink** to
    `/scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm` (the rebuilt
    binary — see "Rebuild the host binary" below). Replace the symlink with a
@@ -106,26 +108,47 @@ directory at all: it can replace `~/.local/bin/oxutrm` directly.
 
    The shim execs the real binary by its **absolute path**, so there is no
    recursion through the now-shadowed `~/.local/bin/oxutrm`.
-3. **Verify before using it for the real test**: a throwaway
-   `ssh thinlinc 'which oxutrm; oxutrm --version'` should still print
-   `oxutrm 0.2.0` (the shim's `exec` makes it behave like the real binary for
-   `--version` too — see the discrimination note below for why a version
-   string alone is not enough to trust the *build*, though it is enough here
-   to confirm the shim itself is reachable and executable).
+3. **Verify before using it for the real test — by LOOKING at it, never by
+   running it.**
+
+   ```bash
+   ssh thinlinc 'which oxutrm; ls -la ~/.local/bin/oxutrm; cat ~/.local/bin/oxutrm'
+   ```
+
+   `which` should name `~/.local/bin/oxutrm`, `ls -la` should show a regular
+   executable file (no `->` arrow) and `cat` should show the two shim lines
+   with the intended id in them.
+
+   **Do not verify with `oxutrm --version`.** The shim is
+   `exec <abs-path> host --attach <id>` with no `"$@"`: it *discards* argv, so
+   `ssh thinlinc 'oxutrm --version'` does not print a version — it performs a
+   real attach against `<id>`, burning a generation before the test has
+   started and displacing whoever is attached. That is also why every
+   remaining step below that wants the real binary on the target spells out
+   its absolute path.
 4. **Remove the shim afterwards. This step must not be skipped.** A shim left
    in place turns every future `oxutrm <target>` on this machine into an
    attach against a specific old session id instead of a normal connection,
-   silently, for whoever runs it next. Restore the symlink exactly:
+   silently, for whoever runs it next. Put the original symlink back — the one
+   step 2 stashed, so that nothing else is left behind either:
+
+   ```bash
+   mv ~/.local/bin/oxutrm.real-symlink ~/.local/bin/oxutrm
+   ```
+
+   Only if that stash is somehow gone, recreate the symlink instead:
 
    ```bash
    rm ~/.local/bin/oxutrm
    ln -sf /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm ~/.local/bin/oxutrm
    ```
 
-   (equivalent to `mv ~/.local/bin/oxutrm.real-symlink ~/.local/bin/oxutrm`
-   if that file from step 2 is still around). Confirm removal with
-   `ssh thinlinc 'ls -la ~/.local/bin/oxutrm'` — it should show a symlink
-   arrow (`->`) again, not a regular executable file.
+   Confirm with
+   `ssh thinlinc 'ls -la ~/.local/bin/oxutrm ~/.local/bin/oxutrm.real-symlink'`:
+   the first should show a symlink arrow (`->`) again, not a regular
+   executable file, and the second should be **gone** ("No such file or
+   directory"). A leftover `oxutrm.real-symlink` is the tell that the `rm` +
+   `ln -sf` branch was used and the stash was never cleaned up.
 
 ## Before any of this: rebuild the host binary
 
@@ -191,6 +214,11 @@ builds:
   (`git -C /scratch/oetiker/oxutrm-handtest rev-parse HEAD`) should match
   this branch's HEAD, not `origin/main` or an older commit.
 
+Both of those are file and repository inspections, which is the second reason
+to prefer them: this whole section runs **before** the shim is installed, and
+once it is installed nothing on `thinlinc` may be verified by running
+`oxutrm` at all — see recipe step 3.
+
 Do not let the rebuild silently repoint the `~/.local/bin/oxutrm` symlink at
 a different tree; if it does, put it back
 (`ln -sf /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm
@@ -229,29 +257,63 @@ checkout does not need to be disturbed.
 
 ## The recipe
 
-1. `oxutrm thinlinc`, run something that leaves a recognisable screen (e.g.
-   `date` a few times, or a short-lived counter), detach cleanly.
-2. `oxutrm host --list` on `thinlinc`, in a second terminal — note the
-   session id and the `attach` number shown in the listing (this is the
-   `attach_id` generation counter mirrored from `HostHello.attach_id`; a
-   second attach is expected to bump it).
-3. Set up the shim per "The scaffold this method needs" above, pointed at
-   the id from step 2. Verify it resolves before using it for the real test.
-4. From a **third** terminal, run the real client through real ssh
-   (`oxutrm thinlinc`, unmodified) — ssh now lands on the shim, which execs
-   `oxutrm host --attach <id>` instead of `--serve`. Record:
+**Every `oxutrm` command run ON `thinlinc` below uses the absolute path**, not
+the bare name. From the moment the shim is installed at step 3, `oxutrm` on
+that machine means "attach to `<id>`, discarding argv" — so a bare
+`oxutrm host --list` would not list anything, it would perform an attach and
+burn a generation. Only the Mac-side `oxutrm thinlinc` is deliberately bare:
+resolving through the shim on the far end is the whole point of the scaffold.
+For brevity below:
+
+```bash
+OX=/scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm
+```
+
+### Part 1 — the LIVE takeover (a second attach while a client is still there)
+
+This is the case B4 builds on, and it is the only one that produces
+`TAKEN_OVER` and a displaced-client experience. It has to come first, because
+it needs the first client still attached.
+
+1. **Terminal 1 (Mac):** `oxutrm thinlinc`. Run something that leaves a
+   recognisable screen (e.g. `date` a few times, or a short-lived counter).
+   **Leave it attached** — do not detach. Note this terminal's size
+   (`stty size` inside the session, or the window's own dimensions).
+2. **Terminal 2 (Mac):** `ssh thinlinc "$OX host --list"` — note the session
+   id and the `attach` number in the listing (this is the `attach_id`
+   generation counter mirrored from `HostHello.attach_id`; a second attach is
+   expected to bump it).
+3. Set up the shim per "The scaffold this method needs" above, pointed at the
+   id from step 2, and verify it **by looking at it** (`ls -la` + `cat`) —
+   never by running it.
+4. **Terminal 3 (Mac), deliberately a DIFFERENT SIZE from terminal 1:** run
+   the real client through real ssh (`oxutrm thinlinc`, unmodified) — ssh now
+   lands on the shim, which execs `oxutrm host --attach <id>` instead of
+   `--serve`. Record:
    - Does the screen arrive complete, and how long did it take?
-   - What did the **second** terminal (the one that had the session before
-     this attach) show at the moment it was displaced?
-5. `oxutrm host --list` again: did `attach` increment in the registry?
-6. Detach the client normally (not `Ctrl-\ q` — see below) and observe:
-   **does `oxutrm host --attach` (via the shim) return promptly when the far
-   end hangs up, and is any output lost at that moment?** This is not in the
-   brief's original question list — it is here because of a review finding.
-   `run_host_attach` calls `runtime.shutdown_background()` on exit rather
-   than letting the runtime drop naturally, because a blocking stdin read
-   cannot be cancelled, only abandoned, and a normally-dropped runtime would
-   wait for it forever. The reason is real. But `tokio`'s `io-std` feature
+   - **Is the shell at THIS terminal's geometry?** Run `stty size` in the
+     reattached session and compare with terminal 3's own size. A review
+     found `adopt` recording the newcomer's size without resizing the pty or
+     the emulator, which left the shell at terminal 1's geometry until the
+     window was resized by hand; this is the field check for that fix.
+   - **What did terminal 1 — the client that was still attached — show at the
+     moment it was displaced?** Specifically: did it say it had been taken
+     over (`TAKEN_OVER` is the close reason the host sends), or did it just go
+     silent / report the host as unreachable? Copy the exact wording.
+5. **Terminal 2:** `ssh thinlinc "$OX host --list"` again — did `attach`
+   increment in the registry?
+
+### Part 2 — the reattach AFTER a detach
+
+6. Detach terminal 3's client normally (not `Ctrl-\ q` — see below) and
+   observe: **does `oxutrm host --attach` (via the shim) return promptly when
+   the far end hangs up, and is any output lost at that moment?** This is not
+   in the brief's original question list — it is here because of a review
+   finding. `run_host_attach` calls `runtime.shutdown_background()` on exit
+   rather than letting the runtime drop naturally, because a blocking stdin
+   read cannot be cancelled, only abandoned, and a normally-dropped runtime
+   would wait for it forever. That half now has an automated guard
+   (`tests/host_attach.rs`). What still does not: `tokio`'s `io-std` feature
    backs `stdout()` with the blocking pool too, so if the stdin→socket branch
    of the `tokio::select!` in `run_host_attach` wins the race, the
    socket→stdout branch can be cancelled mid-write, and `shutdown_background`
@@ -259,17 +321,25 @@ checkout does not need to be disturbed.
    tail of a screen update at the exact moment of detach. It is self-healing
    — the host's first datagram of any fresh attach is a full state (design
    spec §8.5, `docs/superpowers/specs/2026-08-29-session-recovery-design.md`)
-   — and the window is narrow, but **nothing automated tests this path, and
-   this hand test is the only place it is exercised.** Watch for it and
-   record whatever is observed, including "nothing observed" if that is what
+   — and the window is narrow, but **nothing automated tests that, and this
+   hand test is the only place it is exercised.** Watch for it and record
+   whatever is observed, including "nothing observed" if that is what
    happens.
-7. Repeat the shim setup for a fourth attach (a new shim pointed at the same
-   id, or the same shim re-run — either is fine since the id does not
-   change). Does the generation (`attach` in `--list`) keep moving?
-8. **Remove the shim.** Do not skip this — see above.
+7. With **no client attached** (step 6 left the session detached), run
+   `oxutrm thinlinc` again — the shim is still installed and still points at
+   the same id, so this is a reattach-after-detach rather than a takeover.
+   Record:
+   - Does the screen arrive complete, and does it still show what the shell
+     did while nobody was attached?
+   - Does the generation (`attach` in
+     `ssh thinlinc "$OX host --list"`) keep moving?
+   - Nothing should be displaced this time, because there was no live client
+     to displace. Note it if anything is.
+8. **Remove the shim.** Do not skip this — see above, including the check that
+   `~/.local/bin/oxutrm.real-symlink` is gone.
 9. **Cleanup**: `pgrep -a -f oxutrm` on both ends, `kill -CONT` then
-   `kill -TERM` whatever is left, confirm `oxutrm host --list` reports no
-   live sessions.
+   `kill -TERM` whatever is left, confirm `ssh thinlinc "$OX host --list"`
+   reports no live sessions.
 
 ## Observations
 
@@ -281,16 +351,24 @@ do not estimate or infer a plausible-looking number.)*
 | Mac `date +%T` at test start | — not run — |
 | `thinlinc` `date +%T` at test start | — not run — |
 | Session id used | — not run — |
+| Terminal 1 size (`stty size` inside the session) | — not run — |
+| Terminal 3 size (deliberately different) | — not run — |
 | `attach` number before this test's first attach | — not run — |
-| Shim verified reachable before real test (`ssh thinlinc 'which oxutrm; oxutrm --version'` output) | — not run — |
-| Screen arrived complete? | — not run — |
-| Time to arrive | — not run — |
-| Displaced terminal's screen at the moment of takeover | — not run — |
-| `attach` number after the attach, per `--list` | — not run — |
-| `run_host_attach` return time after far end hangs up | — not run — |
-| Any output lost at that moment (tail of a screen update)? | — not run — |
-| `attach` number after a fourth attach — does the generation keep moving? | — not run — |
+| Shim verified by `ls -la ~/.local/bin/oxutrm` (regular file, no `->`) | — not run — |
+| Shim verified by `cat ~/.local/bin/oxutrm` (the two lines, right id) | — not run — |
+| **Part 1, live takeover:** screen arrived complete? | — not run — |
+| Part 1: time to arrive | — not run — |
+| Part 1: `stty size` in the reattached session vs terminal 3's own size | — not run — |
+| Part 1: what terminal 1 (still attached) showed at the moment it was displaced, verbatim | — not run — |
+| Part 1: did the displaced client name the takeover, or just go silent? | — not run — |
+| Part 1: `attach` number after the takeover, per `--list` | — not run — |
+| **Part 2, reattach after detach:** `run_host_attach` return time after far end hangs up | — not run — |
+| Part 2: any output lost at that moment (tail of a screen update)? | — not run — |
+| Part 2: screen arrived complete, including what ran while detached? | — not run — |
+| Part 2: `attach` number after it — does the generation keep moving? | — not run — |
+| Part 2: anything displaced, though there was nothing to displace? | — not run — |
 | Shim removed and symlink restored (`ls -la ~/.local/bin/oxutrm` shows `->` again)? | — not run — |
+| `~/.local/bin/oxutrm.real-symlink` gone after restore? | — not run — |
 | `pgrep -a -f oxutrm` after cleanup | — not run — |
 
 ## Anomalies
