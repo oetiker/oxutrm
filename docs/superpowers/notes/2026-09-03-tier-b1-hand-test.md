@@ -33,11 +33,10 @@ Two independent reasons, both real, neither worked around:
    (`crates/oxutrm-host/src/ssh.rs:231`) appends the hardcoded
    `REMOTE_SERVE = ["oxutrm", "host", "--serve"]`, and `src/connect.rs:58`
    calls it via `SshLauncher::ssh()` with no CLI override to ask for
-   `--attach` instead. **"`REMOTE_SERVE` is a hardcoded
-   `["oxutrm", "host", "--serve"]`" is a standing project constraint.** This
-   is exactly the B2 gap the plan itself names — B1 ships the host-side half
-   of reattach but no client-side attach path — and the plan's own hand-test
-   recipe reaches into that gap without noticing it.
+   `--attach` instead — a standing project constraint. This is exactly the B2
+   gap the plan itself names — B1 ships the host-side half of reattach but no
+   client-side attach path — and the plan's own hand-test recipe reaches into
+   that gap without noticing it.
 
 2. `ssh` is unavailable to this session (project policy requires explicit
    user confirmation before any network-reaching command, which was not
@@ -78,47 +77,55 @@ someone else's id, which would be a real incident, not a test artifact.
 
 ### Concrete steps for the shim
 
+**Verified on `thinlinc`: `~/.local/bin` is on the non-interactive ssh
+`PATH`** — `ssh thinlinc 'echo $PATH'` shows it, so `ssh host command`
+resolves `oxutrm` to `~/.local/bin/oxutrm` without needing `.bashrc`,
+`.bash_profile`, `.profile`, or `~/.ssh/environment` to run at all. (A reader
+on a different machine should not assume this — `ssh host command` runs a
+*non-interactive, non-login* shell on most configurations, which typically
+does **not** source the interactive-only parts of shell startup files, so
+re-check with the same `ssh <host> 'echo $PATH'` probe before trusting it
+there.) Given that fact, the shim does not need a separate earlier-in-`PATH`
+directory at all: it can replace `~/.local/bin/oxutrm` directly.
+
 1. Pick the session id to attach to (from `oxutrm host --list` on `thinlinc`,
    after Test 1 below has left a detached session behind — see the recipe).
-2. Create the shim somewhere earlier in `PATH` than the real binary's
-   directory, e.g. `~/.local/bin-shim/oxutrm`:
+2. `~/.local/bin/oxutrm` is currently a **symlink** to
+   `/scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm` (the rebuilt
+   binary — see "Rebuild the host binary" below). Replace the symlink with a
+   shim script at the same path:
 
    ```bash
+   mv ~/.local/bin/oxutrm ~/.local/bin/oxutrm.real-symlink   # save the symlink itself, not its target
+   cat > ~/.local/bin/oxutrm <<'EOF'
    #!/bin/sh
-   exec ~/.local/bin/oxutrm host --attach <id>
+   exec /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm host --attach <id>
+   EOF
+   chmod +x ~/.local/bin/oxutrm
    ```
 
-   (`~/.local/bin/oxutrm` is the symlink Tier A's note already established
-   points at the rebuilt binary — see "Rebuild the host binary" below.
-   `chmod +x` the shim.)
-3. **Where it must sit for a non-interactive ssh shell to pick it up.**
-   `ssh host command` runs a *non-interactive, non-login* shell on most
-   configurations, which does **not** source `~/.bashrc`'s interactive-only
-   guard or `~/.bash_profile`/`~/.profile` the way an interactive login
-   does — so a `PATH` change made only in those files will not apply to the
-   command ssh runs. What this note concludes, to be verified rather than
-   asserted when the test actually runs: either (a) prepend the shim's
-   directory to `PATH` in `~/.bashrc` *above* the `[ -z "$PS1" ] && return`
-   interactive-only guard (if the guard is below the `PATH` line, a
-   non-interactive shell still sees it), or (b) set it in `~/.ssh/environment`
-   with `PermitUserEnvironment yes` on the target if that is already enabled,
-   or (c) simplest and least invasive: don't rely on `PATH` resolution order
-   at all — temporarily move the real binary aside and put the shim at the
-   exact path the real one occupied, restoring it in cleanup. **Verify
-   whichever is chosen** with a throwaway `ssh thinlinc 'which oxutrm; oxutrm
-   --version'` *before* running the real test through it, so the first real
-   observation is not also the first check that the shim is even reachable.
-4. **The real binary is still reached from inside the shim** by an absolute
-   path (`~/.local/bin/oxutrm`, not bare `oxutrm`) — the shim must not call
-   itself through the now-shadowed `PATH`, which would recurse.
-5. **Remove the shim afterwards. This step must not be skipped.** A shim left
+   The shim execs the real binary by its **absolute path**, so there is no
+   recursion through the now-shadowed `~/.local/bin/oxutrm`.
+3. **Verify before using it for the real test**: a throwaway
+   `ssh thinlinc 'which oxutrm; oxutrm --version'` should still print
+   `oxutrm 0.2.0` (the shim's `exec` makes it behave like the real binary for
+   `--version` too — see the discrimination note below for why a version
+   string alone is not enough to trust the *build*, though it is enough here
+   to confirm the shim itself is reachable and executable).
+4. **Remove the shim afterwards. This step must not be skipped.** A shim left
    in place turns every future `oxutrm <target>` on this machine into an
    attach against a specific old session id instead of a normal connection,
-   silently, for whoever runs it next. Concretely: delete the shim file (or
-   restore the real binary to its original path if approach (c) was used),
-   and remove whatever `PATH`/environment change was made in step 3. Confirm
-   removal with the same throwaway `ssh thinlinc 'which oxutrm'` check used to
-   verify it went in, now expecting the real binary's path back.
+   silently, for whoever runs it next. Restore the symlink exactly:
+
+   ```bash
+   rm ~/.local/bin/oxutrm
+   ln -sf /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm ~/.local/bin/oxutrm
+   ```
+
+   (equivalent to `mv ~/.local/bin/oxutrm.real-symlink ~/.local/bin/oxutrm`
+   if that file from step 2 is still around). Confirm removal with
+   `ssh thinlinc 'ls -la ~/.local/bin/oxutrm'` — it should show a symlink
+   arrow (`->`) again, not a regular executable file.
 
 ## Before any of this: rebuild the host binary
 
@@ -128,23 +135,72 @@ branch (`feat/session-recovery-tier-b1`) before running this test.** A binary
 that predates this branch cannot exercise a socket this branch is what binds
 — `run_host_attach`, `HostSession::adopt`, and `run_with_attaches` are all new
 here. Tier A's equivalence note ("host-equivalent to trunk") does not carry
-forward across a phase that changes host code, and this one does.
+forward across a phase that changes host code, and this one does. If the
+socket isn't bound because the binary predates the branch, the hand test
+would fail for the wrong reason — a missing feature masquerading as a
+protocol or timing bug.
 
-Rebuild with an explicit `CARGO_TARGET_DIR` so the existing
-`~/.local/bin/oxutrm` symlink picks up the new binary without repointing —
-Tier A's note found that leaving this implicit builds into `.bashrc`'s
-different default target dir and leaves the old binary in place, silently:
+**`/scratch/oetiker/oxutrm-handtest` already exists** as a detached worktree
+left behind on purpose by the Tier A run (see that note's cleanup section).
+Reusing it is the expected case, not the exception — `git worktree add` to an
+already-registered path errors out, so do not copy a bare `add` command
+blindly. Check which state applies and use the matching branch:
 
 ```bash
-git -C checkouts/oxutrm worktree add --detach /scratch/oetiker/oxutrm-handtest <this branch's HEAD sha>
+# Expected case: the worktree from Tier A (or a previous B1 run) is still there.
+git -C /scratch/oetiker/oxutrm-handtest fetch origin --prune
+git -C /scratch/oetiker/oxutrm-handtest checkout --detach <this branch's HEAD sha>
+cd /scratch/oetiker/oxutrm-handtest
+CARGO_TARGET_DIR=/scratch/oetiker/cargo-target-oxutrm-main \
+  cargo build --release -j4
+
+# Only if the worktree is genuinely gone (e.g. someone ran `worktree remove`):
+git -C checkouts/oxutrm worktree add --detach /scratch/oetiker/oxutrm-handtest <sha>
 cd /scratch/oetiker/oxutrm-handtest
 CARGO_TARGET_DIR=/scratch/oetiker/cargo-target-oxutrm-main cargo build --release -j4
 ```
 
-Verify after: `~/.local/bin/oxutrm --version` should print a version built
-from this branch, and the symlink target's mtime should be recent. Do not let
-the rebuild silently repoint the symlink at a different tree; if it does, put
-it back before running anything below.
+The explicit `CARGO_TARGET_DIR` is what keeps
+`~/.local/bin/oxutrm` (a symlink into that same target dir) pointing at the
+new binary with no repointing needed — Tier A's note found that leaving this
+implicit builds into `.bashrc`'s different default target dir and leaves the
+old binary in place, silently.
+
+**Already confirmed working on `thinlinc` at `origin/main`** (not yet this
+branch's HEAD, but the same build path this section describes): the reuse
+path above, release build in 1m21s, producing an 8.9 MB `x86_64` binary,
+`--version` printing `oxutrm 0.2.0`. `cargo` there is **1.96.0**, which is
+exactly this project's MSRV floor — a toolchain downgrade on `thinlinc` would
+break this build outright, so if the build fails with a version-gated
+feature error, check `cargo --version` before anything else. The vendored
+`quinn-proto` `[patch.crates-io]` (see `docs/quinn-pto-backoff.md`) applied
+cleanly there too — it had previously only been exercised on macOS, so
+Linux/x86_64 was an open question this build closes.
+
+**A version string alone does not prove the binary is from this branch.**
+Both a pre-B1 binary and a post-B1 binary print `oxutrm --version` as
+`0.2.0` — the crate version was not bumped for this branch, so `--version`
+cannot discriminate them. Trusting it here would repeat exactly the mistake
+this project was burned by once already (a confident report from stale
+state). Verify instead with something that actually distinguishes the two
+builds:
+- the target binary's own timestamp, immediately after the build
+  (`ls -la /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm`) should
+  be from the run just performed, not from an earlier rebuild; or
+- the sha actually checked out in the worktree
+  (`git -C /scratch/oetiker/oxutrm-handtest rev-parse HEAD`) should match
+  this branch's HEAD, not `origin/main` or an older commit.
+
+Do not let the rebuild silently repoint the `~/.local/bin/oxutrm` symlink at
+a different tree; if it does, put it back
+(`ln -sf /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm
+~/.local/bin/oxutrm`) before running anything below.
+
+**Leave `~/checkouts/oxutrm` on `thinlinc` alone.** Tier A's note found it
+stale at `39b2379` and dirty with 5 modified files, and that is still true.
+None of the commands above touch it — they operate on the separate detached
+worktree at `/scratch/oetiker/oxutrm-handtest` specifically so this dirty
+checkout does not need to be disturbed.
 
 ## Rules carried over from Tier A, still load-bearing
 
@@ -226,7 +282,7 @@ do not estimate or infer a plausible-looking number.)*
 | `thinlinc` `date +%T` at test start | — not run — |
 | Session id used | — not run — |
 | `attach` number before this test's first attach | — not run — |
-| Shim verified reachable before real test (`which oxutrm` output) | — not run — |
+| Shim verified reachable before real test (`ssh thinlinc 'which oxutrm; oxutrm --version'` output) | — not run — |
 | Screen arrived complete? | — not run — |
 | Time to arrive | — not run — |
 | Displaced terminal's screen at the moment of takeover | — not run — |
@@ -234,7 +290,7 @@ do not estimate or infer a plausible-looking number.)*
 | `run_host_attach` return time after far end hangs up | — not run — |
 | Any output lost at that moment (tail of a screen update)? | — not run — |
 | `attach` number after a fourth attach — does the generation keep moving? | — not run — |
-| Shim removed and verified gone (`which oxutrm` back to the real path)? | — not run — |
+| Shim removed and symlink restored (`ls -la ~/.local/bin/oxutrm` shows `->` again)? | — not run — |
 | `pgrep -a -f oxutrm` after cleanup | — not run — |
 
 ## Anomalies
