@@ -1,13 +1,31 @@
-# Tier B1 hand test — method, not yet run
+# Tier B1 hand test — method, and the run
 
-**Status: NOT RUN.** Every table below is empty on purpose. This file is the
-recipe a person runs against the real host (`thinlinc`) over ssh, with the two
-ends timestamped and liveness read from the process or the exit file — never
-from a tmux pane, which keeps showing the last painted screen after the
-process behind it has exited. Nothing here may be read as a finding until the
-corresponding blank has been filled in from an actual run; a prediction in a
-handoff is a hypothesis, not a finding, and this project was burned once
-already by a confident report from a frozen pane.
+**Status: RUN on 2026-09-04, 16:01–16:05 CEST, against `thinlinc` from macOS,
+with the binary built from `68d12d5` (trunk).** Both parts are TAKEN and every
+observation slot below is filled from that run.
+
+**Headline: B1's claim holds. A live shell moved between three terminals of
+three different sizes, keeping its scrollback, and the displaced client said
+it had been taken over rather than going silent.** The generation counter
+advanced 1 → 2 → 3 in the registry and the shell's pid never changed. The
+`adopt`-resize bug that the whole-branch review found by reading is confirmed
+fixed in the field: each newcomer got its own geometry, not its predecessor's.
+
+**The one thing this run could NOT exercise is the question the note added
+for it** — `run_host_attach`'s behaviour when the far end hangs up. The relay
+had already exited on its own before any hangup, which turns out to be by
+design and to mean the risk was described in the wrong place. See
+"Anomalies", item 2: it is a correction to a code comment, not a defect.
+
+The original text of the method follows, unchanged except for the filled-in
+tables. This file is the recipe a person runs against the real host
+(`thinlinc`) over ssh, with the two ends timestamped and liveness read from
+the process or the exit file — never from a tmux pane, which keeps showing the
+last painted screen after the process behind it has exited (**that trap fired
+again in this run — see Anomalies item 1**). Nothing here may be read as a
+finding unless the corresponding slot was filled in from the actual run; a
+prediction in a handoff is a hypothesis, not a finding, and this project was
+burned once already by a confident report from a frozen pane.
 
 This note follows the precedent of
 `docs/superpowers/notes/2026-08-30-tier-a-hand-test.md`: same tone, same
@@ -343,40 +361,99 @@ it needs the first client still attached.
 
 ## Observations
 
-*(All slots below are intentionally empty. Fill in only from an actual run;
-do not estimate or infer a plausible-looking number.)*
+*(Every slot is filled from the run of 2026-09-04. Nothing here is estimated
+or inferred; where something could not be observed, that is what it says.)*
 
 | Step | Observation |
 |---|---|
-| Mac `date +%T` at test start | — not run — |
-| `thinlinc` `date +%T` at test start | — not run — |
-| Session id used | — not run — |
-| Terminal 1 size (`stty size` inside the session) | — not run — |
-| Terminal 3 size (deliberately different) | — not run — |
-| `attach` number before this test's first attach | — not run — |
-| Shim verified by `ls -la ~/.local/bin/oxutrm` (regular file, no `->`) | — not run — |
-| Shim verified by `cat ~/.local/bin/oxutrm` (the two lines, right id) | — not run — |
-| **Part 1, live takeover:** screen arrived complete? | — not run — |
-| Part 1: time to arrive | — not run — |
-| Part 1: `stty size` in the reattached session vs terminal 3's own size | — not run — |
-| Part 1: what terminal 1 (still attached) showed at the moment it was displaced, verbatim | — not run — |
-| Part 1: did the displaced client name the takeover, or just go silent? | — not run — |
-| Part 1: `attach` number after the takeover, per `--list` | — not run — |
-| **Part 2, reattach after detach:** `run_host_attach` return time after far end hangs up | — not run — |
-| Part 2: any output lost at that moment (tail of a screen update)? | — not run — |
-| Part 2: screen arrived complete, including what ran while detached? | — not run — |
-| Part 2: `attach` number after it — does the generation keep moving? | — not run — |
-| Part 2: anything displaced, though there was nothing to displace? | — not run — |
-| Shim removed and symlink restored (`ls -la ~/.local/bin/oxutrm` shows `->` again)? | — not run — |
-| `~/.local/bin/oxutrm.real-symlink` gone after restore? | — not run — |
-| `pgrep -a -f oxutrm` after cleanup | — not run — |
+| Mac `date +%T` at test start | `16:01:42` |
+| `thinlinc` `date +%T` at test start | `16:01:42` — the two ends agreed to the second, so no number below needs a clock correction |
+| Session id used | `65d0e54d9f125b657df50b4572c1695b`, host pid `3535400` |
+| Terminal 1 size (`stty size` inside the session) | `30 100` (tmux `-x 100 -y 30`) |
+| Terminal 3 size (deliberately different) | `40 120` (tmux `-x 120 -y 40`) |
+| `attach` number before this test's first attach | `attach 1` |
+| Shim verified by `ls -la ~/.local/bin/oxutrm` (regular file, no `->`) | Yes — `-rwxr-xr-x 1 oetiker oep 119 Sep 4 16:02`, no arrow |
+| Shim verified by `cat ~/.local/bin/oxutrm` (the two lines, right id) | Yes — `#!/bin/sh` + `exec /scratch/…/oxutrm host --attach 65d0e54d…`, id matched |
+| **Part 1, live takeover:** screen arrived complete? | **Yes.** Terminal 3 showed the running shell's screen including `TERMINAL-ONE-MARKER 16:02:08`, the marker terminal 1 had printed — i.e. the shell itself moved, scrollback intact |
+| Part 1: time to arrive | Client launched `16:02:43`, screen observed complete at `16:02:48` — **≤5 s**. Not measured more finely; the observation was a poll, not a timer, so this is an upper bound |
+| Part 1: `stty size` in the reattached session vs terminal 3's own size | **`40 120` — matches terminal 3, not terminal 1's `30 100`.** This is the field confirmation of the `adopt` resize fix |
+| Part 1: what terminal 1 (still attached) showed at the moment it was displaced, verbatim | On its stderr: `Error: the host closed the session without the shell exiting: taken over by a newer attach`, then `EXITED rc=1`. Its tmux **pane** still showed the last painted screen — see Anomalies item 1 |
+| Part 1: did the displaced client name the takeover, or just go silent? | **Named it explicitly** ("taken over by a newer attach"). It did not report silence or an unreachable host — which is the whole point of `TAKEN_OVER` |
+| Part 1: `attach` number after the takeover, per `--list` | `attach 2`, and the registry's recorded size changed to `120x40`. Host pid unchanged at `3535400` |
+| **Part 2, reattach after detach:** `run_host_attach` return time after far end hangs up | **Could not be exercised as framed.** No `host --attach` process was alive even *before* the hangup — the relay exits as soon as the signalling exchange completes. So it returns promptly, but not for the reason the question assumed. See Anomalies item 2 |
+| Part 2: any output lost at that moment (tail of a screen update)? | **None observed** — and per Anomalies item 2, no screen update ever flows through that relay, so this is not the place such a loss could occur |
+| Part 2: screen arrived complete, including what ran while detached? | Screen arrived complete at the third size — full history, both `TERMINAL-ONE-MARKER 16:02:08` and `TERMINAL-THREE 16:03:00`. **"What ran while detached" was NOT exercised**: nothing was started before the detach, so there was no detached-period output to carry. A gap in this run, not a finding |
+| Part 2: `attach` number after it — does the generation keep moving? | **Yes — `attach 3`**, registry size `90x25`, host pid still `3535400`. Geometry followed a third time (`stty size` → `25 90`) |
+| Part 2: anything displaced, though there was nothing to displace? | Nothing. `err4` stayed empty and no client reported a takeover — correct, since no client was attached |
+| Shim removed and symlink restored (`ls -la ~/.local/bin/oxutrm` shows `->` again)? | Yes — `lrwxrwxrwx … -> /scratch/oetiker/cargo-target-oxutrm-main/release/oxutrm`. `oxutrm --version` printing `0.2.0` normally is itself the proof the shim is gone: under the shim it would have attached instead |
+| `~/.local/bin/oxutrm.real-symlink` gone after restore? | Yes — `No such file or directory`. The `mv` branch was used, so no stash was left behind |
+| `pgrep -a -f oxutrm` after cleanup | `thinlinc`: no live sessions, no processes. Mac: no clients, tmux server killed |
 
 ## Anomalies
 
-*(None recorded — the test has not been run. Anomalies seen during a real run
-belong here, each described in full, with the standing rule applied: seen
-once and not reproduced is not a known defect, and non-reproduction is not a
-fix.)*
+Three, none of them a failure of B1's claim. The standing rule applies to all
+of them: **something seen once and not reproduced is not a known defect, and
+its non-reproduction is not a fix.**
+
+### 1. The tmux-pane trap fired again, exactly as this note warns
+
+After terminal 1 was displaced, its tmux pane still showed the full, healthy,
+last-painted screen — prompt and all. Nothing about the pane suggested the
+process behind it had died. The only signals that told the truth were the
+redirected stderr (`taken over by a newer attach`, `EXITED rc=1`) and the
+process table.
+
+Not a defect: it is how tmux works, and this note and Tier A's both warn about
+it. Recorded because it fired **in the one run that was watching for it**,
+which is the strongest possible argument for keeping the rule. A reader who
+had judged the takeover from the pane would have concluded the displaced
+client was fine.
+
+### 2. The relay's lifetime is the exchange, not the session — so the `shutdown_background()` risk is described in the wrong place
+
+The observation slot for "does `run_host_attach` return promptly when the far
+end hangs up" could not be filled as intended, and finding out why is the most
+useful thing this run produced besides the headline.
+
+**No `oxutrm host --attach` process was alive on `thinlinc` at all**, at any
+point after the takeover completed — checked before the hangup, while the
+session was working normally. `run_host_attach` relays *signalling*: once the
+attach exchange finishes and the QUIC path is up, terminal traffic flows
+directly between the client and the host session, the relay's socket side
+completes, and the process exits on its own. It never sees a user detach,
+because it is already gone by then.
+
+That means the risk `run_host_attach`'s comment describes is real but
+mislocated. The comment (and this note's own step 6, and the review finding
+behind both) frames the cancelled-write window as losing **"the tail of a
+screen update at the exact moment of detach."** No screen update ever traverses
+that relay. What could be lost is the tail of a **signalling message**, at the
+moment the exchange completes — a bounded, single-message loss, not a stream,
+and at a different point in the session's life than anyone had assumed.
+
+The `shutdown_background()` call itself is not implicated: the process was
+observed exiting promptly and unaided every time, which is the property it
+exists to protect. **What needs fixing is the comment at `src/main.rs`, and
+step 6 of this note.** Filed rather than fixed here, so that the correction is
+made with a reviewer rather than in the same breath as the observation.
+
+### 3. `thinlinc` warns on every invocation that the session socket may be unreliable
+
+Not new, and not caused by B1, but B1 is the first thing that makes it matter.
+Every `host --list` and `host --serve` prints:
+
+> lingering is off for this user, so `XDG_RUNTIME_DIR` is destroyed at logout
+> and a detached session would become unreachable, so sessions are recorded in
+> `/home/oetiker/.local/state/oxutrm` instead … **on a networked home
+> directory the session socket may be unreliable.**
+
+B1's whole feature is a Unix socket bound in that directory. On this run it
+worked perfectly across three attaches — but a Unix socket on a networked
+home directory is exactly the kind of thing that works until it does not, and
+"it worked once on one machine" is the standing of evidence here. Worth a
+deliberate look before anyone concludes reattach is reliable in this
+deployment: either `loginctl enable-linger $USER`, or `OXUTRM_STATE_DIR`
+pointed at local disk.
 
 ## The honest limit
 
@@ -388,11 +465,23 @@ client process on the far end of a real attach and watches a screen arrive —
 that needs the client-side attach path, which is B2's job to extract. **B1's
 evidence for its headline behaviour — that `oxutrm host --attach <id>` moves
 a live shell between terminals — is this one hand test, run once, on one
-machine, once it is actually run.** That is the same standing of evidence the
-PTO backoff fix had, and it is worth the same scepticism: a single run on a
-single machine confirms the mechanism fires and looks right, not that it is
-free of the kind of anomaly Tier A's note found (and left unexplained) in its
-first afternoon of real use.
+machine, on 2026-09-04.** That is the same standing of evidence the PTO
+backoff fix had, and it is worth the same scepticism: a single run on a single
+machine confirms the mechanism fires and looks right, not that it is free of
+the kind of anomaly Tier A's note found (and left unexplained) in its first
+afternoon of real use.
+
+Two specific gaps in *this* run, stated so nobody reads more into it than it
+carries:
+
+- **The detached-period case was not exercised.** Nothing was left running
+  before the detach, so "does the screen show what the shell did while nobody
+  was attached" is still unanswered.
+- **The hangup case was not exercised either**, and could not be — Anomalies
+  item 2 explains why the question was aimed at a process that had already
+  exited.
+
+Everything else in the recipe was run, and passed.
 
 **Something seen once and not reproduced is not a known defect, and its
 non-reproduction is not a fix.** This applies to whatever this run finds, the
