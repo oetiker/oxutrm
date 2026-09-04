@@ -4,6 +4,13 @@
 
 ### New
 
+- **A running session can be picked up from another terminal.** `oxutrm host
+  --list` has always shown live sessions and `--attach` has always refused to
+  do anything about them, because the socket every session registers was never
+  bound. It is bound now: attaching hands the same shell to the new terminal,
+  with the screen it has right now, and tells the terminal that had it that it
+  was taken over rather than leaving it to report silence.
+
 ### Changed
 
 ### Fixed
