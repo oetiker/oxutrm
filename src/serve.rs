@@ -57,6 +57,15 @@ pub fn run_host_serve() -> anyhow::Result<()> {
     // still want. The session is over; the registry entry has already been
     // removed by its guard; the only thing outstanding is a message from a
     // client we have stopped listening to.
+    //
+    // The middle clause is the one this depends on, and it is a claim about
+    // code rather than a hope: `serve()` awaits the aborted listener task
+    // before it drops the guard, so the last `Arc` really is gone and
+    // `RegistryGuard::drop` really has run by the time `serve()` returns. When
+    // that await was missing, the guard was still held by a task the runtime
+    // had not got round to dropping, `remove_dir_all` did not run, and this
+    // paragraph was licensing the process to walk away from a cleanup that had
+    // not happened.
     runtime.shutdown_background();
     outcome
 }
@@ -147,6 +156,7 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
             std::sync::Arc::clone(&guard),
             std::sync::Arc::clone(&meta),
             cfg,
+            crate::listener::ATTACH_TIMEOUT,
             attach_tx,
         ));
         Some((task, attach_rx))
@@ -166,7 +176,16 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     let code = match listening {
         Some((task, mut attach_rx)) => {
             let code = session.run_with_attaches(&mut attach_rx).await;
-            task.abort();
+            // `abort()` only SCHEDULES cancellation: the future — and with it
+            // the listener's `Arc` clone of the guard — is dropped by the
+            // runtime at some later point on some worker. Without this await
+            // the `drop(guard)` below decrements from two to one, the guard's
+            // `Drop` never runs, and whether the abandoned task's destructor
+            // beats `shutdown_background()` is a race. Awaiting an aborted
+            // handle returns as soon as the runtime has dropped the future,
+            // and `serve_attaches` touches no blocking pool, so this is
+            // prompt.
+            let _ = task.await;
             code
         }
         None => session.run().await,
