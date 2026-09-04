@@ -396,7 +396,14 @@ impl HostSession {
     /// `run_with_attaches`' own note — so this costs nothing and every
     /// existing caller and test is unchanged.
     pub async fn run(&mut self) -> Result<i32> {
-        let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        // Dropped, not merely unnamed. `let (_tx, ...)` binds the sender for
+        // the whole `await`, which leaves an open-and-empty channel whose
+        // `recv()` pends for ever — the behaviour is the same, but it is not
+        // the mechanism the sentence above describes, and it means the arm
+        // that `Some(a) = ...` is there to disable is never actually
+        // disabled by anything `run` does.
+        drop(tx);
         self.run_with_attaches(&mut rx).await
     }
 
@@ -599,12 +606,23 @@ impl HostSession {
             .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
 
         self.link = link;
-        self.size = size;
+        // `resize`, not `self.size = size`. The field means "the size the
+        // terminal currently IS", and writing it directly left the emulator
+        // and the pty at the FIRST client's geometry while every frame
+        // announced the newcomer's. Nothing downstream healed it either: the
+        // `input_rx` seeded below carries this same size, so `turn_at`'s
+        // `wanted != self.size` self-heal is false on every subsequent turn
+        // and the client only re-sends a size on a window change. A newcomer
+        // on a differently-sized terminal is the common case for reattach.
+        self.resize(size)
+            .context("resizing for the second attach")?;
 
         // §8.5. New generation, so both channels restart at 1. The screen
         // itself is NOT reset — the emulator kept running — so the base state
         // is blank and `screen_stale` forces the snapshot that fills it.
-        let blank = ScreenState::blank(size.rows, size.cols)?;
+        // Built from `self.size`, which the resize above has just made current
+        // (and which `resize` leaves untouched when the size did not change).
+        let blank = ScreenState::blank(self.size.rows, self.size.cols)?;
         self.screen_tx = oxutrm_sync::Sender::new(blank);
         self.input_rx = Receiver::new(InputState {
             seq: 1,
@@ -1914,6 +1932,59 @@ mod tests {
             TAKEN_OVER,
             "displaced with the wrong reason; the client cannot tell a takeover \
              from silence"
+        );
+    }
+
+    /// The newcomer's terminal is usually a different size, and the shell has
+    /// to land at ITS geometry.
+    ///
+    /// `adopt` used to write `self.size = size` directly. `self.size` means
+    /// "the size the terminal currently IS", and the only other writer,
+    /// [`HostSession::resize`], moves the emulator and the pty first. Writing
+    /// the field alone left both at the FIRST client's geometry — and nothing
+    /// downstream healed it, because `adopt` seeds `input_rx` with the very
+    /// value it wrote, so `turn_at`'s `wanted != self.size` self-heal is false
+    /// on that turn and on every turn after it. The client only re-sends a
+    /// size on a window change, so the shell stayed wrong until the user
+    /// resized their window by hand.
+    ///
+    /// Asserted on the screen the host actually SHIPS, not on `self.size`.
+    /// The blank placeholder `adopt` installs is built from a size too, so a
+    /// field assertion — or one taken before a turn — passes happily with the
+    /// emulator still at the old geometry. One turn later the sender holds
+    /// `term.snapshot()`, which can only be the emulator's own dimensions.
+    #[tokio::test]
+    async fn adopting_a_link_resizes_the_shell_to_the_newcomers_terminal() {
+        let (mut host, client) = pair("/bin/sh").await;
+        assert_eq!(
+            (host.screen().rows, host.screen().cols),
+            (size().rows, size().cols),
+            "the fixture did not start where this test thinks it did"
+        );
+        drop(client);
+
+        let newcomer = TermSize {
+            cols: 132,
+            rows: 43,
+        };
+        let (_host2, client2) = pair("/bin/sh").await;
+        host.adopt(client2.link_take(), newcomer)
+            .expect("adopting a second attach");
+
+        // `screen_stale` is set by `adopt`, so this turn snapshots the
+        // emulator whether or not the shell happened to write anything.
+        host.turn_at(Instant::now(), None)
+            .expect("turn after adopting");
+
+        assert_eq!(
+            (host.screen().rows, host.screen().cols),
+            (newcomer.rows, newcomer.cols),
+            "the shell is still at the previous client's geometry: the \
+             newcomer asked for {}x{} and the authoritative screen is {}x{}",
+            newcomer.cols,
+            newcomer.rows,
+            host.screen().cols,
+            host.screen().rows
         );
     }
 

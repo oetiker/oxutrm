@@ -84,6 +84,19 @@ where
         bound_port,
     );
     let client = exchange_hellos(&mut stdin, &mut stdout, &hello).await?;
+    // I7, checked HERE so that a size no screen can be built at fails the
+    // ATTACH and not the session. `ScreenState::blank` is the first thing that
+    // would refuse it, and on a reattach that refusal lands inside
+    // `HostSession::adopt` — after the old link has already been closed and
+    // replaced — where it propagates out of `run_with_attaches` and takes a
+    // running shell with it. `check_bounds` is the existing check and is
+    // called before allocating, which is its whole contract.
+    client.size.check_bounds().with_context(|| {
+        format!(
+            "the client asked for a {}x{} terminal",
+            client.size.cols, client.size.rows
+        )
+    })?;
     meta.size = client.size;
 
     // R8. The controlling side nominates; this side is told.
@@ -325,6 +338,23 @@ mod tests {
         }
     }
 
+    /// A configuration that reaches no network at all.
+    ///
+    /// Public STUN servers are a list of hopes, not of requirements
+    /// (`stun_discover`'s own words), and an empty list is a supported
+    /// configuration — not a test reaching the internet for a check that has
+    /// nothing to do with STUN. It is also what makes these tests fast and
+    /// deterministic: with a gather budget in play, "the exchange has
+    /// finished" and "the test looked" stop being reliably ordered.
+    fn stun_free() -> NetConfig {
+        NetConfig {
+            stun_servers: vec![],
+            enable_port_mapping: false,
+            enable_birthday: false,
+            ..Default::default()
+        }
+    }
+
     /// R11 is the caller's, not the exchange's.
     ///
     /// `detachable` is settled from the *nominated rung* by
@@ -343,22 +373,7 @@ mod tests {
         let (client, host) = tokio::io::duplex(64);
         drop(client);
         let (r, w) = tokio::io::split(host);
-        // Public STUN servers are a list of hopes, not of requirements
-        // (`stun_discover`'s own words), and an empty list is a supported
-        // configuration -- not this test reaching the internet for a check
-        // that has nothing to do with STUN.
-        let _ = run_attach_exchange(
-            tokio::io::BufReader::new(r),
-            w,
-            &mut meta,
-            &NetConfig {
-                stun_servers: vec![],
-                enable_port_mapping: false,
-                enable_birthday: false,
-                ..Default::default()
-            },
-        )
-        .await;
+        let _ = run_attach_exchange(tokio::io::BufReader::new(r), w, &mut meta, &stun_free()).await;
 
         assert!(
             !meta.detachable,
@@ -371,6 +386,64 @@ mod tests {
              got {}: {meta:?}",
             meta.attach_id
         );
+    }
+
+    /// A size no screen can be built at must fail the ATTACH, not the session.
+    ///
+    /// `ScreenState::blank` refuses anything past I7's bounds, and the caller
+    /// that builds one on a REATTACH is [`crate::session::HostSession::adopt`]
+    /// — which runs after the old link has been closed and replaced, and whose
+    /// `?` propagates out of `run_with_attaches` and takes a running shell with
+    /// it. The exchange is where that has to be caught: it is the last point
+    /// at which "no" costs only this attach.
+    #[tokio::test]
+    async fn a_client_size_no_screen_can_be_built_at_fails_the_attach_not_the_session() {
+        let mut meta = fresh_meta("huge");
+        let (theirs, ours) = tokio::io::duplex(64 * 1024);
+
+        // A peer that behaves exactly like a real client up to the one thing
+        // under test: it waits for the offer, then asks for a screen far past
+        // MAX_SCREEN_DIM in both directions.
+        let client = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let _ = oxutrm_host::signalling::read_signal_async(&mut r).await;
+            let mut hello = a_client_hello();
+            if let Signal::ClientHello { size, .. } = &mut hello {
+                *size = TermSize {
+                    cols: 4000,
+                    rows: 4000,
+                };
+            }
+            let _ = oxutrm_host::signalling::write_signal_async(&mut w, &hello).await;
+            // Held: dropping the write half here would close the pipe and the
+            // exchange would fail for that reason instead of this one.
+            std::future::pending::<()>().await;
+        });
+
+        let (r, w) = tokio::io::split(ours);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_attach_exchange(tokio::io::BufReader::new(r), w, &mut meta, &stun_free()),
+        )
+        .await
+        .expect("the exchange must not hang on an impossible size");
+        // `Attached` is not `Debug` — it owns a live connection — so this
+        // cannot be an `expect_err`.
+        let Err(error) = outcome else {
+            panic!("a size no screen can be built at was accepted as an attach");
+        };
+
+        assert!(
+            format!("{error:#}").contains("4000"),
+            "the refusal does not name the size that caused it: {error:#}"
+        );
+        assert_eq!(
+            meta.size,
+            TermSize { cols: 80, rows: 24 },
+            "the impossible size was recorded on the session record anyway"
+        );
+        client.abort();
     }
 
     // ---- the hello exchange, and the order that is its whole content ---------
