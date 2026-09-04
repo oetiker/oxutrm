@@ -145,15 +145,26 @@ fn run_host_attach(id: &str) -> Result<()> {
         anyhow::Ok(())
     });
 
-    // Do not wait for a stdin read that may still be parked in the blocking
-    // pool. `tokio::select!` above cancels whichever `relay_signals` branch
-    // lost, but a blocking read can't be cancelled, only abandoned — and
-    // `tokio::io::stdin()` is exactly that read. `serve.rs`'s R3 comment
-    // documents the same shape of bug, measured on the host's signalling
-    // pipe: a runtime dropped normally waits for that read and the process
-    // never returns until the terminal produces a byte. Shutting down in the
-    // background is the same fix, here for the terminal instead of ssh's
-    // pipe.
+    // Do not wait for whichever `relay_signals` branch `tokio::select!` just
+    // cancelled. The workspace's `io-std` feature backs BOTH `stdin()` and
+    // `stdout()` with the blocking pool, so this is not only the
+    // stdin-can't-be-cancelled case `serve.rs`'s R3 comment documents for
+    // ssh's pipe: if the stdin-to-socket branch wins instead, the socket-to-
+    // stdout branch can be cancelled mid-write, and unlike an implicit drop —
+    // which would block until that write's blocking-pool task finishes —
+    // `shutdown_background()` does not wait for it either. So what can be
+    // lost here, unlike in `serve.rs`, is a write of content the user is
+    // trying to see: the tail of the host's most recent screen update,
+    // mid-flight to this terminal at the moment of detach. Two things keep
+    // that cheap: design spec §8.5 guarantees the next attach's first
+    // datagram is a full state, so this heals on reconnect rather than
+    // corrupting anything lasting; and `read_signal_async` (blocking on new
+    // data) dominates wall-clock time over `write_signal_async` (a fast local
+    // write), so the loser of the select is usually parked in a read, not a
+    // write, same as `serve.rs`. Shutting down in the background is still the
+    // right call: the hang it avoids — the process never returning once the
+    // session end hangs up, until the terminal produces a byte — is real and
+    // certain, where the write it might drop is rare and self-healing.
     runtime.shutdown_background();
     outcome
 }
@@ -398,8 +409,10 @@ mod tests {
     /// `--attach` was the same story: both usage strings called it
     /// unimplemented, and the day it worked (this commit) that half of the
     /// test was deleted rather than left asserting a now-false claim — see
-    /// `attach_without_an_id_says_where_to_find_one` and
-    /// `crates/oxutrm-host/tests/attach.rs` for what actually covers it now.
+    /// `attach_without_an_id_says_where_to_find_one` for the no-id usage
+    /// error, `crates/oxutrm-host/tests/attach.rs` for `connect_to_session`
+    /// and `relay_signals` themselves, and `tests/host_attach.rs` for
+    /// `run_host_attach`'s own wiring between the two.
     #[test]
     fn the_help_text_agrees_with_what_is_actually_implemented() {
         for (name, text) in [("USAGE", USAGE), ("HOST_USAGE", HOST_USAGE)] {

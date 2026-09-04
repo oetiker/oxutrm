@@ -134,28 +134,6 @@ async fn an_unknown_id_lists_what_does_exist() {
     );
 }
 
-/// The id is what a user types, and mistyping it is the common case.
-///
-/// `--attach` must reach `connect_to_session`'s error, which lists what does
-/// exist — that listing is the whole value of the error.
-#[tokio::test]
-async fn attaching_to_an_unknown_id_lists_what_is_actually_there() {
-    let tmp = short_tempdir();
-    let root = Registry::dir_at(tmp.path());
-    let (_guard, _listener) = serving(&root, "realone").await;
-
-    let err = connect_to_session(&root, "typo")
-        .await
-        .expect_err("no session called typo");
-
-    let text = err.to_string();
-    assert!(
-        text.contains("realone"),
-        "the error does not name the session that IS there, so the user has \
-         nothing to correct their typo against: {text}"
-    );
-}
-
 #[tokio::test]
 async fn an_empty_registry_says_so_rather_than_listing_nothing() {
     let tmp = short_tempdir();
