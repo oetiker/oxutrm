@@ -124,6 +124,13 @@ fn run_host_list() -> Result<()> {
 fn run_host_attach(id: &str) -> Result<()> {
     let root = oxutrm_host::resolve_registry_root()
         .context("deciding where oxutrm records its sessions")?;
+    // Printed here for the same reason `--serve` and `--list` print it: on a
+    // fallback root, "no session <id> here" is the message the user gets, and
+    // without this line there is nothing to explain why the id they were just
+    // shown is not there.
+    if let Some(warning) = &root.warning {
+        eprintln!("{warning}");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
