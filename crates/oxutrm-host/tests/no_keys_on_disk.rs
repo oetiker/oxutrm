@@ -72,6 +72,7 @@ fn nothing_a_session_writes_contains_its_key_material() {
             rows: 40,
         },
         detachable: true,
+        boot: None,
     };
     let guard = RegistryGuard::register_in(&root, &meta).expect("register");
 
@@ -128,7 +129,7 @@ fn nothing_a_session_writes_contains_its_key_material() {
 /// exist; this fails the moment somebody adds a field to `SessionMeta`,
 /// whatever it is called, so the addition gets looked at rather than shipped.
 #[test]
-fn meta_json_holds_exactly_the_seven_fields_it_is_allowed_to() {
+fn meta_json_holds_exactly_the_eight_fields_it_is_allowed_to() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Registry::dir_at(tmp.path());
     let meta = SessionMeta {
@@ -139,6 +140,10 @@ fn meta_json_holds_exactly_the_seven_fields_it_is_allowed_to() {
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        // `boot` was looked at deliberately here: it is a boot/machine
+        // identifier (a Linux boot UUID or a macOS boot timestamp), never key
+        // material, so it belongs in this list rather than being excluded.
+        boot: None,
     };
     let guard = RegistryGuard::register_in(&root, &meta).expect("register");
 
@@ -152,6 +157,7 @@ fn meta_json_holds_exactly_the_seven_fields_it_is_allowed_to() {
         keys,
         vec![
             "attach_id",
+            "boot",
             "created_unix",
             "detachable",
             "pid",

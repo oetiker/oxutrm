@@ -166,6 +166,7 @@ fn run_split(report: &str, held: &[(String, i32)], gate: bool, keep_open: bool) 
         shell: "/bin/sh".to_string(),
         size: oxutrm_proto::TermSize { cols: 80, rows: 24 },
         detachable: false,
+        boot: oxutrm_host::boot_token(),
     };
     let permit = oxutrm_host::settle_detachability(&mut meta, oxutrm_proto::Rung::StunPunch)
         .expect("a nominated non-tunnel rung must yield a permit");

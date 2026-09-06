@@ -204,6 +204,7 @@ async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed()
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        boot: None,
     };
     let guard = RegistryGuard::register_in(&root, &meta).expect("register");
     let sock = guard.socket_path();

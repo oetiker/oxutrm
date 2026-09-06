@@ -19,6 +19,7 @@ fn meta(id: &str, pid: u32) -> SessionMeta {
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        boot: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn plant(root: &Path, id: &str, pid: u32, created: u64) -> std::path::PathBuf {
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        boot: None,
     };
     std::fs::write(dir.join(META_FILE), serde_json::to_vec(&m).unwrap()).expect("write meta");
     std::fs::write(dir.join("sock"), b"").expect("write sock");

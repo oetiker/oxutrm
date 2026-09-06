@@ -335,6 +335,7 @@ mod tests {
             shell: "/bin/sh".to_owned(),
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
+            boot: None,
         }
     }
 
@@ -468,6 +469,7 @@ mod tests {
             shell: "/bin/sh".to_owned(),
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
+            boot: None,
         };
         let attach = oxutrm_host::begin_attach(&mut meta, HostSpki::new([7u8; 32]))
             .expect("fresh key material");

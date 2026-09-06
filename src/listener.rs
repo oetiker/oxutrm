@@ -126,6 +126,7 @@ mod tests {
             shell: "/bin/sh".to_owned(),
             size: oxutrm_proto::TermSize { cols: 80, rows: 24 },
             detachable: false,
+            boot: None,
         }
     }
 

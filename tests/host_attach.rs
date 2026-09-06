@@ -59,6 +59,7 @@ fn a_session(id: &str) -> SessionMeta {
         shell: "/bin/bash".to_owned(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        boot: None,
     }
 }
 

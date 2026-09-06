@@ -48,7 +48,7 @@ pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_d
 pub use ladder::LadderPlan;
 pub use registry::{
     META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot,
-    RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, check_socket_path_length,
+    RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, boot_token, check_socket_path_length,
     choose_registry_root, detachable_for_rung, entry_is_stale, linger_enabled, new_session_id,
     now_unix, pid_alive, process_start_unix, read_root_env, resolve_registry_root,
 };

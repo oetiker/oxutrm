@@ -90,6 +90,7 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         // safe direction: a record that over-promises reattachment is worse
         // than one that under-promises it for a few hundred milliseconds.
         detachable: false,
+        boot: oxutrm_host::boot_token(),
     };
 
     let attached = crate::attach_exchange::run_attach_exchange(

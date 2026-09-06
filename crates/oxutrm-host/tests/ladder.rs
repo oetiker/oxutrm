@@ -26,6 +26,7 @@ fn meta() -> SessionMeta {
         shell: "/bin/bash".to_string(),
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
+        boot: None,
     }
 }
 

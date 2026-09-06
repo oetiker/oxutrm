@@ -50,6 +50,14 @@ pub struct SessionMeta {
     /// never daemonizes, and dies with its ssh. `--list` shows the difference,
     /// because "reattach later" is a promise oxutrm must not make falsely.
     pub detachable: bool,
+    /// Which boot this session belongs to — see [`boot_token`].
+    ///
+    /// `Option` for two reasons that both matter: a platform may not be able
+    /// to answer, and an entry written before this field existed must keep
+    /// parsing. `serde(default)` is what makes the second true; without it an
+    /// upgrade would strand every running session behind a parse error.
+    #[serde(default)]
+    pub boot: Option<String>,
 }
 
 impl SessionMeta {
@@ -329,6 +337,19 @@ pub fn boot_token() -> Option<String> {
 /// process (spec §9.2).
 #[must_use]
 pub fn entry_is_stale(meta: &SessionMeta) -> bool {
+    // A different boot means a different process table: this pid refers to
+    // another boot, or another machine sharing the registry directory. Decide
+    // here and do not look at the pid at all -- on a shared registry it names
+    // an unrelated live process on this host, which would read as "alive".
+    //
+    // Only when BOTH sides have a token: a `None` on either side means "cannot
+    // tell", and the rules below are the answer for that case.
+    if let (Some(entry), Some(current)) = (meta.boot.as_deref(), boot_token().as_deref())
+        && entry != current
+    {
+        return true;
+    }
+
     if !pid_alive(meta.pid) {
         return true;
     }
@@ -716,5 +737,53 @@ mod tests {
         // The whole design rests on this: two reads during one boot must agree,
         // or every entry would look foreign to the next `--list`.
         assert_eq!(boot_token(), boot_token());
+    }
+
+    fn meta_for_staleness(pid: u32, boot: Option<&str>) -> SessionMeta {
+        SessionMeta {
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            attach_id: 1,
+            pid,
+            created_unix: now_unix(),
+            shell: "/bin/sh".to_owned(),
+            size: TermSize { cols: 80, rows: 24 },
+            detachable: true,
+            boot: boot.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn an_entry_from_another_boot_is_stale_even_though_its_pid_is_alive() {
+        // Our own pid, so every pre-existing liveness check says "alive". Only
+        // the boot comparison can make this stale -- delete that check and this
+        // test fails rather than passing for the wrong reason.
+        let meta = meta_for_staleness(std::process::id(), Some("not-this-boot"));
+        assert!(entry_is_stale(&meta));
+    }
+
+    #[test]
+    fn an_entry_from_this_boot_still_follows_the_pid_rules() {
+        let live = meta_for_staleness(std::process::id(), boot_token().as_deref());
+        assert!(
+            !entry_is_stale(&live),
+            "our own live pid, this boot: not stale"
+        );
+    }
+
+    #[test]
+    fn an_entry_with_no_boot_token_follows_the_old_rules_unchanged() {
+        // Written by a version before this field existed. It must not become
+        // stale merely for lacking a token, or upgrading would strand sessions.
+        let live = meta_for_staleness(std::process::id(), None);
+        assert!(!entry_is_stale(&live));
+    }
+
+    #[test]
+    fn meta_json_written_before_this_field_existed_still_parses() {
+        let old = r#"{"session_id":"0123456789abcdef0123456789abcdef","attach_id":1,
+            "pid":1,"created_unix":1,"shell":"/bin/sh",
+            "size":{"cols":80,"rows":24},"detachable":true}"#;
+        let meta: SessionMeta = serde_json::from_str(old).expect("old meta.json must still parse");
+        assert_eq!(meta.boot, None);
     }
 }

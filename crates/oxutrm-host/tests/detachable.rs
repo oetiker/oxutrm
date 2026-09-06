@@ -23,6 +23,7 @@ fn meta(id: &str) -> SessionMeta {
         // The host's intent, before ICE has nominated anything. Deliberately
         // optimistic, which is why it must not be trusted.
         detachable: true,
+        boot: None,
     }
 }
 
