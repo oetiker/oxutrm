@@ -367,7 +367,7 @@ pub struct Registry;
 
 impl Registry {
     /// The registry directory, wherever it has to live to survive logout.
-    /// See [`choose_registry_root`].
+    /// See [`resolve_registry_root`].
     pub fn dir() -> anyhow::Result<PathBuf> {
         Ok(Self::dir_at(&resolve_registry_root()?.base))
     }
@@ -779,8 +779,8 @@ pub struct RootEnv {
     /// to prefer, nothing to warn about and nothing to advise: the state
     /// directory is simply where sessions live.
     ///
-    /// A field rather than a `cfg` in [`choose_registry_root`], so the whole
-    /// decision table stays testable from either platform.
+    /// A field rather than a `cfg` in [`registry_root_candidates`], so the
+    /// whole decision table stays testable from either platform.
     pub runtime_dirs_exist: bool,
     /// Whether this system has `/dev/shm` at all.
     ///
@@ -861,76 +861,28 @@ pub fn registry_root_candidates(env: &RootEnv) -> Vec<RegistryRoot> {
     out
 }
 
-/// Decide where sessions are recorded.
+/// Take the first candidate that is usable.
 ///
-/// `$XDG_RUNTIME_DIR` is preferred, but **only when it is known to survive the
-/// user logging out**. On a systemd host `/run/user/<uid>` is destroyed with
-/// the last login session: the session process keeps running while its registry
-/// directory and its `sock` vanish underneath it, so `--list` shows nothing and
-/// reattach is impossible. That is exactly the failure oxutrm exists to
-/// prevent, arriving through the back door.
-///
-/// The runtime directory still wins wherever it is safe, because a home
-/// directory may be on NFS, where Unix sockets are unreliable.
-pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
-    if let Some(dir) = &env.override_dir {
-        return Ok(RegistryRoot {
-            base: dir.clone(),
-            kind: RegistryRootKind::HomeState,
-            warning: None,
-        });
+/// `Unavailable` and `Io` mean "nothing of ours is here" and move on.
+/// **`Occupied` stops the walk.** That asymmetry is the whole point: falling
+/// through on an occupied path would let any local user squat both local
+/// candidates and silently push every session onto the last resort, which may
+/// be a networked home directory. Two `mkdir`s, repeatable, invisible. A
+/// squat is reported and acted on by a human, never routed around.
+pub fn walk_candidates(candidates: Vec<RegistryRoot>) -> anyhow::Result<RegistryRoot> {
+    let mut reasons = Vec::new();
+    for root in candidates {
+        match prepare_root(&root.base) {
+            Ok(()) => return Ok(root),
+            Err(PrepareError::Occupied(why)) => return Err(anyhow!("{why}")),
+            Err(e) => reasons.push(format!("{}: {e}", root.base.display())),
+        }
     }
-
-    let fallback = |reason: Option<&str>| -> anyhow::Result<RegistryRoot> {
-        let home = env.home.as_ref().ok_or_else(|| {
-            anyhow!(
-                "neither a usable XDG_RUNTIME_DIR nor a HOME, so there is nowhere \
-                 to record sessions. Set OXUTRM_STATE_DIR to a directory that \
-                 survives logout."
-            )
-        })?;
-        Ok(RegistryRoot {
-            base: state_base(home),
-            kind: RegistryRootKind::HomeState,
-            warning: reason.map(|reason| {
-                format!(
-                    "oxutrm: {reason}, so sessions are recorded in {} instead of \
-                     XDG_RUNTIME_DIR. Sessions will survive, but on a networked \
-                     home directory the session socket may be unreliable. To use \
-                     the runtime directory instead, run `loginctl enable-linger \
-                     $USER` on this host; to choose the location yourself, set \
-                     OXUTRM_STATE_DIR.",
-                    state_base(home).join(REGISTRY_SUBDIR).display()
-                )
-            }),
-        })
-    };
-
-    // Nothing to prefer and nothing to explain. Note that this ignores an
-    // `XDG_RUNTIME_DIR` somebody set by hand: on a system with no runtime
-    // directories there is no way to ask whether that one outlives the login,
-    // and an unverifiable runtime directory is exactly what the table below
-    // refuses everywhere else. `OXUTRM_STATE_DIR` remains the way to say where
-    // sessions go, and it was already handled above.
-    if !env.runtime_dirs_exist {
-        return fallback(None);
-    }
-
-    match (&env.xdg_runtime_dir, env.linger) {
-        (Some(dir), Some(true)) => Ok(RegistryRoot {
-            base: dir.clone(),
-            kind: RegistryRootKind::RuntimeDir,
-            warning: None,
-        }),
-        (Some(_), Some(false)) => fallback(Some(
-            "lingering is off for this user, so XDG_RUNTIME_DIR is destroyed at \
-             logout and a detached session would become unreachable",
-        )),
-        (Some(_), None) => fallback(Some(
-            "whether XDG_RUNTIME_DIR survives logout could not be determined",
-        )),
-        (None, _) => fallback(Some("XDG_RUNTIME_DIR is not set")),
-    }
+    Err(anyhow!(
+        "nowhere to record sessions. Tried:\n  {}\nSet OXUTRM_STATE_DIR to a \
+         directory that survives logout.",
+        reasons.join("\n  ")
+    ))
 }
 
 /// Ask systemd whether this user's runtime directory outlives their sessions.
@@ -960,7 +912,7 @@ pub fn read_root_env() -> RootEnv {
     RootEnv {
         // The one place the platform is asked. macOS has neither the variable
         // nor `loginctl`; every other Unix oxutrm runs on is systemd-shaped
-        // enough for the table in `choose_registry_root` to apply.
+        // enough for the table in `registry_root_candidates` to apply.
         runtime_dirs_exist: !cfg!(target_os = "macos"),
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -976,8 +928,14 @@ pub fn read_root_env() -> RootEnv {
     }
 }
 
+/// Decide where sessions are recorded.
+///
+/// [`registry_root_candidates`] ranks the places this environment could keep
+/// its registry, best first; [`walk_candidates`] takes the first one that
+/// proves safe, and refuses to fall past one that is squatted rather than
+/// silently downgrading to the next.
 pub fn resolve_registry_root() -> anyhow::Result<RegistryRoot> {
-    choose_registry_root(&read_root_env())
+    walk_candidates(registry_root_candidates(&read_root_env()))
 }
 
 /// `sockaddr_un::sun_path` holds 108 bytes on Linux and 104 on macOS, in both

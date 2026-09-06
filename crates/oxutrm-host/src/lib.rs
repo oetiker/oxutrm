@@ -17,8 +17,12 @@
 //! systemd tears it down when the user's last login session ends. A session
 //! that daemonized into a directory which then vanished is still running and
 //! completely unreachable — no socket, no `--list` entry, no way back. So
-//! [`registry::choose_registry_root`] uses the runtime directory only where
-//! lingering is known to keep it alive, and says so loudly when it falls back.
+//! sessions are recorded on local, boot-cleared storage first — `/dev/shm` on
+//! Linux, `/var/tmp` elsewhere — and only fall back to the runtime directory
+//! where lingering is known to keep it alive, with the home directory as a
+//! last resort. A candidate that turns out to be squatted by something else
+//! is a hard stop, not a reason to quietly try the next one. See
+//! [`registry::resolve_registry_root`].
 //!
 //! **When it is safe to detach.** Detaching is two operations, and they are
 //! not safe at the same moment. [`detach_process`] forks away from ssh and is
@@ -47,10 +51,11 @@ pub use daemon::{Detached, FD_DIRS, daemonize, daemonize_session, detach_process
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
 pub use ladder::LadderPlan;
 pub use registry::{
-    META_FILE, PID_REUSE_SLACK_SECS, REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot,
-    RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, boot_token, check_socket_path_length,
-    choose_registry_root, detachable_for_rung, entry_is_stale, linger_enabled, new_session_id,
-    now_unix, pid_alive, process_start_unix, read_root_env, resolve_registry_root,
+    DirVerdict, META_FILE, PID_REUSE_SLACK_SECS, PrepareError, REGISTRY_SUBDIR, Registry,
+    RegistryGuard, RegistryRoot, RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, boot_token,
+    check_socket_path_length, detachable_for_rung, dir_verdict, entry_is_stale, linger_enabled,
+    new_session_id, now_unix, pid_alive, prepare_root, process_start_unix, read_root_env,
+    registry_root_candidates, resolve_registry_root, walk_candidates,
 };
 
 // There is deliberately no `transport::Path` here any more. It existed to hold

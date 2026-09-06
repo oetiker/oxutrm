@@ -15,6 +15,20 @@
 
 ### Fixed
 
+- **Reattaching no longer needs `loginctl enable-linger`.** A detached session
+  outlives your login on most systems, but the directory it registered itself
+  in — `/run/user/<uid>` — does not, so oxutrm used to record sessions in your
+  home directory instead. On a networked home that put the session's Unix
+  socket on a filesystem where Unix sockets are not reliable, and on a shared
+  home it meant `--list` could show sessions belonging to another machine and
+  test their process ids against the wrong computer. Sessions are now recorded
+  on local storage — `/dev/shm` on Linux, `/var/tmp` elsewhere — which survives
+  logout without any administrative setup, and each entry records which boot it
+  belongs to, so entries left behind by an earlier boot or a different machine
+  are recognised instead of believed. If something else has taken the directory
+  oxutrm wants, it now says so and stops rather than quietly falling back to
+  the home directory.
+
 - **A session whose network came back stayed dead for minutes.** Removing the
   idle timeout in 0.2.0 so a session could outlive an outage also removed,
   unnoticed, the only thing bounding QUIC's exponential probe backoff: the

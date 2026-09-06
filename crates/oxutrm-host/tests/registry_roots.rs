@@ -1,7 +1,12 @@
 //! Real directories, real symlinks, real modes. `prepare_root` is about the
 //! filesystem, so it cannot be tested against a table.
 
-use oxutrm_host::registry::{PrepareError, prepare_root};
+use oxutrm_host::registry::{
+    PrepareError, RegistryRoot, RegistryRootKind, RootEnv, check_socket_path_length, prepare_root,
+    registry_root_candidates, walk_candidates,
+};
+use oxutrm_host::{Registry, RegistryGuard, SessionMeta, now_unix};
+use oxutrm_proto::TermSize;
 
 /// A short private directory under `/tmp` rather than `std::env::temp_dir()`:
 /// on macOS the latter is `/var/folders/<hash>/T/`, which eats into the
@@ -147,4 +152,174 @@ fn a_group_writable_parent_without_the_sticky_bit_is_unavailable() {
         prepare_root(&base),
         Err(PrepareError::Unavailable(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Walking the candidate list
+// ---------------------------------------------------------------------------
+
+fn root(base: &std::path::Path, kind: RegistryRootKind) -> RegistryRoot {
+    RegistryRoot {
+        base: base.to_path_buf(),
+        kind,
+        warning: None,
+    }
+}
+
+#[test]
+fn an_unavailable_candidate_falls_through_to_the_next() {
+    let scratch = scratch();
+    let missing = scratch.path().join("no-such-parent").join("oxutrm-1234");
+    let good = scratch.path().join("oxutrm-1234");
+
+    let chosen = walk_candidates(vec![
+        root(&missing, RegistryRootKind::SharedMemory),
+        root(&good, RegistryRootKind::VarTmp),
+    ])
+    .expect("an absent location is a reason to look elsewhere");
+    assert_eq!(chosen.kind, RegistryRootKind::VarTmp);
+}
+
+#[test]
+fn a_squatted_candidate_stops_the_walk_instead_of_downgrading() {
+    // THE test for this change. If Occupied fell through like Unavailable,
+    // a local user could squat both local candidates with two mkdirs and
+    // silently force every session back onto the networked home directory.
+    let scratch = scratch();
+    let squatted = scratch.path().join("oxutrm-1234");
+    std::fs::write(&squatted, b"squat").unwrap();
+    let home = scratch.path().join("home-state");
+
+    let err = walk_candidates(vec![
+        root(&squatted, RegistryRootKind::SharedMemory),
+        root(&home, RegistryRootKind::HomeState),
+    ])
+    .expect_err("a squatted candidate must stop the walk");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not a directory"),
+        "must say what is wrong: {msg}"
+    );
+    assert!(
+        msg.contains("OXUTRM_STATE_DIR"),
+        "must say how to recover: {msg}"
+    );
+    assert!(
+        !home.exists(),
+        "the walk must not have reached, let alone created, the next candidate"
+    );
+}
+
+#[test]
+fn an_explicit_choice_never_falls_through() {
+    let scratch = scratch();
+    let squatted = scratch.path().join("chosen");
+    std::fs::write(&squatted, b"squat").unwrap();
+
+    assert!(
+        walk_candidates(vec![root(&squatted, RegistryRootKind::Explicit)]).is_err(),
+        "the user's own choice is never second-guessed"
+    );
+}
+
+#[test]
+fn a_walk_with_nothing_usable_says_so() {
+    let scratch = scratch();
+    let missing = scratch.path().join("no-such-parent").join("oxutrm-1234");
+    let err =
+        walk_candidates(vec![root(&missing, RegistryRootKind::VarTmp)]).expect_err("none usable");
+    assert!(
+        err.to_string().contains("nowhere to record sessions"),
+        "the empty case needs its own message: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Moved from the now-deleted tests/registry_root.rs: everything else there
+// tested `choose_registry_root`'s two-way decision table, which is gone.
+// These two survive because they test what is still here: the socket-length
+// guard, and the regression this whole subsystem exists to prevent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_socket_path_too_long_for_sun_path_is_refused_with_advice() {
+    let long = std::path::PathBuf::from(format!(
+        "/home/{}/.local/state/oxutrm/abc/sock",
+        "x".repeat(120)
+    ));
+    let err = check_socket_path_length(&long).expect_err("108 bytes is the limit");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("OXUTRM_STATE_DIR"),
+        "must offer the override: {text}"
+    );
+    check_socket_path_length(std::path::Path::new("/run/user/1000/oxutrm/abc/sock"))
+        .expect("a normal path is fine");
+}
+
+/// The runtime directory disappearing at logout must not take the session
+/// with it. This is the regression guard for the bug this whole subsystem
+/// exists to prevent.
+#[tokio::test]
+async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed() {
+    let tmp = scratch();
+    let fake_runtime = tmp.path().join("run-user-1000");
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_runtime).expect("runtime dir");
+    std::fs::create_dir_all(&fake_home).expect("home");
+
+    // Lingering is off, so no candidate the walk would try may lie under the
+    // runtime directory that is about to vanish.
+    let env = RootEnv {
+        xdg_runtime_dir: Some(fake_runtime.clone()),
+        home: Some(fake_home.clone()),
+        override_dir: None,
+        linger: Some(false),
+        runtime_dirs_exist: true,
+        // Not the production shape under test here; `false` is honest.
+        shm_exists: false,
+    };
+    let candidates = registry_root_candidates(&env);
+    assert!(
+        candidates
+            .iter()
+            .all(|c| !c.base.starts_with(&fake_runtime)),
+        "no candidate may lie under the directory that is about to vanish: {candidates:?}"
+    );
+
+    // Exercise the register/bind/list half against a scratch directory, never
+    // the real /var/tmp or /dev/shm.
+    let root = Registry::dir_at(&tmp.path().join("state"));
+    let meta = SessionMeta {
+        session_id: "1234abcd1234abcd1234abcd1234abcd".to_string(),
+        attach_id: 1,
+        pid: std::process::id(),
+        // Must be recent: an entry older than the process holding its pid is
+        // stale by the pid-reuse rule.
+        created_unix: now_unix(),
+        shell: "/bin/bash".to_string(),
+        size: TermSize { cols: 80, rows: 24 },
+        detachable: true,
+        boot: None,
+    };
+    let guard = RegistryGuard::register_in(&root, &meta).expect("register");
+    let sock = guard.socket_path();
+    check_socket_path_length(&sock).expect("short enough");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+
+    // Logout: systemd tears the runtime directory down.
+    std::fs::remove_dir_all(&fake_runtime).expect("simulate logout");
+    assert!(!fake_runtime.exists());
+
+    let listed = Registry::list_in(&root).expect("list");
+    assert_eq!(listed.len(), 1, "the session must still be discoverable");
+    assert_eq!(listed[0].session_id, meta.session_id);
+
+    let connected = tokio::net::UnixStream::connect(&sock).await;
+    assert!(
+        connected.is_ok(),
+        "the socket must still be reachable: {connected:?}"
+    );
+    drop(listener);
 }
