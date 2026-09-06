@@ -527,6 +527,138 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Proving a candidate registry root is safe to use
+// ---------------------------------------------------------------------------
+
+/// What an existing path at a candidate registry root turns out to be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirVerdict {
+    /// Nothing there. Create it.
+    Absent,
+    /// A directory, ours, mode `0700`. Reuse it.
+    Ours,
+    /// A directory, ours, wrong mode. `chmod` and reuse: we own it, so this is
+    /// recovery from a crash or an older version.
+    OursWrongMode,
+    /// Anything else. Never used, never repaired. The string says why, for a
+    /// message a user has to act on.
+    NotOurs(String),
+}
+
+/// Judge a path from metadata obtained **without following symlinks**.
+///
+/// Pure, and takes `our_uid` rather than calling `getuid` itself, so the
+/// foreign-owner case is testable without privileges — a directory owned by
+/// another user cannot be created by a test.
+#[must_use]
+pub fn dir_verdict(md: &std::fs::Metadata, our_uid: u32) -> DirVerdict {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if md.file_type().is_symlink() {
+        return DirVerdict::NotOurs("it is a symbolic link".to_owned());
+    }
+    if !md.is_dir() {
+        return DirVerdict::NotOurs("it is not a directory".to_owned());
+    }
+    if md.uid() != our_uid {
+        return DirVerdict::NotOurs(format!("it is owned by uid {}, not {our_uid}", md.uid()));
+    }
+    // Exactly 0700, not merely "no group or other bits". A directory at 0600
+    // has no bits we object to and still cannot be traversed, so testing only
+    // `& 0o077` would accept a root nothing could be created inside.
+    if md.permissions().mode() & 0o777 != 0o700 {
+        return DirVerdict::OursWrongMode;
+    }
+    DirVerdict::Ours
+}
+
+/// Why a candidate registry root could not be used.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// This location does not exist on this system, or is not a safe place to
+    /// put anything. Nothing of ours is there. **Try the next candidate.**
+    Unavailable(String),
+    /// The path exists and is not safely ours. **Do not try the next
+    /// candidate** — falling through is a downgrade a squatter can force.
+    Occupied(String),
+    /// An ordinary I/O failure: a full or read-only filesystem. Try the next.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(why) | Self::Occupied(why) => f.write_str(why),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Create a registry root, or prove an existing one is safe to reuse.
+///
+/// The parent of a candidate is often world-writable (`/dev/shm` and
+/// `/var/tmp` are both `1777`), so this function is the whole of the
+/// protection. Two rules carry it:
+///
+/// **The parent's sticky bit is load-bearing.** `1777` lets only an entry's
+/// owner delete or rename it, which is what stops another user replacing our
+/// directory once it exists. A world-writable parent *without* `S_ISVTX`
+/// offers no such protection, so that location is refused outright.
+///
+/// **An occupied path is terminal, not a reason to look elsewhere.** See
+/// `resolve_registry_root`.
+pub fn prepare_root(base: &Path) -> Result<(), PrepareError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = base
+        .parent()
+        .ok_or_else(|| PrepareError::Unavailable(format!("{} has no parent", base.display())))?;
+
+    let parent_md = std::fs::metadata(parent)
+        .map_err(|e| PrepareError::Unavailable(format!("{}: {e}", parent.display())))?;
+    if !parent_md.is_dir() {
+        return Err(PrepareError::Unavailable(format!(
+            "{} is not a directory",
+            parent.display()
+        )));
+    }
+    let parent_mode = parent_md.permissions().mode();
+    // World-writable without the sticky bit: anyone could replace our
+    // directory between sessions, so nothing we put here can be trusted later.
+    if parent_mode & 0o002 != 0 && parent_mode & 0o1000 == 0 {
+        return Err(PrepareError::Unavailable(format!(
+            "{} is world-writable without the sticky bit, so a directory created \
+             there could be replaced by another user",
+            parent.display()
+        )));
+    }
+
+    let our_uid = rustix::process::getuid().as_raw();
+    let verdict = match std::fs::symlink_metadata(base) {
+        Ok(md) => dir_verdict(&md, our_uid),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirVerdict::Absent,
+        Err(e) => return Err(PrepareError::Io(e)),
+    };
+
+    match verdict {
+        DirVerdict::Absent => {
+            std::fs::create_dir(base).map_err(PrepareError::Io)?;
+            set_private_mode(base, 0o700)
+                .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string())))
+        }
+        DirVerdict::Ours => Ok(()),
+        DirVerdict::OursWrongMode => set_private_mode(base, 0o700)
+            .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string()))),
+        DirVerdict::NotOurs(why) => Err(PrepareError::Occupied(format!(
+            "{} cannot be used because {why}. Remove or rename it, or set \
+             OXUTRM_STATE_DIR to a directory you control.",
+            base.display()
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Where the registry lives
 // ---------------------------------------------------------------------------
 
@@ -785,5 +917,76 @@ mod tests {
             "size":{"cols":80,"rows":24},"detachable":true}"#;
         let meta: SessionMeta = serde_json::from_str(old).expect("old meta.json must still parse");
         assert_eq!(meta.boot, None);
+    }
+
+    #[test]
+    fn a_directory_we_own_at_0700_is_ours() {
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        set_private_mode(dir.path(), 0o700).unwrap();
+        let md = std::fs::symlink_metadata(dir.path()).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(matches!(dir_verdict(&md, uid), DirVerdict::Ours));
+    }
+
+    #[test]
+    fn a_directory_we_own_with_extra_bits_is_recoverable_not_refused() {
+        // Ours, so a wrong mode is a crash or an older version, not a trust
+        // decision about somebody else's directory. Recovering beats refusing.
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        set_private_mode(dir.path(), 0o755).unwrap();
+        let md = std::fs::symlink_metadata(dir.path()).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(matches!(dir_verdict(&md, uid), DirVerdict::OursWrongMode));
+    }
+
+    #[test]
+    fn a_directory_owned_by_someone_else_is_not_ours() {
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        set_private_mode(dir.path(), 0o700).unwrap();
+        let md = std::fs::symlink_metadata(dir.path()).unwrap();
+        let not_us = rustix::process::getuid().as_raw().wrapping_add(1);
+        assert!(matches!(dir_verdict(&md, not_us), DirVerdict::NotOurs(_)));
+    }
+
+    #[test]
+    fn a_plain_file_is_not_ours_however_it_is_owned() {
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let file = dir.path().join("squat");
+        std::fs::write(&file, b"").unwrap();
+        let md = std::fs::symlink_metadata(&file).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(matches!(dir_verdict(&md, uid), DirVerdict::NotOurs(_)));
+    }
+
+    #[test]
+    fn a_symlink_is_not_ours_even_when_it_points_at_a_directory_we_own() {
+        // The case that catches an lstat-versus-stat mistake. Following the link
+        // would report a directory we own and pass -- while handing control of the
+        // path to whoever can rewrite the link.
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        set_private_mode(&target, 0o700).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let md = std::fs::symlink_metadata(&link).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(matches!(dir_verdict(&md, uid), DirVerdict::NotOurs(_)));
     }
 }
