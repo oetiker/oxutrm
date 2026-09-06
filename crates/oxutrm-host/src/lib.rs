@@ -16,13 +16,15 @@
 //! **Where the registry lives.** `$XDG_RUNTIME_DIR` is `/run/user/<uid>`, and
 //! systemd tears it down when the user's last login session ends. A session
 //! that daemonized into a directory which then vanished is still running and
-//! completely unreachable — no socket, no `--list` entry, no way back. So
-//! sessions are recorded on local, boot-cleared storage first — `/dev/shm` on
-//! Linux, `/var/tmp` elsewhere — and only fall back to the runtime directory
-//! where lingering is known to keep it alive, with the home directory as a
-//! last resort. A candidate that turns out to be squatted by something else
-//! is a hard stop, not a reason to quietly try the next one. See
-//! [`registry::resolve_registry_root`].
+//! completely unreachable — no socket, no `--list` entry, no way back. So the
+//! runtime directory is used first, but only where lingering is known to keep
+//! it alive; otherwise sessions fall to local storage that needs no
+//! administrative setup — `/dev/shm` on Linux, cleared at every boot, or
+//! `/var/tmp` elsewhere, which survives a reboot and is kept honest by a
+//! per-entry boot token — and only as a last resort to the home directory,
+//! which warns because it may be on a network filesystem. A candidate that
+//! turns out to be squatted by something else is a hard stop, not a reason to
+//! quietly try the next one. See [`registry::resolve_registry_root`].
 //!
 //! **When it is safe to detach.** Detaching is two operations, and they are
 //! not safe at the same moment. [`detach_process`] forks away from ssh and is

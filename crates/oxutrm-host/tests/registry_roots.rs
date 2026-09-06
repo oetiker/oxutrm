@@ -235,6 +235,67 @@ fn a_walk_with_nothing_usable_says_so() {
     );
 }
 
+#[test]
+fn an_explicit_override_that_cannot_be_used_names_itself_not_generic_advice() {
+    // OXUTRM_STATE_DIR is the only candidate in this shape (see
+    // `registry_root_candidates`), so when it fails the generic "Set
+    // OXUTRM_STATE_DIR" advice is circular: the user already set it. The
+    // message must instead name the value they set and why it failed.
+    let scratch = scratch();
+    let missing = scratch.path().join("no-such-parent").join("chosen");
+    let err = walk_candidates(vec![root(&missing, RegistryRootKind::Explicit)])
+        .expect_err("a missing parent is unusable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("OXUTRM_STATE_DIR points at"),
+        "must lead with the override, not generic advice: {msg}"
+    );
+    assert!(
+        msg.contains(&missing.display().to_string()),
+        "must name the path the user set: {msg}"
+    );
+    assert!(
+        !msg.contains("Set OXUTRM_STATE_DIR"),
+        "telling the user to set what they already set is circular: {msg}"
+    );
+}
+
+#[test]
+fn a_skipped_local_candidates_reason_is_folded_into_the_chosen_warning() {
+    // When the local candidates are refused (Task 3's parent rules can make
+    // this happen, e.g. a group-writable $HOME/.local under umask 002) and
+    // the walk lands on HomeState, the canned "no local directory was
+    // usable" warning alone does not say *why* -- the reasons collected
+    // along the way must be folded in.
+    let scratch = scratch();
+    let missing = scratch.path().join("no-such-parent").join("oxutrm-1234");
+    let home = scratch.path().join("home-state");
+
+    let home_candidate = RegistryRoot {
+        base: home.clone(),
+        kind: RegistryRootKind::HomeState,
+        warning: Some(
+            "oxutrm: no local directory was usable, so sessions are recorded in \
+             the home directory instead."
+                .to_owned(),
+        ),
+    };
+
+    let chosen = walk_candidates(vec![
+        root(&missing, RegistryRootKind::VarTmp),
+        home_candidate,
+    ])
+    .expect("the home directory is the fallback");
+
+    let warning = chosen
+        .warning
+        .expect("the chosen root already carries a warning to extend");
+    assert!(
+        warning.contains(&missing.display().to_string()),
+        "must say why the skipped local candidate was skipped: {warning}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Moved from the now-deleted tests/registry_root.rs: everything else there
 // tested `choose_registry_root`'s two-way decision table, which is gone.
@@ -288,9 +349,15 @@ async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed()
         "no candidate may lie under the directory that is about to vanish: {candidates:?}"
     );
 
-    // Exercise the register/bind/list half against a scratch directory, never
-    // the real /var/tmp or /dev/shm.
-    let root = Registry::dir_at(&tmp.path().join("state"));
+    // Exercise the register/bind/list half against the HomeState candidate's
+    // own base -- `fake_home/.local/state`, already scratch -- rather than an
+    // arbitrary directory unconnected to anything the walk would produce.
+    // Never the real /var/tmp or /dev/shm.
+    let home_state = candidates
+        .iter()
+        .find(|c| c.kind == RegistryRootKind::HomeState)
+        .expect("a home was supplied, so HomeState must be among the candidates");
+    let root = Registry::dir_at(&home_state.base);
     let meta = SessionMeta {
         session_id: "1234abcd1234abcd1234abcd1234abcd".to_string(),
         attach_id: 1,

@@ -771,13 +771,15 @@ pub struct RootEnv {
     pub linger: Option<bool>,
     /// Whether this system has runtime directories at all.
     ///
-    /// `false` on macOS, and the difference is not cosmetic. Every fallback
-    /// below also explains itself, and on a Mac that explanation would name
-    /// `XDG_RUNTIME_DIR` and tell the user to run `loginctl enable-linger` —
-    /// a variable that is never set and a program that is not installed — on
-    /// every single session. Where the concept does not exist there is nothing
-    /// to prefer, nothing to warn about and nothing to advise: the state
-    /// directory is simply where sessions live.
+    /// `false` on macOS, and the difference is not cosmetic. Where the
+    /// concept exists but the runtime directory turns out unusable, the
+    /// `HomeState` candidate explains why in its warning. Where it does not
+    /// exist at all there is no `XDG_RUNTIME_DIR` to name and no `loginctl
+    /// enable-linger` to suggest, so [`registry_root_candidates`] skips the
+    /// runtime-directory branch entirely rather than reporting on a question
+    /// that was never asked — sessions still land on local storage first
+    /// (`/dev/shm` or `/var/tmp`), exactly as they would on a Linux host with
+    /// lingering off.
     ///
     /// A field rather than a `cfg` in [`registry_root_candidates`], so the
     /// whole decision table stays testable from either platform.
@@ -869,19 +871,64 @@ pub fn registry_root_candidates(env: &RootEnv) -> Vec<RegistryRoot> {
 /// candidates and silently push every session onto the last resort, which may
 /// be a networked home directory. Two `mkdir`s, repeatable, invisible. A
 /// squat is reported and acted on by a human, never routed around.
+///
+/// Two refinements on top of "first that works":
+///
+/// **An `Explicit` list of one that fails gets its own message.** The
+/// ordinary exhausted-list message ends "Set OXUTRM_STATE_DIR to a directory
+/// that survives logout" -- advice that is circular when the whole reason
+/// there was only one candidate is that the user already set it.
+///
+/// **A skipped local candidate's reason travels with a warning.** When the
+/// walk lands on a candidate that already warns (`HomeState`, today), a
+/// silent local candidate that was tried and refused along the way is worth
+/// more than the canned "no local directory was usable" -- so its reason is
+/// appended. A candidate with no warning of its own gets none added: an
+/// ordinary success (the runtime directory, `/dev/shm`, `/var/tmp`) has
+/// nothing to explain.
 pub fn walk_candidates(candidates: Vec<RegistryRoot>) -> anyhow::Result<RegistryRoot> {
-    let mut reasons = Vec::new();
-    for root in candidates {
+    let is_lone_explicit = matches!(
+        candidates.as_slice(),
+        [RegistryRoot {
+            kind: RegistryRootKind::Explicit,
+            ..
+        }]
+    );
+
+    let mut reasons: Vec<(PathBuf, String)> = Vec::new();
+    for mut root in candidates {
         match prepare_root(&root.base) {
-            Ok(()) => return Ok(root),
+            Ok(()) => {
+                if !reasons.is_empty()
+                    && let Some(warning) = &mut root.warning
+                {
+                    for (path, reason) in &reasons {
+                        warning.push_str(&format!("\n  tried: {}: {reason}", path.display()));
+                    }
+                }
+                return Ok(root);
+            }
             Err(PrepareError::Occupied(why)) => return Err(anyhow!("{why}")),
-            Err(e) => reasons.push(format!("{}: {e}", root.base.display())),
+            Err(e) => reasons.push((root.base.clone(), e.to_string())),
         }
     }
+
+    if is_lone_explicit {
+        let (path, reason) = &reasons[0];
+        return Err(anyhow!(
+            "OXUTRM_STATE_DIR points at {}, which cannot be used: {reason}",
+            path.display()
+        ));
+    }
+
     Err(anyhow!(
         "nowhere to record sessions. Tried:\n  {}\nSet OXUTRM_STATE_DIR to a \
          directory that survives logout.",
-        reasons.join("\n  ")
+        reasons
+            .iter()
+            .map(|(path, reason)| format!("{}: {reason}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n  ")
     ))
 }
 
@@ -1130,6 +1177,11 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, RegistryRootKind::Explicit);
         assert_eq!(got[0].base, PathBuf::from("/somewhere/chosen"));
+        assert!(
+            got[0].warning.is_none(),
+            "the user asked for this explicitly: {:?}",
+            got[0].warning
+        );
     }
 
     #[test]
