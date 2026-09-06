@@ -737,10 +737,19 @@ fn create_root(base: &Path, our_uid: u32) -> Result<(), PrepareError> {
 /// Where the registry lives, and why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegistryRootKind {
+    /// `$OXUTRM_STATE_DIR`: the user said so. Never second-guessed.
+    Explicit,
     /// `$XDG_RUNTIME_DIR`, which is known to survive logout here.
     RuntimeDir,
-    /// `$HOME/.local/state`, chosen because the runtime directory would not.
-    StateDir,
+    /// `/dev/shm/oxutrm-<uid>`: tmpfs, cleared at boot, carries no ageing
+    /// rule. The normal case on Linux without lingering.
+    SharedMemory,
+    /// `/var/tmp/oxutrm-<uid>`: local and logout-surviving everywhere, but it
+    /// outlives a reboot, so staleness detection is load-bearing here.
+    VarTmp,
+    /// `$HOME/.local/state`: last resort. May be a network filesystem, where
+    /// a Unix socket is unreliable, so it warns.
+    HomeState,
 }
 
 #[derive(Clone, Debug)]
@@ -773,11 +782,83 @@ pub struct RootEnv {
     /// A field rather than a `cfg` in [`choose_registry_root`], so the whole
     /// decision table stays testable from either platform.
     pub runtime_dirs_exist: bool,
+    /// Whether this system has `/dev/shm` at all.
+    ///
+    /// `false` on macOS. A field rather than a `cfg` in
+    /// [`registry_root_candidates`], so the whole decision table stays
+    /// testable from either platform — the same reasoning as
+    /// `runtime_dirs_exist` above.
+    pub shm_exists: bool,
 }
 
 /// `$HOME/.local/state`, per the XDG base directory specification.
 fn state_base(home: &Path) -> PathBuf {
     home.join(".local").join("state")
+}
+
+/// The ordered places this environment could keep its registry, best first.
+///
+/// Pure: it decides *preference*, not *safety*. Whether a candidate is
+/// actually usable is a filesystem question and belongs to [`prepare_root`].
+/// Keeping them apart is what lets this table be exhaustively tested from
+/// either platform.
+#[must_use]
+pub fn registry_root_candidates(env: &RootEnv) -> Vec<RegistryRoot> {
+    // An explicit choice is the whole list: falling through would silently
+    // put sessions somewhere the user did not ask for.
+    if let Some(dir) = &env.override_dir {
+        return vec![RegistryRoot {
+            base: dir.clone(),
+            kind: RegistryRootKind::Explicit,
+            warning: None,
+        }];
+    }
+
+    let uid = rustix::process::getuid().as_raw();
+    let mut out = Vec::new();
+
+    // Ahead of /dev/shm on purpose: it is tmpfs and boot-cleared like shm, and
+    // additionally 0700 by construction rather than 1777, so there is no
+    // squatting race to lose in the first place.
+    if env.runtime_dirs_exist
+        && let (Some(dir), Some(true)) = (&env.xdg_runtime_dir, env.linger)
+    {
+        out.push(RegistryRoot {
+            base: dir.clone(),
+            kind: RegistryRootKind::RuntimeDir,
+            warning: None,
+        });
+    }
+
+    if env.shm_exists {
+        out.push(RegistryRoot {
+            base: PathBuf::from(format!("/dev/shm/oxutrm-{uid}")),
+            kind: RegistryRootKind::SharedMemory,
+            warning: None,
+        });
+    }
+
+    out.push(RegistryRoot {
+        base: PathBuf::from(format!("/var/tmp/oxutrm-{uid}")),
+        kind: RegistryRootKind::VarTmp,
+        warning: None,
+    });
+
+    if let Some(home) = &env.home {
+        out.push(RegistryRoot {
+            base: state_base(home),
+            kind: RegistryRootKind::HomeState,
+            warning: Some(format!(
+                "oxutrm: no local directory was usable, so sessions are recorded in {} \
+                 instead. Sessions will survive, but on a networked home directory the \
+                 session socket may be unreliable. Set OXUTRM_STATE_DIR to choose the \
+                 location yourself.",
+                state_base(home).join(REGISTRY_SUBDIR).display()
+            )),
+        });
+    }
+
+    out
 }
 
 /// Decide where sessions are recorded.
@@ -795,7 +876,7 @@ pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
     if let Some(dir) = &env.override_dir {
         return Ok(RegistryRoot {
             base: dir.clone(),
-            kind: RegistryRootKind::StateDir,
+            kind: RegistryRootKind::HomeState,
             warning: None,
         });
     }
@@ -810,7 +891,7 @@ pub fn choose_registry_root(env: &RootEnv) -> anyhow::Result<RegistryRoot> {
         })?;
         Ok(RegistryRoot {
             base: state_base(home),
-            kind: RegistryRootKind::StateDir,
+            kind: RegistryRootKind::HomeState,
             warning: reason.map(|reason| {
                 format!(
                     "oxutrm: {reason}, so sessions are recorded in {} instead of \
@@ -891,6 +972,7 @@ pub fn read_root_env() -> RootEnv {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
         linger: linger_enabled(uid),
+        shm_exists: cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir(),
     }
 }
 
@@ -1060,6 +1142,117 @@ mod tests {
         let md = std::fs::symlink_metadata(&link).unwrap();
         let uid = rustix::process::getuid().as_raw();
         assert!(matches!(dir_verdict(&md, uid), DirVerdict::NotOurs(_)));
+    }
+
+    fn env_linux() -> RootEnv {
+        RootEnv {
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            home: Some(PathBuf::from("/home/u")),
+            override_dir: None,
+            linger: Some(false),
+            runtime_dirs_exist: true,
+            shm_exists: true,
+        }
+    }
+
+    fn kinds(env: &RootEnv) -> Vec<RegistryRootKind> {
+        registry_root_candidates(env)
+            .iter()
+            .map(|r| r.kind)
+            .collect()
+    }
+
+    #[test]
+    fn an_explicit_state_dir_is_the_only_candidate() {
+        // Never second-guessed, and nothing to fall through to: if the user's own
+        // choice is unusable they must be told, not quietly overridden.
+        let mut env = env_linux();
+        env.override_dir = Some(PathBuf::from("/somewhere/chosen"));
+        let got = registry_root_candidates(&env);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, RegistryRootKind::Explicit);
+        assert_eq!(got[0].base, PathBuf::from("/somewhere/chosen"));
+    }
+
+    #[test]
+    fn without_lingering_shared_memory_comes_first() {
+        // The whole point of the change: no `loginctl enable-linger` required.
+        assert_eq!(
+            kinds(&env_linux()),
+            vec![
+                RegistryRootKind::SharedMemory,
+                RegistryRootKind::VarTmp,
+                RegistryRootKind::HomeState
+            ]
+        );
+    }
+
+    #[test]
+    fn with_lingering_the_runtime_dir_still_wins() {
+        // It is tmpfs, boot-cleared AND 0700 by construction rather than 1777.
+        let mut env = env_linux();
+        env.linger = Some(true);
+        assert_eq!(kinds(&env)[0], RegistryRootKind::RuntimeDir);
+    }
+
+    #[test]
+    fn an_undeterminable_linger_does_not_win_the_runtime_dir() {
+        // `None` means "could not tell", and an unverifiable runtime directory is
+        // exactly what the old code refused everywhere else.
+        let mut env = env_linux();
+        env.linger = None;
+        assert_eq!(kinds(&env)[0], RegistryRootKind::SharedMemory);
+    }
+
+    #[test]
+    fn without_shared_memory_the_portable_fallback_leads() {
+        // The macOS shape: no runtime directories, no /dev/shm.
+        let mut env = env_linux();
+        env.shm_exists = false;
+        env.runtime_dirs_exist = false;
+        env.xdg_runtime_dir = None;
+        env.linger = None;
+        assert_eq!(
+            kinds(&env),
+            vec![RegistryRootKind::VarTmp, RegistryRootKind::HomeState]
+        );
+    }
+
+    #[test]
+    fn home_state_is_last_and_carries_the_warning_no_other_candidate_does() {
+        let got = registry_root_candidates(&env_linux());
+        let home = got.last().unwrap();
+        assert_eq!(home.kind, RegistryRootKind::HomeState);
+        let warning = home
+            .warning
+            .as_deref()
+            .expect("the last resort must explain itself");
+        assert!(
+            warning.contains("networked"),
+            "it must name the actual risk: {warning}"
+        );
+        assert!(
+            got[..got.len() - 1].iter().all(|r| r.warning.is_none()),
+            "a local candidate has nothing to warn about"
+        );
+    }
+
+    #[test]
+    fn with_no_home_the_list_simply_ends_early() {
+        let mut env = env_linux();
+        env.home = None;
+        assert_eq!(
+            kinds(&env),
+            vec![RegistryRootKind::SharedMemory, RegistryRootKind::VarTmp]
+        );
+    }
+
+    #[test]
+    fn the_per_uid_directories_are_named_for_this_user() {
+        let got = registry_root_candidates(&env_linux());
+        let uid = rustix::process::getuid().as_raw();
+        assert_eq!(got[0].base, PathBuf::from(format!("/dev/shm/oxutrm-{uid}")));
+        assert_eq!(got[1].base, PathBuf::from(format!("/var/tmp/oxutrm-{uid}")));
     }
 
     #[test]

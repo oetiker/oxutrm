@@ -21,6 +21,9 @@ fn env(xdg: Option<&str>, home: Option<&str>, linger: Option<bool>) -> RootEnv {
         override_dir: None,
         linger,
         runtime_dirs_exist: true,
+        // `choose_registry_root` (the function under test in this file)
+        // never looks at this field; `false` is honest here.
+        shm_exists: false,
     }
 }
 
@@ -37,10 +40,11 @@ fn a_system_without_runtime_directories_falls_back_silently() {
         override_dir: None,
         linger: None,
         runtime_dirs_exist: false,
+        shm_exists: false,
     })
     .expect("choose");
 
-    assert_eq!(root.kind, RegistryRootKind::StateDir);
+    assert_eq!(root.kind, RegistryRootKind::HomeState);
     assert_eq!(root.base, PathBuf::from("/Users/u/.local/state"));
     assert!(
         root.warning.is_none(),
@@ -61,6 +65,7 @@ fn a_runtime_directory_set_by_hand_is_ignored_where_the_concept_does_not_exist()
         override_dir: None,
         linger: None,
         runtime_dirs_exist: false,
+        shm_exists: false,
     })
     .expect("choose");
 
@@ -90,7 +95,7 @@ fn without_lingering_the_state_directory_wins_and_says_why() {
     let root = choose_registry_root(&env(Some("/run/user/1000"), Some("/home/u"), Some(false)))
         .expect("choose");
     assert_eq!(root.base, PathBuf::from("/home/u/.local/state"));
-    assert_eq!(root.kind, RegistryRootKind::StateDir);
+    assert_eq!(root.kind, RegistryRootKind::HomeState);
     let warning = root.warning.expect("this case must warn");
     assert!(
         warning.contains("loginctl enable-linger"),
@@ -112,7 +117,7 @@ fn an_unverifiable_runtime_directory_is_not_trusted() {
         choose_registry_root(&env(Some("/run/user/1000"), Some("/home/u"), None)).expect("choose");
     assert_eq!(
         root.kind,
-        RegistryRootKind::StateDir,
+        RegistryRootKind::HomeState,
         "when in doubt, persist"
     );
     assert!(root.warning.is_some());
@@ -185,9 +190,12 @@ async fn a_session_stays_discoverable_after_the_runtime_directory_is_destroyed()
         override_dir: None,
         linger: Some(false),
         runtime_dirs_exist: true,
+        // `choose_registry_root` never looks at this field; `false` is
+        // honest here.
+        shm_exists: false,
     })
     .expect("choose");
-    assert_eq!(chosen.kind, RegistryRootKind::StateDir);
+    assert_eq!(chosen.kind, RegistryRootKind::HomeState);
     assert!(
         !chosen.base.starts_with(&fake_runtime),
         "the registry must not be inside the directory that is about to vanish"
