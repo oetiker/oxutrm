@@ -194,10 +194,10 @@ pub fn process_start_unix(pid: u32) -> Option<u64> {
 /// A process belonging to another user can refuse to answer, and that is
 /// harmless: see the `None` case in [`entry_is_stale`].
 ///
-/// Exercised by this crate's test suite on macOS, both in CI and locally,
-/// since 2026-09-04 — not just compile-checked. That does not mean every
-/// branch is covered; it means the happy path runs on real hardware. Its
-/// failure mode if it is wrong is the mild one: a `None` costs the
+/// Run locally on macOS since 2026-09-04 — not just compile-checked. This
+/// task's own tests exercise the same file there too. That does not mean
+/// every branch is covered; it means the happy path runs on real hardware.
+/// Its failure mode if it is wrong is the mild one: a `None` costs the
 /// pid-reuse guard and nothing else.
 #[cfg(target_os = "macos")]
 // The rest of this crate is `deny(unsafe_code)` and stays that way. This is
