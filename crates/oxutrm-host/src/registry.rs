@@ -194,9 +194,11 @@ pub fn process_start_unix(pid: u32) -> Option<u64> {
 /// A process belonging to another user can refuse to answer, and that is
 /// harmless: see the `None` case in [`entry_is_stale`].
 ///
-/// **Compile-verified against `aarch64-apple-darwin`, never run** — nobody on
-/// the project has a Mac yet. Its failure mode if it is wrong is the mild one:
-/// a `None` costs the pid-reuse guard and nothing else.
+/// Exercised by this crate's test suite on macOS, both in CI and locally,
+/// since 2026-09-04 — not just compile-checked. That does not mean every
+/// branch is covered; it means the happy path runs on real hardware. Its
+/// failure mode if it is wrong is the mild one: a `None` costs the
+/// pid-reuse guard and nothing else.
 #[cfg(target_os = "macos")]
 // The rest of this crate is `deny(unsafe_code)` and stays that way. This is
 // one FFI call with a scalar return, kept to the smallest scope that can hold
@@ -240,6 +242,85 @@ pub fn process_start_unix(pid: u32) -> Option<u64> {
 #[must_use]
 pub fn process_start_unix(_pid: u32) -> Option<u64> {
     None
+}
+
+/// A token identifying the boot this session belongs to.
+///
+/// The only contract is that it differs across boots and, where the platform
+/// allows, across machines. `None` when the platform cannot answer, which
+/// costs the cross-boot staleness check in [`entry_is_stale`] and nothing
+/// else.
+///
+/// There is no portable way to ask this, so there is one implementation per
+/// system and they agree only on the return type.
+///
+/// # Linux
+///
+/// `/proc/sys/kernel/random/boot_id` is a UUID the kernel regenerates at every
+/// boot, and it is random rather than derived, so it also differs between two
+/// machines that booted at the same instant. That is what lets a registry on
+/// shared storage tell another host's entries from its own.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn boot_token() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// # macOS
+///
+/// `kern.boottime` is the wall-clock time the kernel started, to the
+/// microsecond, and `libc` types it as a `timeval` — so unlike the
+/// `proc_pidinfo` call above there is no kernel struct to declare here.
+///
+/// **It carries no machine identity.** Two Macs that booted in the same
+/// microsecond and shared a registry directory would collide. Accepted
+/// deliberately: shared home directories are rare on macOS, and Linux — where
+/// they are not — has a random per-boot UUID that is exact. Recorded as a
+/// known limit in the design note rather than engineered around.
+///
+/// Asking for pid 1's start time would have reused the FFI exception above
+/// instead of adding one, and does not work: `proc_pidinfo` refuses for
+/// root-owned `launchd`, verified by experiment on 2026-09-06.
+#[cfg(target_os = "macos")]
+// The rest of this crate is `deny(unsafe_code)` and stays that way. This is
+// one FFI call with a scalar return, kept to the smallest scope that can hold
+// it rather than a module-wide allowance.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn boot_token() -> Option<String> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let want = std::mem::size_of::<libc::timeval>();
+    let mut len = want;
+
+    // SAFETY: `tv` is an owned local of exactly the type this sysctl reports
+    // and of exactly the size passed in `len`, and it is not aliased. The
+    // name is a NUL-terminated C string literal. Passing a null new-value
+    // pointer with a zero length is the documented way to read without
+    // writing.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            std::ptr::from_mut(&mut tv).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if rc != 0 || len != want {
+        return None;
+    }
+    // Zero-padded microseconds so the string orders the same way the instant
+    // does, and so two tokens never differ only by formatting.
+    Some(format!("{}.{:06}", tv.tv_sec, tv.tv_usec))
 }
 
 /// Is this registry entry dead wood?
@@ -608,4 +689,32 @@ pub fn check_socket_path_length(path: &Path) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_boot_token_is_available_on_this_platform() {
+        // Both supported platforms can answer. A `None` here means the reader
+        // below is broken, not that the platform is exotic -- oxutrm-host is
+        // cfg'd for linux and macos only.
+        let token = boot_token().expect("this platform must supply a boot token");
+        assert!(
+            !token.is_empty(),
+            "an empty token would compare equal to itself forever"
+        );
+        assert!(
+            !token.contains(char::is_whitespace),
+            "token must be trimmed: {token:?}"
+        );
+    }
+
+    #[test]
+    fn the_boot_token_is_stable_within_one_boot() {
+        // The whole design rests on this: two reads during one boot must agree,
+        // or every entry would look foreign to the next `--list`.
+        assert_eq!(boot_token(), boot_token());
+    }
 }
