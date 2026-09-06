@@ -597,18 +597,30 @@ impl std::fmt::Display for PrepareError {
 
 /// Create a registry root, or prove an existing one is safe to reuse.
 ///
-/// The parent of a candidate is often world-writable (`/dev/shm` and
-/// `/var/tmp` are both `1777`), so this function is the whole of the
-/// protection. Two rules carry it:
+/// The parent of a candidate is often group- or world-writable (`/dev/shm`
+/// and `/var/tmp` are both `1777`), so this function is the whole of the
+/// protection. Three rules carry it:
 ///
 /// **The parent's sticky bit is load-bearing.** `1777` lets only an entry's
 /// owner delete or rename it, which is what stops another user replacing our
-/// directory once it exists. A world-writable parent *without* `S_ISVTX`
-/// offers no such protection, so that location is refused outright.
+/// directory once it exists. A group- or world-writable parent *without*
+/// `S_ISVTX` offers no such protection — a fellow group member (0770) or any
+/// user (0777) could rename our directory away and put something else in its
+/// place — so that location is refused outright.
+///
+/// **The parent must be owned by us or by root.** A parent owned by anyone
+/// else was created by someone we have no reason to trust, sticky bit or not
+/// — the sticky bit only says *other* users cannot rearrange its entries, it
+/// says nothing about the owner, who always can.
 ///
 /// **An occupied path is terminal, not a reason to look elsewhere.** See
-/// `resolve_registry_root`.
+/// `resolve_registry_root`. This includes losing a race to create the
+/// directory: a squatter who wins `mkdir` under a sticky, world-writable
+/// parent can create and remove their own entry for free, so this must never
+/// silently fall through to the next candidate — [`create_root`] re-judges
+/// whatever is there the moment `mkdir` reports it already exists.
 pub fn prepare_root(base: &Path) -> Result<(), PrepareError> {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     let parent = base
@@ -624,29 +636,44 @@ pub fn prepare_root(base: &Path) -> Result<(), PrepareError> {
         )));
     }
     let parent_mode = parent_md.permissions().mode();
-    // World-writable without the sticky bit: anyone could replace our
-    // directory between sessions, so nothing we put here can be trusted later.
-    if parent_mode & 0o002 != 0 && parent_mode & 0o1000 == 0 {
+    // Group- or world-writable without the sticky bit: another member of the
+    // owning group, or (world-writable) any user, could replace our
+    // directory between sessions, so nothing we put here could be trusted
+    // later.
+    if parent_mode & 0o022 != 0 && parent_mode & 0o1000 == 0 {
         return Err(PrepareError::Unavailable(format!(
-            "{} is world-writable without the sticky bit, so a directory created \
-             there could be replaced by another user",
+            "{} is group- or world-writable without the sticky bit, so a directory \
+             created there could be replaced by another user",
             parent.display()
         )));
     }
-
     let our_uid = rustix::process::getuid().as_raw();
-    let verdict = match std::fs::symlink_metadata(base) {
-        Ok(md) => dir_verdict(&md, our_uid),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirVerdict::Absent,
-        Err(e) => return Err(PrepareError::Io(e)),
-    };
+    // The sticky bit only constrains who can rearrange the parent's other
+    // entries -- its own owner is exempt from it. A parent owned by neither
+    // us nor root was created by whoever that uid is, and trusting it would
+    // mean trusting them.
+    if parent_md.uid() != our_uid && parent_md.uid() != 0 {
+        return Err(PrepareError::Unavailable(format!(
+            "{} is owned by uid {}, which is neither us nor root, so it is not a \
+             safe place to create a registry root",
+            parent.display(),
+            parent_md.uid()
+        )));
+    }
 
+    match std::fs::symlink_metadata(base) {
+        Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid), our_uid),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_root(base, our_uid),
+        Err(e) => Err(PrepareError::Io(e)),
+    }
+}
+
+/// Act on a verdict already reached for an existing (or freshly re-checked)
+/// path. Split out of [`prepare_root`] so [`create_root`] can re-enter it
+/// after losing the `mkdir` race, without re-running the parent checks.
+fn apply_verdict(base: &Path, verdict: DirVerdict, our_uid: u32) -> Result<(), PrepareError> {
     match verdict {
-        DirVerdict::Absent => {
-            std::fs::create_dir(base).map_err(PrepareError::Io)?;
-            set_private_mode(base, 0o700)
-                .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string())))
-        }
+        DirVerdict::Absent => create_root(base, our_uid),
         DirVerdict::Ours => Ok(()),
         DirVerdict::OursWrongMode => set_private_mode(base, 0o700)
             .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string()))),
@@ -655,6 +682,51 @@ pub fn prepare_root(base: &Path) -> Result<(), PrepareError> {
              OXUTRM_STATE_DIR to a directory you control.",
             base.display()
         ))),
+    }
+}
+
+/// Create `base` fresh, private from the instant `mkdir` returns.
+///
+/// The mode is passed to `mkdir` itself via `DirBuilder`, not applied
+/// afterwards with a separate `chmod`: plain `std::fs::create_dir` creates at
+/// `0777 & !umask`, and under a loose umask (`002`, say) that leaves the
+/// directory group- or world-writable for the whole window between creation
+/// and a follow-up `chmod` — long enough for another process to plant an
+/// entry inside that survives the tightening. `set_private_mode` afterwards
+/// remains, as a belt for whatever mode the platform's `mkdir` actually
+/// honours under its own umask handling.
+fn create_root(base: &Path, our_uid: u32) -> Result<(), PrepareError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(base) {
+        Ok(()) => set_private_mode(base, 0o700)
+            .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string()))),
+        // Something now occupies the path that `symlink_metadata` reported
+        // absent a moment ago. A squatter racing us under a sticky,
+        // world-writable parent can always win this: creating and removing
+        // their own entry costs them nothing, and they can retry forever.
+        // Falling through to `Io` here would let that race force the exact
+        // downgrade this module exists to prevent, so whatever is there now
+        // is judged on its own terms rather than treated as a transient
+        // failure.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(base) {
+                Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid), our_uid),
+                // Disappeared again between the failed `mkdir` and this
+                // re-check: something is actively creating and removing
+                // entries at this path. That is not a location to trust with
+                // a retry loop of our own -- stop here, the same as any other
+                // occupied path.
+                Err(_) => Err(PrepareError::Occupied(format!(
+                    "{} could not be created because something else is creating \
+                     and removing entries there at the same time",
+                    base.display()
+                ))),
+            }
+        }
+        // Anything else -- ENOSPC, EROFS -- says nothing about who owns the
+        // path, so it is an ordinary I/O failure rather than a trust decision.
+        Err(e) => Err(PrepareError::Io(e)),
     }
 }
 
@@ -988,5 +1060,29 @@ mod tests {
         let md = std::fs::symlink_metadata(&link).unwrap();
         let uid = rustix::process::getuid().as_raw();
         assert!(matches!(dir_verdict(&md, uid), DirVerdict::NotOurs(_)));
+    }
+
+    #[test]
+    fn create_root_that_loses_the_mkdir_race_is_occupied_not_io() {
+        // `create_root` only ever sees `AlreadyExists` when something is
+        // already at `base` the instant `mkdir` runs -- which is exactly what
+        // a squatter racing a real `prepare_root` call produces. Planting the
+        // squat ourselves first reproduces that outcome deterministically,
+        // without needing an actual concurrent process.
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let base = dir.path().join("oxutrm-1234");
+        std::fs::write(&base, b"squat").unwrap();
+        let uid = rustix::process::getuid().as_raw();
+
+        match create_root(&base, uid) {
+            Err(PrepareError::Occupied(_)) => {}
+            other => panic!(
+                "losing the mkdir race to a squatter must be Occupied, not {other:?} -- \
+                 Io would let the caller fall through to the next candidate"
+            ),
+        }
     }
 }

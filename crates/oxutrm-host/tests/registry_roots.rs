@@ -111,3 +111,40 @@ fn a_missing_parent_is_unavailable_not_occupied() {
         Err(PrepareError::Unavailable(_))
     ));
 }
+
+#[test]
+fn a_sticky_world_writable_parent_we_own_is_accepted() {
+    // The production shape: `/dev/shm` and `/var/tmp` are `1777` and owned by
+    // root, but a test can only own what it creates, so this parent is ours
+    // instead -- the owner rule accepts either. Without this positive test,
+    // every negative parent-permission test above could pass by accident: an
+    // inverted sticky-bit condition would make this exact shape `Unavailable`
+    // too, and nothing here would catch it.
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = scratch();
+    let parent = scratch.path().join("sticky");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let base = parent.join("oxutrm-1234");
+
+    prepare_root(&base).expect("a sticky, world-writable parent we own is safe");
+}
+
+#[test]
+fn a_group_writable_parent_without_the_sticky_bit_is_unavailable() {
+    // 0770, not 0777: group-writable alone is enough to let a fellow group
+    // member rename or delete our directory, the same capability the sticky
+    // rule exists to deny. A check that only looked at the world-writable bit
+    // would miss this shape entirely.
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = scratch();
+    let parent = scratch.path().join("group-writable");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let base = parent.join("oxutrm-1234");
+
+    assert!(matches!(
+        prepare_root(&base),
+        Err(PrepareError::Unavailable(_))
+    ));
+}
