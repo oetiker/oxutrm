@@ -24,10 +24,17 @@
   test their process ids against the wrong computer. Sessions are now recorded
   on local storage — `/dev/shm` on Linux, `/var/tmp` elsewhere — which survives
   logout without any administrative setup, and each entry records which boot it
-  belongs to, so entries left behind by an earlier boot or a different machine
-  are recognised instead of believed. If something else has taken the directory
-  oxutrm wants, it now says so and stops rather than quietly falling back to
-  the home directory.
+  belongs to, so entries left behind by an earlier boot — or, on Linux, a
+  different machine — are recognised instead of believed. If something else
+  has taken the directory oxutrm wants, it now says so and stops rather than
+  quietly falling back to the home directory.
+
+- **The directory oxutrm records sessions in is now private.** Whatever
+  location it ends up using — including one you point `OXUTRM_STATE_DIR` at —
+  is created, or corrected, to mode `0700` before anything is written into it.
+  Its parent must already exist: oxutrm no longer creates intermediate
+  directories on the way there, so an `OXUTRM_STATE_DIR` pointed at a path
+  whose parent is missing is refused rather than silently built out.
 
 - **A session whose network came back stayed dead for minutes.** Removing the
   idle timeout in 0.2.0 so a session could outlive an outage also removed,

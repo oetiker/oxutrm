@@ -99,9 +99,10 @@ fn run_host(args: &[String]) -> Result<()> {
 
 /// `oxutrm host --list`: what is running on this machine.
 ///
-/// Prints the registry's own warning first when it had to fall back out of
-/// `$XDG_RUNTIME_DIR`, because a user wondering why a session vanished at
-/// logout needs that sentence more than they need the list.
+/// Prints the registry's own warning first when no local root was usable and
+/// it had to fall back to the home directory, because a user wondering why a
+/// session vanished at logout needs those per-candidate reasons more than
+/// they need the list.
 fn run_host_list() -> Result<()> {
     let root = oxutrm_host::resolve_registry_root()
         .context("deciding where oxutrm records its sessions")?;
@@ -109,7 +110,8 @@ fn run_host_list() -> Result<()> {
         eprintln!("{warning}");
     }
 
-    let sessions = oxutrm_host::Registry::list().context("reading the session registry")?;
+    let sessions = oxutrm_host::Registry::list_in(&oxutrm_host::Registry::dir_at(&root.base))
+        .context("reading the session registry")?;
     print!("{}", oxutrm_host::attach::format_session_list(&sessions));
     Ok(())
 }

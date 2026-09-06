@@ -202,9 +202,10 @@ pub fn process_start_unix(pid: u32) -> Option<u64> {
 /// A process belonging to another user can refuse to answer, and that is
 /// harmless: see the `None` case in [`entry_is_stale`].
 ///
-/// Run locally on macOS since 2026-09-04 — not just compile-checked. This
-/// task's own tests exercise the same file there too. That does not mean
-/// every branch is covered; it means the happy path runs on real hardware.
+/// Run locally on macOS since 2026-09-04 — not just compile-checked. The
+/// `boot_token` tests in this module run on that same machine too. That does
+/// not mean every branch is covered; it means the happy path runs on real
+/// hardware.
 /// Its failure mode if it is wrong is the mild one: a `None` costs the
 /// pid-reuse guard and nothing else.
 #[cfg(target_os = "macos")]
@@ -498,9 +499,37 @@ fn set_private_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 }
 
 /// Create a directory owned by this user alone, whatever the umask says.
+///
+/// Checked with `symlink_metadata`, which does not follow symlinks, rather
+/// than `exists()`, which does. This is called beneath a root that
+/// [`prepare_root`] already proved is ours, but that proof covers the root
+/// itself, not every path under it: an entry planted here while the root was
+/// still loose-moded, before `prepare_root` tightened it, could be a symlink
+/// pointing anywhere. Following it here — as `exists()` plus
+/// `create_dir_all` would — could create or reuse a directory outside the
+/// registry root entirely.
 pub(crate) fn create_private_dir(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => {}
+        Ok(md) if md.file_type().is_symlink() => {
+            anyhow::bail!(
+                "{} is a symbolic link, not a directory, so it cannot be used as one",
+                path.display()
+            );
+        }
+        Ok(_) => {
+            anyhow::bail!(
+                "{} exists and is not a directory, so it cannot be used as one",
+                path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("checking {}", path.display()));
+        }
     }
     set_private_mode(path, 0o700)
 }
@@ -533,8 +562,6 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()
 /// What an existing path at a candidate registry root turns out to be.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DirVerdict {
-    /// Nothing there. Create it.
-    Absent,
     /// A directory, ours, mode `0700`. Reuse it.
     Ours,
     /// A directory, ours, wrong mode. `chmod` and reuse: we own it, so this is
@@ -591,6 +618,15 @@ impl std::fmt::Display for PrepareError {
         match self {
             Self::Unavailable(why) | Self::Occupied(why) => f.write_str(why),
             Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Unavailable(_) | Self::Occupied(_) => None,
         }
     }
 }
@@ -662,18 +698,17 @@ pub fn prepare_root(base: &Path) -> Result<(), PrepareError> {
     }
 
     match std::fs::symlink_metadata(base) {
-        Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid), our_uid),
+        Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_root(base, our_uid),
         Err(e) => Err(PrepareError::Io(e)),
     }
 }
 
-/// Act on a verdict already reached for an existing (or freshly re-checked)
-/// path. Split out of [`prepare_root`] so [`create_root`] can re-enter it
-/// after losing the `mkdir` race, without re-running the parent checks.
-fn apply_verdict(base: &Path, verdict: DirVerdict, our_uid: u32) -> Result<(), PrepareError> {
+/// Act on a verdict already reached for a path that exists. Split out of
+/// [`prepare_root`] so [`create_root`] can re-enter it after losing the
+/// `mkdir` race, without re-running the parent checks.
+fn apply_verdict(base: &Path, verdict: DirVerdict) -> Result<(), PrepareError> {
     match verdict {
-        DirVerdict::Absent => create_root(base, our_uid),
         DirVerdict::Ours => Ok(()),
         DirVerdict::OursWrongMode => set_private_mode(base, 0o700)
             .map_err(|e| PrepareError::Io(std::io::Error::other(e.to_string()))),
@@ -711,7 +746,7 @@ fn create_root(base: &Path, our_uid: u32) -> Result<(), PrepareError> {
         // failure.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             match std::fs::symlink_metadata(base) {
-                Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid), our_uid),
+                Ok(md) => apply_verdict(base, dir_verdict(&md, our_uid)),
                 // Disappeared again between the failed `mkdir` and this
                 // re-check: something is actively creating and removing
                 // entries at this path. That is not a location to trust with
@@ -771,9 +806,11 @@ pub struct RootEnv {
     pub linger: Option<bool>,
     /// Whether this system has runtime directories at all.
     ///
-    /// `false` on macOS, and the difference is not cosmetic. Where the
-    /// concept exists but the runtime directory turns out unusable, the
-    /// `HomeState` candidate explains why in its warning. Where it does not
+    /// `false` on macOS, and the difference is not cosmetic. An explanation
+    /// only ever appears if the walk gets all the way down to the home
+    /// directory: the ordinary case — `/dev/shm` succeeding with lingering
+    /// off — is silent, on purpose, and it is only the `HomeState` candidate
+    /// that explains anything, in its own warning. Where the concept does not
     /// exist at all there is no `XDG_RUNTIME_DIR` to name and no `loginctl
     /// enable-linger` to suggest, so [`registry_root_candidates`] skips the
     /// runtime-directory branch entirely rather than reporting on a question
@@ -1147,6 +1184,43 @@ mod tests {
         let md = std::fs::symlink_metadata(&link).unwrap();
         let uid = rustix::process::getuid().as_raw();
         assert!(matches!(dir_verdict(&md, uid), DirVerdict::NotOurs(_)));
+    }
+
+    #[test]
+    fn create_private_dir_refuses_a_symlink_at_the_target() {
+        // `create_private_dir` runs beneath a root `prepare_root` already
+        // proved is ours, but that proof does not cover every path under it.
+        // A symlink planted at the target -- say, while the root was still
+        // loose-moded, before `prepare_root` tightened it -- must not be
+        // followed the way `exists()` plus `create_dir_all` would follow it.
+        let dir = tempfile::Builder::new()
+            .prefix("oxu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let target = dir.path().join("registry");
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+        let err = create_private_dir(&target).expect_err("a symlink target must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&target.display().to_string()),
+            "error must name the path: {msg}"
+        );
+
+        // Refused, not followed: nothing was created or tightened at the
+        // symlink's destination.
+        use std::os::unix::fs::PermissionsExt;
+        let elsewhere_mode = std::fs::symlink_metadata(&elsewhere)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_ne!(
+            elsewhere_mode, 0o700,
+            "the symlink's destination must not have been touched"
+        );
     }
 
     fn env_linux() -> RootEnv {
