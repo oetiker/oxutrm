@@ -5,10 +5,12 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 
 use oxutrm_client::{RawGuard, terminal_size};
+use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_host::ssh::{SshChannel, SshLauncher};
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk, Signal,
+    Candidate, Choice, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk,
+    SessionSummary, Signal, TermSize,
 };
 use oxutrm_term::detect_caps;
 
@@ -53,22 +55,122 @@ pub fn run_connect(args: &[String]) -> Result<()> {
 async fn connect(target: &str) -> Result<i32> {
     let cfg = NetConfig::default();
 
-    // L3. Spawns `ssh <target> oxutrm host --serve` and drains its stderr
+    // L3. Spawns `ssh <target> oxutrm host --connect` and drains its stderr
     // continuously -- an undrained stderr is a deadlock, not an inconvenience.
     let mut channel = SshChannel::open(&SshLauncher::ssh(), target)
         .await
         .with_context(|| format!("starting a session on {target}"))?;
 
+    // The offer. Task 5 turns this into a real decision; until it does, a
+    // fresh connect asks for a fresh session, which is what it did before.
+    //
+    // This first read is also where a far end that is missing, too old, or
+    // drowned in a chatty rc file is diagnosed: `SshChannel::recv` reaps the
+    // child and turns an EOF into `RemoteBinaryMissing`, `SshFailed` or
+    // `NoSignal`. `establish` reads a plain stream and cannot do that, which
+    // is exactly why the offer is read here and not inside it.
+    let _offer = read_offer(&mut channel).await?;
+    channel
+        .send(&Signal::Choose {
+            choice: Choice::New,
+        })
+        .await
+        .context("telling the host which session we want")?;
+
+    let size = terminal_size().context("oxutrm needs a real terminal to connect from")?;
+
+    // L4 to L10.
+    let (reader, writer) = channel.halves();
+    let established = establish(reader, writer, size, &cfg).await?;
+
+    // L11. Late, deliberately: after every prompt ssh could have shown, and
+    // after the last thing that could have failed with a message worth
+    // reading on an ordinary terminal.
+    let raw = RawGuard::enter().context("putting the terminal into raw mode")?;
+
+    let mut session = ClientSession::new(size, detect_caps(), established.link)
+        .context("preparing the client session")?;
+
+    // L12. One line, and then silence.
+    let mut stdout = std::io::stdout();
+    session
+        .announce(&established.path, &mut stdout)
+        .context("announcing the path")?;
+
+    // L13.
+    let code = session.run(&mut stdout).await;
+
+    // L14's first half. The guard comes off before anything a human should
+    // read is printed, and before the error below is rendered -- a backtrace
+    // on a terminal still in raw mode climbs diagonally down the screen.
+    drop(raw);
+    code
+}
+
+/// One completed client-side attach, and the two identities the rebuild loop
+/// needs afterwards.
+pub(crate) struct Established {
+    pub link: Link,
+    pub path: PathDescription,
+    /// Kept, not discarded: a rebuild attaches to THIS session by name, and
+    /// before this existed `host_facts` threw the id away with `..`.
+    ///
+    /// Nothing in `connect` reads it yet, and the allow says so rather than a
+    /// fabricated call site inventing a use — what is worth knowing here is
+    /// precisely that the rebuild loop these two fields exist for has not been
+    /// written. The test below is what stops them silently going stale in the
+    /// meantime: it asserts the id and the generation that actually crossed
+    /// the wire.
+    #[allow(dead_code)]
+    pub session_id: String,
+    /// Which attach generation this is. Both `seq` counters restart at 1 per
+    /// attach, so a rebuild has to name the one it is resuming from.
+    #[allow(dead_code)]
+    pub attach_id: u64,
+}
+
+/// L4 to L10: one socket, the hello exchange, the ICE ladder and the QUIC
+/// handshake, ending the moment the host declares the path up.
+///
+/// Generic over its signalling stream for the same reason the host's
+/// `run_attach_exchange` is: the ssh channel is one caller, and a `duplex`
+/// pair in a test is another. Until this was extracted, the only way to
+/// exercise a reattach was to shadow the remote binary with a shim.
+///
+/// `Send` mirrors `run_attach_exchange`, so a caller that wants to spawn this
+/// may. There is deliberately no `'static` alongside it: this side *pins* its
+/// candidate pumps rather than spawning them (see the comment on `from_host`),
+/// so nothing here outlives the call — and `connect` can only ever offer the
+/// **borrowed** halves of a live [`SshChannel`], because the channel has to
+/// survive the exchange to keep `diagnose` and its stderr buffer.
+pub(crate) async fn establish<R, W>(
+    reader: R,
+    writer: W,
+    size: TermSize,
+    cfg: &NetConfig,
+) -> Result<Established>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut reader = reader;
+    let mut writer = writer;
+
     // L4. One socket for STUN, ICE and QUIC.
-    let bound = oxutrm_net::bind_socket(&cfg).context("binding a UDP socket")?;
+    let bound = oxutrm_net::bind_socket(cfg).context("binding a UDP socket")?;
     let mut candidates = oxutrm_net::local_candidates(&bound);
     let socket = crate::ladder::adopt(bound).context("handing the socket to the runtime")?;
 
-    // L5. Banner and motd are skipped inside `recv`; version skew fails loudly.
-    let host = host_facts(channel.recv().await.context("reading the host's offer")?)?;
+    // L5. Banner and motd are skipped inside `read_signal_async`; version skew
+    // fails loudly.
+    let host = host_facts(
+        read_signal_async(&mut reader)
+            .await
+            .context("reading the host's offer")?,
+    )?;
 
     // L6.
-    let (reflexive, nat) = oxutrm_net::stun_discover(&socket, &cfg).await;
+    let (reflexive, nat) = oxutrm_net::stun_discover(&socket, cfg).await;
     candidates.extend(reflexive);
 
     // L7. Our own throwaway certificate, whose fingerprint the host pins in
@@ -76,29 +178,29 @@ async fn connect(target: &str) -> Result<i32> {
     // gating the punched socket, and the PSK never reaches TLS.
     let (cert, key, our_spki) =
         oxutrm_net::generate_cert().context("generating this attach's certificate")?;
-    let size = terminal_size().context("oxutrm needs a real terminal to connect from")?;
-    channel
-        .send(&Signal::ClientHello {
+    write_signal_async(
+        &mut writer,
+        &Signal::ClientHello {
             proto: PROTO_VERSION,
             cert_spki_sha256: ClientSpki::new(our_spki),
             candidates: candidates.clone(),
             nat_type: nat,
             caps: detect_caps(),
             size,
-        })
-        .await
-        .context("answering the host's offer")?;
+        },
+    )
+    .await
+    .context("answering the host's offer")?;
 
     // L8. This side is `Controlling`: only the controlling side nominates.
     let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(32);
     let (learned_tx, mut learned_rx) = tokio::sync::mpsc::channel(32);
-    let (reader, writer) = channel.halves();
 
     // Pinned rather than spawned, and NOT cancelled when the ladder finishes:
     // this same future goes on to deliver `Established` at L10. Cancelling a
     // `read_line` that had already buffered part of a line would eat those
     // bytes, and the next read would start mid-message.
-    let mut from_host = std::pin::pin!(inbound_candidates(reader, &in_tx));
+    let mut from_host = std::pin::pin!(inbound_candidates(&mut reader, &in_tx));
 
     let nomination = {
         let race = async {
@@ -108,7 +210,7 @@ async fn connect(target: &str) -> Result<i32> {
                     psk: &host.psk,
                     role: IceRole::Controlling,
                     nat,
-                    cfg: &cfg,
+                    cfg,
                     local: candidates,
                     remote: host.candidates,
                 },
@@ -122,7 +224,7 @@ async fn connect(target: &str) -> Result<i32> {
             drop(learned_tx);
             outcome
         };
-        let to_host = outbound_candidates(writer, &mut learned_rx);
+        let to_host = outbound_candidates(&mut writer, &mut learned_rx);
 
         tokio::select! {
             (raced, sent) = async { tokio::join!(race, to_host) } => {
@@ -155,41 +257,49 @@ async fn connect(target: &str) -> Result<i32> {
     .await
     .context("bringing up QUIC over the nominated path")?;
 
-    // L10. The last signalling message. After this nothing reads the ssh
-    // channel again: the host is about to sever, and the EOF that follows is
-    // expected rather than an error.
+    // L10. The last signalling message. After this nothing reads the
+    // signalling stream again: the host is about to sever, and the EOF that
+    // follows is expected rather than an error.
     let path = established_path(from_host.await.context("waiting for the host's verdict")?)?;
 
-    // L11. Late, deliberately: after every prompt ssh could have shown, and
-    // after the last thing that could have failed with a message worth
-    // reading on an ordinary terminal.
-    let raw = RawGuard::enter().context("putting the terminal into raw mode")?;
+    Ok(Established {
+        link: Link::new(connection, endpoint, nomination.socket),
+        path,
+        session_id: host.session_id,
+        attach_id: host.attach_id,
+    })
+}
 
-    let mut session = ClientSession::new(
-        size,
-        detect_caps(),
-        Link::new(connection, endpoint, nomination.socket),
-    )
-    .context("preparing the client session")?;
-
-    // L12. One line, and then silence.
-    let mut stdout = std::io::stdout();
-    session
-        .announce(&path, &mut stdout)
-        .context("announcing the path")?;
-
-    // L13.
-    let code = session.run(&mut stdout).await;
-
-    // L14's first half. The guard comes off before anything a human should
-    // read is printed, and before the error below is rendered -- a backtrace
-    // on a terminal still in raw mode climbs diagonally down the screen.
-    drop(raw);
-    code
+/// The offer, read before either side has committed to a session.
+///
+/// It arrives ahead of `HostHello` and is the only message that a first
+/// connect and a reattach do not share, which is what makes reattach reachable
+/// from a bare `oxutrm <target>` without a second code path behind it. An
+/// empty list is the ordinary first-connect case and is not an error.
+async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSummary>> {
+    match channel
+        .recv()
+        .await
+        .context("reading the host's list of live sessions")?
+    {
+        Signal::Sessions { sessions } => Ok(sessions),
+        // The host's own words, exactly as at L5: it is the only explanation
+        // there is for why this connection is not going to happen.
+        Signal::Failed { reason } => Err(anyhow::anyhow!("the host gave up: {reason}")),
+        other => Err(anyhow::anyhow!(
+            "the host opened with {other:?} instead of its list of sessions"
+        )),
+    }
 }
 
 /// What the host offered, once its hello arrived.
 struct HostFacts {
+    /// 32 lowercase hex characters. Kept because a rebuild attaches to THIS
+    /// session by name; it used to be discarded by the `..` below.
+    session_id: String,
+    /// Which attach generation this is. Both `seq` counters restart at 1 per
+    /// attach, so a rebuild has to know which one it is resuming from.
+    attach_id: u64,
     psk: Psk,
     /// The fingerprint the client pins. [`HostSpki`] and not the bare
     /// encoding: `ClientHello` carries a field of the same name and shape
@@ -206,10 +316,12 @@ impl std::fmt::Debug for HostFacts {
     /// [`Psk`]'s own `Debug` redacts, so a derived one would be safe *today*.
     /// It would also be a standing invitation: the next field added here gets
     /// printed automatically, and the one thing this struct must never print
-    /// is already inside it. Naming the three fields that may be shown is the
+    /// is already inside it. Naming the fields that may be shown is the
     /// version that cannot drift.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostFacts")
+            .field("session_id", &self.session_id)
+            .field("attach_id", &self.attach_id)
             .field("host_spki", &self.host_spki)
             .field("candidates", &self.candidates)
             .field("nat", &self.nat)
@@ -221,12 +333,16 @@ impl std::fmt::Debug for HostFacts {
 fn host_facts(signal: Signal) -> Result<HostFacts> {
     match signal {
         Signal::HostHello {
+            session_id,
+            attach_id,
             psk,
             cert_spki_sha256,
             candidates,
             nat_type,
             ..
         } => Ok(HostFacts {
+            session_id,
+            attach_id,
             psk,
             host_spki: cert_spki_sha256,
             candidates,
@@ -261,6 +377,95 @@ fn established_path(signal: Signal) -> Result<PathDescription> {
 mod tests {
     use super::*;
     use oxutrm_proto::{CandidateKind, Rung};
+
+    /// STUN-free, like every other test in this repo: a test that reaches STUN
+    /// makes every timing in it non-deterministic, and an injected bug once
+    /// passed because a real gather ate the ordering.
+    fn test_config() -> oxutrm_net::NetConfig {
+        oxutrm_net::NetConfig {
+            stun_servers: vec![],
+            enable_port_mapping: false,
+            enable_birthday: false,
+            ..Default::default()
+        }
+    }
+
+    /// The composition the reattach path has never had a test for.
+    ///
+    /// Both halves of the handshake are generic over their signalling stream,
+    /// so they join through a `tokio::io::duplex` pair: no ssh, no shim on the
+    /// remote host, no Unix socket. The UDP path between them is real
+    /// loopback, because what is under test is the handshake and not the
+    /// transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_and_a_host_complete_an_exchange_over_a_pipe() {
+        use oxutrm_proto::TermSize;
+
+        let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_side);
+        let (client_read, client_write) = tokio::io::split(client_side);
+
+        let mut meta = oxutrm_host::SessionMeta {
+            session_id: "b".repeat(32),
+            attach_id: 0,
+            pid: std::process::id(),
+            created_unix: 0,
+            shell: "/bin/sh".to_owned(),
+            size: TermSize { cols: 80, rows: 24 },
+            detachable: true,
+            boot: oxutrm_host::boot_token(),
+        };
+
+        let cfg = test_config();
+        let host = tokio::spawn({
+            let cfg = cfg.clone();
+            async move {
+                crate::attach_exchange::run_attach_exchange(
+                    tokio::io::BufReader::new(host_read),
+                    host_write,
+                    &mut meta,
+                    &cfg,
+                )
+                .await
+            }
+        });
+
+        let client = establish(
+            tokio::io::BufReader::new(client_read),
+            client_write,
+            TermSize {
+                cols: 120,
+                rows: 40,
+            },
+            &cfg,
+        )
+        .await
+        .expect("the client exchange completes");
+
+        let attached = host
+            .await
+            .expect("the host task joins")
+            .expect("the host exchange completes");
+
+        // The side effects, not just "it returned Ok":
+        assert_eq!(
+            client.session_id,
+            "b".repeat(32),
+            "the client must keep the session id -- the rebuild loop cannot exist without it"
+        );
+        assert_eq!(
+            client.attach_id, 1,
+            "begin_attach bumps the generation, and the client must see the bumped one"
+        );
+        assert_eq!(
+            attached.client_size,
+            TermSize {
+                cols: 120,
+                rows: 40
+            },
+            "the host must adopt the CLIENT's size, not the size the session had"
+        );
+    }
 
     fn a_host_hello() -> Signal {
         Signal::HostHello {

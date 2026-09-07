@@ -84,10 +84,14 @@ async fn a_full_handshake_survives_a_banner_and_a_motd() {
 }
 
 #[tokio::test]
-async fn the_wrapper_asks_the_remote_for_host_serve() {
+async fn the_wrapper_asks_the_remote_for_host_connect() {
     // The fixture exits 2 if the argv it received is not
-    // `<target> oxutrm host --serve`, so a wrapper that built the wrong
+    // `<target> oxutrm host --connect`, so a wrapper that built the wrong
     // command line fails here rather than silently connecting to nothing.
+    //
+    // `--connect` and not `--serve`: the far end offers its live sessions
+    // before either side has committed to one, which is what makes reattach
+    // reachable from a bare `oxutrm <target>`.
     let mut ch = SshChannel::open(&fake("serve"), "bastion.example.net")
         .await
         .expect("open");

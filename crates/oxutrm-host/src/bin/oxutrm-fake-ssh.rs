@@ -13,7 +13,7 @@
 //!   stderr and nowhere else.
 //!
 //! It is invoked with exactly the argv shape the real thing gets —
-//! `<prefix args...> <target> oxutrm host --serve` — so the test exercises the
+//! `<prefix args...> <target> oxutrm host --connect` — so the test exercises the
 //! wrapper's own argument construction rather than a paraphrase of it. The
 //! behaviour is chosen by `$OXUTRM_FAKE_SSH_MODE`.
 
@@ -46,7 +46,9 @@ fn main() {
 
     // The last four arguments are the remote command; everything before the
     // target is ssh's own options.
-    let saw_remote_command = args.windows(3).any(|w| w == ["oxutrm", "host", "--serve"]);
+    let saw_remote_command = args
+        .windows(3)
+        .any(|w| w == ["oxutrm", "host", "--connect"]);
 
     match mode.as_str() {
         // The remote binary is not installed. A shell reports 127 and says so
@@ -97,7 +99,7 @@ fn main() {
     }
 
     if !saw_remote_command {
-        eprintln!("fake-ssh: the wrapper did not ask for `oxutrm host --serve`; got {args:?}");
+        eprintln!("fake-ssh: the wrapper did not ask for `oxutrm host --connect`; got {args:?}");
         std::process::exit(2);
     }
 

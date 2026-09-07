@@ -39,8 +39,13 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::signalling::{read_signal_async, write_signal_async};
 
-/// The command the wrapper asks the far end to run.
-pub const REMOTE_SERVE: [&str; 3] = ["oxutrm", "host", "--serve"];
+/// What the client asks ssh to run on the far end.
+///
+/// `--connect` and not `--serve`: the far end offers its live sessions first
+/// and the client chooses. A host binary too old to know the flag exits with
+/// ssh's own error, which `SshChannel`'s `diagnose` already reports as a remote
+/// binary that needs upgrading.
+pub const REMOTE_CONNECT: [&str; 3] = ["oxutrm", "host", "--connect"];
 
 /// How to launch `ssh`.
 ///
@@ -220,7 +225,7 @@ where
 }
 
 impl SshChannel {
-    /// Spawn `ssh <target> oxutrm host --serve` and take its pipes.
+    /// Spawn `ssh <target> oxutrm host --connect` and take its pipes.
     pub async fn open(launcher: &SshLauncher, target: &str) -> Result<SshChannel, BootstrapError> {
         let mut cmd = Command::new(&launcher.program);
         cmd.args(&launcher.args);
@@ -228,7 +233,7 @@ impl SshChannel {
             cmd.env(k, v);
         }
         cmd.arg(target);
-        cmd.args(REMOTE_SERVE);
+        cmd.args(REMOTE_CONNECT);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
