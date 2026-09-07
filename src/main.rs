@@ -39,6 +39,7 @@ use std::os::fd::BorrowedFd;
 use anyhow::{Context as _, Result};
 
 use oxutrm_client::{RawGuard, terminal_size};
+use oxutrm_proto::{Choice, Signal};
 use oxutrm_term::detect_caps;
 
 fn main() -> Result<()> {
@@ -76,6 +77,7 @@ fn run_host(args: &[String]) -> Result<()> {
         }
         // Works today: it needs the registry and nothing else.
         Some("--list") => run_host_list(),
+        Some("--connect") => run_host_connect(),
         Some("--serve") => serve::run_host_serve(),
         Some("--attach") => match args.get(1) {
             Some(id) => run_host_attach(id),
@@ -90,7 +92,7 @@ fn run_host(args: &[String]) -> Result<()> {
         }
         None => {
             eprintln!(
-                "oxutrm host: needs one of --serve, --list or --attach <id>.\nTry `oxutrm host --help`."
+                "oxutrm host: needs one of --connect, --serve, --list or --attach <id>.\nTry `oxutrm host --help`."
             );
             std::process::exit(2);
         }
@@ -114,6 +116,84 @@ fn run_host_list() -> Result<()> {
         .context("reading the session registry")?;
     print!("{}", oxutrm_host::attach::format_session_list(&sessions));
     Ok(())
+}
+
+/// `oxutrm host --connect`: offer what is running, then do what is chosen.
+///
+/// This is the command the client spawns over ssh. It is a DISPATCHER and
+/// nothing else: after the choice it calls the same `run_host_serve` or
+/// `run_host_attach` that were already there, so no code path exists that
+/// only a reattach exercises — `attach.rs`'s standing rule.
+///
+/// The offer goes out before `HostHello`, which is why it can be sent at all:
+/// at this point neither side has committed to a session.
+///
+/// # Why the plain blocking `oxutrm_proto` pair, and not `oxutrm_host::signalling`
+///
+/// `oxutrm_host::signalling::{read,write}_signal_async` exist to skip noise a
+/// LOGIN SHELL prints before it hands control to the command ssh was told to
+/// run: a banner, a motd, `stty` complaining about a missing tty. That is a
+/// real hazard for `run_host_serve`'s read of `ClientHello`, because that read
+/// sits on descriptors ssh itself still owns. It is not a hazard here: the far
+/// end of THIS pipe is the client's own `oxutrm` binary, invoked directly as
+/// the ssh command, speaking the wire protocol from its very first byte — the
+/// same assumption `tests/serve_exits.rs` and `tests/host_connect.rs` both
+/// make by writing a bare `Signal` straight onto the child's stdin with no
+/// preamble at all.
+///
+/// A `tokio` runtime, `run_host_attach`'s pattern, would also be the wrong
+/// shape here for a second, independent reason: `run_host_serve` forks (via
+/// `detach_process`) as its very first act, and a runtime built before that
+/// fork wakes up in the child with its worker threads gone (see `serve.rs`'s
+/// own R1/R3 comments). Reading and writing the offer and the choice with
+/// nothing but blocking I/O keeps that fork the FIRST thing this process ever
+/// does on the `Choice::New` path, exactly as `run_host_serve` alone would
+/// have done if invoked directly.
+fn run_host_connect() -> Result<()> {
+    let root = oxutrm_host::resolve_registry_root()
+        .context("deciding where oxutrm records its sessions")?;
+    let sessions = oxutrm_host::Registry::list_in(&oxutrm_host::Registry::dir_at(&root.base))
+        .context("reading the session registry")?;
+
+    let mut stdout = std::io::stdout();
+    oxutrm_proto::write_signal(
+        &mut stdout,
+        &Signal::Sessions {
+            sessions: oxutrm_host::attach::summarize(&sessions),
+        },
+    )
+    .context("offering the live sessions")?;
+
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let choice =
+        match oxutrm_proto::read_signal(&mut stdin).context("reading the client's choice")? {
+            Signal::Choose { choice } => choice,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "the client answered the offer with {other:?} instead of a choice"
+                ));
+            }
+        };
+
+    match choice {
+        Choice::New => serve::run_host_serve(),
+        Choice::Attach { id } => {
+            // Refused HERE rather than inside the relay, because the client is
+            // still listening on this channel: a `Failed` it can read is worth
+            // more than an exit code it has to guess at.
+            if !sessions.iter().any(|m| m.session_id == id) {
+                let reason = format!("no such session on this host: {id}");
+                let _ = oxutrm_proto::write_signal(
+                    &mut std::io::stdout(),
+                    &Signal::Failed {
+                        reason: reason.clone(),
+                    },
+                );
+                return Err(anyhow::anyhow!(reason));
+            }
+            run_host_attach(&id)
+        }
+    }
 }
 
 /// `oxutrm host --attach <id>`: relay a second client into a running session.
@@ -349,9 +429,15 @@ oxutrm host — the remote half of a session. Normally spawned over ssh rather
 than typed by hand.
 
 USAGE
+  oxutrm host --connect       The command the client spawns over ssh: offer
+                              what is running, then serve or attach.
   oxutrm host --list          Sessions on this machine, oldest first.
   oxutrm host --serve         Create a session and hand it to a client.
   oxutrm host --attach <id>   Relay a new attach into a running session.
+
+--connect is not normally typed by hand either: it is what a client actually
+runs over ssh, offering its live sessions before committing to --serve or
+--attach so an ordinary connect and a reattach are the same command.
 
 --serve creates the session and hands it to the first client, which connects,
 paints and carries the shell's exit code back. --attach relays a second
