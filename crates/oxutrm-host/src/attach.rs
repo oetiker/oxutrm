@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oxutrm_proto::ProtoError;
+use oxutrm_proto::{ProtoError, SessionSummary};
 use tokio::io::{AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
 
@@ -155,4 +155,59 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
         ));
     }
     out
+}
+
+/// The registry's entries, as a client is allowed to see them.
+///
+/// The filtering is the caller's: `Registry::list_in` has already dropped
+/// stale entries, and a NOT-detachable session is offered rather than hidden
+/// (see [`SessionSummary::detachable`]).
+#[must_use]
+pub fn summarize(sessions: &[SessionMeta]) -> Vec<SessionSummary> {
+    sessions
+        .iter()
+        .map(|m| SessionSummary {
+            session_id: m.session_id.clone(),
+            created_unix: m.created_unix,
+            shell: m.shell.clone(),
+            size: m.size,
+            detachable: m.detachable,
+            attach_id: m.attach_id,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxutrm_proto::TermSize;
+
+    #[test]
+    fn a_summary_keeps_the_id_and_drops_the_pid() {
+        let meta = SessionMeta {
+            session_id: "a".repeat(32),
+            attach_id: 2,
+            pid: 4242,
+            created_unix: 1_757_200_000,
+            shell: "/bin/zsh".to_owned(),
+            size: TermSize {
+                cols: 100,
+                rows: 30,
+            },
+            detachable: true,
+            boot: Some("boot-token".to_owned()),
+        };
+        let summaries = summarize(std::slice::from_ref(&meta));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, meta.session_id);
+        assert_eq!(summaries[0].attach_id, 2);
+        assert_eq!(summaries[0].size.cols, 100);
+        // The side effect that matters: nothing local survives the crossing.
+        let encoded = serde_json::to_string(&summaries[0]).expect("a summary encodes");
+        assert!(!encoded.contains("4242"), "the pid escaped: {encoded}");
+        assert!(
+            !encoded.contains("boot-token"),
+            "the boot token escaped: {encoded}"
+        );
+    }
 }
