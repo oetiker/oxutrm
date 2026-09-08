@@ -5653,16 +5653,34 @@ mod tests {
         let (mut host, mut client) = pair("").await;
         let mut out = Vec::new();
 
+        // Wait for the shell to draw SOMETHING -- deliberately not for a `$`.
+        //
+        // This used to wait for `contains('$')`, which is a property of the
+        // PROMPT and therefore of whoever happens to run the tests. `/bin/sh`
+        // is bash in sh mode and honours an exported `PS1` it inherits, so on
+        // a machine whose prompt is `❯ ` or `% ` the shell drew its prompt
+        // perfectly well and this test sat through the entire 20 s never
+        // recognising it, then reported that nothing had settled. It failed
+        // every run on the user's machine and none of 36 here, which is what
+        // an environment-dependent test looks like when only one machine has
+        // the environment -- it reads as a flake and is not one. Measured on
+        // the tree this replaces: PS1='❯ ' and PS1='% ' both fail in 20.03 s,
+        // PS1='$ ' passes in 0.70 s.
+        //
+        // A non-blank screen is all this step actually needs. It is the
+        // settle loop below that proves the shell has FINISHED talking, which
+        // is the precondition the test is really after, and every shell draws
+        // something to a pty it owns.
         assert!(
             drive(
                 &mut host,
                 &mut client,
                 &mut out,
                 Duration::from_secs(20),
-                |_, c| text(c.screen()).contains('$')
+                |_, c| !text(c.screen()).trim().is_empty()
             )
             .await,
-            "the client never saw the shell's prompt, so nothing has settled"
+            "the client never saw the shell draw anything, so nothing has settled"
         );
 
         // Settled means the host has run out of things to say: the prompt has
