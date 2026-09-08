@@ -115,15 +115,32 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
         // More than one session is live and nothing else settled it. The
         // terminal is still ordinary here -- raw mode is L11, well below --
         // so the picker is plain line I/O on stdin and stdout.
-        Decision::Ask => match pick(
-            &offered,
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout(),
-        )? {
-            Some(choice) => choice,
-            // The user quit. Not an error: they were asked, and declined.
-            None => std::process::exit(0),
-        },
+        //
+        // Run on tokio's blocking pool, not on this async task: `pick` waits
+        // on a human with no bound on how long that takes, and `SshChannel`'s
+        // own stderr drainer (`oxutrm_host::ssh::SshChannel::open`) is a
+        // `tokio::spawn` task on this same multi-threaded runtime. On a
+        // single-worker or cgroup-limited host, a human sitting at the `>`
+        // prompt would monopolise the only worker, starving that drainer;
+        // once its pipe buffer fills, `ssh` itself blocks on the write.
+        // `spawn_blocking` keeps the wait off the async workers entirely.
+        Decision::Ask => {
+            let offered = offered.clone();
+            let picked = tokio::task::spawn_blocking(move || {
+                pick(
+                    &offered,
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                )
+            })
+            .await
+            .context("running the picker")??;
+            match picked {
+                Some(choice) => choice,
+                // The user quit. Not an error: they were asked, and declined.
+                None => std::process::exit(0),
+            }
+        }
     };
     channel
         .send(&Signal::Choose { choice })

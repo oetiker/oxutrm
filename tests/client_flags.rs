@@ -36,6 +36,16 @@ fn attach_and_new_together_are_refused_by_name() {
 
 /// `--attach` with nothing after it is a usage error, not a panic on a
 /// missing argument.
+///
+/// `stderr.contains("--attach")` alone would pass against the
+/// PRE-IMPLEMENTATION binary too: without the flag parser (and its dispatch
+/// arm), a bare `oxutrm --attach` falls into `dispatch`'s existing
+/// "unknown option" catch-all at `src/main.rs`'s `Some(other) if
+/// other.starts_with('-')` arm, which prints `oxutrm: unknown option
+/// "--attach"` and exits 2 -- both the exit code and that substring already
+/// held before this task did anything. The specific complaint --
+/// "needs a session id" -- only exists once `run_connect`'s own parser is
+/// reached and finds nothing after the flag.
 #[test]
 fn attach_without_an_id_exits_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_oxutrm"))
@@ -50,15 +60,25 @@ fn attach_without_an_id_exits_two() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--attach"),
-        "the error must name the flag that needed an argument: {stderr}"
+        stderr.contains("needs a session id"),
+        "the error does not say what was actually wrong -- an \"unknown \
+         option\" message from dispatch's old catch-all would also contain \
+         \"--attach\" without ever reaching run_connect's own parser: {stderr}"
     );
 }
 
-/// `--help` must mention `--attach`, or a user who wants it has nowhere to
-/// read about it.
+/// `--help` must mention the CLIENT's `--attach <session-id>` flag, or a user
+/// who wants it has nowhere to read about it.
+///
+/// `stdout.contains("--attach")` alone would pass against the
+/// PRE-IMPLEMENTATION help text too: `HOST_USAGE`/`USAGE` already documented
+/// the unrelated `oxutrm host --attach <session-id>` (relay a second client
+/// into a running session) before this task touched anything, so that
+/// substring was already present. `"[--attach <session-id>]"` -- the bracketed
+/// optional-flag form -- only appears in the new top USAGE line this task
+/// added.
 #[test]
-fn help_mentions_attach() {
+fn help_mentions_the_attach_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_oxutrm"))
         .arg("--help")
         .output()
@@ -67,7 +87,8 @@ fn help_mentions_attach() {
     assert!(output.status.success(), "--help must exit successfully");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("--attach"),
-        "the help text does not mention --attach: {stdout}"
+        stdout.contains("[--attach <session-id>]"),
+        "the help text does not mention the client's --attach flag (as \
+         opposed to the pre-existing, unrelated `host --attach`): {stdout}"
     );
 }
