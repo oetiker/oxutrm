@@ -45,7 +45,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{Notice, Renderer, layout_notice, status_line, terminal_size_of};
+use oxutrm_client::{
+    Notice, Renderer, layout_notice, recovering_notice, status_line, terminal_size_of,
+};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
@@ -1199,6 +1201,15 @@ impl ClientSession {
                         "closes oxutrm here; it does not touch the host".to_string(),
                     )],
                 })
+            }
+            // Task 4 adds the phase and the notice content; nothing yet drives
+            // an attempt, so there is no failure reason to report. Task 6
+            // adds one once something actually runs an attempt and can fail
+            // it.
+            Phase::Recovering { attempt, next_try } => {
+                let quiet = now.duration_since(self.link_state.last_heard());
+                let next_try_in = next_try.saturating_duration_since(now);
+                Some(recovering_notice(quiet, attempt, next_try_in))
             }
             Phase::Confirming => {
                 let held = crate::linkstate::render_held(self.link_state.held());

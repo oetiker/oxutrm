@@ -6,6 +6,8 @@
 //! session is safe: a dead network and a crashed host are indistinguishable
 //! from here.
 
+use std::time::Duration;
+
 use oxutrm_proto::TermSize;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -26,6 +28,28 @@ pub struct Notice {
     pub body: Vec<String>,
     /// `(keys, what it does)`, rendered as a two-column list.
     pub keys: Vec<(String, String)>,
+}
+
+/// The notice shown while the client is rebuilding the link itself.
+///
+/// `quiet` is how long the host has been silent, `attempt` is the rebuild
+/// attempt number (zero-based, as counted by `Phase::Recovering`), and
+/// `next_try_in` is how long until the next attempt is due. Only these three
+/// are shown: there is no failure reason to report until something actually
+/// runs an attempt and can fail one, and that is Task 6's business.
+pub fn recovering_notice(quiet: Duration, attempt: u32, next_try_in: Duration) -> Notice {
+    Notice {
+        headline: "waiting for the network".to_string(),
+        body: vec![
+            format!("host quiet for {}s", quiet.as_secs()),
+            format!("reconnect attempt {attempt}"),
+            format!("next try in {}s", next_try_in.as_secs()),
+        ],
+        keys: vec![(
+            "Ctrl-\\ q".to_string(),
+            "closes oxutrm here; it does not touch the host".to_string(),
+        )],
+    }
 }
 
 /// Lay a notice out for this screen, as cells ready to composite.
@@ -213,6 +237,22 @@ mod tests {
         assert!(text.contains("no reply from host"), "{text}");
         assert!(text.contains("Ctrl-\\ q"), "{text}");
         assert!(text.contains("it does not touch the host"), "{text}");
+    }
+
+    /// The `Recovering` notice reports the three things there is anything to
+    /// say about: none of these phrases appear in the `Silent` notice above,
+    /// so this could not pass against the old text by accident.
+    #[test]
+    fn the_recovering_notice_reports_quiet_time_attempt_and_countdown() {
+        let n = recovering_notice(Duration::from_secs(23), 2, Duration::from_secs(5));
+        let o = layout_notice(&n, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+
+        assert!(text.contains("waiting for the network"), "{text}");
+        assert!(text.contains("host quiet for 23s"), "{text}");
+        assert!(text.contains("reconnect attempt 2"), "{text}");
+        assert!(text.contains("next try in 5s"), "{text}");
+        assert!(text.contains("Ctrl-\\ q"), "{text}");
     }
 
     /// A box that does not fit is worse than a line that does.

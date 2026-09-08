@@ -11,6 +11,28 @@ use std::time::{Duration, Instant};
 /// the noise it was built to remove.
 pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 
+/// How long silence lasts before the client starts rebuilding the link on its
+/// own.
+///
+/// **Twenty seconds**, and it is a guess the spec is honest about: long
+/// enough that a rebuild is not raced against an outage about to end by
+/// itself, short enough not to feel abandoned. Revisit it against a real bad
+/// network, not by reasoning about it.
+pub const REBUILD_AFTER: Duration = Duration::from_secs(20);
+
+/// How long to wait before attempt `attempt` (zero-based).
+///
+/// 1, 2, 4, 8, then every 8 s for ever. Saturating rather than shifting: an
+/// attempt counter that runs for a week must not wrap into an instant retry.
+#[must_use]
+// Bridge: `backoff`'s only callers are `begin_attempt`/`attempt_failed`,
+// which nothing calls outside tests until Task 6's rebuild loop exists.
+// Task 6 removes this line and the attribute below as one block.
+#[allow(dead_code)]
+pub fn backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(3))
+}
+
 /// How long a session may be completely quiet before the client says something
 /// merely to see whether anyone is still there.
 ///
@@ -37,7 +59,18 @@ const HELD_SHOWN: usize = 200;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Live,
-    Silent { since: Instant },
+    Silent {
+        since: Instant,
+    },
+    /// Silent long enough that the client is rebuilding the link itself.
+    ///
+    /// `attempt` is zero-based and feeds [`backoff`]; `next_try` is when the
+    /// next one is due. The client never leaves this state of its own accord
+    /// — only a frame arriving does that, or the user quitting.
+    Recovering {
+        attempt: u32,
+        next_try: Instant,
+    },
     Confirming,
 }
 
@@ -151,6 +184,16 @@ impl LinkState {
         self.phase
     }
 
+    /// The last time anything at all arrived from the host.
+    ///
+    /// `Phase::Recovering` does not carry its own `since`, unlike `Silent`:
+    /// only a frame arriving leaves `Recovering`, and that same frame is what
+    /// updates this, so a caller building the notice for `Recovering` reads
+    /// the silence's start from here instead.
+    pub fn last_heard(&self) -> Instant {
+        self.last_heard
+    }
+
     /// A frame arrived. Whatever we believed, the host is answering.
     pub fn heard(&mut self, now: Instant) {
         self.last_heard = now;
@@ -209,9 +252,21 @@ impl LinkState {
     /// silence is indistinguishable from calm and this reports `Live` --
     /// closing that gap is what the heartbeat is for.
     pub fn evaluate(&mut self, now: Instant, reply_owed: bool) -> Phase {
-        if let Phase::Silent { .. } = self.phase {
-            // Already told the user. The clock keeps running from `last_heard`;
-            // recomputing it here would restart the counter every lap.
+        // Recovering is terminal until something arrives: `heard` is the only
+        // way out, and re-deciding here would reset the attempt counter every
+        // lap.
+        if let Phase::Recovering { .. } = self.phase {
+            return self.phase;
+        }
+        if let Phase::Silent { since } = self.phase {
+            // The one escalation. The clock still runs from `last_heard`, so
+            // the displayed silence stays continuous across the boundary.
+            if now.duration_since(since) >= REBUILD_AFTER {
+                self.phase = Phase::Recovering {
+                    attempt: 0,
+                    next_try: now,
+                };
+            }
             return self.phase;
         }
 
@@ -251,6 +306,33 @@ impl LinkState {
             };
         }
         self.phase
+    }
+
+    /// The client is about to run an attempt.
+    // Bridge: nothing calls this outside tests until Task 6's rebuild loop
+    // exists. Task 6 removes this line and the attribute below as one block.
+    #[allow(dead_code)]
+    pub fn begin_attempt(&mut self, now: Instant) {
+        if let Phase::Recovering { attempt, .. } = self.phase {
+            self.phase = Phase::Recovering {
+                attempt,
+                next_try: now + backoff(attempt),
+            };
+        }
+    }
+
+    /// An attempt failed for a reason worth retrying.
+    // Bridge: nothing calls this outside tests until Task 6's rebuild loop
+    // exists. Task 6 removes this line and the attribute below as one block.
+    #[allow(dead_code)]
+    pub fn attempt_failed(&mut self, now: Instant) {
+        if let Phase::Recovering { attempt, .. } = self.phase {
+            let next = attempt.saturating_add(1);
+            self.phase = Phase::Recovering {
+                attempt: next,
+                next_try: now + backoff(next),
+            };
+        }
     }
 
     pub fn held(&self) -> &[u8] {
@@ -822,5 +904,117 @@ mod tests {
             "the character's leading byte (0xE4) was rendered as a raw \
              Latin-1 scalar instead of the cut being backed off: {shown:?}"
         );
+    }
+
+    #[test]
+    fn silence_becomes_recovering_only_after_rebuild_after() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        assert_eq!(state.evaluate(t0, true), Phase::Live);
+        // Silent first, and it must STAY Silent across the whole grace period:
+        // a client that starts spawning ssh after two seconds spawns one on
+        // every blip.
+        let silent = t0 + SILENT_AFTER;
+        assert!(matches!(state.evaluate(silent, true), Phase::Silent { .. }));
+        let nearly = t0 + REBUILD_AFTER - Duration::from_millis(1);
+        assert!(
+            matches!(state.evaluate(nearly, true), Phase::Silent { .. }),
+            "one millisecond early is still Silent"
+        );
+        match state.evaluate(t0 + REBUILD_AFTER, true) {
+            Phase::Recovering { attempt, .. } => {
+                assert_eq!(attempt, 0, "the first attempt is numbered 0")
+            }
+            other => panic!("expected Recovering, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_returns_to_live_from_recovering() {
+        // The whole reason the old link is held: whichever path revives first
+        // wins. A client that could not leave Recovering would keep rebuilding
+        // over a link that had already come back.
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        // `evaluate` escalates one stage per call -- see
+        // `silence_becomes_recovering_only_after_rebuild_after` -- so reaching
+        // `Recovering` from a fresh `Live` state needs the same build-up
+        // through `Silent` rather than a single jump to `REBUILD_AFTER`.
+        let _ = state.evaluate(t0, true);
+        let _ = state.evaluate(t0 + SILENT_AFTER, true);
+        let _ = state.evaluate(t0 + REBUILD_AFTER, true);
+        assert!(
+            matches!(state.phase_now(), Phase::Recovering { .. }),
+            "expected Recovering before hearing anything, got {:?}",
+            state.phase_now()
+        );
+        state.heard(t0 + REBUILD_AFTER + Duration::from_millis(1));
+        assert_eq!(
+            state.evaluate(t0 + REBUILD_AFTER + Duration::from_millis(2), false),
+            Phase::Live
+        );
+    }
+
+    #[test]
+    fn the_backoff_doubles_then_holds_at_eight_seconds() {
+        // Spec: 1, 2, 4, 8, then every 8 s indefinitely. The cap is the point --
+        // an unbounded doubling means a client that reconnects hours after the
+        // network came back.
+        assert_eq!(backoff(0), Duration::from_secs(1));
+        assert_eq!(backoff(1), Duration::from_secs(2));
+        assert_eq!(backoff(2), Duration::from_secs(4));
+        assert_eq!(backoff(3), Duration::from_secs(8));
+        assert_eq!(backoff(4), Duration::from_secs(8));
+        assert_eq!(backoff(1000), Duration::from_secs(8));
+        // And it never overflows, which a shift-based implementation would.
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn beginning_an_attempt_schedules_next_try_by_the_backoff() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        // See the comment in `a_frame_returns_to_live_from_recovering`: this
+        // build-up is what actually reaches `Recovering`.
+        let _ = state.evaluate(t0, true);
+        let _ = state.evaluate(t0 + SILENT_AFTER, true);
+        let _ = state.evaluate(t0 + REBUILD_AFTER, true);
+        state.begin_attempt(t0 + REBUILD_AFTER);
+        match state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(
+                    attempt, 0,
+                    "begin_attempt must not itself advance the attempt count"
+                );
+                assert_eq!(next_try, t0 + REBUILD_AFTER + backoff(0));
+            }
+            other => panic!("expected Recovering, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_attempt_schedules_the_next_one_further_out() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        // See the comment in `a_frame_returns_to_live_from_recovering`: this
+        // build-up is what actually reaches `Recovering`.
+        let _ = state.evaluate(t0, true);
+        let _ = state.evaluate(t0 + SILENT_AFTER, true);
+        let _ = state.evaluate(t0 + REBUILD_AFTER, true);
+        let first = match state.phase_now() {
+            Phase::Recovering { next_try, .. } => next_try,
+            other => panic!("expected Recovering, got {other:?}"),
+        };
+        state.attempt_failed(t0 + REBUILD_AFTER + Duration::from_secs(1));
+        match state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(attempt, 1);
+                assert!(
+                    next_try > first,
+                    "the second attempt must be scheduled later than the first"
+                );
+            }
+            other => panic!("expected Recovering, got {other:?}"),
+        }
     }
 }
