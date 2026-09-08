@@ -3849,8 +3849,36 @@ mod tests {
     /// Does the CPU clock this file's two spin guards depend on actually
     /// measure CPU on THIS platform? Ported off `/proc`, and a guard whose
     /// instrument reads zero passes every time while proving nothing.
+    ///
+    /// The spin is bounded by the CPU clock and NOT by the wall clock, which
+    /// is the whole difficulty here. A thread only accumulates 300 ms of CPU
+    /// in 300 ms of wall time when it has a core to itself; under a loaded
+    /// `make check` -- four test threads, on a box that is shared anyway --
+    /// it is descheduled, the wall clock runs on regardless, and the CPU
+    /// figure a wall-bounded spin produced fell straight through any floor
+    /// worth asserting. Measured on a ten-core machine: with 20 spinners this
+    /// failed a third of the time, with 40 it failed every single run, while
+    /// the instrument it exists to guard was perfectly healthy throughout.
+    /// Spinning until the CPU clock ITSELF reads `SPUN_TARGET` costs more
+    /// wall time under load and the same CPU time, which is precisely the
+    /// property being measured.
+    ///
+    /// `WALL_LIMIT` is an escape hatch and not a deadline: a clock stuck at
+    /// zero is the very failure this test exists to catch, and without a way
+    /// out the loop would hang for ever rather than report it. It sits far
+    /// past any real scheduling delay, so reaching it means the instrument is
+    /// broken -- which is then what the message says.
     #[test]
     fn the_cpu_clock_measures_work_and_not_wall_time() {
+        /// Enough CPU to be unambiguous, and reached in well under a second
+        /// of wall time on an idle core.
+        const SPUN_TARGET: u64 = 200;
+        /// Only a broken clock gets here.
+        const WALL_LIMIT: Duration = Duration::from_secs(60);
+        /// Work per clock reading, so the loop stays a spin rather than a
+        /// benchmark of `clock_gettime`.
+        const BATCH: u32 = 100_000;
+
         let a = thread_cpu_millis();
         std::thread::sleep(Duration::from_millis(300));
         let slept = thread_cpu_millis() - a;
@@ -3858,16 +3886,24 @@ mod tests {
         let b = thread_cpu_millis();
         let start = Instant::now();
         let mut x: u64 = 0;
-        while start.elapsed() < Duration::from_millis(300) {
-            x = x.wrapping_add(1);
+        let mut spun = 0;
+        while spun < SPUN_TARGET && start.elapsed() < WALL_LIMIT {
+            for _ in 0..BATCH {
+                x = x.wrapping_add(1);
+            }
+            spun = thread_cpu_millis() - b;
         }
-        let spun = thread_cpu_millis() - b;
 
         assert!(x > 0, "the spin was optimised away");
+        // Unchanged, and still the assertion that catches a clock reading
+        // WALL time: 300 ms of sleeping costs a few microseconds of CPU and
+        // 300 ms of wall.
         assert!(slept < 50, "sleeping cost {slept} ms of CPU");
         assert!(
-            spun > 200,
-            "spinning for 300 ms measured only {spun} ms of CPU"
+            spun >= SPUN_TARGET,
+            "spinning gave up after {:?} of wall time with only {spun} ms of \
+             CPU measured, so the clock does not advance with work",
+            start.elapsed()
         );
     }
 
