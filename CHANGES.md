@@ -29,10 +29,12 @@
 
 - **A client whose network dies reconnects by itself.** After twenty seconds of
   silence — long enough that a blip is not raced against an outage about to end
-  on its own — the client starts building a new link back into the same
-  session: a fresh ssh, the same handshake a first connect runs, paced 1, 2, 4,
-  8 seconds and then every 8 seconds for as long as you leave it running. It
-  never gives up on its own; `Ctrl-\ q` is how you stop it.
+  on its own — the client builds a new link back into the same session: a fresh
+  ssh, the same handshake a first connect runs. The first attempt goes out
+  immediately, because the twenty seconds have already been waited; each
+  failure after that backs off, two seconds, then four, then eight, and every
+  eight from then on. It never gives up on its own; `Ctrl-\ q` is how you stop
+  it.
 
   The old link is held throughout, so whichever path comes back first wins: a
   frame arriving on it ends the rebuild, and a rebuild landing first swaps the
@@ -52,10 +54,12 @@
 - **Both ends have to be upgraded together.** The client now runs
   `oxutrm host --connect` on the far end rather than `oxutrm host --serve`, so
   it can be offered the live sessions before choosing one. An older host does
-  not know that option: it exits with its own usage error, and the client
-  reports that the far end is too old rather than blaming the network. There is
-  no protocol version bump, because the version field lives in the hellos and
-  this exchange happens before them.
+  not know that option and exits with its own usage error, which oxutrm shows
+  you as the reason it could not connect rather than reporting a network
+  failure — and if it happens while a session is being rebuilt after an outage,
+  oxutrm names it as a version mismatch and stops instead of retrying an answer
+  that will not change. There is no protocol version bump, because the version
+  field lives in the hellos and this exchange happens before them.
 
 ### Changed
 

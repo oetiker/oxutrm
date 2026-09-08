@@ -89,9 +89,11 @@ asking, and with several oxutrm asks which. `--attach` names one directly and
 `--new` always starts a fresh one.
 
 A client whose network dies reconnects by itself. After twenty seconds of
-silence it starts rebuilding the link — a new ssh, back into the same session —
-and keeps trying on a 1, 2, 4, 8 second backoff for as long as you leave it
-running. The old link is held throughout, so whichever comes back first wins.
+silence it rebuilds the link — a new ssh, back into the same session. The first
+attempt is immediate, since the twenty seconds have already been waited, and
+after that it backs off: two seconds after the first failure, then four, then
+eight, and every eight for as long as you leave it running. The old link is
+held throughout, so whichever comes back first wins.
 Until the askpass work lands, those attempts run `ssh -o BatchMode=yes`: a key
 that needs a passphrase typed cannot be unlocked from under a session that owns
 the screen, so the attempt fails cleanly and the box on screen says why.

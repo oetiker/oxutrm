@@ -139,6 +139,15 @@ pub(crate) struct Rebuild {
     launcher: SshLauncher,
     cfg: NetConfig,
     in_flight: Option<tokio::task::JoinHandle<()>>,
+    /// An attempt has begun and no swap has happened since, so a `TAKEN_OVER`
+    /// on the link this client is holding may be our own doing.
+    ///
+    /// A latch and not `in_flight.is_some()`, because the two come apart in
+    /// exactly the case that matters: an attempt can get far enough for the
+    /// host to adopt it -- which is what closes the old link -- and then fail,
+    /// so the failure is delivered, the attempt is over, and the close is
+    /// still on its way.
+    displacing: bool,
 }
 
 impl Rebuild {
@@ -149,6 +158,7 @@ impl Rebuild {
             launcher: SshLauncher::ssh(),
             cfg: NetConfig::default(),
             in_flight: None,
+            displacing: false,
         }
     }
 
@@ -169,6 +179,20 @@ impl Rebuild {
         self.in_flight.is_some()
     }
 
+    /// Could a `TAKEN_OVER` on the current link be this client's own rebuild?
+    ///
+    /// True from the moment an attempt starts until a swap, and it stays true
+    /// across a failed attempt on purpose -- see `displacing`.
+    pub(crate) fn may_have_displaced_us(&self) -> bool {
+        self.displacing
+    }
+
+    /// A rebuilt link is in place, so nothing still outstanding can displace
+    /// us out of a link we did not build.
+    pub(crate) fn swapped(&mut self) {
+        self.displacing = false;
+    }
+
     /// Start one, reporting its outcome on `outcomes`.
     pub(crate) fn begin(
         &mut self,
@@ -179,6 +203,7 @@ impl Rebuild {
         let target = self.target.clone();
         let session_id = self.session_id.clone();
         let cfg = self.cfg.clone();
+        self.displacing = true;
         self.in_flight = Some(tokio::spawn(async move {
             let outcome = attempt(&launcher, &target, &session_id, size, &cfg).await;
             // A closed receiver means the session this was for has ended.
@@ -204,6 +229,22 @@ impl Rebuild {
         if let Some(task) = self.in_flight.take() {
             task.abort();
         }
+    }
+}
+
+impl Drop for Rebuild {
+    /// An attempt does not outlive the session that wanted it.
+    ///
+    /// The loop cancels on every path it takes itself, so this is about the
+    /// paths it does not take: the quit key pressed while `Recovering` --
+    /// which is the key the notice on screen is offering at that exact moment
+    /// -- the shell exiting mid-attempt, and any error returned out of
+    /// `run_on`. Today all of those end with the runtime being dropped
+    /// normally, which happens to take the task down with it. That is one
+    /// `std::process::exit` away from leaving somebody an ssh nobody reaps,
+    /// and this makes the guarantee belong to the type instead.
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -421,7 +462,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ssh_that_dies_is_retried() {
         match attempt_against(fake_host_that_exits_immediately(), "abc123").await {
-            AttemptOutcome::Retry(_) => {}
+            // The reason, and not merely the variant: `Retry` is what
+            // `classify` returns for everything that is not one of the two
+            // definite cases, so a `classify` that had stopped reading its
+            // argument at all would satisfy `Retry(_)`. What this has to show
+            // is that the sentence reaching the notice is the one ssh gave.
+            AttemptOutcome::Retry(why) => assert!(
+                why.contains("Network is unreachable"),
+                "the reason ssh gave was thrown away: {why}"
+            ),
             other => panic!("expected Retry, got {other:?}"),
         }
     }

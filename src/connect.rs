@@ -159,10 +159,11 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // is the only moment it is known -- `HostFacts::session_id` names
     // whichever session actually resulted, which for `Choice::New` is a fresh
     // id the client had no way to guess in advance.
-    println!(
-        "oxutrm: session {} (attach #{}).",
-        established.session_id, established.attach_id
-    );
+    //
+    // The attach generation used to be here too and is not any more. It is
+    // internal bookkeeping -- which generation of the sync counters this is --
+    // and unlike the id there is nothing a user can do with it.
+    println!("oxutrm: session {}.", established.session_id);
 
     // L11. Late, deliberately: after every prompt ssh could have shown, and
     // after the last thing that could have failed with a message worth

@@ -336,10 +336,14 @@ mod tests {
         );
         let shown = n.body.last().expect("the reason is the last body line");
 
+        // Against `REASON_SHOWN` itself, plus the label and the ellipsis. A
+        // loose bound -- "< 200" against a cap of 120 -- passes for every cap
+        // between the two, which is to say it does not pin the cap at all.
         assert!(
-            shown.len() < 200,
-            "the whole of a {}-byte reason went into the box: {shown}",
-            long.len()
+            shown.chars().count() <= REASON_SHOWN + "last attempt: ".len() + "...".len(),
+            "the reason was cut at something other than REASON_SHOWN ({REASON_SHOWN}): \
+             {} characters of {shown}",
+            shown.chars().count()
         );
         assert!(
             shown.contains("ssh said:"),

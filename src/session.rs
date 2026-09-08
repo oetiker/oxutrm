@@ -1356,10 +1356,12 @@ impl ClientSession {
     /// second time. Anything typed while the notice was up is not in here at
     /// all: it is held in [`LinkState`] and still needs the user's answer.
     ///
-    /// The phase is deliberately NOT set. Landing is not the same as being
+    /// The phase is deliberately NOT left. Landing is not the same as being
     /// answered, and the first frame to arrive is what returns the phase to
     /// `Live` -- or to `Confirming`, if there is blind typing to ask about.
-    fn swap_in(&mut self, link: Link) -> Result<()> {
+    /// What the phase DOES get is a fresh schedule, and that is not a detail:
+    /// see [`LinkState::rebuilt`] for the self-displacing loop it prevents.
+    fn swap_in(&mut self, link: Link, now: Instant) -> Result<()> {
         // Closed first, and with a reason, for the same reason `adopt` closes
         // the displaced one with `TAKEN_OVER`: a connection that is merely
         // dropped is indistinguishable from one that went quiet.
@@ -1388,6 +1390,15 @@ impl ClientSession {
         );
         self.probed_at = None;
         self.last_failure = None;
+
+        // A full backoff before another attempt, and the old link's failures
+        // left behind with it.
+        self.link_state.rebuilt(now);
+        // Whatever we displaced, we have now displaced. A `TAKEN_OVER` after
+        // this point belongs to somebody else.
+        if let Some(rebuild) = self.rebuild.as_mut() {
+            rebuild.swapped();
+        }
         Ok(())
     }
 
@@ -1669,7 +1680,7 @@ impl ClientSession {
                     }
                     match outcome {
                         AttemptOutcome::Landed(established) => {
-                            self.swap_in(established.link)
+                            self.swap_in(established.link, Instant::now())
                                 .context("swapping in the rebuilt link")?;
                             // Both of these belong to the link that has just
                             // been replaced: the arm has to watch the new
@@ -1700,12 +1711,25 @@ impl ClientSession {
                     // the host closes it as it adopts the newcomer, which is
                     // what `HostSession::adopt` is for. Reporting that as the
                     // end of the session would end it at the exact moment it
-                    // was rescued (spec §5.3). Only while an attempt is
-                    // actually in flight: with none, a takeover is somebody
-                    // else attaching and today's behaviour stands, until B4
-                    // makes it `Displaced`.
+                    // was rescued (spec §5.3).
+                    //
+                    // `may_have_displaced_us` and not `is_running`: an attempt
+                    // can get far enough for the host to adopt it -- closing
+                    // this link -- and fail AFTERWARDS, say with ssh dying
+                    // while it waits for `Established`. That failure clears
+                    // `is_running` before the close arrives, and the client
+                    // would exit saying the host closed the session, in the
+                    // one scenario this arm exists for. The latch outlives the
+                    // attempt and is cleared by the swap instead.
+                    //
+                    // With no rebuild in the picture at all, a takeover is
+                    // somebody else attaching and today's behaviour stands,
+                    // until B4 makes it `Displaced`.
                     if is_takeover(&reason)
-                        && self.rebuild.as_ref().is_some_and(Rebuild::is_running)
+                        && self
+                            .rebuild
+                            .as_ref()
+                            .is_some_and(Rebuild::may_have_displaced_us)
                     {
                         takeover_expected = true;
                         continue;
@@ -4424,6 +4448,88 @@ mod tests {
         assert_gone(ssh, "the abandoned attempt's ssh").await;
     }
 
+    /// A rebuilt link is not immediately rebuilt again.
+    ///
+    /// The swap deliberately leaves the phase at `Recovering`, because only a
+    /// frame may say the host is answering. The trap that follows from it: the
+    /// phase still carries the `next_try` set when the attempt that just
+    /// landed STARTED, and any real attempt -- ssh, ICE, a QUIC handshake --
+    /// outlives that by seconds. So the very same lap of `run_on` that swapped
+    /// the link would go on to build another one, that one can land too and
+    /// displace the first, and the phase is STILL `Recovering`: a loop that
+    /// displaces itself for as long as no frame gets through, which is exactly
+    /// the condition it was built to survive.
+    ///
+    /// The third assertion is what stops the fix from being "never rebuild
+    /// again". A guard that simply latched off would satisfy the first two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_landed_swap_does_not_immediately_start_another_attempt() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_host2, newcomer) = pair("/bin/sh").await;
+
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        // One real attempt, so the phase reaches the swap carrying the
+        // schedule an attempt leaves behind rather than a fresh one.
+        session.rebuild_step(entered, &tx);
+        assert!(
+            session.rebuild.as_ref().expect("a rebuild").is_running(),
+            "the fixture started no attempt"
+        );
+        let ssh = wait_for_pid(&pidfile).await;
+
+        // It lands, five seconds later -- comfortably past the one second
+        // `begin_attempt` scheduled, as any real ssh handshake is. `cancel`
+        // rather than the loop's own `finished`, because a real attempt's task
+        // has ENDED by the time its outcome is read and this fake's never
+        // would; the phase state either one leaves behind is identical.
+        let landed = entered + Duration::from_secs(5);
+        session.rebuild.as_mut().expect("a rebuild").cancel();
+        session
+            .swap_in(newcomer.link_take(), landed)
+            .expect("swapping in the rebuilt link");
+        assert_gone(ssh, "the landed attempt's ssh").await;
+
+        // The rest of that same lap.
+        session.rebuild_step(landed, &tx);
+        assert!(
+            !session.rebuild.as_ref().expect("a rebuild").is_running(),
+            "the lap that swapped a rebuilt link in went straight on to build \
+             another one, which can land and displace it"
+        );
+
+        match session.link_state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(
+                    attempt, 0,
+                    "the notice will keep counting attempts up over a link \
+                     that has already been rebuilt"
+                );
+                assert_eq!(next_try, landed + crate::linkstate::backoff(0));
+            }
+            other => {
+                panic!("the swap left Recovering by itself; only a frame may do that: {other:?}")
+            }
+        }
+
+        // Delayed, not disabled: a rebuilt link that never produces a frame
+        // has to be rebuilt again in its turn.
+        session.rebuild_step(
+            landed + crate::linkstate::backoff(0) + Duration::from_millis(1),
+            &tx,
+        );
+        assert!(
+            session.rebuild.as_ref().expect("a rebuild").is_running(),
+            "the rebuild loop stopped for good at the first swap, so a link \
+             that landed and then said nothing is never rebuilt"
+        );
+    }
+
     /// A landed attempt replaces the transport and starts the sync state over.
     ///
     /// Design spec §8.5: both ends reset their sequence counters at every
@@ -4464,7 +4570,7 @@ mod tests {
         // identical.
         let displaced = host.link.sink.connection().clone();
         session
-            .swap_in(newcomer.link_take())
+            .swap_in(newcomer.link_take(), Instant::now())
             .expect("swapping in the rebuilt link");
 
         assert_eq!(

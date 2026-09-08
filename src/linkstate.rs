@@ -20,10 +20,23 @@ pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 /// network, not by reasoning about it.
 pub const REBUILD_AFTER: Duration = Duration::from_secs(20);
 
-/// How long to wait before attempt `attempt` (zero-based).
+/// The delay that belongs to attempt `attempt` (zero-based): 1, 2, 4, 8, and
+/// 8 for ever after.
 ///
-/// 1, 2, 4, 8, then every 8 s for ever. Saturating rather than shifting: an
-/// attempt counter that runs for a week must not wrap into an instant retry.
+/// Saturating rather than shifting: an attempt counter that runs for a week
+/// must not wrap into an instant retry.
+///
+/// **This is not the schedule a user sees, and the difference has already been
+/// written down wrongly once.** The delay that actually separates two attempts
+/// comes from [`LinkState::attempt_failed`], which schedules the NEXT
+/// attempt's number -- `backoff(attempt + 1)` -- from the moment the current
+/// one failed. And the first attempt of an outage waits for nothing at all,
+/// because `evaluate` enters `Recovering` with `next_try: now`: twenty seconds
+/// of silence have already elapsed, and adding a second to them helps nobody.
+///
+/// So the observed sequence is: an immediate first attempt, then 2 s, 4 s,
+/// 8 s, 8 s ... measured from each failure. Deliberate, and correct; only the
+/// prose describing it was wrong.
 #[must_use]
 pub fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(1u64 << attempt.min(3))
@@ -310,6 +323,35 @@ impl LinkState {
             self.phase = Phase::Recovering {
                 attempt,
                 next_try: now + backoff(attempt),
+            };
+        }
+    }
+
+    /// An attempt landed and its link is in place, but nothing has arrived on
+    /// it yet.
+    ///
+    /// The phase stays `Recovering`, deliberately: a link being up is not the
+    /// same as the host answering on it, and only a frame -- through
+    /// [`LinkState::heard`] -- may say that. What this does is stop the
+    /// rebuilt link from being torn down by the loop that built it.
+    ///
+    /// Without it the phase still carries the OLD `next_try`, which is in the
+    /// past by the time any real attempt has finished, so the very next lap
+    /// starts another attempt against a link that was just swapped in. That
+    /// second attempt can land too, displacing the first, leaving the phase
+    /// still `Recovering` and starting a third: a loop that displaces itself
+    /// for as long as no frame gets through, which is precisely the condition
+    /// it exists to survive.
+    ///
+    /// The counter starts over as well. The failures that ran it up belong to
+    /// the link that is gone; counting on across a successful rebuild would
+    /// have the box telling the user about an eleventh attempt over a
+    /// connection built by the tenth.
+    pub fn rebuilt(&mut self, now: Instant) {
+        if let Phase::Recovering { .. } = self.phase {
+            self.phase = Phase::Recovering {
+                attempt: 0,
+                next_try: now + backoff(0),
             };
         }
     }
@@ -986,6 +1028,69 @@ mod tests {
             }
             other => panic!("expected Recovering, got {other:?}"),
         }
+    }
+
+    /// A rebuilt link gets a full backoff to produce its first frame, and the
+    /// failures of the link it replaced do not follow it.
+    ///
+    /// Without the reschedule the phase keeps the `next_try` set when the
+    /// landed attempt STARTED, which any real attempt outlives, so the loop
+    /// immediately builds a second link and displaces the one it just made.
+    #[test]
+    fn a_rebuilt_link_is_given_a_backoff_before_the_next_attempt() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        let _ = state.evaluate(t0, true);
+        let _ = state.evaluate(t0 + SILENT_AFTER, true);
+        let _ = state.evaluate(t0 + REBUILD_AFTER, true);
+        state.begin_attempt(t0 + REBUILD_AFTER);
+        state.attempt_failed(t0 + REBUILD_AFTER + Duration::from_secs(1));
+        assert!(
+            matches!(state.phase_now(), Phase::Recovering { attempt: 1, .. }),
+            "the fixture did not run the counter up, so the reset below would \
+             prove nothing: {:?}",
+            state.phase_now()
+        );
+
+        let landed = t0 + REBUILD_AFTER + Duration::from_secs(9);
+        state.rebuilt(landed);
+
+        match state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(
+                    attempt, 0,
+                    "the failures of the link that is gone were carried onto \
+                     the one that replaced it"
+                );
+                // The exact instant, not merely "later than it was": a
+                // reschedule that only advanced by a tick would still leave
+                // the next lap starting an attempt over a fresh link.
+                assert_eq!(next_try, landed + backoff(0));
+            }
+            other => {
+                panic!("a rebuilt link is still Recovering until a frame arrives, got {other:?}")
+            }
+        }
+    }
+
+    /// Landing is not being answered. Only a frame may say the host is back,
+    /// so the phase has to survive the swap.
+    #[test]
+    fn a_rebuilt_link_does_not_by_itself_leave_recovering() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        let _ = state.evaluate(t0, true);
+        let _ = state.evaluate(t0 + SILENT_AFTER, true);
+        let _ = state.evaluate(t0 + REBUILD_AFTER, true);
+
+        state.rebuilt(t0 + REBUILD_AFTER);
+
+        assert!(
+            matches!(state.phase_now(), Phase::Recovering { .. }),
+            "the swap declared the host to be answering, which nothing has \
+             observed: {:?}",
+            state.phase_now()
+        );
     }
 
     #[test]
