@@ -1138,14 +1138,21 @@ impl ClientSession {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
 
-        // Only `Silent` carries numbers that move on their own. `Confirming`
-        // shows the held buffer, which changes only when the user types --
-        // and when they do, they should see it.
+        // `Silent` and `Recovering` both carry numbers that move on their
+        // own -- `Silent`'s "silent for Ns", and `Recovering`'s "host quiet
+        // for Ns" and "next try in Ns". `Confirming` shows the held buffer,
+        // which changes only when the user types -- and when they do, they
+        // should see it.
         //
         // `built_for == phase` and not merely "a box is up": the box already
-        // there has to be THIS phase's, or entering `Silent` would itself be
-        // delayed by whenever the previous box happened to be built.
-        if let Phase::Silent { .. } = phase
+        // there has to be THIS phase's, or entering `Silent`/`Recovering`
+        // would itself be delayed by whenever the previous box happened to be
+        // built. For `Recovering` this comparison is exact rather than
+        // approximate: `attempt` and `next_try` only move when
+        // `begin_attempt`/`attempt_failed` run, never on an ordinary
+        // `evaluate` lap, so `built_for == phase` staying true for a whole
+        // second does not paper over a countdown that actually ticked.
+        if matches!(phase, Phase::Silent { .. } | Phase::Recovering { .. })
             && let Some((built_for, built_at)) = self.built
             && let Some(shown) = self.shown.as_ref()
             && built_for == phase
@@ -1509,9 +1516,10 @@ impl ClientSession {
             }
 
             // Follow the route if it moved. Inside the loop rather than on a
-            // timer of its own: `follow_route` is gated on `Silent` and paced
-            // by `ROUTE_PROBE_EVERY`, so a healthy session reaches this line
-            // ten times a second and does nothing but one `matches!`.
+            // timer of its own: `follow_route` is gated on `Silent` or
+            // `Recovering` and paced by `ROUTE_PROBE_EVERY`, so a healthy
+            // session reaches this line ten times a second and does nothing
+            // but one `matches!`.
             //
             // After the notice, so the box describing the silence is already
             // on the screen before anything is done about it -- and the user
@@ -1559,11 +1567,17 @@ impl ClientSession {
     ///
     /// Returns whether the session socket was actually swapped.
     ///
-    /// **Only while `Silent`**, per design spec 4.2: a rebind moves our source
-    /// port, which invalidates a punched NAT hole, so doing it to a working
-    /// path breaks the path in order to test it. `Silent` means a reply has
-    /// been owed for `SILENT_AFTER` with none arriving -- the path is already
-    /// not working, so there is nothing left to break.
+    /// **Only while `Silent` or `Recovering`**, per design spec 4.2: a rebind
+    /// moves our source port, which invalidates a punched NAT hole, so doing
+    /// it to a working path breaks the path in order to test it. Both phases
+    /// mean a reply has been owed with none arriving -- the path is already
+    /// not working, so there is nothing left to break. `Recovering` cannot be
+    /// excluded: it is silence that has lasted past `REBUILD_AFTER`, still on
+    /// the same broken path, and the whole reason it never tears the old link
+    /// down is that either path -- this probe reviving the old one, or a
+    /// rebuilt link -- may win. Stopping the probe at the exact moment
+    /// recovery becomes necessary would leave a client that changed networks
+    /// mid-outage with neither path available.
     ///
     /// Nothing here may end the session. A machine in the middle of an outage
     /// is exactly where `connect` fails with `ENETUNREACH` and where binding a
@@ -1599,7 +1613,10 @@ impl ClientSession {
     /// the new address as the baseline, so the mistake is made once and not
     /// once a second.
     fn follow_route(&mut self, now: Instant) -> bool {
-        if !matches!(self.link_state.phase_now(), Phase::Silent { .. }) {
+        if !matches!(
+            self.link_state.phase_now(),
+            Phase::Silent { .. } | Phase::Recovering { .. }
+        ) {
             // The pace belongs to one outage, not to the session. Left set
             // across a return to `Live`, `probed_at` would also swallow the
             // FIRST probe of the next outage whenever that outage began within
@@ -3951,6 +3968,57 @@ mod tests {
             "this is not the notice that asks about the held input: {shown}"
         );
         assert_claims_nothing_it_cannot_see(&shown);
+    }
+
+    /// The only path by which a user ever sees `Phase::Recovering`. The
+    /// `notice.rs` test for `recovering_notice` calls it directly with
+    /// numbers already computed; nothing there exercises `notice_at`'s own
+    /// derivation of them -- `now.duration_since(self.link_state.last_heard())`
+    /// for the quiet count, `next_try.saturating_duration_since(now)` for the
+    /// countdown -- so this drives the real wiring through `evaluate`
+    /// instead.
+    ///
+    /// Not run through `assert_claims_nothing_it_cannot_see`: that guard
+    /// forbids "reconnect"/"retry" because phase 1 has no reconnection
+    /// mechanism to promise. `Recovering` is exactly the mechanism phase 2
+    /// adds, so the word belongs here and the guard does not apply.
+    #[tokio::test]
+    async fn the_recovering_notice_reports_the_wired_numbers() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+        let _ = session.notice_at(t + Duration::from_secs(3));
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Silent { .. }),
+            "fixture did not reach Silent: {:?}",
+            session.link_state.phase_now()
+        );
+
+        let n = session
+            .notice_at(t + crate::linkstate::REBUILD_AFTER)
+            .expect("no notice while Recovering");
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
+            "fixture did not reach Recovering: {:?}",
+            session.link_state.phase_now()
+        );
+
+        let shown = painted_words(&n);
+        assert!(shown.contains("waiting for the network"), "{shown}");
+        // `last_heard` is `t`; this call lands exactly `REBUILD_AFTER` later,
+        // so a quiet count read from anywhere other than `last_heard` (say,
+        // `owed_since`, which this session never set to `t`) would not say
+        // 20s here.
+        assert!(shown.contains("host quiet for 20s"), "{shown}");
+        // Attempt 0 internally (the first attempt), rendered as 1.
+        assert!(shown.contains("reconnect attempt 1"), "{shown}");
+        // `next_try` was set to exactly `now` on entering `Recovering`, and
+        // this call is that same `now` -- so the countdown, read through
+        // `saturating_duration_since`, must be zero rather than negative or
+        // panicking.
+        assert!(shown.contains("next try in 0s"), "{shown}");
     }
 
     /// Every word a notice puts on the screen: headline, body and key list.

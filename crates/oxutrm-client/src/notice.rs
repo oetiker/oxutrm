@@ -37,12 +37,16 @@ pub struct Notice {
 /// `next_try_in` is how long until the next attempt is due. Only these three
 /// are shown: there is no failure reason to report until something actually
 /// runs an attempt and can fail one, and that is Task 6's business.
+///
+/// `attempt` is rendered as `attempt + 1`: zero-based is right internally,
+/// where it indexes `backoff`, but a person reading "reconnect attempt 0"
+/// for the very first try would read it as a bug.
 pub fn recovering_notice(quiet: Duration, attempt: u32, next_try_in: Duration) -> Notice {
     Notice {
         headline: "waiting for the network".to_string(),
         body: vec![
             format!("host quiet for {}s", quiet.as_secs()),
-            format!("reconnect attempt {attempt}"),
+            format!("reconnect attempt {}", attempt + 1),
             format!("next try in {}s", next_try_in.as_secs()),
         ],
         keys: vec![(
@@ -250,7 +254,10 @@ mod tests {
 
         assert!(text.contains("waiting for the network"), "{text}");
         assert!(text.contains("host quiet for 23s"), "{text}");
-        assert!(text.contains("reconnect attempt 2"), "{text}");
+        // The `attempt` argument is 2 (zero-based); the box must show the
+        // human count, 3 -- proving the +1 actually happened, not just that
+        // some number is printed.
+        assert!(text.contains("reconnect attempt 3"), "{text}");
         assert!(text.contains("next try in 5s"), "{text}");
         assert!(text.contains("Ctrl-\\ q"), "{text}");
     }

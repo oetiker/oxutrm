@@ -66,7 +66,7 @@ pub enum Phase {
     ///
     /// `attempt` is zero-based and feeds [`backoff`]; `next_try` is when the
     /// next one is due. The client never leaves this state of its own accord
-    /// — only a frame arriving does that, or the user quitting.
+    /// -- only a frame arriving does that, or the user quitting.
     Recovering {
         attempt: u32,
         next_try: Instant,
@@ -957,6 +957,14 @@ mod tests {
 
     #[test]
     fn the_backoff_doubles_then_holds_at_eight_seconds() {
+        // Asserted first, and deliberately: a shift-based implementation
+        // (`1u64 << attempt` with no cap) does not merely disagree with the
+        // spec here, it panics on overflow. Put after the ordinary cases,
+        // that panic is unreachable -- `assert_eq!` on `backoff(4)` already
+        // fails and stops the test before this line ever runs. Asserted
+        // first, an injection that removes the cap is guaranteed to be seen
+        // failing on the line whose comment claims to prove it.
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(8));
         // Spec: 1, 2, 4, 8, then every 8 s indefinitely. The cap is the point --
         // an unbounded doubling means a client that reconnects hours after the
         // network came back.
@@ -966,8 +974,6 @@ mod tests {
         assert_eq!(backoff(3), Duration::from_secs(8));
         assert_eq!(backoff(4), Duration::from_secs(8));
         assert_eq!(backoff(1000), Duration::from_secs(8));
-        // And it never overflows, which a shift-based implementation would.
-        assert_eq!(backoff(u32::MAX), Duration::from_secs(8));
     }
 
     #[test]
@@ -1001,17 +1007,23 @@ mod tests {
         let _ = state.evaluate(t0, true);
         let _ = state.evaluate(t0 + SILENT_AFTER, true);
         let _ = state.evaluate(t0 + REBUILD_AFTER, true);
-        let first = match state.phase_now() {
-            Phase::Recovering { next_try, .. } => next_try,
-            other => panic!("expected Recovering, got {other:?}"),
-        };
+        assert!(
+            matches!(state.phase_now(), Phase::Recovering { .. }),
+            "expected Recovering before the failure, got {:?}",
+            state.phase_now()
+        );
         state.attempt_failed(t0 + REBUILD_AFTER + Duration::from_secs(1));
         match state.phase_now() {
             Phase::Recovering { attempt, next_try } => {
                 assert_eq!(attempt, 1);
-                assert!(
-                    next_try > first,
-                    "the second attempt must be scheduled later than the first"
+                // The exact schedule, not merely "later than before": a
+                // `next_try` that only advanced by one tick of `now` -- with
+                // `+ backoff(next)` dropped from `attempt_failed` entirely --
+                // would still satisfy a bare `>` comparison, so that is not
+                // what "further out" means here.
+                assert_eq!(
+                    next_try,
+                    t0 + REBUILD_AFTER + Duration::from_secs(1) + backoff(1)
                 );
             }
             other => panic!("expected Recovering, got {other:?}"),
