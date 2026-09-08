@@ -16,6 +16,10 @@
 //! `<prefix args...> <target> oxutrm host --connect` — so the test exercises the
 //! wrapper's own argument construction rather than a paraphrase of it. The
 //! behaviour is chosen by `$OXUTRM_FAKE_SSH_MODE`.
+//!
+//! It checks the `--connect` argv but still answers with the `--serve`
+//! dialect (`HostHello` first, no `Sessions`/`Choose` turn): this is an
+//! argv-and-pipes fixture for `SshChannel`, not a protocol peer.
 
 use std::io::{BufRead, Write};
 

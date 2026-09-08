@@ -463,7 +463,7 @@ mod tests {
                 cols: 120,
                 rows: 40
             },
-            "the host must adopt the CLIENT's size, not the size the session had"
+            "the host must carry the client's size out of the exchange, not the size the session already had"
         );
     }
 

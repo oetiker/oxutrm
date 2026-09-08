@@ -42,9 +42,10 @@ use crate::signalling::{read_signal_async, write_signal_async};
 /// What the client asks ssh to run on the far end.
 ///
 /// `--connect` and not `--serve`: the far end offers its live sessions first
-/// and the client chooses. A host binary too old to know the flag exits with
-/// ssh's own error, which `SshChannel`'s `diagnose` already reports as a remote
-/// binary that needs upgrading.
+/// and the client chooses. A host binary too old to know the flag exits
+/// non-zero with its own usage error, not ssh's; `SshChannel`'s `diagnose`
+/// has no way to tell that apart from any other remote failure, so it
+/// surfaces as `SshFailed` carrying that usage message on stderr.
 pub const REMOTE_CONNECT: [&str; 3] = ["oxutrm", "host", "--connect"];
 
 /// How to launch `ssh`.
