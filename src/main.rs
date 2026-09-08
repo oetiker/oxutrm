@@ -23,6 +23,7 @@
 mod accept;
 mod attach_exchange;
 mod candidates;
+mod choose;
 mod connect;
 mod ladder;
 mod link;
@@ -59,6 +60,10 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         Some("host") => run_host(&args[1..]),
         Some("loopback") => run_loopback(&args[1..]),
+        // `--attach` and `--new` are `run_connect`'s own flags, not unknown
+        // options: they come before the target, so they must reach it rather
+        // than be caught by the catch-all below.
+        Some("--attach") | Some("--new") => connect::run_connect(args),
         Some(other) if other.starts_with('-') => {
             eprintln!("oxutrm: unknown option {other:?}\nTry `oxutrm --help`.");
             std::process::exit(2);
@@ -468,9 +473,10 @@ oxutrm — a remote terminal that survives bad networks, changing IP addresses
 and NAT on both ends.
 
 USAGE
-  oxutrm <ssh-target> [command ...]
-      Start a session there and connect to it. Each connection starts a
-      fresh session; reattaching to an existing one is not implemented.
+  oxutrm [--attach <session-id>] [--new] <ssh-target>
+      Connect to that host. If a session of yours is already running
+      there it is resumed; with several, oxutrm asks which. --attach
+      names one directly, --new always starts a fresh session.
 
   oxutrm host --serve
       Run the remote half. Spawned over SSH; not normally typed by hand.
@@ -525,13 +531,14 @@ mod tests {
                 "{name} still claims --attach is unimplemented, which is no \
                  longer true"
             );
-            // Reattach via a bare `oxutrm <ssh-target>` is a *different*,
-            // still-unimplemented thing from `host --attach <id>` — see the
-            // top line of USAGE, which still says so on purpose.
+            // Reattach via a bare `oxutrm <ssh-target>` used to be the one
+            // promise USAGE explicitly took back: "reattaching to an
+            // existing one is not implemented". This branch is that
+            // implementation, so the disclaimer must be gone.
             assert!(
-                !text.contains("or reattach to a session already running"),
-                "{name} promises reattach, which is the one thing that does \
-                 not work; a second connection starts a fresh session"
+                !text.contains("reattaching to an existing one is not implemented"),
+                "{name} still claims reattach is unimplemented, which is no \
+                 longer true: a bare connect resumes an existing session"
             );
         }
     }
@@ -539,7 +546,7 @@ mod tests {
     #[test]
     fn help_is_the_default_and_names_every_subcommand() {
         for needle in [
-            "oxutrm <ssh-target>",
+            "oxutrm [--attach <session-id>] [--new] <ssh-target>",
             "oxutrm host --serve",
             "oxutrm host --list",
             "oxutrm host --attach",

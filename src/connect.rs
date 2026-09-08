@@ -9,12 +9,13 @@ use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_host::ssh::{SshChannel, SshLauncher};
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, Choice, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk,
-    SessionSummary, Signal, TermSize,
+    Candidate, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk, SessionSummary,
+    Signal, TermSize,
 };
 use oxutrm_term::detect_caps;
 
 use crate::candidates::{inbound_candidates, outbound_candidates};
+use crate::choose::{Decision, decide, pick};
 use crate::ladder::nominate;
 use crate::link::Link;
 use crate::session::ClientSession;
@@ -27,8 +28,41 @@ use crate::session::ClientSession;
 /// prompt it asks with; [`RawGuard`] goes on at L11, after every prompt ssh
 /// could possibly have shown.
 pub fn run_connect(args: &[String]) -> Result<()> {
-    let Some(target) = args.first() else {
-        anyhow::bail!("oxutrm needs an ssh target. Try `oxutrm --help`.");
+    // `--attach <id>` and `--new` come before the target, in either order.
+    //
+    // Every usage mistake here exits 2, the same convention `dispatch`'s own
+    // "unknown option" and `run_host`'s missing-subcommand cases use: a typo
+    // in the invocation is not a connection failure, and it is reported and
+    // exited before anything -- ssh included -- has been started.
+    let mut attach: Option<String> = None;
+    let mut new = false;
+    let mut rest = args;
+    loop {
+        match rest.first().map(String::as_str) {
+            Some("--attach") => {
+                let Some(id) = rest.get(1) else {
+                    eprintln!("oxutrm: --attach needs a session id. Try `oxutrm --help`.");
+                    std::process::exit(2);
+                };
+                attach = Some(id.clone());
+                rest = &rest[2..];
+            }
+            Some("--new") => {
+                new = true;
+                rest = &rest[1..];
+            }
+            _ => break,
+        }
+    }
+
+    if attach.is_some() && new {
+        eprintln!("oxutrm: --attach and --new cannot both be given. Try `oxutrm --help`.");
+        std::process::exit(2);
+    }
+
+    let Some(target) = rest.first() else {
+        eprintln!("oxutrm: needs an ssh target. Try `oxutrm --help`.");
+        std::process::exit(2);
     };
 
     // L2. The local side never forks, so a runtime here is free of the
@@ -37,7 +71,7 @@ pub fn run_connect(args: &[String]) -> Result<()> {
         .enable_all()
         .build()
         .context("building the runtime")?;
-    let outcome = runtime.block_on(connect(target));
+    let outcome = runtime.block_on(connect(target, attach.as_deref(), new));
 
     // Same reasoning as `host --serve`: the ssh channel's reader may be parked
     // on a pipe the far end is in no hurry to close, and waiting for a read we
@@ -52,7 +86,7 @@ pub fn run_connect(args: &[String]) -> Result<()> {
 }
 
 /// L3 to L13.
-async fn connect(target: &str) -> Result<i32> {
+async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     let cfg = NetConfig::default();
 
     // L3. Spawns `ssh <target> oxutrm host --connect` and drains its stderr
@@ -61,19 +95,38 @@ async fn connect(target: &str) -> Result<i32> {
         .await
         .with_context(|| format!("starting a session on {target}"))?;
 
-    // The offer. Task 5 turns this into a real decision; until it does, a
-    // fresh connect asks for a fresh session, which is what it did before.
+    // The offer, decided against `--attach`/`--new`/nothing (`choose::decide`)
+    // before anything else touches the terminal.
     //
     // This first read is also where a far end that is missing, too old, or
     // drowned in a chatty rc file is diagnosed: `SshChannel::recv` reaps the
     // child and turns an EOF into `RemoteBinaryMissing`, `SshFailed` or
     // `NoSignal`. `establish` reads a plain stream and cannot do that, which
     // is exactly why the offer is read here and not inside it.
-    let _offer = read_offer(&mut channel).await?;
+    let offered = read_offer(&mut channel).await?;
+    let choice = match decide(&offered, attach, new) {
+        Decision::Chosen(choice) => choice,
+        // Before raw mode: this is an ordinary line on an ordinary terminal,
+        // the same as any other reason `connect` cannot go on.
+        Decision::Refused(why) => {
+            eprintln!("oxutrm: {why}");
+            std::process::exit(2);
+        }
+        // More than one session is live and nothing else settled it. The
+        // terminal is still ordinary here -- raw mode is L11, well below --
+        // so the picker is plain line I/O on stdin and stdout.
+        Decision::Ask => match pick(
+            &offered,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        )? {
+            Some(choice) => choice,
+            // The user quit. Not an error: they were asked, and declined.
+            None => std::process::exit(0),
+        },
+    };
     channel
-        .send(&Signal::Choose {
-            choice: Choice::New,
-        })
+        .send(&Signal::Choose { choice })
         .await
         .context("telling the host which session we want")?;
 
@@ -82,6 +135,16 @@ async fn connect(target: &str) -> Result<i32> {
     // L4 to L10.
     let (reader, writer) = channel.halves();
     let established = establish(reader, writer, size, &cfg).await?;
+
+    // Before raw mode, on the ordinary terminal: the session id is the one
+    // thing a user needs written down to `--attach` back into later, and this
+    // is the only moment it is known -- `HostFacts::session_id` names
+    // whichever session actually resulted, which for `Choice::New` is a fresh
+    // id the client had no way to guess in advance.
+    println!(
+        "oxutrm: session {} (attach #{}).",
+        established.session_id, established.attach_id
+    );
 
     // L11. Late, deliberately: after every prompt ssh could have shown, and
     // after the last thing that could have failed with a message worth
@@ -113,19 +176,12 @@ pub(crate) struct Established {
     pub link: Link,
     pub path: PathDescription,
     /// Kept, not discarded: a rebuild attaches to THIS session by name, and
-    /// before this existed `host_facts` threw the id away with `..`.
-    ///
-    /// Nothing in `connect` reads it yet, and the allow says so rather than a
-    /// fabricated call site inventing a use — what is worth knowing here is
-    /// precisely that the rebuild loop these two fields exist for has not been
-    /// written. The test below is what stops them silently going stale in the
-    /// meantime: it asserts the id and the generation that actually crossed
-    /// the wire.
-    #[allow(dead_code)]
+    /// before this existed `host_facts` threw the id away with `..`. `connect`
+    /// prints it to the user as the one thing worth writing down to `--attach`
+    /// back into later.
     pub session_id: String,
     /// Which attach generation this is. Both `seq` counters restart at 1 per
     /// attach, so a rebuild has to name the one it is resuming from.
-    #[allow(dead_code)]
     pub attach_id: u64,
 }
 
@@ -276,12 +332,25 @@ where
 /// connect and a reattach do not share, which is what makes reattach reachable
 /// from a bare `oxutrm <target>` without a second code path behind it. An
 /// empty list is the ordinary first-connect case and is not an error.
+///
+/// The read itself stays on the concrete `&mut SshChannel` rather than a
+/// generic stream: `SshChannel::recv` is what reaps the child and turns an
+/// EOF into a diagnosed `RemoteBinaryMissing` or `SshFailed`, and a generic
+/// read cannot do that. What the signal MEANS, once read, is split out into
+/// [`sessions_offered`] so that part -- and only that part -- can be driven
+/// without ssh in the test below.
 async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSummary>> {
-    match channel
-        .recv()
-        .await
-        .context("reading the host's list of live sessions")?
-    {
+    sessions_offered(
+        channel
+            .recv()
+            .await
+            .context("reading the host's list of live sessions")?,
+    )
+}
+
+/// What a `Signal` means as the host's offer, once it has been read.
+fn sessions_offered(signal: Signal) -> Result<Vec<SessionSummary>> {
+    match signal {
         Signal::Sessions { sessions } => Ok(sessions),
         // The host's own words, exactly as at L5: it is the only explanation
         // there is for why this connection is not going to happen.
@@ -376,7 +445,7 @@ fn established_path(signal: Signal) -> Result<PathDescription> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxutrm_proto::{CandidateKind, Rung};
+    use oxutrm_proto::{CandidateKind, Choice, Rung};
 
     /// STUN-free, like every other test in this repo: a test that reaches STUN
     /// makes every timing in it non-deterministic, and an injected bug once
@@ -388,6 +457,88 @@ mod tests {
             enable_birthday: false,
             ..Default::default()
         }
+    }
+
+    /// The offer step itself, end to end: read it, decide, answer it.
+    ///
+    /// Before this, `connect`'s own offer step had no automated coverage:
+    /// `ssh_bootstrap`'s tests drive `SshChannel` directly and never reach the
+    /// offer, and the subprocess tests in `tests/client_flags.rs` only reach
+    /// the flag parsing in front of it. This drives the CLIENT half the same
+    /// way `a_client_and_a_host_complete_an_exchange_over_a_pipe` below drives
+    /// `establish`: two ends of a `tokio::io::duplex`, no ssh, no shim, paired
+    /// with a task standing in for the host's side of the same exchange.
+    ///
+    /// It would catch a decode mismatch between what a real host sends and
+    /// what `sessions_offered` expects, a `decide` that picks the wrong
+    /// `Choice` for what was actually offered, or a `Choice` that fails to
+    /// round-trip back onto the wire -- none of which the pure unit tests in
+    /// `choose.rs` can see, because none of them touch the wire.
+    #[tokio::test]
+    async fn the_client_reads_the_offer_decides_and_answers_it() {
+        let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host_side);
+        let (client_read, mut client_write) = tokio::io::split(client_side);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+
+        let offered = vec![SessionSummary {
+            session_id: "a".repeat(32),
+            created_unix: 1_757_200_000,
+            shell: "/bin/sh".to_owned(),
+            size: TermSize { cols: 80, rows: 24 },
+            detachable: true,
+            attach_id: 1,
+        }];
+
+        // Stands in for `oxutrm host --connect`: sends the offer first, then
+        // waits for the client's answer.
+        let host = tokio::spawn({
+            let offered = offered.clone();
+            async move {
+                write_signal_async(&mut host_write, &Signal::Sessions { sessions: offered })
+                    .await
+                    .expect("writing the offer");
+                match read_signal_async(&mut tokio::io::BufReader::new(host_read))
+                    .await
+                    .expect("reading the choice")
+                {
+                    Signal::Choose { choice } => choice,
+                    other => panic!("expected Choose, got {other:?}"),
+                }
+            }
+        });
+
+        // The client half `connect` actually runs: read the offer, decide,
+        // send the choice back.
+        let signal = read_signal_async(&mut client_read)
+            .await
+            .expect("reading the offer");
+        let sessions = sessions_offered(signal).expect("the offer parses");
+        let decision = decide(&sessions, None, false);
+        let Decision::Chosen(choice) = decision else {
+            panic!(
+                "with exactly one detachable session and no flags, decide must choose: {decision:?}"
+            );
+        };
+        write_signal_async(
+            &mut client_write,
+            &Signal::Choose {
+                choice: choice.clone(),
+            },
+        )
+        .await
+        .expect("sending the choice");
+
+        let got = host.await.expect("the host task joins");
+        assert_eq!(
+            got, choice,
+            "the host must see exactly the choice the client's own decision made"
+        );
+        assert_eq!(
+            choice,
+            Choice::Attach { id: "a".repeat(32) },
+            "the one live, detachable session must be resumed without asking"
+        );
     }
 
     /// The composition the reattach path has never had a test for.
