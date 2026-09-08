@@ -22,10 +22,15 @@
   used to strand the old session: it stayed live, holding your shell, and the
   reconnect started a second one beside it.
 
-  The session id is printed on connect, which is the one thing worth writing
-  down to `--attach` back into later. A session that cannot be resumed because
-  it tunnels its data through the ssh connection that created it is still
-  offered, and refused with that reason rather than quietly omitted.
+  Connecting prints one line saying which of the two happened — `oxutrm:
+  resumed session <id>.` or `oxutrm: new session <id>.` — before the terminal
+  goes into raw mode. The id is the one thing worth writing down to `--attach`
+  back into later, and the first word is there because landing in a two-day-old
+  session with a half-typed command already at the prompt should not be
+  something you have to work out from the screen. A session that cannot be
+  resumed because it tunnels its data through the ssh connection that created
+  it is still offered, and refused with that reason rather than quietly
+  omitted.
 
 - **A client whose network dies reconnects by itself.** After twenty seconds of
   silence — long enough that a blip is not raced against an outage about to end
@@ -41,7 +46,18 @@
   transport under a session that never noticed. The box on screen says how long
   the host has been quiet, which attempt is next, when it is due, and why the
   last one failed. If the far end answers that the session is gone, that is an
-  answer rather than an outage: oxutrm says so and stops.
+  answer rather than an outage: oxutrm says so and stops. An attempt that gets
+  no answer at all — a far end that accepts the connection and then goes quiet
+  — is given up after two minutes and tried again, rather than leaving the
+  client waiting on it for ever.
+
+  Once an outage is over, it is over: if somebody else takes the session over
+  later on, oxutrm tells you and exits, exactly as it would have if no outage
+  had ever happened. It used to stay quietly convinced, for the rest of that
+  session, that any takeover must be its own reconnection — so it swallowed the
+  notice, sat on a connection the host had already closed showing a screen that
+  would never change again, and after twenty seconds took the session back off
+  whoever had attached to it.
 
   Those attempts run `ssh -o BatchMode=yes`, so a key that needs a passphrase
   typed will not reconnect: raw mode is held and the screen belongs to the

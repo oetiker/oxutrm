@@ -94,8 +94,13 @@ fn attaching_to_a_session_that_is_not_there_fails_definitively() {
         "a missing session is a definite answer: {reply}"
     );
     let reason = reply["reason"].as_str().expect("a reason");
+    // The exact phrase `run_host_connect` writes, and nothing looser: the
+    // `|| reason.contains("not")` this used to carry was satisfied by
+    // "cannot", "another", "nothing" and "note" -- which is to say by nearly
+    // any English sentence, including every generic failure this assertion
+    // exists to reject.
     assert!(
-        reason.contains("no such session") || reason.contains("not"),
+        reason.contains("no such session"),
         "the reason must say the session is gone, not something generic: {reason}"
     );
 

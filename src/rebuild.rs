@@ -26,6 +26,29 @@ use crate::connect::{Established, HostRefused, establish, read_offer};
 /// asks for.
 const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 
+/// The outer bound on one whole attempt.
+///
+/// Nothing inside [`attempt`] bounds the wait for a far end that accepts the
+/// connection and then says nothing -- a hung registry read, a stalled NFS
+/// home directory, an ssh that connected and never ran the command. Without
+/// this the task stays alive for ever, `Rebuild::is_running` stays true, the
+/// loop starts no further attempt, and the notice sits at "next try in 0s"
+/// permanently. The feature dead-ends at the exact moment it is needed, and
+/// the link it would otherwise fall back on is by definition the dead one.
+///
+/// **Two minutes, and it is deliberately the largest number in the picture.**
+/// Every step inside an attempt already has the right budget for itself, and
+/// this is not a second opinion about any of them: the candidate gather has
+/// `NetConfig::gather_timeout` (3 s), the birthday blast 6 s,
+/// `oxutrm_net::CONNECT_TIMEOUT` 30 s, and the far end applies
+/// [`crate::listener::ATTACH_TIMEOUT`] -- 90 s -- to the whole exchange from
+/// its own side. A cap at or below 90 s would race that one, cutting off
+/// attaches the host was still legitimately working on and reporting them as
+/// network failures. Sitting clear of it means this fires only where the far
+/// end's own guard cannot: before the relay, in front of everything that has
+/// a budget of its own.
+const ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// What one attempt produced, and what the loop should do about it.
 ///
 /// The split between the two failures is the whole design (spec §5.4). A
@@ -83,6 +106,48 @@ impl std::fmt::Debug for AttemptOutcome {
 /// no implementation anywhere in the tree (see `ladder::nominate`), so it
 /// cannot be nominated.
 pub(crate) async fn attempt(
+    launcher: &SshLauncher,
+    target: &str,
+    session_id: &str,
+    size: TermSize,
+    cfg: &NetConfig,
+) -> AttemptOutcome {
+    attempt_within(ATTEMPT_DEADLINE, launcher, target, session_id, size, cfg).await
+}
+
+/// [`attempt`], with its outer bound as a parameter.
+///
+/// A parameter rather than a constant read inside, for exactly the reason
+/// `crate::listener::serve_attaches` takes its `attach_timeout` that way: the
+/// guard can then be exercised in a fraction of a second instead of in two
+/// minutes. It is not a knob -- the one production caller is [`attempt`] and
+/// it passes [`ATTEMPT_DEADLINE`].
+///
+/// Timing out is a [`AttemptOutcome::Retry`] and not a `Definite`: a far end
+/// that hung is not a far end that answered, and the loop's whole split
+/// (spec §5.4) turns on that difference.
+async fn attempt_within(
+    deadline: std::time::Duration,
+    launcher: &SshLauncher,
+    target: &str,
+    session_id: &str,
+    size: TermSize,
+    cfg: &NetConfig,
+) -> AttemptOutcome {
+    let body = one_attempt(launcher, target, session_id, size, cfg);
+    match tokio::time::timeout(deadline, body).await {
+        Ok(outcome) => outcome,
+        Err(_) => AttemptOutcome::Retry(format!(
+            "the attempt to reach {target} timed out after {}s -- \
+             it was accepted and then nothing came back",
+            deadline.as_secs()
+        )),
+    }
+}
+
+/// The attempt itself, unbounded. Only [`attempt_within`] calls it, and it is
+/// what that puts the clock on.
+async fn one_attempt(
     launcher: &SshLauncher,
     target: &str,
     session_id: &str,
@@ -181,8 +246,12 @@ impl Rebuild {
 
     /// Could a `TAKEN_OVER` on the current link be this client's own rebuild?
     ///
-    /// True from the moment an attempt starts until a swap, and it stays true
-    /// across a failed attempt on purpose -- see `displacing`.
+    /// True from the moment an attempt starts until the OUTAGE ENDS, however
+    /// it ends: [`Rebuild::swapped`] when a rebuilt link took over, and
+    /// [`Rebuild::stood_down`] when the old link came back by itself. It stays
+    /// true across a failed attempt on purpose -- see `displacing` -- but it
+    /// must not outlive the outage, or a genuine third-party takeover hours
+    /// later would be excused as our own doing.
     pub(crate) fn may_have_displaced_us(&self) -> bool {
         self.displacing
     }
@@ -190,6 +259,25 @@ impl Rebuild {
     /// A rebuilt link is in place, so nothing still outstanding can displace
     /// us out of a link we did not build.
     pub(crate) fn swapped(&mut self) {
+        self.displacing = false;
+    }
+
+    /// The outage ended on the OLD link, so the attempt is given up and
+    /// nothing it started can have displaced us.
+    ///
+    /// The two halves are one operation on purpose: cancelling without
+    /// dropping the latch is what left `displacing` set for the whole
+    /// remaining session, and a `TAKEN_OVER` arriving hours later -- somebody
+    /// else genuinely attaching -- was then attributed to a rebuild that ended
+    /// long ago. The client sat on a connection the host had closed, showing a
+    /// screen that would never change again.
+    ///
+    /// **Why dropping the latch here is safe.** Reaching this needs the phase
+    /// to have left `Recovering`, and only a FRAME on the old link does that.
+    /// A host that had adopted a rebuilt link would have closed this one
+    /// instead of sending on it, so a frame is proof that no adopt happened.
+    pub(crate) fn stood_down(&mut self) {
+        self.cancel();
         self.displacing = false;
     }
 
@@ -393,6 +481,19 @@ mod tests {
         FakeHost::new(dir, body)
     }
 
+    /// A far end that accepts the connection and then says nothing at all.
+    ///
+    /// The shape of a hung registry read or a stalled home directory: stdout
+    /// stays open, so there is no EOF for `SshChannel::recv` to diagnose, and
+    /// the read simply never returns. `exec` rather than a plain `sleep`, so
+    /// the process the launcher spawned IS the sleeper and `kill_on_drop`
+    /// reaches it -- a `sleep` left as a child of the shell would outlive the
+    /// test as an orphan.
+    fn fake_host_that_never_answers() -> FakeHost {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        FakeHost::new(dir, "#!/bin/sh\nexec sleep 300\n")
+    }
+
     /// The offer, and then whatever the client answered it with, written to
     /// `choice.json` exactly as it arrived on the wire.
     fn fake_host_recording_the_choice() -> FakeHost {
@@ -492,6 +593,57 @@ mod tests {
                 );
             }
             other => panic!("expected Definite, got {other:?}"),
+        }
+    }
+
+    /// A far end that hangs must not hang the loop.
+    ///
+    /// Nothing inside an attempt bounds the wait for a far end that accepted
+    /// the connection and then said nothing, so before [`ATTEMPT_DEADLINE`]
+    /// this task stayed alive for ever: `is_running()` never cleared,
+    /// `rebuild_step` started no further attempt, and the notice sat at "next
+    /// try in 0s" for the rest of the session -- the feature dead-ending at
+    /// the exact moment it is needed.
+    ///
+    /// The OUTER timeout is what makes a regression fail rather than hang:
+    /// with the deadline taken back out, the attempt returns nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_far_end_that_never_answers_is_given_up_on_and_retried() {
+        let fake = fake_host_that_never_answers();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            attempt_within(
+                std::time::Duration::from_millis(200),
+                &fake.launcher,
+                "bastion.example.net",
+                "abc123",
+                a_size(),
+                &test_config(),
+            ),
+        )
+        .await
+        .expect("an attempt against a far end that never answers hung for ever");
+
+        match outcome {
+            // The sentence, not merely the variant: `Retry` is what
+            // `classify` returns for nearly everything that can go wrong, so
+            // `Retry(_)` would be satisfied by the fake failing to start at
+            // all. Only the deadline's own branch writes "timed out after".
+            //
+            // And `Retry` rather than `Definite`: a far end that hung did not
+            // answer, and ending the loop on it would strand a session that
+            // asking again might well recover.
+            AttemptOutcome::Retry(why) => {
+                assert!(
+                    why.contains("timed out after"),
+                    "the deadline was not what ended this: {why}"
+                );
+                assert!(
+                    why.contains("bastion.example.net"),
+                    "the notice has to name what could not be reached: {why}"
+                );
+            }
+            other => panic!("expected a Retry naming the deadline, got {other:?}"),
         }
     }
 

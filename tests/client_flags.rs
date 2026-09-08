@@ -10,7 +10,9 @@
 //! `--attach`/`--new` reach `run_connect` at all, rather than being caught by
 //! its "unknown option" catch-all -- is part of what is under test.
 
-use std::process::Command;
+use std::io::Read as _;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// `--attach` and `--new` are mutually exclusive: nothing sensible follows
 /// from asking for a specific session AND insisting on a fresh one.
@@ -64,6 +66,72 @@ fn attach_without_an_id_exits_two() {
         "the error does not say what was actually wrong -- an \"unknown \
          option\" message from dispatch's old catch-all would also contain \
          \"--attach\" without ever reaching run_connect's own parser: {stderr}"
+    );
+}
+
+/// A flag where the session id should be is a usage mistake, and it must be
+/// caught before ssh.
+///
+/// `oxutrm --attach --new example.invalid` used to take `--new` as the id: the
+/// mutual-exclusion check never fired (nothing had set `new`), ssh was spawned
+/// and the far end was contacted, and only then did the offer come back and
+/// `decide` refuse a session nobody had ever created. A session id is 32
+/// lowercase hex characters and cannot begin with `-`.
+///
+/// Neither assertion can be satisfied by the PRE-FIX binary, and neither by
+/// `dispatch`'s "unknown option" catch-all -- `--attach` has its own arm
+/// there, so it reaches `run_connect` either way:
+///
+/// - pre-fix this runs off to ssh and comes back with a connection failure,
+///   which exits 1 (an `anyhow::Error` out of `main`), not 2;
+/// - "needs a session id" is written only by `run_connect`'s own parser.
+///
+/// The target is a reserved `.invalid` name (RFC 2606), so a regression never
+/// dials a real host. It is WAITED FOR rather than simply run, because the
+/// regression's shape is a hang and not a wrong answer: this was verified by
+/// putting the bug back, and `ssh no-such-host.invalid` then sat there
+/// indefinitely -- a resolver that blackholes an unknown name rather than
+/// refusing it is entirely ordinary. A CI job that hangs instead of failing is
+/// the worse failure mode, so the wait is bounded and the timeout is itself
+/// the assertion.
+#[test]
+fn attach_followed_by_a_flag_is_refused_before_ssh() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxutrm"))
+        .args(["--attach", "--new", "no-such-host.invalid"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("running oxutrm --attach --new <target>");
+    let mut errors = child.stderr.take().expect("stderr is piped");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("checking on oxutrm") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "oxutrm went off to contact the far end instead of refusing \
+                     a flag where the session id should be"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+
+    let mut stderr = String::new();
+    errors.read_to_string(&mut stderr).expect("reading stderr");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "a flag where the id should be must exit 2 before ssh, not run off \
+         and try to connect: {stderr}"
+    );
+    assert!(
+        stderr.contains("needs a session id"),
+        "the error must say what was actually wrong rather than reporting a \
+         session the user never asked for: {stderr}"
     );
 }
 

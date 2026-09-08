@@ -170,6 +170,25 @@ fn run_host_connect() -> Result<()> {
     )
     .context("offering the live sessions")?;
 
+    // # Why buffering this read is safe, and what it rests on
+    //
+    // Whatever this `BufReader` pulls in past the end of the choice line is
+    // unrecoverable: both paths below go on to read the DESCRIPTOR directly --
+    // `run_host_serve` after its fork, and `run_host_attach` through
+    // `tokio::io::stdin()` -- and neither has any way to be handed a buffered
+    // remainder. Anything read ahead of the newline here is simply gone.
+    //
+    // Nothing is ever read ahead, because the client is strictly turn-taking
+    // at this point: `connect` writes `Choose` and then BLOCKS inside
+    // `establish` waiting for `HostHello`, which cannot arrive until one of
+    // those two paths has started. So the choice line is the last byte on this
+    // pipe until we have handed the descriptor on, and the buffer is empty
+    // when we do.
+    //
+    // That invariant is load-bearing for the whole dispatcher. A client that
+    // ever pipelined a byte after the choice -- a second signal written
+    // speculatively, say -- would break this in a way that shows up as a
+    // session hanging on its hello, nowhere near here.
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let choice =
         match oxutrm_proto::read_signal(&mut stdin).context("reading the client's choice")? {

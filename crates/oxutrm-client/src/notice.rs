@@ -78,19 +78,65 @@ pub fn recovering_notice(
     }
 }
 
-/// One line of `reason`, short enough to read.
+/// One line of `reason`, safe to put in a cell and short enough to read.
 ///
 /// The first line only: ssh says why it failed first and pads afterwards, so a
 /// multi-line reason's later lines are the least useful part of it. Cut on a
 /// character boundary rather than a byte one -- a reason carries a remote's
 /// stderr, which can be anything at all.
+///
+/// Made legible BEFORE the cut, so the cap bounds what actually reaches the
+/// screen rather than what went into the escaping.
 fn summarised(reason: &str) -> String {
-    let line = reason.lines().next().unwrap_or("").trim();
+    let line = legible(reason.lines().next().unwrap_or("").trim());
     if line.chars().count() <= REASON_SHOWN {
-        return line.to_string();
+        return line;
     }
     let kept: String = line.chars().take(REASON_SHOWN).collect();
     format!("{kept}...")
+}
+
+/// `line` with every control scalar shown rather than emitted.
+///
+/// **This string is a remote's stderr**, relayed through ssh and an error
+/// chain and handed to the renderer. Anything in it that a terminal acts on --
+/// C0 (0x00-0x1F and DEL), and C1 (U+0080-U+009F, of which U+009B is CSI and
+/// terminals in UTF-8 mode obey it) -- is untrusted input landing as a control
+/// sequence. What saved this before was incidental: ratatui's
+/// `Buffer::set_stringn` skips zero-width graphemes, so an ESC happened never
+/// to become a cell. That is a property of a third-party crate and not a
+/// decision anybody here made.
+///
+/// # Why a second escaper rather than the one that already exists
+///
+/// `linkstate::render_held` does this same job for held input, and it lives in
+/// the ROOT crate -- which DEPENDS on this one, so it cannot be called from
+/// here, and moving it across is restructuring rather than a fix. The
+/// alternative was to sanitise at the call site in the root crate, before the
+/// reason reaches [`recovering_notice`]. This is the better half of that
+/// trade: it leaves the escaping owned by the function that already owns
+/// "make this reason fit in the box", so no future caller of a public
+/// `recovering_notice` can reintroduce the hole by not knowing about it. The
+/// two escapers deliberately use the same vocabulary -- `^X`, `^?`, `<9B>` --
+/// so a user who has seen one recognises the other. `render_held` is not a
+/// drop-in either way: it takes bytes and applies the held-input cap, and this
+/// takes a `&str` and applies [`REASON_SHOWN`].
+fn legible(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for ch in line.chars() {
+        match ch {
+            // Every C0 except the ones `lines()` and `trim()` have already
+            // removed, plus DEL.
+            '\u{0}'..='\u{1f}' => {
+                out.push('^');
+                out.push((ch as u8 + b'@') as char);
+            }
+            '\u{7f}' => out.push_str("^?"),
+            '\u{80}'..='\u{9f}' => out.push_str(&format!("<{:02X}>", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Lay a notice out for this screen, as cells ready to composite.
@@ -366,6 +412,42 @@ mod tests {
         assert!(
             !shown.contains("banner line"),
             "a multi-line reason was pasted into the box whole: {shown}"
+        );
+    }
+
+    /// The reason is a REMOTE's stderr. A terminal must never act on it.
+    ///
+    /// Nothing here relies on the renderer dropping what it cannot paint:
+    /// ratatui's `set_stringn` happens to skip zero-width graphemes, which is
+    /// why an ESC never became a cell before this, but that is a third-party
+    /// crate's behaviour and not a decision this code made. `is_control()`
+    /// covers C0 and C1 alike -- U+0080-U+009F are `Cc` -- and U+009B is CSI,
+    /// which a terminal in UTF-8 mode obeys exactly as it obeys `ESC [`.
+    #[test]
+    fn control_scalars_in_a_failure_reason_are_shown_rather_than_emitted() {
+        let n = recovering_notice(
+            Duration::from_secs(1),
+            0,
+            Duration::from_secs(1),
+            Some("ssh said: \u{1b}[2Jcleared\u{9b}31m and \u{7} rang"),
+        );
+        let shown = n.body.last().expect("the reason is the last body line");
+
+        assert!(
+            !shown.chars().any(char::is_control),
+            "an untrusted control scalar reached the notice: {shown:?}"
+        );
+        assert!(
+            shown.contains("^[") && shown.contains("^G"),
+            "a C0 scalar must be shown, not merely dropped: {shown:?}"
+        );
+        assert!(
+            shown.contains("<9B>"),
+            "a bare C1 CSI must be shown, not merely dropped: {shown:?}"
+        );
+        assert!(
+            shown.contains("ssh said:") && shown.contains("cleared"),
+            "the readable part of the reason must survive: {shown:?}"
         );
     }
 

@@ -9,8 +9,8 @@ use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_host::ssh::{SshChannel, SshLauncher};
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk, SessionSummary,
-    Signal, TermSize,
+    Candidate, Choice, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk,
+    SessionSummary, Signal, TermSize,
 };
 use oxutrm_term::detect_caps;
 
@@ -41,7 +41,15 @@ pub fn run_connect(args: &[String]) -> Result<()> {
     loop {
         match rest.first().map(String::as_str) {
             Some("--attach") => {
-                let Some(id) = rest.get(1) else {
+                // A session id is 32 lowercase hex characters, so it can never
+                // begin with `-`. Taking the next word unconditionally turned
+                // `oxutrm --attach --new host` into a request for a session
+                // called "--new": ssh was spawned, the far end contacted, and
+                // only `decide` -- after all of that -- said there was no such
+                // session. A flag where the id should be is a usage mistake and
+                // is reported like every other one here, before anything at all
+                // has been started.
+                let Some(id) = rest.get(1).filter(|id| !id.starts_with('-')) else {
                     eprintln!("oxutrm: --attach needs a session id. Try `oxutrm --help`.");
                     std::process::exit(2);
                 };
@@ -143,6 +151,11 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
             }
         }
     };
+    // Kept past the send, because the line printed below has to say which of
+    // the two things happened and the `Choice` is the only place that knows:
+    // `established.session_id` names whichever session resulted, but not
+    // whether it was already running.
+    let chosen = choice.clone();
     channel
         .send(&Signal::Choose { choice })
         .await
@@ -154,16 +167,24 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     let (reader, writer) = channel.halves();
     let established = establish(reader, writer, size, &cfg).await?;
 
-    // Before raw mode, on the ordinary terminal: the session id is the one
-    // thing a user needs written down to `--attach` back into later, and this
-    // is the only moment it is known -- `HostFacts::session_id` names
-    // whichever session actually resulted, which for `Choice::New` is a fresh
-    // id the client had no way to guess in advance.
+    // Before raw mode, on the ordinary terminal. Two things at once:
+    //
+    // The id, because it is the one thing a user needs written down to
+    // `--attach` back into later, and this is the only moment it is known --
+    // `HostFacts::session_id` names whichever session actually resulted, which
+    // for `Choice::New` is a fresh id the client had no way to guess.
+    //
+    // And WHICH of the two happened, because spec §4.2's "exactly one,
+    // detachable" row resumes without asking and §10.3 forbids doing that
+    // silently. A bare `oxutrm <target>` that lands in a two-day-old session
+    // must say so here: after this line raw mode goes on, and the only other
+    // signal is a screen repaint that arrives too late to read as an
+    // explanation.
     //
     // The attach generation used to be here too and is not any more. It is
     // internal bookkeeping -- which generation of the sync counters this is --
     // and unlike the id there is nothing a user can do with it.
-    println!("oxutrm: session {}.", established.session_id);
+    println!("{}", opening_line(&chosen, &established.session_id));
 
     // L11. Late, deliberately: after every prompt ssh could have shown, and
     // after the last thing that could have failed with a message worth
@@ -184,7 +205,8 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // what made the first one worth asking: a bare `oxutrm <target>` now
     // RESUMES a session rather than always starting one, so which session it
     // picked is exactly the kind of thing §10.3 forbids doing silently. The
-    // line above says which; this one says how it is reached. After it,
+    // line above says which session, and whether it was already running; this
+    // one says how it is reached. After it,
     // silence -- `announce` prints nothing when called again with the same
     // path, and only a migration makes it speak.
     let mut stdout = std::io::stdout();
@@ -200,6 +222,22 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // on a terminal still in raw mode climbs diagonally down the screen.
     drop(raw);
     code
+}
+
+/// The one line a session opens with, before raw mode.
+///
+/// A function rather than a `println!` inline, because `connect` cannot be
+/// reached from a test at all -- it wants a real ssh, a real far end and a
+/// real terminal -- and this line said the same words for both outcomes until
+/// somebody read it. The text is the whole behaviour, so the text is what is
+/// pinned.
+fn opening_line(chosen: &Choice, session_id: &str) -> String {
+    match chosen {
+        // Spec §4.2: the "exactly one, detachable" row resumes without asking,
+        // "with one line saying so". This is that line.
+        Choice::Attach { .. } => format!("oxutrm: resumed session {session_id}."),
+        Choice::New => format!("oxutrm: new session {session_id}."),
+    }
 }
 
 /// One completed client-side attach, and the two identities the rebuild loop
@@ -500,7 +538,7 @@ fn established_path(signal: Signal) -> Result<PathDescription> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxutrm_proto::{CandidateKind, Choice, Rung};
+    use oxutrm_proto::{CandidateKind, Rung};
 
     /// STUN-free, like every other test in this repo: a test that reaches STUN
     /// makes every timing in it non-deterministic, and an injected bug once
@@ -565,26 +603,36 @@ mod tests {
 
         // The client half `connect` actually runs: read the offer, decide,
         // send the choice back.
-        let signal = read_signal_async(&mut client_read)
+        //
+        // Bounded, like every other duplex-paired exchange in this crate
+        // (`attach_exchange.rs`): both halves of this are blocking reads on a
+        // pipe, so the failure shape for a mismatched exchange is a hang, and
+        // a CI job that hangs instead of failing is the worse failure mode.
+        let exchange = async {
+            let signal = read_signal_async(&mut client_read)
+                .await
+                .expect("reading the offer");
+            let sessions = sessions_offered(signal).expect("the offer parses");
+            let decision = decide(&sessions, None, false);
+            let Decision::Chosen(choice) = decision else {
+                panic!(
+                    "with exactly one detachable session and no flags, decide must choose: {decision:?}"
+                );
+            };
+            write_signal_async(
+                &mut client_write,
+                &Signal::Choose {
+                    choice: choice.clone(),
+                },
+            )
             .await
-            .expect("reading the offer");
-        let sessions = sessions_offered(signal).expect("the offer parses");
-        let decision = decide(&sessions, None, false);
-        let Decision::Chosen(choice) = decision else {
-            panic!(
-                "with exactly one detachable session and no flags, decide must choose: {decision:?}"
-            );
-        };
-        write_signal_async(
-            &mut client_write,
-            &Signal::Choose {
-                choice: choice.clone(),
-            },
-        )
-        .await
-        .expect("sending the choice");
+            .expect("sending the choice");
 
-        let got = host.await.expect("the host task joins");
+            (choice, host.await.expect("the host task joins"))
+        };
+        let (choice, got) = tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .expect("the offer round trip must not hang");
         assert_eq!(
             got, choice,
             "the host must see exactly the choice the client's own decision made"
@@ -636,20 +684,29 @@ mod tests {
             }
         });
 
-        let client = establish(
-            tokio::io::BufReader::new(client_read),
-            client_write,
-            TermSize {
-                cols: 120,
-                rows: 40,
-            },
-            &cfg,
+        // Bounded exactly as `attach_exchange.rs` bounds the same exchange
+        // from the other side: an exchange whose two halves disagree does not
+        // fail, it deadlocks on a pipe, and a CI job that hangs instead of
+        // failing is the worse failure mode.
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            establish(
+                tokio::io::BufReader::new(client_read),
+                client_write,
+                TermSize {
+                    cols: 120,
+                    rows: 40,
+                },
+                &cfg,
+            ),
         )
         .await
+        .expect("the client exchange must not hang")
         .expect("the client exchange completes");
 
-        let attached = host
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(10), host)
             .await
+            .expect("the host exchange must not hang")
             .expect("the host task joins")
             .expect("the host exchange completes");
 
@@ -670,6 +727,38 @@ mod tests {
                 rows: 40
             },
             "the host must carry the client's size out of the exchange, not the size the session already had"
+        );
+    }
+
+    /// Landing in a two-day-old session and being told nothing about it is
+    /// the same silence spec §10.3 forbids, pointing the other way.
+    ///
+    /// This line used to read `oxutrm: session {id}.` whichever happened, so
+    /// somebody typing a bare `oxutrm <target>` expecting a fresh shell got a
+    /// resumed one -- half-typed command still at the prompt -- with the
+    /// screen repaint, which arrives after raw mode, as the only signal.
+    #[test]
+    fn the_opening_line_says_whether_the_session_was_already_running() {
+        let id = "a".repeat(32);
+        let resumed = opening_line(&Choice::Attach { id: id.clone() }, &id);
+        let fresh = opening_line(&Choice::New, &id);
+
+        // The one assertion the pre-fix line cannot satisfy: it produced
+        // exactly the same string for both.
+        assert_ne!(
+            resumed, fresh,
+            "a resumed session and a brand new one are announced identically"
+        );
+        assert!(
+            resumed.contains("resumed") && !fresh.contains("resumed"),
+            "the word has to be on the resuming side and only there: \
+             {resumed:?} / {fresh:?}"
+        );
+        // The id is why this line exists at all -- it is what a user writes
+        // down to `--attach` back into later.
+        assert!(
+            resumed.contains(&id) && fresh.contains(&id),
+            "the session id must survive in both: {resumed:?} / {fresh:?}"
         );
     }
 

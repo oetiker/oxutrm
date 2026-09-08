@@ -1325,7 +1325,13 @@ impl ClientSession {
         };
 
         let Phase::Recovering { next_try, .. } = phase else {
-            rebuild.cancel();
+            // `stood_down` and not a bare `cancel`: the displacing latch
+            // belongs to the outage too. Left set, the next `TAKEN_OVER` on
+            // this link -- somebody else attaching, an hour later, over a
+            // healthy network -- would be excused as our own rebuild, and the
+            // `conn.closed()` arm that reports it would stay disabled for the
+            // rest of the session.
+            rebuild.stood_down();
             // Belongs to the outage that has just ended, not to the session:
             // the same reasoning as `follow_route`'s `probed_at`.
             self.last_failure = None;
@@ -4434,6 +4440,19 @@ mod tests {
              testing nothing"
         );
 
+        // Set by `begin`, and the thing this test's sibling assertion is
+        // about: without it being true HERE, the assertion after the step
+        // would be reading a latch that was never raised.
+        assert!(
+            session
+                .rebuild
+                .as_ref()
+                .expect("the rebuild is still there")
+                .may_have_displaced_us(),
+            "the attempt in flight never raised the displacing latch, so \
+             clearing it below would prove nothing"
+        );
+
         // The rest of that same lap of `run_on`.
         session.rebuild_step(Instant::now(), &tx);
 
@@ -4444,6 +4463,21 @@ mod tests {
                 .expect("the rebuild is still there")
                 .is_running(),
             "the client is still rebuilding a link that came back by itself"
+        );
+        // The outage is over, so the rebuild's claim on the next `TAKEN_OVER`
+        // is over with it. Left standing, a third-party takeover any time
+        // later in this session is attributed to a rebuild that ended here:
+        // the close is swallowed, `conn.closed()` is disabled for good, and
+        // the client sits on a dead connection showing a screen that will
+        // never change -- then goes `Silent`, `Recovering`, and silently takes
+        // the session back off whoever attached.
+        assert!(
+            !session
+                .rebuild
+                .as_ref()
+                .expect("the rebuild is still there")
+                .may_have_displaced_us(),
+            "the displacing latch outlived the outage that raised it"
         );
         assert_gone(ssh, "the abandoned attempt's ssh").await;
     }

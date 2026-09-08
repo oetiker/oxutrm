@@ -37,6 +37,15 @@ pub const REBUILD_AFTER: Duration = Duration::from_secs(20);
 /// So the observed sequence is: an immediate first attempt, then 2 s, 4 s,
 /// 8 s, 8 s ... measured from each failure. Deliberate, and correct; only the
 /// prose describing it was wrong.
+///
+/// Two more callers schedule from this, and leaving them out of a doc whose
+/// whole job is to keep the schedule written down correctly is the one defect
+/// it cannot afford. [`LinkState::begin_attempt`] re-stamps the CURRENT
+/// attempt as `now + backoff(attempt)` when it starts, which is what stops a
+/// lap that ran late from firing the same attempt twice; it does not advance
+/// the counter. [`LinkState::rebuilt`] starts the count over at
+/// `landed + backoff(0)` -- one second in which the freshly swapped link may
+/// produce a frame before the loop is allowed to consider building another.
 #[must_use]
 pub fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(1u64 << attempt.min(3))
