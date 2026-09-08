@@ -54,6 +54,7 @@ use oxutrm_term::HostTerm;
 
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{Command, LinkState, Phase};
+use crate::rebuild::{AttemptOutcome, Rebuild};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -656,9 +657,23 @@ enum Wake {
     Winch,
     /// The pacing deadline came round.
     Due,
+    /// A rebuild attempt finished, one way or another.
+    Rebuilt(AttemptOutcome),
     Closed(quinn::ConnectionError),
     /// A readiness that turned out to be nothing. Costs one lap.
     Nothing,
+}
+
+/// Was this link closed because a newer attach displaced it?
+///
+/// The reason phrase, and not merely "an application close": every deliberate
+/// close looks like one, and [`exit_code`] exists because they mean different
+/// things. This is the one the host sends as it adopts a newcomer.
+fn is_takeover(reason: &quinn::ConnectionError) -> bool {
+    matches!(
+        reason,
+        quinn::ConnectionError::ApplicationClosed(closed) if closed.reason.as_ref() == TAKEN_OVER
+    )
 }
 
 /// The host's half of the same idea. Separate from [`Wake`] because the two
@@ -713,6 +728,15 @@ pub const SHELL_EXITED: &[u8] = b"the shell exited";
 /// Read by the displaced client so it can say it was taken over rather than
 /// reporting silence. Spec §6; the `Displaced` state itself is B4.
 pub const TAKEN_OVER: &[u8] = b"taken over by a newer attach";
+
+/// Why the client closed a link of its own: it built a better one.
+///
+/// Local, and it never reaches anybody. The host on the far end of a link this
+/// closes has already adopted the replacement -- that is what made the swap
+/// possible -- so this is the client tidying up a connection whose successor
+/// is already carrying the session. It exists so that a `close` here is as
+/// legible in a packet trace as [`TAKEN_OVER`] is.
+pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
 
 /// Why the session ended, as an exit status.
 ///
@@ -784,10 +808,32 @@ pub struct ClientSession {
     /// Cleared on any lap that is not `Silent`, so the pace belongs to one
     /// outage rather than to the session: see [`ClientSession::follow_route`].
     probed_at: Option<Instant>,
+    /// How to get back into this session, and the attempt in flight if there
+    /// is one. `None` where there is nothing to rebuild through -- the
+    /// fixtures in this file's own tests, which build a link directly rather
+    /// than over ssh.
+    rebuild: Option<Rebuild>,
+    /// Why the last rebuild attempt failed, for the notice.
+    ///
+    /// Spec §5.1: the box says what the last attempt produced, when it
+    /// produced anything. Cleared when the phase leaves `Recovering`, so a
+    /// later outage never opens by reporting an older one's reason.
+    last_failure: Option<String>,
 }
 
 impl ClientSession {
-    pub fn new(size: TermSize, caps: TerminalCaps, link: Link) -> Result<ClientSession> {
+    /// `rebuild` is what a lost link is rebuilt through: the ssh target and
+    /// the session id the host named, or `None` for a session that cannot be
+    /// rebuilt because it was not reached over ssh. It is a parameter rather
+    /// than a setter so that every construction site has to say which it is —
+    /// a session that silently could not rebuild would look exactly like one
+    /// whose network never came back.
+    pub fn new(
+        size: TermSize,
+        caps: TerminalCaps,
+        link: Link,
+        rebuild: Option<Rebuild>,
+    ) -> Result<ClientSession> {
         let blank = ScreenState::blank(size.rows, size.cols)?;
         let empty = InputState {
             seq: 1,
@@ -831,6 +877,8 @@ impl ClientSession {
             built: None,
             route: crate::roam::RouteWatch::new(seed),
             probed_at: None,
+            rebuild,
+            last_failure: None,
         })
     }
 
@@ -1209,14 +1257,20 @@ impl ClientSession {
                     )],
                 })
             }
-            // Task 4 adds the phase and the notice content; nothing yet drives
-            // an attempt, so there is no failure reason to report. Task 6
-            // adds one once something actually runs an attempt and can fail
-            // it.
             Phase::Recovering { attempt, next_try } => {
                 let quiet = now.duration_since(self.link_state.last_heard());
                 let next_try_in = next_try.saturating_duration_since(now);
-                Some(recovering_notice(quiet, attempt, next_try_in))
+                // The reason the LAST attempt failed, where there has been
+                // one. It is the only thing in the box that says anything
+                // about why this is not working yet -- "Permission denied
+                // (publickey)" under `BatchMode` is a different afternoon from
+                // "Network is unreachable".
+                Some(recovering_notice(
+                    quiet,
+                    attempt,
+                    next_try_in,
+                    self.last_failure.as_deref(),
+                ))
             }
             Phase::Confirming => {
                 let held = crate::linkstate::render_held(self.link_state.held());
@@ -1246,6 +1300,95 @@ impl ClientSession {
                 })
             }
         }
+    }
+
+    /// One lap of the rebuild loop.
+    ///
+    /// Called once per lap of [`ClientSession::run_on`], with the same `now`
+    /// the notice was built from, and a method rather than the body of that
+    /// loop for the reason [`ClientSession::route_keys`] is one: the loop
+    /// itself cannot be reached from a test without a real terminal and a real
+    /// twenty seconds of silence, and the clock being a parameter is what lets
+    /// this be driven instead. The loop calls nothing else, so what is tested
+    /// is what ships.
+    ///
+    /// Two rules, and the second is the one worth stating: **whichever path
+    /// revives first wins**. A frame on the old link has already taken the
+    /// phase out of `Recovering` by the time this runs, and the attempt in
+    /// flight is then not merely redundant -- left running, it could land and
+    /// swap the transport under a session that had already come back.
+    fn rebuild_step(&mut self, now: Instant, outcomes: &tokio::sync::mpsc::Sender<AttemptOutcome>) {
+        let phase = self.link_state.phase_now();
+        let size = self.size;
+        let Some(rebuild) = self.rebuild.as_mut() else {
+            return;
+        };
+
+        let Phase::Recovering { next_try, .. } = phase else {
+            rebuild.cancel();
+            // Belongs to the outage that has just ended, not to the session:
+            // the same reasoning as `follow_route`'s `probed_at`.
+            self.last_failure = None;
+            return;
+        };
+
+        // One at a time. `next_try` is not a pace to catch up on: a lap that
+        // ran late must start one attempt, not the several it was "due".
+        if rebuild.is_running() || now < next_try {
+            return;
+        }
+        rebuild.begin(size, outcomes.clone());
+        self.link_state.begin_attempt(now);
+    }
+
+    /// Put a freshly rebuilt link in place of the one that stopped answering.
+    ///
+    /// The client's half of [`HostSession::adopt`], and deliberately its
+    /// mirror image: design spec §8.5 says both ends reset their sequence
+    /// counters at every attach and the host's first datagram is a full state.
+    /// The host has just done exactly that on its side -- this attempt reached
+    /// it as an ordinary attach -- so anything less here would leave the two
+    /// ends disagreeing about the base from the first frame onwards.
+    ///
+    /// **Input the host had not acknowledged is dropped rather than replayed.**
+    /// `adopt` resets the host's `written` counter along with its receiver, so
+    /// carrying the old pending bytes across would write them to the shell a
+    /// second time. Anything typed while the notice was up is not in here at
+    /// all: it is held in [`LinkState`] and still needs the user's answer.
+    ///
+    /// The phase is deliberately NOT set. Landing is not the same as being
+    /// answered, and the first frame to arrive is what returns the phase to
+    /// `Live` -- or to `Confirming`, if there is blind typing to ask about.
+    fn swap_in(&mut self, link: Link) -> Result<()> {
+        // Closed first, and with a reason, for the same reason `adopt` closes
+        // the displaced one with `TAKEN_OVER`: a connection that is merely
+        // dropped is indistinguishable from one that went quiet.
+        self.link
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), REBUILT);
+
+        self.link = link;
+
+        let blank = ScreenState::blank(self.size.rows, self.size.cols)?;
+        self.screen_rx = Receiver::new(blank);
+        self.input_tx = Sender::new(InputState {
+            seq: 1,
+            pending: Vec::new(),
+            size: self.size,
+        });
+        self.last_send = None;
+
+        // The baseline the route probe compares against belongs to the path
+        // that has just gone away. Re-seeded here for the same reason
+        // `ClientSession::new` seeds it at all: taken later, inside the next
+        // outage, it would already be the address the machine had moved to.
+        self.route = crate::roam::RouteWatch::new(
+            crate::roam::route_source(self.link.sink.connection().remote_address()).ok(),
+        );
+        self.probed_at = None;
+        self.last_failure = None;
+        Ok(())
     }
 
     /// The window changed size. The renderer forgets what is painted and the
@@ -1399,7 +1542,33 @@ impl ClientSession {
 
         // Cloned OUT of the session, so the arm that waits for the link to
         // close borrows a local instead of `self`. See `Wake`.
-        let conn = self.link.sink.connection().clone();
+        //
+        // `mut`, because a rebuild swaps the link underneath the session and
+        // this has to follow it. Left pointing at the old connection, the arm
+        // would watch a connection that has just been closed on purpose --
+        // permanently ready, so the loop would spin and then report the
+        // session as over.
+        let mut conn = self.link.sink.connection().clone();
+
+        // Where a rebuild attempt reports back. A LOCAL and never a field, so
+        // the arm below borrows this and not `self` (C1) -- exactly as
+        // `HostSession::run_with_attaches` holds its receiver, and for the
+        // same reason. Depth one: only one attempt ever runs at a time.
+        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel::<AttemptOutcome>(1);
+        // A `TAKEN_OVER` close that has already been explained: our own
+        // rebuild reaching the host. The ARM is disabled rather than the wake
+        // being ignored, because a closed connection is permanently ready, so
+        // an ignored wake would come straight back on every lap for as long as
+        // the rebuild ran.
+        //
+        // It stays disabled until a swap puts a live connection in `conn` --
+        // including when the attempt that displaced us then fails. That is not
+        // an oversight: the old link is closed either way, this client is
+        // still in `Recovering` and still trying, and re-arming the arm on a
+        // connection that is closed for ever is the spin above, with an exit
+        // at the end of it.
+        let mut takeover_expected = false;
+
         let mut winch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
@@ -1438,7 +1607,8 @@ impl ClientSession {
                 Some(frame) = self.link.source.recv() => Wake::Frame(frame),
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
-                reason = conn.closed() => Wake::Closed(reason),
+                Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
+                reason = conn.closed(), if !takeover_expected => Wake::Closed(reason),
             };
 
             // Every borrow of `self` starts HERE, after the select expression
@@ -1492,10 +1662,54 @@ impl ClientSession {
                 Wake::Due => {
                     self.turn(&[], out)?;
                 }
+                // A rebuild attempt finished.
+                Wake::Rebuilt(outcome) => {
+                    if let Some(rebuild) = self.rebuild.as_mut() {
+                        rebuild.finished();
+                    }
+                    match outcome {
+                        AttemptOutcome::Landed(established) => {
+                            self.swap_in(established.link)
+                                .context("swapping in the rebuilt link")?;
+                            // Both of these belong to the link that has just
+                            // been replaced: the arm has to watch the new
+                            // connection, and a takeover on the old one can no
+                            // longer arrive because nothing is watching it.
+                            conn = self.link.sink.connection().clone();
+                            takeover_expected = false;
+                        }
+                        // The network, not the far end. The loop keeps its
+                        // cadence and the notice explains the last try.
+                        AttemptOutcome::Retry(why) => {
+                            self.link_state.attempt_failed(Instant::now());
+                            self.last_failure = Some(why);
+                        }
+                        // An answer, and repeating the question gets the same
+                        // one. `run_connect` prints this after the raw guard
+                        // is dropped and exits non-zero.
+                        AttemptOutcome::Definite(why) => {
+                            return Err(anyhow::anyhow!("this session cannot be resumed: {why}"));
+                        }
+                    }
+                }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
                 // nothing at all.
                 Wake::Closed(reason) => {
+                    // A rebuild that reached the host displaces this link --
+                    // the host closes it as it adopts the newcomer, which is
+                    // what `HostSession::adopt` is for. Reporting that as the
+                    // end of the session would end it at the exact moment it
+                    // was rescued (spec §5.3). Only while an attempt is
+                    // actually in flight: with none, a takeover is somebody
+                    // else attaching and today's behaviour stands, until B4
+                    // makes it `Displaced`.
+                    if is_takeover(&reason)
+                        && self.rebuild.as_ref().is_some_and(Rebuild::is_running)
+                    {
+                        takeover_expected = true;
+                        continue;
+                    }
                     self.drain(out).await?;
                     return exit_code(&reason);
                 }
@@ -1532,6 +1746,12 @@ impl ClientSession {
             // whether a prod was due. The loop does not care: it prods or it
             // does not, and either way the next lap is the same.
             let _ = self.heartbeat(now);
+
+            // After the notice, for the same reason the route probe is: the
+            // box explaining the silence is on the screen before anything is
+            // done about it. After the probe, too -- a rebind is the cheaper
+            // of the two ways back and costs no ssh at all.
+            self.rebuild_step(now, &outcomes_tx);
 
             // The next WAKE-UP, which is a different thing from `due()`, and
             // conflating the two is a busy loop rather than an optimisation.
@@ -1724,6 +1944,7 @@ mod tests {
     // `use super::*` reaches the session module's own imports, not `crate`'s
     // other modules, so the route pace has to be named explicitly.
     use crate::roam::ROUTE_PROBE_EVERY;
+    use oxutrm_host::ssh::SshLauncher;
     use oxutrm_net::{generate_cert, quic_client, quic_server};
     use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
 
@@ -1760,7 +1981,7 @@ mod tests {
 
     /// A host and a client joined by a real QUIC connection on loopback.
     async fn pair(shell: &str) -> (HostSession, ClientSession) {
-        pair_on("127.0.0.1:0", shell).await
+        pair_on("127.0.0.1:0", shell, None).await
     }
 
     /// A UDP relay the test can blackhole in both directions.
@@ -1873,6 +2094,7 @@ mod tests {
             size(),
             caps(),
             Link::new(client_conn, client_ep, client_sock),
+            None,
         )
         .unwrap();
 
@@ -1881,7 +2103,15 @@ mod tests {
         (host, client, relay)
     }
 
-    async fn pair_on(client_bind: &str, shell: &str) -> (HostSession, ClientSession) {
+    /// `rebuild` is what the client would rebuild a lost link through.
+    /// `None` for every fixture that is not testing the rebuild loop: these
+    /// links are built directly rather than over ssh, so there is no target to
+    /// rebuild to and nothing that could stand in for one.
+    async fn pair_on(
+        client_bind: &str,
+        shell: &str,
+        rebuild: Option<Rebuild>,
+    ) -> (HostSession, ClientSession) {
         let (cert, key, fingerprint) = generate_cert().unwrap();
         // The client now has an identity of its own, and the host has to be
         // told about it before it can listen at all.
@@ -1923,6 +2153,7 @@ mod tests {
             size(),
             caps(),
             Link::new(client_conn, client_ep, client_sock),
+            rebuild,
         )
         .unwrap();
 
@@ -2274,7 +2505,7 @@ mod tests {
     /// the sender fell back to full states.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_client_that_stops_typing_keeps_receiving_output() {
-        let (mut host, mut client) = pair_on("127.0.0.1:0", "").await;
+        let (mut host, mut client) = pair_on("127.0.0.1:0", "", None).await;
         let mut out = Vec::new();
 
         // One burst of typing, then the client goes quiet for good.
@@ -2613,7 +2844,8 @@ mod tests {
 
         let mut host =
             HostSession::spawn("/bin/sh", big, 200, Link::new(hc, he, host_sock)).unwrap();
-        let mut client = ClientSession::new(big, caps(), Link::new(cc, ce, client_sock)).unwrap();
+        let mut client =
+            ClientSession::new(big, caps(), Link::new(cc, ce, client_sock), None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.
         host.term
@@ -2972,7 +3204,8 @@ mod tests {
             );
             return;
         }
-        let (mut host, mut client) = pair_on("127.0.0.1:0", "printf 'before-roam\r\n'\n").await;
+        let (mut host, mut client) =
+            pair_on("127.0.0.1:0", "printf 'before-roam\r\n'\n", None).await;
         let mut out = Vec::new();
 
         assert!(
@@ -4019,6 +4252,245 @@ mod tests {
         // `saturating_duration_since`, must be zero rather than negative or
         // panicking.
         assert!(shown.contains("next try in 0s"), "{shown}");
+    }
+
+    // ---- the rebuild loop --------------------------------------------------
+
+    /// STUN-free, like every other test in this repo: a test that reaches STUN
+    /// makes every timing in it non-deterministic.
+    fn stunless() -> oxutrm_net::NetConfig {
+        oxutrm_net::NetConfig {
+            stun_servers: vec![],
+            enable_port_mapping: false,
+            enable_birthday: false,
+            ..Default::default()
+        }
+    }
+
+    /// An `ssh` that records its own pid and then never says anything.
+    ///
+    /// An attempt against this is permanently in flight, which is what the
+    /// cancellation test needs to have something to cancel. `exec` matters:
+    /// without it the pid recorded is the shell's and `sleep` is a child of it
+    /// that would outlive the kill.
+    fn hanging_ssh(dir: &std::path::Path, pidfile: &std::path::Path) -> SshLauncher {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = dir.join("hanging-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                pidfile.display()
+            ),
+        )
+        .expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        SshLauncher::command(&script)
+    }
+
+    /// Wait until the fake ssh has recorded its pid, and answer with it.
+    ///
+    /// A completed observation rather than a sleep: the file existing IS the
+    /// attempt having reached the point of spawning ssh.
+    async fn wait_for_pid(pidfile: &std::path::Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attempt never started an ssh"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Is `pid` a process that is still running?
+    ///
+    /// A zombie counts as gone, and that is the whole reason this asks `ps`
+    /// rather than `kill -0`: tokio kills the child on drop and reaps it from
+    /// its orphan queue afterwards, so between those two moments the pid still
+    /// exists and `kill -0` still succeeds.
+    fn process_is_alive(pid: u32) -> bool {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    async fn assert_gone(pid: u32, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while process_is_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} (pid {pid}) is still running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Drive a fresh session into `Recovering` on a clock of our own.
+    ///
+    /// The same build-up `the_recovering_notice_reports_the_wired_numbers`
+    /// uses, and it has to be a build-up: `evaluate` escalates one stage per
+    /// call, so a single jump to `REBUILD_AFTER` reaches `Silent` and stops
+    /// there. Returns the instant the phase was entered at.
+    fn drive_to_recovering(session: &mut ClientSession) -> Instant {
+        let t = Instant::now();
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.notice_at(t).is_none());
+        let _ = session.notice_at(t + Duration::from_secs(3));
+        let entered = t + crate::linkstate::REBUILD_AFTER;
+        let _ = session.notice_at(entered);
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
+            "the fixture did not reach Recovering: {:?}",
+            session.link_state.phase_now()
+        );
+        entered
+    }
+
+    /// Whichever path revives first wins, and the loser is stopped.
+    ///
+    /// The old link is held throughout a rebuild precisely so that it may come
+    /// back on its own (spec §5.3). When it does, the attempt in flight is not
+    /// merely redundant: left running it can still land, and then it swaps the
+    /// transport out from under a session that had already recovered.
+    ///
+    /// The assertion that matters is **the ssh is dead**, not that the handle
+    /// was let go of. Dropping a `JoinHandle` detaches its task rather than
+    /// stopping it, so a `cancel` written as `self.in_flight.take()` — no
+    /// `abort` — would leave `is_running()` false and the attempt, its ssh and
+    /// its eventual swap all very much alive. Only the process check tells
+    /// those two apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_on_the_old_link_stops_the_attempt_in_flight() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (mut host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+
+        let entered = drive_to_recovering(&mut session);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert!(
+            session
+                .rebuild
+                .as_ref()
+                .expect("the fixture built a rebuild")
+                .is_running(),
+            "no attempt was started, so there is nothing for this test to \
+             cancel and every assertion below would pass for free"
+        );
+        let ssh = wait_for_pid(&pidfile).await;
+
+        // The old link answers. This is the ordinary scavenging path: the
+        // frame lands in the channel and `turn` picks it up.
+        let mut out = Vec::new();
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        assert_eq!(
+            session.link_state.phase_now(),
+            Phase::Live,
+            "the frame did not revive the link, so what follows would be \
+             testing nothing"
+        );
+
+        // The rest of that same lap of `run_on`.
+        session.rebuild_step(Instant::now(), &tx);
+
+        assert!(
+            !session
+                .rebuild
+                .as_ref()
+                .expect("the rebuild is still there")
+                .is_running(),
+            "the client is still rebuilding a link that came back by itself"
+        );
+        assert_gone(ssh, "the abandoned attempt's ssh").await;
+    }
+
+    /// A landed attempt replaces the transport and starts the sync state over.
+    ///
+    /// Design spec §8.5: both ends reset their sequence counters at every
+    /// attach and the host's first datagram is a full state. The host has
+    /// already done its half — the attempt reached it as an ordinary attach,
+    /// so `HostSession::adopt` ran — and a client that kept its old counters
+    /// would reject that first frame as a base mismatch and freeze on the
+    /// screen it had.
+    ///
+    /// Driven with a link built by the fixture rather than by a real rebuild:
+    /// what is under test is the swap, and `establish` reaching a real host is
+    /// `connect.rs`'s duplex-paired test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_landed_rebuild_swaps_the_link_and_starts_the_sync_state_over() {
+        let (mut host, mut session) = pair("/bin/sh").await;
+        let (_host2, newcomer) = pair("/bin/sh").await;
+
+        // Get both counters off their starting values, so "back to 1" is a
+        // claim about the reset rather than about a session that never moved.
+        let mut out = Vec::new();
+        session.turn(b"hello", &mut out).expect("a keystroke");
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        assert!(
+            session.input_tx.current().seq() > 1,
+            "the fixture never moved the input counter"
+        );
+        assert!(
+            session.screen_rx.state().rows > 0,
+            "the fixture has no screen to lose"
+        );
+
+        // The HOST's handle of the link about to be replaced. Watched from
+        // there and not from this side: `closed()` on the connection we
+        // ourselves closed answers `LocallyClosed` and says nothing about what
+        // went out, so a close whose reason never reached the peer would look
+        // identical.
+        let displaced = host.link.sink.connection().clone();
+        session
+            .swap_in(newcomer.link_take())
+            .expect("swapping in the rebuilt link");
+
+        assert_eq!(
+            session.input_tx.current().seq(),
+            1,
+            "the input counter carried across the swap, so the host -- which \
+             reset its receiver to 1 when it adopted -- will reject \
+             everything typed from here"
+        );
+        assert_eq!(
+            session.screen_rx.ack(),
+            0,
+            "the client still acknowledges a screen state the rebuilt link's \
+             host has never sent, so the host's first full state looks like \
+             an old one"
+        );
+
+        // The connection this replaced is closed, and closed with a reason:
+        // the same discipline `adopt` follows on the host's side.
+        let reason = tokio::time::timeout(Duration::from_secs(5), displaced.closed())
+            .await
+            .expect("the replaced connection was never closed");
+        let quinn::ConnectionError::ApplicationClosed(closed) = reason else {
+            panic!("the replaced connection ended with {reason:?}, not an application close");
+        };
+        assert_eq!(closed.reason.as_ref(), REBUILT);
     }
 
     /// Every word a notice puts on the screen: headline, body and key list.

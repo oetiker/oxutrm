@@ -30,6 +30,7 @@ mod link;
 mod linkstate;
 mod listener;
 mod loopback;
+mod rebuild;
 mod roam;
 mod serve;
 mod session;

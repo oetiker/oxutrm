@@ -1366,3 +1366,19 @@ passphrase prompt would fight the renderer. That is B3's askpass."
 **Resolved while writing:** the root crate has no `src/lib.rs` and no `[lib]` section in `Cargo.toml`, so the centrepiece test is a unit test in `src/connect.rs` rather than an integration test. Task 3 says so and names the command that runs it.
 
 **Signalling helpers checked:** `oxutrm_proto::read_signal` and `oxutrm_proto::write_signal` are the blocking pair Task 2 uses; `oxutrm_host::signalling::{read_signal_async, write_signal_async}` are the async pair Task 3 uses. Both exist today.
+
+---
+
+## Correction, 2026-09-08 (recorded during Task 6)
+
+Task 3's justification for the duplex-paired composition test repeats the
+design spec's claim that it catches the Tier B1 "`adopt` must call `resize`"
+regression. It does not and cannot: the value it asserts on,
+`attached.client_size`, is produced by `run_attach_exchange` when it parses
+`ClientHello`, which is upstream of `adopt`, so breaking `adopt` cannot move
+it. The regression is caught by the pre-existing
+`session::tests::adopting_a_link_resizes_the_shell_to_the_newcomers_terminal`,
+which reads the screen the host ships. No coverage is missing; the rationale
+was overstated, and it is recorded here rather than only in a task report so
+the correction outlives this branch's scratch workspace. See the matching note
+appended to the design spec.

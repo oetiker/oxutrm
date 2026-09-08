@@ -11,6 +11,52 @@
   with the screen it has right now, and tells the terminal that had it that it
   was taken over rather than leaving it to report silence.
 
+- **Connecting to a host resumes your session there instead of replacing it.**
+  `oxutrm <ssh-target>` now asks the far end what is already running before
+  either side commits to anything. One session of yours, and it is resumed —
+  same shell, same scrollback, same screen — without asking. Several, and
+  oxutrm lists them and asks which; `q` leaves without touching any of them.
+  None, and you get a new one, exactly as before. `--attach <id>` names one
+  directly, by as few as four characters of its id, and `--new` starts a fresh
+  session however many are already there. Killing a client and reconnecting
+  used to strand the old session: it stayed live, holding your shell, and the
+  reconnect started a second one beside it.
+
+  The session id is printed on connect, which is the one thing worth writing
+  down to `--attach` back into later. A session that cannot be resumed because
+  it tunnels its data through the ssh connection that created it is still
+  offered, and refused with that reason rather than quietly omitted.
+
+- **A client whose network dies reconnects by itself.** After twenty seconds of
+  silence — long enough that a blip is not raced against an outage about to end
+  on its own — the client starts building a new link back into the same
+  session: a fresh ssh, the same handshake a first connect runs, paced 1, 2, 4,
+  8 seconds and then every 8 seconds for as long as you leave it running. It
+  never gives up on its own; `Ctrl-\ q` is how you stop it.
+
+  The old link is held throughout, so whichever path comes back first wins: a
+  frame arriving on it ends the rebuild, and a rebuild landing first swaps the
+  transport under a session that never noticed. The box on screen says how long
+  the host has been quiet, which attempt is next, when it is due, and why the
+  last one failed. If the far end answers that the session is gone, that is an
+  answer rather than an outage: oxutrm says so and stops.
+
+  Those attempts run `ssh -o BatchMode=yes`, so a key that needs a passphrase
+  typed will not reconnect: raw mode is held and the screen belongs to the
+  renderer, so a prompt would fight it for the terminal. The attempt fails
+  cleanly and the box says why, which is the deliberate half of this until the
+  askpass work lands. An agent coming back is a real way it resolves.
+
+### Compatibility
+
+- **Both ends have to be upgraded together.** The client now runs
+  `oxutrm host --connect` on the far end rather than `oxutrm host --serve`, so
+  it can be offered the live sessions before choosing one. An older host does
+  not know that option: it exits with its own usage error, and the client
+  reports that the far end is too old rather than blaming the network. There is
+  no protocol version bump, because the version field lives in the hellos and
+  this exchange happens before them.
+
 ### Changed
 
 ### Fixed

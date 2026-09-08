@@ -18,6 +18,7 @@ use crate::candidates::{inbound_candidates, outbound_candidates};
 use crate::choose::{Decision, decide, pick};
 use crate::ladder::nominate;
 use crate::link::Link;
+use crate::rebuild::Rebuild;
 use crate::session::ClientSession;
 
 /// `oxutrm <ssh-target>`: L1 to L14.
@@ -168,10 +169,23 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // reading on an ordinary terminal.
     let raw = RawGuard::enter().context("putting the terminal into raw mode")?;
 
-    let mut session = ClientSession::new(size, detect_caps(), established.link)
+    // The two identities a rebuild needs: the target the user typed, and
+    // whichever session actually resulted -- which for `Choice::New` is an id
+    // the client had no way to guess in advance.
+    let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
+    let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
         .context("preparing the client session")?;
 
-    // L12. One line, and then silence.
+    // L12. The SECOND of the two lines a session opens with, and the last.
+    //
+    // It used to be the only one, and the comment here used to say so. Both
+    // are kept, because they answer different questions and this branch is
+    // what made the first one worth asking: a bare `oxutrm <target>` now
+    // RESUMES a session rather than always starting one, so which session it
+    // picked is exactly the kind of thing §10.3 forbids doing silently. The
+    // line above says which; this one says how it is reached. After it,
+    // silence -- `announce` prints nothing when called again with the same
+    // path, and only a migration makes it speak.
     let mut stdout = std::io::stdout();
     session
         .announce(&established.path, &mut stdout)
@@ -343,6 +357,27 @@ where
     })
 }
 
+/// The far end refused, in its own words.
+///
+/// A type rather than a bare `anyhow!` because the rebuild loop has to tell
+/// this apart from everything else that can go wrong (design spec §5.4): an
+/// answer FROM the host ends the loop, and a transport failure never does.
+/// Sniffing for a phrase in a formatted message would work until somebody
+/// reworded it, at which point a client would quietly start retrying a session
+/// that is gone every eight seconds for ever.
+#[derive(Debug)]
+pub(crate) struct HostRefused(pub String);
+
+impl std::fmt::Display for HostRefused {
+    /// Word for word what this used to be written as, so the messages every
+    /// existing caller shows the user are unchanged.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the host gave up: {}", self.0)
+    }
+}
+
+impl std::error::Error for HostRefused {}
+
 /// The offer, read before either side has committed to a session.
 ///
 /// It arrives ahead of `HostHello` and is the only message that a first
@@ -355,8 +390,10 @@ where
 /// EOF into a diagnosed `RemoteBinaryMissing` or `SshFailed`, and a generic
 /// read cannot do that. What the signal MEANS, once read, is split out into
 /// [`sessions_offered`] so that part -- and only that part -- can be driven
-/// without ssh in the test below.
-async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSummary>> {
+/// without ssh in the test below. [`crate::rebuild::attempt`] reads its own
+/// fresh channel's offer through this same function, and for the same reason:
+/// the first read is where a missing binary or a dead ssh is diagnosed.
+pub(crate) async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSummary>> {
     sessions_offered(
         channel
             .recv()
@@ -371,7 +408,7 @@ fn sessions_offered(signal: Signal) -> Result<Vec<SessionSummary>> {
         Signal::Sessions { sessions } => Ok(sessions),
         // The host's own words, exactly as at L5: it is the only explanation
         // there is for why this connection is not going to happen.
-        Signal::Failed { reason } => Err(anyhow::anyhow!("the host gave up: {reason}")),
+        Signal::Failed { reason } => Err(anyhow::Error::new(HostRefused(reason))),
         other => Err(anyhow::anyhow!(
             "the host opened with {other:?} instead of its list of sessions"
         )),
@@ -437,7 +474,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
         // The host's own words. It is the only explanation there is for why
         // this connection is not going to happen, and it is the sentence the
         // user is looking at.
-        Signal::Failed { reason } => Err(anyhow::anyhow!("the host gave up: {reason}")),
+        Signal::Failed { reason } => Err(anyhow::Error::new(HostRefused(reason))),
         other => Err(anyhow::anyhow!(
             "the host opened with {other:?} instead of its hello"
         )),
@@ -452,7 +489,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
 fn established_path(signal: Signal) -> Result<PathDescription> {
     match signal {
         Signal::Established { path } => Ok(path),
-        Signal::Failed { reason } => Err(anyhow::anyhow!("the host gave up: {reason}")),
+        Signal::Failed { reason } => Err(anyhow::Error::new(HostRefused(reason))),
         other => Err(anyhow::anyhow!(
             "the host sent {other:?} where the link should have been declared up"
         )),

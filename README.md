@@ -44,8 +44,8 @@ authoritative state rather than approximating it.
 ## Installing
 
 **oxutrm has to be on both machines** — the one you type on and the one you
-connect to. `oxutrm <ssh-target>` runs `ssh <target> oxutrm host --serve` on the
-far end, so the far end needs it on a `PATH` that a *non-interactive* ssh
+connect to. `oxutrm <ssh-target>` runs `ssh <target> oxutrm host --connect` on
+the far end, so the far end needs it on a `PATH` that a *non-interactive* ssh
 searches. `ssh <target> command -v oxutrm` is the check; a login shell's `PATH`
 is not the one that matters.
 
@@ -74,16 +74,27 @@ and no macOS package is built, so treat it as unproven rather than supported.
 ## Using it
 
 ```
-oxutrm <ssh-target>          # connect to a session there
+oxutrm <ssh-target>          # resume your session there, or start one
+oxutrm --attach <id> <tgt>   # resume that one in particular
+oxutrm --new <ssh-target>    # start a fresh one regardless
 oxutrm host --list           # sessions on this machine
 oxutrm loopback              # both halves in one process, no network
 ```
 
 `oxutrm <ssh-target>` works: it drives ssh, races the connection ladder, brings
 up QUIC on whichever rung wins, and hands you the shell. The session survives
-the client going away — `oxutrm host --list` shows it as detachable — though
-**reattaching to it does not work yet**, so a session you leave is a session you
-can see but not return to.
+the client going away, and you get it back by connecting again: the far end
+offers what is already running, a single session of yours is resumed without
+asking, and with several oxutrm asks which. `--attach` names one directly and
+`--new` always starts a fresh one.
+
+A client whose network dies reconnects by itself. After twenty seconds of
+silence it starts rebuilding the link — a new ssh, back into the same session —
+and keeps trying on a 1, 2, 4, 8 second backoff for as long as you leave it
+running. The old link is held throughout, so whichever comes back first wins.
+Until the askpass work lands, those attempts run `ssh -o BatchMode=yes`: a key
+that needs a passphrase typed cannot be unlocked from under a session that owns
+the screen, so the attempt fails cleanly and the box on screen says why.
 
 `loopback` runs both halves in one process with no network in between: a shell
 on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.
@@ -133,12 +144,13 @@ anyone else's domain in SNI to look like something it is not.
 Phase A+B is the transport, the terminal core and the session loops. In
 progress or not started:
 
-- **`oxutrm <ssh-target>` and `oxutrm host` are not wired, and they panic
-  rather than saying so.** Running either prints a Rust panic and a
-  `not implemented` message instead of a sentence. The pieces beneath them
-  exist and are tested — the SSH bootstrap and its failure taxonomy, the
-  session registry, `daemonize`, the attach path — but the subcommand dispatch
-  does not call them yet. `oxutrm loopback` is what runs today.
+- **A reconnect cannot ask for a passphrase.** The client rebuilds a lost link
+  with `ssh -o BatchMode=yes`, because raw mode is held and a passphrase prompt
+  would fight the renderer for the terminal. If your key needs unlocking and no
+  agent is holding it, the attempts fail and say so rather than reconnecting.
+- **A session taken over by somebody else is reported as an error**, not as its
+  own state: the client says the host closed the session without the shell
+  exiting. It is accurate and it is not the sentence that case deserves.
 - **Scrollback is not synced.** The host keeps it; the client cannot fetch it
   yet. Phase C.
 - **No speculative local echo.** Typing waits for the round trip. Phase C.

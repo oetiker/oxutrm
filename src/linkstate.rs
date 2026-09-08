@@ -25,10 +25,6 @@ pub const REBUILD_AFTER: Duration = Duration::from_secs(20);
 /// 1, 2, 4, 8, then every 8 s for ever. Saturating rather than shifting: an
 /// attempt counter that runs for a week must not wrap into an instant retry.
 #[must_use]
-// Bridge: `backoff`'s only callers are `begin_attempt`/`attempt_failed`,
-// which nothing calls outside tests until Task 6's rebuild loop exists.
-// Task 6 removes this line and the attribute below as one block.
-#[allow(dead_code)]
 pub fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(1u64 << attempt.min(3))
 }
@@ -309,9 +305,6 @@ impl LinkState {
     }
 
     /// The client is about to run an attempt.
-    // Bridge: nothing calls this outside tests until Task 6's rebuild loop
-    // exists. Task 6 removes this line and the attribute below as one block.
-    #[allow(dead_code)]
     pub fn begin_attempt(&mut self, now: Instant) {
         if let Phase::Recovering { attempt, .. } = self.phase {
             self.phase = Phase::Recovering {
@@ -322,9 +315,6 @@ impl LinkState {
     }
 
     /// An attempt failed for a reason worth retrying.
-    // Bridge: nothing calls this outside tests until Task 6's rebuild loop
-    // exists. Task 6 removes this line and the attribute below as one block.
-    #[allow(dead_code)]
     pub fn attempt_failed(&mut self, now: Instant) {
         if let Phase::Recovering { attempt, .. } = self.phase {
             let next = attempt.saturating_add(1);

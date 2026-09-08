@@ -1,10 +1,14 @@
 //! What layer 1 says, and how big it is.
 //!
-//! Phase 1 deliberately makes no promise about reconnection, because nothing
-//! reconnects yet. The notice reports what the client can observe -- silence,
-//! counters -- and nothing it cannot know. In particular it never claims the
-//! session is safe: a dead network and a crashed host are indistinguishable
-//! from here.
+//! A notice reports what the client can observe -- silence, counters, what an
+//! attempt of its own produced -- and nothing it cannot know. In particular it
+//! never claims the session is safe: a dead network and a crashed host are
+//! indistinguishable from here.
+//!
+//! The `Silent` box therefore still promises nothing about reconnection, and
+//! the guard in `session.rs` that forbids it the words holds. The `Recovering`
+//! box is the exception and earns it: something IS reconnecting by the time it
+//! is on the screen, and it names only what that something has actually done.
 
 use std::time::Duration;
 
@@ -30,30 +34,63 @@ pub struct Notice {
     pub keys: Vec<(String, String)>,
 }
 
+/// How much of the last failure's reason is shown.
+///
+/// The reason is an error chain built partly from a remote's stderr, so its
+/// length is not ours to choose. The box wraps and is clamped to the screen,
+/// so a long one cannot overflow anything -- but it can fill the screen, and a
+/// box that covers the terminal it is apologising for is not an improvement.
+/// The useful part of an ssh failure is at the front.
+const REASON_SHOWN: usize = 120;
+
 /// The notice shown while the client is rebuilding the link itself.
 ///
 /// `quiet` is how long the host has been silent, `attempt` is the rebuild
-/// attempt number (zero-based, as counted by `Phase::Recovering`), and
-/// `next_try_in` is how long until the next attempt is due. Only these three
-/// are shown: there is no failure reason to report until something actually
-/// runs an attempt and can fail one, and that is Task 6's business.
+/// attempt number (zero-based, as counted by `Phase::Recovering`),
+/// `next_try_in` is how long until the next attempt is due, and `last_failure`
+/// is why the previous attempt did not work -- `None` before any attempt has
+/// finished, which is the state the first few seconds of every outage are in.
 ///
 /// `attempt` is rendered as `attempt + 1`: zero-based is right internally,
 /// where it indexes `backoff`, but a person reading "reconnect attempt 0"
 /// for the very first try would read it as a bug.
-pub fn recovering_notice(quiet: Duration, attempt: u32, next_try_in: Duration) -> Notice {
+pub fn recovering_notice(
+    quiet: Duration,
+    attempt: u32,
+    next_try_in: Duration,
+    last_failure: Option<&str>,
+) -> Notice {
+    let mut body = vec![
+        format!("host quiet for {}s", quiet.as_secs()),
+        format!("reconnect attempt {}", attempt + 1),
+        format!("next try in {}s", next_try_in.as_secs()),
+    ];
+    if let Some(why) = last_failure {
+        body.push(format!("last attempt: {}", summarised(why)));
+    }
     Notice {
         headline: "waiting for the network".to_string(),
-        body: vec![
-            format!("host quiet for {}s", quiet.as_secs()),
-            format!("reconnect attempt {}", attempt + 1),
-            format!("next try in {}s", next_try_in.as_secs()),
-        ],
+        body,
         keys: vec![(
             "Ctrl-\\ q".to_string(),
             "closes oxutrm here; it does not touch the host".to_string(),
         )],
     }
+}
+
+/// One line of `reason`, short enough to read.
+///
+/// The first line only: ssh says why it failed first and pads afterwards, so a
+/// multi-line reason's later lines are the least useful part of it. Cut on a
+/// character boundary rather than a byte one -- a reason carries a remote's
+/// stderr, which can be anything at all.
+fn summarised(reason: &str) -> String {
+    let line = reason.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= REASON_SHOWN {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(REASON_SHOWN).collect();
+    format!("{kept}...")
 }
 
 /// Lay a notice out for this screen, as cells ready to composite.
@@ -248,7 +285,7 @@ mod tests {
     /// so this could not pass against the old text by accident.
     #[test]
     fn the_recovering_notice_reports_quiet_time_attempt_and_countdown() {
-        let n = recovering_notice(Duration::from_secs(23), 2, Duration::from_secs(5));
+        let n = recovering_notice(Duration::from_secs(23), 2, Duration::from_secs(5), None);
         let o = layout_notice(&n, TermSize { cols: 80, rows: 24 });
         let text = text_of(&o);
 
@@ -260,6 +297,72 @@ mod tests {
         assert!(text.contains("reconnect attempt 3"), "{text}");
         assert!(text.contains("next try in 5s"), "{text}");
         assert!(text.contains("Ctrl-\\ q"), "{text}");
+        // Nothing has failed yet, so there is nothing to report about a last
+        // attempt -- and a box that said so anyway would be inventing one.
+        assert!(!text.contains("last attempt"), "{text}");
+    }
+
+    /// Why the last attempt failed is the only thing in the box that says
+    /// anything about the cause. "Permission denied (publickey)" under
+    /// `BatchMode` and "Network is unreachable" are different afternoons.
+    #[test]
+    fn the_recovering_notice_reports_why_the_last_attempt_failed() {
+        let n = recovering_notice(
+            Duration::from_secs(23),
+            2,
+            Duration::from_secs(5),
+            Some("ssh exited with status 255: Permission denied (publickey)"),
+        );
+        let o = layout_notice(&n, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+
+        assert!(
+            text.contains("Permission denied (publickey)"),
+            "the reason the last attempt failed never reached the box: {text}"
+        );
+    }
+
+    /// The reason is built partly from a remote's stderr, so its length is not
+    /// ours to choose. A box that filled the screen would cover the terminal
+    /// it is apologising for.
+    #[test]
+    fn a_very_long_failure_reason_is_summarised_rather_than_shown_whole() {
+        let long = format!("ssh said: {}", "noise ".repeat(400));
+        let n = recovering_notice(
+            Duration::from_secs(1),
+            0,
+            Duration::from_secs(1),
+            Some(&long),
+        );
+        let shown = n.body.last().expect("the reason is the last body line");
+
+        assert!(
+            shown.len() < 200,
+            "the whole of a {}-byte reason went into the box: {shown}",
+            long.len()
+        );
+        assert!(
+            shown.contains("ssh said:"),
+            "the front of the reason is the useful part and must survive: {shown}"
+        );
+    }
+
+    /// ssh says why it failed on its first line and pads afterwards.
+    #[test]
+    fn only_the_first_line_of_a_failure_reason_is_shown() {
+        let n = recovering_notice(
+            Duration::from_secs(1),
+            0,
+            Duration::from_secs(1),
+            Some("Permission denied (publickey).\nbanner line nobody needs"),
+        );
+        let shown = n.body.last().expect("the reason is the last body line");
+
+        assert!(shown.contains("Permission denied"), "{shown}");
+        assert!(
+            !shown.contains("banner line"),
+            "a multi-line reason was pasted into the box whole: {shown}"
+        );
     }
 
     /// A box that does not fit is worse than a line that does.

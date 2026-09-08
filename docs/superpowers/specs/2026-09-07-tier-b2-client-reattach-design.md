@@ -322,3 +322,21 @@ rejected frame must never disconnect, and a send failure must never end a
 session. Both ends reset sequence counters at every attach and the host's first
 datagram is a full state. Never a bare `cargo test` — `make check` only.
 A changelog entry is part of the work.
+
+---
+
+## Correction, 2026-09-08 (recorded during Task 6)
+
+§6 says of the duplex-paired `establish` / `run_attach_exchange` test that "the
+`adopt`-must-`resize` regression that only a reading review caught on B1
+becomes a test that fails". **It does not and cannot.** That test's size
+assertion reads `attached.client_size`, which `run_attach_exchange` produces
+when it parses `ClientHello` — strictly upstream of `adopt`, and reached
+whether or not `adopt` is ever called. Breaking `adopt` cannot move it.
+
+No coverage is missing: `session::tests::adopting_a_link_resizes_the_shell_to_the_newcomers_terminal`
+catches that regression, and catches it on the authoritative screen the host
+actually ships rather than on a field. Only the rationale was overstated. The
+composition test is still worth what the rest of §6 claims for it — it is the
+first thing to exercise both halves of the handshake against each other with no
+ssh and no shim.
