@@ -177,16 +177,8 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     let code = match listening {
         Some((task, mut attach_rx)) => {
             let code = session.run_with_attaches(&mut attach_rx).await;
-            // `abort()` only SCHEDULES cancellation: the future — and with it
-            // the listener's `Arc` clone of the guard — is dropped by the
-            // runtime at some later point on some worker. Without this await
-            // the `drop(guard)` below decrements from two to one, the guard's
-            // `Drop` never runs, and whether the abandoned task's destructor
-            // beats `shutdown_background()` is a race. Awaiting an aborted
-            // handle returns as soon as the runtime has dropped the future,
-            // and `serve_attaches` touches no blocking pool, so this is
-            // prompt.
-            let _ = task.await;
+            // Abort AND await, and why both, is `close_the_door`'s own note.
+            crate::listener::close_the_door(task).await;
             code
         }
         None => session.run().await,

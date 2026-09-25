@@ -109,6 +109,25 @@ pub(crate) async fn serve_attaches(
     }
 }
 
+/// Stop answering the door once the shell has exited.
+///
+/// Both halves are needed. [`serve_attaches`] never returns by itself, so
+/// without the `abort()` the await is for ever: the daemon outlives its shell,
+/// its entry stays on `--list`, and the next reattach completes an exchange
+/// into a session with nothing left to send.
+///
+/// And `abort()` only SCHEDULES cancellation: the future — and with it the
+/// listener's `Arc` clone of the guard — is dropped by the runtime at some
+/// later point on some worker. Without the await, the caller's `drop(guard)`
+/// decrements from two to one, the guard's `Drop` never runs, and whether the
+/// abandoned task's destructor beats `shutdown_background()` is a race.
+/// Awaiting an aborted handle returns as soon as the runtime has dropped the
+/// future, and `serve_attaches` touches no blocking pool, so this is prompt.
+pub(crate) async fn close_the_door(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,9 +400,9 @@ mod tests {
     /// The listener's `Arc` clone of the guard has to be gone before the
     /// session drops its own, or the session directory outlives the session.
     ///
-    /// This is the shape `serve()` (`src/serve.rs`) ends on, and it is the
-    /// shape rather than that call site that can be reached from here.
-    /// `abort()` only SCHEDULES cancellation: without the await, the spawned
+    /// `serve()` (`src/serve.rs`) ends on [`close_the_door`], and so does
+    /// this test; the listener must also be gone at all, which the timeout
+    /// asserts. `abort()` only SCHEDULES cancellation: without the await, the spawned
     /// future — and its clone of the guard — is still alive when `drop(guard)`
     /// runs, `RegistryGuard::drop` decrements two to one instead of one to
     /// zero, `remove_dir_all` never runs, and the session leaves an entry
@@ -416,9 +435,17 @@ mod tests {
         ));
         assert!(session_dir.exists(), "the fixture registered nothing");
 
-        // Exactly what `serve()` does when the shell exits.
-        task.abort();
-        let _ = task.await;
+        // Exactly what `serve()` does when the shell exits -- the same call,
+        // not a copy of it. A copy is how `serve()` lost its `abort()` while
+        // this test, aborting on its own, stayed green: the listener never
+        // returns by itself, so the session's daemon outlived its shell,
+        // stayed on `--list`, and handed the next reattach a dead link.
+        tokio::time::timeout(Duration::from_secs(5), close_the_door(task))
+            .await
+            .expect(
+                "the listener was still running after the shell exited: the \
+                 daemon outlives its session and keeps accepting attaches",
+            );
         drop(guard);
 
         assert!(
