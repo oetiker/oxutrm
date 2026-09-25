@@ -135,10 +135,12 @@ The single difference is at the end. The exchange's `Attached` value carries
 `HostSession::standby: Option<Link>` **instead of calling `adopt`**. The primary
 is untouched.
 
-**Open item for the plan:** `begin_attach` bumps `meta.attach_id`. Whatever
-compares `attach_id` must accept that the host's *current* generation changes
-only at adoption (§3.5), not when a standby is minted. The plan must locate
-every reader of `attach_id` and settle this before any code is written.
+`begin_attach` bumps `meta.attach_id` for the standby too. That is harmless:
+nothing compares `attach_id`. Outside tests it is only written, `Debug`-printed
+(`src/rebuild.rs:80`, `src/connect.rs:486`) and shown as "attach N" in the
+picker (`src/choose.rs:156`). The picker's number therefore counts standbys as
+well. It already means "how many links this session has had", not "how many
+times a person attached".
 
 ### 3.3 Which pairs a standby may use
 
@@ -417,8 +419,6 @@ Each gets its own implementation plan.
 
 ## 9. Risks and open questions
 
-- **`attach_id` semantics with two live generations** (§3.2). This must be
-  settled in P1's plan before any code is written.
 - **NAT timeouts shorter than 10 s** on the standby path would lose it silently
   until the probe fails. If that shows up in the field, a per-standby shorter
   keep-alive is the fix; do not guess it now.
