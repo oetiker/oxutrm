@@ -46,6 +46,15 @@ pub(crate) struct Attached {
     pub role: Role,
 }
 
+/// Aborts a spawned task when dropped, tying its life to its owner's.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// R4 to R10: a fresh certificate, the STUN/ICE ladder, the hello exchange and
 /// the QUIC handshake, ending the moment the client has been told the path is
 /// up.
@@ -126,6 +135,17 @@ where
         let r = outbound_candidates(&mut stdout, &mut learned_rx).await;
         (stdout, r)
     });
+    // The pumps live no longer than this exchange. Dropping a `JoinHandle`
+    // detaches the task rather than cancelling it, and this future IS dropped
+    // from outside: by the listener's `ATTACH_TIMEOUT`, and whenever a socket
+    // attach pre-empts a standby's exchange. Without this the inbound pump
+    // would keep the reader, and the pipe, until the peer's next line. On the
+    // ordinary path both tasks are over before these drop, so aborting them
+    // then changes nothing.
+    let _pumps = (
+        AbortOnDrop(inbound.abort_handle()),
+        AbortOnDrop(outbound.abort_handle()),
+    );
 
     let nomination = nominate(
         Arc::clone(&socket),
@@ -475,6 +495,78 @@ mod tests {
             "the impossible size was recorded on the session record anyway"
         );
         client.abort();
+    }
+
+    /// An exchange dropped from outside mid-race takes its candidate pumps
+    /// with it.
+    ///
+    /// The listener drops a standby's exchange whenever a socket attach
+    /// pre-empts it, and `ATTACH_TIMEOUT` drops any exchange that runs too
+    /// long. Both pumps are spawned tasks, and dropping a `JoinHandle`
+    /// detaches rather than cancels: the inbound pump owns the reader and
+    /// would go on waiting for the peer's next line, holding the pipe open,
+    /// until the pipe failed on its own — on a silent control stream, never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exchange_dropped_mid_race_stops_its_candidate_pumps() {
+        let within = std::time::Duration::from_secs(10);
+        // The client's one candidate is a socket this test holds, so the
+        // ladder's first check landing on it proves the race is under way —
+        // and the pumps are spawned just before the race starts.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a peer socket");
+        let mut hello = a_client_hello();
+        if let Signal::ClientHello { candidates, .. } = &mut hello {
+            *candidates = vec![Candidate {
+                addr: peer.local_addr().expect("the peer's address"),
+                kind: CandidateKind::Host,
+                priority: 1,
+            }];
+        }
+
+        let (theirs, ours) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(ours);
+        let exchange = tokio::spawn(async move {
+            let mut meta = fresh_meta("pumps");
+            let _ =
+                run_attach_exchange(tokio::io::BufReader::new(r), w, &mut meta, &stun_free()).await;
+        });
+
+        let (tr, mut tw) = tokio::io::split(theirs);
+        let mut tr = tokio::io::BufReader::new(tr);
+        let offer = oxutrm_host::signalling::read_signal_async(&mut tr)
+            .await
+            .expect("the host's offer");
+        assert!(matches!(offer, Signal::HostHello { .. }), "{offer:?}");
+        oxutrm_host::signalling::write_signal_async(&mut tw, &hello)
+            .await
+            .expect("the client's hello");
+
+        // Before: the race is running, so both pumps exist.
+        let mut buf = [0u8; 1500];
+        tokio::time::timeout(within, peer.recv_from(&mut buf))
+            .await
+            .expect("the ladder never checked the client's candidate")
+            .expect("receiving the check");
+
+        // Dropped from outside, as the listener does. `tw` is held: a peer
+        // that hung up would end the inbound pump for its own reasons.
+        exchange.abort();
+        let _ = exchange.await;
+
+        // After: nothing holds the host's end of the pipe any more, so ours
+        // reads to its end. Whatever the host wrote before is drained first.
+        let drained = tokio::time::timeout(within, async {
+            let mut sink = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut tr, &mut sink).await
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the exchange was dropped and its pipe is still held: a candidate \
+             pump outlived it"
+        );
+        drop(tw);
     }
 
     // ---- the hello exchange, and the order that is its whole content ---------
