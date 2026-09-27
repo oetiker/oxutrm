@@ -181,7 +181,7 @@ async fn one_attempt(
     }
 
     let (reader, writer) = channel.halves();
-    match establish(reader, writer, size, cfg).await {
+    match establish(reader, writer, size, cfg, None).await {
         Ok(established) => AttemptOutcome::Landed(Box::new(established)),
         Err(e) => classify(target, &e),
     }

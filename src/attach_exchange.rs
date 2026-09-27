@@ -127,6 +127,9 @@ where
             cfg,
             local: candidates,
             remote: client.candidates,
+            // The host never filters: the client is Controlling and the only
+            // side that nominates.
+            admit_remote: None,
         },
         &mut in_rx,
         &learned_tx,

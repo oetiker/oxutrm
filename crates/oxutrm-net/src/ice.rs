@@ -49,6 +49,18 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// How long a single receive waits before the loop reconsiders its timers.
 const POLL_SLICE: Duration = Duration::from_millis(25);
 
+/// A veto over which remote addresses may be nominated.
+///
+/// Checked in `best_validated`, the one place a nomination is decided from a
+/// validated pair. That covers offered, updated and peer-reflexive remotes
+/// alike, and it deliberately leaves checks and responses alone: the peer
+/// still needs our answers to validate ITS side, and a pair we will not
+/// nominate costs a few probes and nothing more. The birthday blast
+/// (`src/ladder.rs`) nominates without going through `best_validated`, so it
+/// carries a second veto of its own — this is not the only place a filter is
+/// enforced, only the one enforced here.
+pub type RemoteFilter = std::sync::Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub enum IceEvent {
     /// We learned one of our own addresses from a peer's answer.
@@ -98,6 +110,9 @@ pub struct IceAgent {
     deadline: Option<Instant>,
     nominated: Option<SocketAddr>,
     done: bool,
+    /// A veto over which remote may be nominated, or `None` to admit any. See
+    /// [`RemoteFilter`].
+    remote_filter: Option<RemoteFilter>,
 }
 
 impl IceAgent {
@@ -115,7 +130,13 @@ impl IceAgent {
             deadline: None,
             nominated: None,
             done: false,
+            remote_filter: None,
         }
+    }
+
+    /// Forbid nominating any remote for which `f` returns false.
+    pub fn set_remote_filter(&mut self, f: RemoteFilter) {
+        self.remote_filter = Some(f);
     }
 
     pub fn add_local(&mut self, c: Candidate) {
@@ -333,6 +354,7 @@ impl IceAgent {
         self.pairs
             .iter()
             .filter(|(_, s)| s.validated())
+            .filter(|(a, _)| self.remote_filter.as_ref().is_none_or(|f| f(**a)))
             .max_by_key(|(a, s)| (s.priority, std::cmp::Reverse(**a)))
             .map(|(a, _)| *a)
     }
@@ -774,6 +796,81 @@ mod tests {
         a.add_local(host_candidate(l));
         a.add_local(host_candidate(l));
         assert_eq!(a.local_count(), 1);
+    }
+
+    /// Runs one controlling agent with `filter` against a plain controlled one,
+    /// and returns what the controlling side reported.
+    async fn run_filtered(filter: RemoteFilter) -> (Vec<IceEvent>, SocketAddr) {
+        let cs = sock().await;
+        let hs = sock().await;
+        let ca = cs.local_addr().unwrap();
+        let ha = hs.local_addr().unwrap();
+
+        let mut client = IceAgent::new(&PSK, IceRole::Controlling, cfg(1500));
+        client.add_local(host_candidate(ca));
+        client.add_remote(host_candidate(ha));
+        client.set_remote_filter(filter);
+
+        let mut host = IceAgent::new(&PSK, IceRole::Controlled, cfg(1500));
+        host.add_local(host_candidate(ha));
+        host.add_remote(host_candidate(ca));
+
+        let c = tokio::spawn(async move {
+            let mut out = Vec::new();
+            for _ in 0..8 {
+                let ev = client.run(cs.clone()).await;
+                let stop = matches!(ev, IceEvent::Nominated { .. } | IceEvent::Failed(_));
+                out.push(ev);
+                if stop {
+                    break;
+                }
+            }
+            out
+        });
+        // The host keeps checking us the whole time, but its checks arrive
+        // FROM `ha` — the same address the client already offered as a
+        // candidate, so they land on the same `BTreeMap` key rather than a
+        // separate peer-reflexive pair. There is no distinct prflx route
+        // exercised here; coverage is structural instead, since the filter is
+        // applied once in `best_validated` over whichever pairs exist,
+        // regardless of how each one's entry got there.
+        let h = tokio::spawn(async move {
+            for _ in 0..8 {
+                if matches!(
+                    host.run(hs.clone()).await,
+                    IceEvent::Nominated { .. } | IceEvent::Failed(_)
+                ) {
+                    break;
+                }
+            }
+        });
+        let out = c.await.unwrap();
+        h.abort();
+        (out, ha)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filtered_remote_is_never_nominated_even_when_it_validates() {
+        let (events, ha) = {
+            // The filter needs `ha`, which does not exist until the sockets do,
+            // so it forbids every address; there is only one.
+            run_filtered(Arc::new(|_| false)).await
+        };
+        assert!(
+            nominated(&events).is_none(),
+            "nominated a forbidden remote {ha}: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(IceEvent::Failed(_))),
+            "must fail within the budget: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_admitted_remote_is_nominated_as_before() {
+        let (events, ha) = run_filtered(Arc::new(|_| true)).await;
+        let (_, remote, _, _) = nominated(&events).expect("nominated");
+        assert_eq!(remote, ha);
     }
 
     /// An IPv6 host pair is rung 0, which is the whole reason the priorities

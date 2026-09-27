@@ -55,7 +55,7 @@ pub use demux::{STUN_HEADER_LEN, STUN_MAGIC_COOKIE, is_stun};
 pub use demuxsock::{StunDemuxSocket, StunRx};
 pub use der::{spki_der, spki_sha256};
 pub use discover::{Probe, classify, stun_discover};
-pub use ice::{IceAgent, IceEvent};
+pub use ice::{IceAgent, IceEvent, RemoteFilter};
 pub use mapping::{PortMapping, default_gateway};
 pub use quic::{ALPN, AcceptPermit, quic_client, quic_server};
 pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};

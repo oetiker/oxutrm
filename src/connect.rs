@@ -165,7 +165,7 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
 
     // L4 to L10.
     let (reader, writer) = channel.halves();
-    let established = establish(reader, writer, size, &cfg).await?;
+    let established = establish(reader, writer, size, &cfg, None).await?;
 
     // Before raw mode, on the ordinary terminal. Two things at once:
     //
@@ -280,6 +280,7 @@ pub(crate) async fn establish<R, W>(
     writer: W,
     size: TermSize,
     cfg: &NetConfig,
+    admit_remote: Option<oxutrm_net::RemoteFilter>,
 ) -> Result<Established>
 where
     R: tokio::io::AsyncBufRead + Unpin + Send,
@@ -347,6 +348,7 @@ where
                     cfg,
                     local: candidates,
                     remote: host.candidates,
+                    admit_remote,
                 },
                 &mut in_rx,
                 &learned_tx,
@@ -712,6 +714,7 @@ mod tests {
                     rows: 40,
                 },
                 &cfg,
+                None,
             ),
         )
         .await
