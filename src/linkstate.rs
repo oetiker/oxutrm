@@ -97,9 +97,11 @@ impl Phase {
     ///
     /// `Confirming` is not an outage: a frame already came back, and the
     /// phase is only waiting on the user to say what to do with what was
-    /// typed blind. Neither is `Live`. This is the one place that predicate
-    /// is spelled out; everything that means "is this an outage" -- inside
-    /// this module and in `session.rs`'s route probe -- reads it from here.
+    /// typed blind. Neither is `Live`. This is the predicate the failover
+    /// decision (`failover_due`, below) and the route-follow decision
+    /// (`session.rs`'s `follow_route`) share; other code that happens to
+    /// look similar, such as the notice box's rebuild check, may have its
+    /// own reasons to draw the same line and is not implied by this doc.
     pub fn is_outage(&self) -> bool {
         matches!(self, Phase::Silent { .. } | Phase::Recovering { .. })
     }
@@ -114,19 +116,6 @@ impl Phase {
 /// costs a full-state snapshot and a new standby search.
 #[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
 pub const FAILOVER_GRACE: Duration = Duration::from_secs(1);
-
-/// How long a probe may take before the standby counts as not answering.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How long after a failed probe the next one may go, within one outage.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
-pub const PROBE_RETRY: Duration = Duration::from_secs(5);
-
-/// How long after a link is up before a standby is searched for, so the
-/// search never competes with the first paint (spec §3.1).
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
-pub const STANDBY_DELAY: Duration = Duration::from_secs(5);
 
 /// The wait before standby search number `failures + 1`.
 #[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
@@ -1272,16 +1261,5 @@ mod tests {
     fn the_standby_backoff_climbs_and_then_holds() {
         let s: Vec<u64> = (0..6).map(|n| standby_backoff(n).as_secs()).collect();
         assert_eq!(s, vec![30, 60, 120, 300, 300, 300]);
-    }
-
-    /// `PROBE_TIMEOUT` and `PROBE_RETRY` have no reader until Task 8's probe
-    /// loop and `STANDBY_DELAY` none until Task 8's search trigger, so this
-    /// is what keeps them from drifting silently -- and, until that wiring,
-    /// what keeps `make check` from calling them dead code.
-    #[test]
-    fn the_probe_and_standby_timings_are_the_ones_the_spec_names() {
-        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(2));
-        assert_eq!(PROBE_RETRY, Duration::from_secs(5));
-        assert_eq!(STANDBY_DELAY, Duration::from_secs(5));
     }
 }
