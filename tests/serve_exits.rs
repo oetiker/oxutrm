@@ -54,6 +54,7 @@ fn a_client_hello(candidates: Vec<Candidate>) -> Signal {
             cols: 100,
             rows: 30,
         },
+        features: vec![],
     }
 }
 

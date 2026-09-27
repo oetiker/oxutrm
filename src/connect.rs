@@ -313,6 +313,8 @@ where
             nat_type: nat,
             caps: detect_caps(),
             size,
+            // The client offers nothing; the host decides.
+            features: vec![],
         },
     )
     .await
@@ -777,6 +779,7 @@ mod tests {
             nat_type: NatType::AddressDependent,
             bound_port: 5000,
             detachable: true,
+            features: vec![],
         }
     }
 

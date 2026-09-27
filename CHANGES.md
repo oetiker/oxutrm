@@ -79,6 +79,14 @@
 
 ### Changed
 
+- **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
+  carry a `features` list — empty today except for the host, which already
+  advertises `control` and `standby` ahead of the work that reads them.
+  Absent on either side, it is read as "nothing", so an older peer on the
+  other end of the exchange is unaffected and there is no `PROTO_VERSION`
+  bump. Three new signals, `StandbyRequest`, `Probe` and `ProbeAck`, are
+  defined for that same upcoming work and are not sent by anything yet.
+
 ### Fixed
 
 - **Reattaching no longer needs `loginctl enable-linger`.** A detached session

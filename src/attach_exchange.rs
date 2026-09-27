@@ -268,6 +268,10 @@ fn host_hello(
         nat_type,
         bound_port,
         detachable: true,
+        features: vec![
+            oxutrm_proto::FEATURE_CONTROL.to_string(),
+            oxutrm_proto::FEATURE_STANDBY.to_string(),
+        ],
     }
 }
 
@@ -487,6 +491,7 @@ mod tests {
                 cols: 132,
                 rows: 43,
             },
+            features: vec![],
         }
     }
 

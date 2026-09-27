@@ -71,6 +71,7 @@ fn client_hello() -> Signal {
             term_name: "xterm-256color".to_string(),
         },
         size: TermSize { cols: 80, rows: 24 },
+        features: vec![],
     }
 }
 
@@ -280,6 +281,7 @@ fn the_minted_key_material_survives_the_wire_unchanged() {
         nat_type: NatType::Unknown,
         bound_port: 443,
         detachable: true,
+        features: vec![],
     };
 
     let mut wire: Vec<u8> = Vec::new();
