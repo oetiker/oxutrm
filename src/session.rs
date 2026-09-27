@@ -1970,10 +1970,7 @@ impl ClientSession {
     /// the new address as the baseline, so the mistake is made once and not
     /// once a second.
     fn follow_route(&mut self, now: Instant) -> bool {
-        if !matches!(
-            self.link_state.phase_now(),
-            Phase::Silent { .. } | Phase::Recovering { .. }
-        ) {
+        if !self.link_state.phase_now().is_outage() {
             // The pace belongs to one outage, not to the session. Left set
             // across a return to `Live`, `probed_at` would also swallow the
             // FIRST probe of the next outage whenever that outage began within
