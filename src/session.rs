@@ -703,7 +703,7 @@ impl HostSession {
                 if let Some(old) = standby.replace(a.link) {
                     old.sink
                         .connection()
-                        .close(quinn::VarInt::from_u32(0), SWITCHED);
+                        .close(quinn::VarInt::from_u32(0), SUPERSEDED);
                 }
                 Ok(())
             }
@@ -817,7 +817,8 @@ async fn keys_readable<K: AsRawFd>(
 ///
 /// QUIC already carries a reason phrase, so distinguishing them costs nothing
 /// on the wire. This is the only phrase [`exit_code`] accepts, and
-/// [`HostSession::close`] is the only place that sends it.
+/// [`close_as_exited`] is the only place that sends it: for the session link
+/// (through [`HostSession::close`]) and for a parked standby at exit.
 pub const SHELL_EXITED: &[u8] = b"the shell exited";
 
 /// Why a link was closed because another one arrived.
@@ -830,6 +831,10 @@ pub const TAKEN_OVER: &[u8] = b"taken over by a newer attach";
 /// (spec §3.5). Not `TAKEN_OVER`: nobody else took anything, and the client
 /// must not read its own failover as a displacement.
 pub const SWITCHED: &[u8] = b"switched to the standby link";
+
+/// The close reason for a parked standby replaced by a newer one. Not
+/// `SWITCHED`: nothing switched to it, it was never used at all.
+pub const SUPERSEDED: &[u8] = b"superseded by a newer standby";
 
 /// Why the client closed a link of its own: it built a better one.
 ///
@@ -4748,7 +4753,7 @@ mod tests {
             "the slot does not hold the newer standby"
         );
         let reason = closed_as(older_client.sink.connection()).await;
-        assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+        assert!(closed_with(&reason, SUPERSEDED), "closed as {reason:?}");
     }
 
     /// A takeover drops the displaced client's standby. Left parked, it would
@@ -4785,12 +4790,33 @@ mod tests {
     /// The old primary is told it was switched away from, not taken over:
     /// nobody else took anything, and the client must not read its own
     /// failover as a displacement.
+    ///
+    /// Driven through `promote_standby`, which is what the loop calls. The
+    /// client keeps its old link open (no `swap_in`), so the close observed
+    /// on it can only be the host's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn promoting_the_standby_closes_the_primary_as_switched() {
         let (mut host, client) = pair("").await;
-        let (standby_host, _standby_client) = crate::link::fixtures::link_pair().await;
+        let (mut standby_host, mut standby_client) = crate::link::fixtures::link_pair().await;
+        // Any frame: only its arrival matters here, not whether it applies.
+        standby_client.sink.send(&Frame {
+            my_state: 1,
+            from_state: 0,
+            ack_state: 0,
+            flags: 0,
+            payload: Vec::new(),
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), standby_host.source.recv())
+            .await
+            .expect("no frame on the standby")
+            .expect("the standby closed");
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the old primary was closed before the promotion"
+        );
 
-        host.adopt_as(standby_host, size(), SWITCHED).unwrap();
+        host.promote_standby(standby_host, first)
+            .expect("promoting the standby");
 
         let reason = closed_as(client.link.sink.connection()).await;
         assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
