@@ -25,6 +25,7 @@ mod attach_exchange;
 mod candidates;
 mod choose;
 mod connect;
+mod egress;
 mod ladder;
 mod link;
 mod linkstate;
