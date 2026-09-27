@@ -549,6 +549,96 @@ impl Link {
     }
 }
 
+/// Real [`Link`]s on loopback, for tests of anything that rides on one: the
+/// session loops, the control stream, the standby.
+///
+/// Built with `oxutrm_net`'s own `quic_server`/`quic_client`, so both ends are
+/// pinned exactly as in production. The one knob is where the client dials,
+/// which is what lets a test put a relay it can blackhole in the middle.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use oxutrm_net::{generate_cert, quic_client, quic_server};
+    use oxutrm_proto::{ClientSpki, HostSpki};
+    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::Link;
+
+    /// A host end bound on loopback and accepting exactly one connection,
+    /// which no client has dialled yet.
+    pub(crate) struct Listening {
+        /// Where the host is bound. A relay forwards to this.
+        pub addr: SocketAddr,
+        host_sock: Arc<tokio::net::UdpSocket>,
+        host_fp: [u8; 32],
+        client_cert: CertificateDer<'static>,
+        client_key: PrivateKeyDer<'static>,
+        accepting: tokio::task::JoinHandle<(quinn::Connection, quinn::Endpoint)>,
+    }
+
+    /// Bind a host end on loopback and start accepting on it.
+    pub(crate) async fn listening() -> Listening {
+        let (cert, key, host_fp) = generate_cert().unwrap();
+        // The client has an identity of its own, and the host has to be told
+        // about it before it can listen at all.
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
+
+        let host_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = host_sock.local_addr().unwrap();
+        let (host_ep, _permit, _stun) =
+            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+                .await
+                .unwrap();
+        let accepting = tokio::spawn(async move {
+            let incoming = host_ep.accept().await.expect("an inbound connection");
+            let conn = incoming.await.expect("a completed handshake");
+            (conn, host_ep)
+        });
+        Listening {
+            addr,
+            host_sock,
+            host_fp,
+            client_cert,
+            client_key,
+            accepting,
+        }
+    }
+
+    impl Listening {
+        /// Dial the host from a socket bound at `client_bind`, sending to
+        /// `to`: the host's own [`Listening::addr`], or a relay in front of
+        /// it. Returns `(host, client)`.
+        pub(crate) async fn dial(self, client_bind: &str, to: SocketAddr) -> (Link, Link) {
+            let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
+            let (client_conn, client_ep, _cstun) = quic_client(
+                &client_sock,
+                to,
+                HostSpki::new(self.host_fp),
+                self.client_cert,
+                self.client_key,
+            )
+            .await
+            .unwrap();
+            let (host_conn, host_ep) = self.accepting.await.unwrap();
+            (
+                Link::new(host_conn, host_ep, self.host_sock),
+                Link::new(client_conn, client_ep, client_sock),
+            )
+        }
+    }
+
+    /// A host link and a client link joined directly on loopback, as
+    /// `(host, client)`. Keep both for as long as the connection is wanted:
+    /// each owns its end's endpoint and socket.
+    pub(crate) async fn link_pair() -> (Link, Link) {
+        let host = listening().await;
+        let addr = host.addr;
+        host.dial("127.0.0.1:0", addr).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

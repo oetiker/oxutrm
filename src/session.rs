@@ -1975,8 +1975,7 @@ mod tests {
     // other modules, so the route pace has to be named explicitly.
     use crate::roam::ROUTE_PROBE_EVERY;
     use oxutrm_host::ssh::SshLauncher;
-    use oxutrm_net::{generate_cert, quic_client, quic_server};
-    use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
+    use oxutrm_proto::{NatType, Rung};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -2003,10 +2002,6 @@ mod tests {
             rtt_ms,
             mtu,
         }
-    }
-
-    async fn udp() -> Arc<tokio::net::UdpSocket> {
-        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
     }
 
     /// A host and a client joined by a real QUIC connection on loopback.
@@ -2082,51 +2077,13 @@ mod tests {
 
     /// `pair`, with a blackholeable relay in the middle.
     async fn pair_through_relay(shell: &str) -> (HostSession, ClientSession, Relay) {
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
-
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _stun) =
-            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-                .await
-                .unwrap();
-
-        let relay = relay_to(host_addr).await;
-
-        let client_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let accepting = tokio::spawn(async move {
-            let incoming = host_ep.accept().await.expect("an inbound connection");
-            let conn = incoming.await.expect("a completed handshake");
-            (conn, host_ep)
-        });
-
+        let listening = crate::link::fixtures::listening().await;
+        let relay = relay_to(listening.addr).await;
         // The client's peer is the RELAY, which is the whole point.
-        let (client_conn, client_ep, _cstun) = quic_client(
-            &client_sock,
-            relay.addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (host_conn, host_ep) = accepting.await.unwrap();
+        let (host_link, client_link) = listening.dial("127.0.0.1:0", relay.addr).await;
 
-        let host = HostSession::spawn(
-            "/bin/sh",
-            size(),
-            200,
-            Link::new(host_conn, host_ep, host_sock),
-        )
-        .unwrap();
-        let client = ClientSession::new(
-            size(),
-            caps(),
-            Link::new(client_conn, client_ep, client_sock),
-            None,
-        )
-        .unwrap();
+        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
+        let client = ClientSession::new(size(), caps(), client_link, None).unwrap();
 
         let mut host = host;
         host.term.write_input(shell.as_bytes()).unwrap();
@@ -2142,50 +2099,12 @@ mod tests {
         shell: &str,
         rebuild: Option<Rebuild>,
     ) -> (HostSession, ClientSession) {
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        // The client now has an identity of its own, and the host has to be
-        // told about it before it can listen at all.
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
+        let listening = crate::link::fixtures::listening().await;
+        let addr = listening.addr;
+        let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _stun) =
-            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-                .await
-                .unwrap();
-
-        let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
-        let accepting = tokio::spawn(async move {
-            let incoming = host_ep.accept().await.expect("an inbound connection");
-            let conn = incoming.await.expect("a completed handshake");
-            (conn, host_ep)
-        });
-
-        let (client_conn, client_ep, _cstun) = quic_client(
-            &client_sock,
-            host_addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (host_conn, host_ep) = accepting.await.unwrap();
-
-        let host = HostSession::spawn(
-            "/bin/sh",
-            size(),
-            200,
-            Link::new(host_conn, host_ep, host_sock),
-        )
-        .unwrap();
-        let client = ClientSession::new(
-            size(),
-            caps(),
-            Link::new(client_conn, client_ep, client_sock),
-            rebuild,
-        )
-        .unwrap();
+        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
+        let client = ClientSession::new(size(), caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
         // the script is fed as input instead, which is also how a real session
@@ -2849,33 +2768,10 @@ mod tests {
             cols: 200,
             rows: 60,
         };
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _s) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-            .await
-            .unwrap();
-        let client_sock = udp().await;
-        let accepting = tokio::spawn(async move {
-            let inc = host_ep.accept().await.unwrap();
-            (inc.await.unwrap(), host_ep)
-        });
-        let (cc, ce, _cs) = quic_client(
-            &client_sock,
-            host_addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (hc, he) = accepting.await.unwrap();
+        let (host_link, client_link) = crate::link::fixtures::link_pair().await;
 
-        let mut host =
-            HostSession::spawn("/bin/sh", big, 200, Link::new(hc, he, host_sock)).unwrap();
-        let mut client =
-            ClientSession::new(big, caps(), Link::new(cc, ce, client_sock), None).unwrap();
+        let mut host = HostSession::spawn("/bin/sh", big, 200, host_link).unwrap();
+        let mut client = ClientSession::new(big, caps(), client_link, None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.
         host.term

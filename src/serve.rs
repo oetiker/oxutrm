@@ -152,16 +152,27 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
             .with_context(|| format!("binding the session socket at {}", path.display()))?;
 
         let (attach_tx, attach_rx) = tokio::sync::mpsc::channel(1);
+        // The door: standby requests from the control streams, served by the
+        // same loop as the socket. The first link's control server is started
+        // here, where the sender exists; every later link's is started by the
+        // listener as it hands the link over.
+        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
+        crate::control::serve_control(attached.link.sink.connection().clone(), door_tx.clone());
         let task = tokio::spawn(crate::listener::serve_attaches(
             listener,
             std::sync::Arc::clone(&guard),
             std::sync::Arc::clone(&meta),
             cfg,
             crate::listener::ATTACH_TIMEOUT,
+            door_rx,
+            door_tx,
             attach_tx,
         ));
         Some((task, attach_rx))
     } else {
+        // No socket, so no listener to run a standby's exchange: no control
+        // server either. Such a session (rung 4, whose QUIC runs inside ssh)
+        // has nothing a standby could outlive it through.
         None
     };
 

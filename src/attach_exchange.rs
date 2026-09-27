@@ -25,6 +25,7 @@ use tokio::io::AsyncWrite;
 
 use crate::accept::accept_one;
 use crate::candidates::{inbound_candidates, outbound_candidates};
+use crate::control::Role;
 use crate::ladder::nominate;
 use crate::link::Link;
 
@@ -35,6 +36,14 @@ pub(crate) struct Attached {
     pub path: PathDescription,
     /// The client's terminal size, from its `ClientHello`.
     pub client_size: TermSize,
+    /// What this attach is for. Always [`Role::Primary`] out of
+    /// [`run_attach_exchange`], which does not know its caller's intent and
+    /// must not need to; the listener overwrites it with the role of the way
+    /// the attach came in.
+    // Read by the session loop from Task 6 (parking a standby); until then
+    // only the tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub role: Role,
 }
 
 /// R4 to R10: a fresh certificate, the STUN/ICE ladder, the hello exchange and
@@ -186,6 +195,7 @@ where
         link: Link::new(connection, endpoint, nomination.socket),
         path,
         client_size: client.size,
+        role: Role::Primary,
     })
 }
 
@@ -328,12 +338,16 @@ where
     }
 }
 
+/// Fixtures more than one module's tests need: this module's own, the
+/// listener's, and anything else that runs an attach exchange.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
+    use oxutrm_host::registry::SessionMeta;
+    use oxutrm_net::NetConfig;
+    use oxutrm_proto::TermSize;
 
     /// A session record as R4 finds it, before any attach.
-    fn fresh_meta(session_id: &str) -> SessionMeta {
+    pub(crate) fn fresh_meta(session_id: &str) -> SessionMeta {
         SessionMeta {
             session_id: session_id.to_owned(),
             attach_id: 0,
@@ -353,8 +367,11 @@ mod tests {
     /// configuration — not a test reaching the internet for a check that has
     /// nothing to do with STUN. It is also what makes these tests fast and
     /// deterministic: with a gather budget in play, "the exchange has
-    /// finished" and "the test looked" stop being reliably ordered.
-    fn stun_free() -> NetConfig {
+    /// finished" and "the test looked" stop being reliably ordered, which is
+    /// how a listener guard once passed under an injected bug — it read
+    /// `meta.json` while the exchange was still probing. Without STUN an
+    /// attempt on a closed pipe fails at once.
+    pub(crate) fn stun_free() -> NetConfig {
         NetConfig {
             stun_servers: vec![],
             enable_port_mapping: false,
@@ -362,6 +379,12 @@ mod tests {
             ..Default::default()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     /// R11 is the caller's, not the exchange's.
     ///
