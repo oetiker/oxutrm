@@ -45,6 +45,20 @@ pub(crate) fn serve_control(
     })
 }
 
+/// Serve control streams on a link that has no door behind it.
+///
+/// A session without a Unix socket (rung 4, whose QUIC runs inside ssh) has
+/// no listener to run a standby's exchange, but its hello still advertised a
+/// control stream: the hello is written before the rung is known. So the
+/// link is served anyway, against a door that is already closed. Probes are
+/// answered; a standby request is refused at once, which the client sees as
+/// its stream ending rather than as silence it would wait on for ever.
+pub(crate) fn serve_control_without_door(conn: quinn::Connection) -> tokio::task::JoinHandle<()> {
+    let (door, closed) = tokio::sync::mpsc::channel(1);
+    drop(closed);
+    serve_control(conn, door)
+}
+
 async fn one_stream(
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -57,8 +71,9 @@ async fn one_stream(
     match first {
         Signal::StandbyRequest => {
             // A busy door is waited for: the door is serial, and the attempt
-            // ahead is bounded by `ATTACH_TIMEOUT`. A closed door (the
-            // listener has gone with its session) drops the stream. The
+            // ahead is bounded by `ATTACH_TIMEOUT`. A closed door (a session
+            // with no listener, see `serve_control_without_door`, or one whose
+            // listener has gone with it) drops the stream at once. The
             // client's search then fails and backs off, which is the whole of
             // the damage.
             let _ = door
@@ -172,5 +187,39 @@ mod tests {
             .expect("the control server stopped serving after a stray stream")
             .expect("the door's sender is gone");
         assert_eq!(req.role, Role::Standby);
+    }
+
+    /// Rung 4 advertises a control stream like every other link, so it has to
+    /// answer one: a standby request ends promptly instead of waiting on a
+    /// door nobody opens, and probes still work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_a_door_a_standby_request_ends_at_once_and_probes_are_answered() {
+        let (host, client) = link_pair().await;
+        let _server = serve_control_without_door(host.sink.connection().clone());
+        let within = std::time::Duration::from_secs(5);
+
+        let (mut send, recv) = client.sink.connection().open_bi().await.unwrap();
+        write_signal_async(&mut send, &Signal::StandbyRequest)
+            .await
+            .unwrap();
+        let mut recv = tokio::io::BufReader::new(recv);
+        let ended = tokio::time::timeout(within, read_signal_async(&mut recv))
+            .await
+            .expect("a standby request with no door behind it was left waiting");
+        assert!(
+            ended.is_err(),
+            "a standby request with no door was answered: {ended:?}"
+        );
+
+        let (mut send, recv) = client.sink.connection().open_bi().await.unwrap();
+        write_signal_async(&mut send, &Signal::Probe { nonce: 3 })
+            .await
+            .unwrap();
+        let mut recv = tokio::io::BufReader::new(recv);
+        let back = tokio::time::timeout(within, read_signal_async(&mut recv))
+            .await
+            .expect("a probe on a doorless link went unanswered")
+            .unwrap();
+        assert!(matches!(back, Signal::ProbeAck { nonce: 3 }), "{back:?}");
     }
 }

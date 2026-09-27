@@ -69,6 +69,8 @@ pub(crate) async fn serve_attaches(
     door_tx: tokio::sync::mpsc::Sender<DoorRequest>,
     tx: tokio::sync::mpsc::Sender<Attached>,
 ) {
+    // A socket attach that pre-empted a standby's exchange, served next.
+    let mut preempting: Option<tokio::net::UnixStream> = None;
     loop {
         // Two ways in, one door. The Unix socket brings ssh-relayed attaches
         // (primary: newest attach wins); a control stream brings a standby.
@@ -78,20 +80,16 @@ pub(crate) async fn serve_attaches(
         //
         // `doors` never closes while this runs, because `door_tx` is held
         // right here; the `Some` pattern is only there to say so.
-        let (reader, writer, role): (
-            Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
-            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-            Role,
-        ) = tokio::select! {
-            r = listener.accept() => match r {
-                Ok((s, _)) => {
-                    let (r, w) = s.into_split();
-                    (Box::new(tokio::io::BufReader::new(r)), Box::new(w), Role::Primary)
-                }
-                // A failed accept is not a reason to stop answering the door.
-                Err(_) => continue,
+        let (reader, writer, role): Pipes = match preempting.take() {
+            Some(s) => primary_pipes(s),
+            None => tokio::select! {
+                r = listener.accept() => match r {
+                    Ok((s, _)) => primary_pipes(s),
+                    // A failed accept is not a reason to stop answering the door.
+                    Err(_) => continue,
+                },
+                Some(d) = doors.recv() => (d.reader, d.writer, d.role),
             },
-            Some(d) = doors.recv() => (d.reader, d.writer, d.role),
         };
 
         // One attach at a time, deliberately. Two concurrent exchanges would
@@ -101,11 +99,30 @@ pub(crate) async fn serve_attaches(
         // Which is exactly why the attempt is bounded: serial and unbounded
         // means one stalled peer closes the door for the life of the session.
         let mut m = meta.lock().await;
-        let outcome = tokio::time::timeout(
+        let exchange = tokio::time::timeout(
             attach_timeout,
             crate::attach_exchange::run_attach_exchange(reader, writer, &mut m, &cfg),
-        )
-        .await;
+        );
+        // A standby gives way to a primary. The standby is an insurance
+        // policy on a link that still works; a socket attach is the client's
+        // ssh rebuild, or a user taking the session over, and either one is
+        // the thing that matters now. A standby whose control stream went
+        // silent would otherwise hold the door for the whole of
+        // `attach_timeout`, longer than a rebuild is prepared to wait. The
+        // dropped attempt is a failed attempt like any other: the registry is
+        // not written and the session never hears of it. A primary is never
+        // pre-empted: newest attach wins among primaries by running in turn.
+        let outcome = if role == Role::Standby {
+            tokio::select! {
+                o = exchange => o,
+                Ok((s, _)) = listener.accept() => {
+                    preempting = Some(s);
+                    continue;
+                }
+            }
+        } else {
+            exchange.await
+        };
         let attached = match outcome {
             Ok(Ok(a)) => a,
             // The attempt failed. The running session is untouched: it never
@@ -145,6 +162,23 @@ pub(crate) async fn serve_attaches(
         // is not held open by a server of its own.
         crate::control::serve_control(conn, door_tx.clone());
     }
+}
+
+/// An attach's two pipes, and what the attach is for.
+type Pipes = (
+    Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    Role,
+);
+
+/// The pipes of an attach that came in over the Unix socket.
+fn primary_pipes(s: tokio::net::UnixStream) -> Pipes {
+    let (r, w) = s.into_split();
+    (
+        Box::new(tokio::io::BufReader::new(r)),
+        Box::new(w),
+        Role::Primary,
+    )
 }
 
 /// Stop answering the door once the shell has exited.
@@ -492,6 +526,92 @@ mod tests {
             "a standby came out of the door as a takeover: it would displace \
              the live link and end the client"
         );
+        task.abort();
+    }
+
+    /// A standby's exchange gives way to an attach over the socket.
+    ///
+    /// The door is serial, and a standby whose control stream went silent
+    /// never errors: without pre-emption it would hold the door for the whole
+    /// of [`ATTACH_TIMEOUT`], ninety seconds, while the client's ssh rebuild —
+    /// the attach that matters — queued behind it. The real timeout is passed
+    /// on purpose, so nothing but pre-emption can free the loop in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_socket_attach_preempts_a_stalled_standby() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sock = dir.path().join("sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
+        let start = fresh_meta("preempt");
+        let guard = std::sync::Arc::new(
+            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
+        );
+        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
+
+        let task = tokio::spawn(serve_attaches(
+            listener,
+            guard,
+            std::sync::Arc::clone(&meta),
+            stun_free(),
+            ATTACH_TIMEOUT,
+            door_rx,
+            door_tx.clone(),
+            tx,
+        ));
+        let within = Duration::from_secs(10);
+
+        // A standby whose peer hears the offer and then says nothing, held
+        // open so nothing about the peer being gone can end the attempt.
+        let (client_side, host_side) = tokio::io::duplex(64 * 1024);
+        let (hr, hw) = tokio::io::split(host_side);
+        door_tx
+            .send(DoorRequest {
+                reader: Box::new(tokio::io::BufReader::new(hr)),
+                writer: Box::new(hw),
+                role: Role::Standby,
+            })
+            .await
+            .unwrap();
+        let (cr, _cw) = tokio::io::split(client_side);
+        let mut cr = tokio::io::BufReader::new(cr);
+        // Before: the standby's exchange is under way, holding the door.
+        let offer =
+            tokio::time::timeout(within, oxutrm_host::signalling::read_signal_async(&mut cr))
+                .await
+                .expect("the standby's exchange never started")
+                .expect("the standby's exchange sent something that is not a Signal");
+        assert!(
+            matches!(offer, oxutrm_proto::Signal::HostHello { .. }),
+            "{offer:?}"
+        );
+
+        // After: a socket attach gets through anyway, and as a primary.
+        let stream = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connecting to the session socket");
+        let (sr, sw) = stream.into_split();
+        tokio::time::timeout(
+            within,
+            crate::connect::establish(
+                tokio::io::BufReader::new(sr),
+                sw,
+                oxutrm_proto::TermSize { cols: 80, rows: 24 },
+                &stun_free(),
+                None,
+            ),
+        )
+        .await
+        .expect(
+            "the socket attach waited behind a stalled standby: the rebuild \
+             it stands for would queue for the whole attach timeout",
+        )
+        .expect("the socket attach completes");
+        let attached = tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("the socket attach never reached the session")
+            .expect("the listener dropped its sender");
+        assert_eq!(attached.role, Role::Primary);
         task.abort();
     }
 

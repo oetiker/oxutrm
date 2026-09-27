@@ -170,9 +170,12 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         ));
         Some((task, attach_rx))
     } else {
-        // No socket, so no listener to run a standby's exchange: no control
-        // server either. Such a session (rung 4, whose QUIC runs inside ssh)
-        // has nothing a standby could outlive it through.
+        // No socket, so no listener to run a standby's exchange. Such a
+        // session (rung 4, whose QUIC runs inside ssh) has nothing a standby
+        // could outlive it through, but its hello advertised a control stream
+        // all the same, so the link still serves one: probes are answered and
+        // a standby request is refused at once rather than left waiting.
+        crate::control::serve_control_without_door(attached.link.sink.connection().clone());
         None
     };
 
