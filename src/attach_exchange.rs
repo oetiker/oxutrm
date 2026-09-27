@@ -40,9 +40,6 @@ pub(crate) struct Attached {
     /// [`run_attach_exchange`], which does not know its caller's intent and
     /// must not need to; the listener overwrites it with the role of the way
     /// the attach came in.
-    // Read by the session loop from Task 6 (parking a standby); until then
-    // only the tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub role: Role,
 }
 

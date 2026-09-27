@@ -413,7 +413,9 @@ impl HostSession {
     /// [`HostSession::run`], plus a second inbound connection completing an
     /// attach exchange elsewhere in the process. Carries the whole
     /// [`crate::attach_exchange::Attached`] rather than just the [`Link`],
-    /// because [`HostSession::adopt`] needs the size as well.
+    /// because [`HostSession::adopt`] needs the size and
+    /// [`HostSession::on_attached`] the role: a primary is adopted at once, a
+    /// standby is parked until the client's first frame arrives on it.
     ///
     /// The descriptors are duplicated out of the terminal before the loop so
     /// the arms borrow locals rather than `self`, which is what lets the body
@@ -443,17 +445,34 @@ impl HostSession {
 
         // A frame taken off the source by the select, owed to the next turn.
         let mut pending: Option<Frame> = None;
+        // The client's parked standby (spec §3.5): a link held, not used,
+        // until the client's first frame arrives on it. A local rather than a
+        // field so the arm watching it borrows the loop, not `self` (C1).
+        let mut standby: Option<Link> = None;
+        // A standby whose first frame has arrived, owed to the next turn with
+        // that frame. `promote_standby` does the reset and the feed together,
+        // in that order.
+        let mut promote: Option<(Link, Frame)> = None;
         // The exit wake fired but `child_exited` disagreed. It is edge
         // triggered and will not fire twice, so re-check on a timer instead of
         // trusting the hint — the same rule that keeps PTY EOF out of this.
         let mut recheck_child = false;
 
         loop {
-            let turn = match pending.take() {
-                None => self.turn()?,
-                Some(frame) => self.turn_with(Some(frame))?,
+            let turn = match (promote.take(), pending.take()) {
+                // `pending` is always empty here: a lap sets one or the other.
+                (Some((link, first)), _) => self
+                    .promote_standby(link, first)
+                    .context("switching to the standby")?,
+                (None, None) => self.turn()?,
+                (None, Some(frame)) => self.turn_with(Some(frame))?,
             };
             if let Some(code) = turn.exited {
+                // Closed, not dropped: its control server holds the
+                // connection open for as long as it is not.
+                if let Some(parked) = standby.take() {
+                    close_as_exited(parked.sink.connection(), code);
+                }
                 self.finish(code).await;
                 return Ok(code);
             }
@@ -519,16 +538,28 @@ impl HostSession {
                 // arm rather than making it hot — the same reason there is no
                 // `conn.closed()` arm above.
                 Some(a) = attaches.recv() => HostWake::Attached(a),
+                // A parked standby carries nothing until the client fails
+                // over onto it, so this arm is quiet until it matters. A
+                // closed one yields `None` once, and is then un-parked.
+                f = async { standby.as_mut().expect("armed").source.recv().await },
+                    if standby.is_some() => match f {
+                        Some(frame) => HostWake::StandbyFrame(frame),
+                        None => HostWake::StandbyGone,
+                    },
             };
 
             match wake {
                 HostWake::Frame(frame) => pending = Some(frame),
                 HostWake::Exit => recheck_child = true,
                 HostWake::Pty | HostWake::Due => {}
-                HostWake::Attached(a) => {
-                    self.adopt(a.link, a.client_size)
-                        .context("adopting a second attach")?;
+                HostWake::Attached(a) => self.on_attached(a, &mut standby)?,
+                HostWake::StandbyFrame(frame) => {
+                    let link = standby.take().expect("the arm was armed");
+                    promote = Some((link, frame));
                 }
+                // Its connection is already closed, which is what ended the
+                // source; there is nothing left to close.
+                HostWake::StandbyGone => standby = None,
             }
         }
     }
@@ -580,11 +611,7 @@ impl HostSession {
     /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
     /// decoration. See its own note.
     pub fn close(&self, code: i32) {
-        let code = u32::try_from(code).unwrap_or(255);
-        self.link
-            .sink
-            .connection()
-            .close(quinn::VarInt::from_u32(code), SHELL_EXITED);
+        close_as_exited(self.link.sink.connection(), code);
     }
 
     /// The authoritative screen, for tests. Nothing in the session loop reads
@@ -600,13 +627,20 @@ impl HostSession {
     /// first datagram of the new attach is a full state. `screen_stale` is
     /// what forces that snapshot on the next turn.
     pub fn adopt(&mut self, link: Link, size: TermSize) -> Result<()> {
+        self.adopt_as(link, size, TAKEN_OVER)
+    }
+
+    /// [`HostSession::adopt`], closing the displaced link with `reason`:
+    /// [`TAKEN_OVER`] for a newer attach, [`SWITCHED`] for the client's own
+    /// standby.
+    pub fn adopt_as(&mut self, link: Link, size: TermSize, reason: &'static [u8]) -> Result<()> {
         // Close the displaced connection FIRST, and say why. A displaced
         // client that is merely dropped reports silence, which is the one
         // thing that did not happen.
         self.link
             .sink
             .connection()
-            .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
+            .close(quinn::VarInt::from_u32(0), reason);
 
         self.link = link;
         // `resize`, not `self.size = size`. The field means "the size the
@@ -640,6 +674,65 @@ impl HostSession {
         self.last_heard = Instant::now();
         Ok(())
     }
+
+    /// One completed attach, by role. `standby` is the loop's local slot.
+    ///
+    /// Every link this lets go of is closed, and with a reason: a dropped
+    /// link is not closed at all, because its control server holds a handle
+    /// to the connection for as long as the connection is open.
+    pub(crate) fn on_attached(
+        &mut self,
+        a: crate::attach_exchange::Attached,
+        standby: &mut Option<Link>,
+    ) -> Result<()> {
+        match a.role {
+            crate::control::Role::Primary => {
+                // A takeover. The standby belongs to the displaced client, and
+                // leaving it parked would let that client take the session back
+                // by failing over onto it, without going through ssh.
+                if let Some(old) = standby.take() {
+                    old.sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
+                }
+                self.adopt(a.link, a.client_size)
+                    .context("adopting a second attach")
+            }
+            crate::control::Role::Standby => {
+                // One slot. A newer standby supersedes the older one.
+                if let Some(old) = standby.replace(a.link) {
+                    old.sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), SWITCHED);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The client has failed over: its first frame arrived on the parked
+    /// standby. Adopt the standby, then take that frame in, in one turn.
+    ///
+    /// Reset first, THEN feed. `adopt_as` restarts the input receiver at a
+    /// fresh generation, and the client's first frame after its own reset
+    /// belongs to that generation. Fed first, it would meet the old
+    /// generation's receiver, be taken for a stale frame and thrown away.
+    ///
+    /// The size is the session's current one. The client's frame carries its
+    /// real size in `InputState`, and `turn_at` reconciles it.
+    pub(crate) fn promote_standby(&mut self, link: Link, first: Frame) -> Result<Turn> {
+        let size = self.size;
+        self.adopt_as(link, size, SWITCHED)?;
+        self.turn_with(Some(first))
+    }
+}
+
+/// Close `conn` saying the shell exited, with `code` as its status.
+///
+/// A code outside `u32` cannot come from a shell; see [`HostSession::close`].
+fn close_as_exited(conn: &quinn::Connection, code: i32) {
+    let code = u32::try_from(code).unwrap_or(255);
+    conn.close(quinn::VarInt::from_u32(code), SHELL_EXITED);
 }
 
 /// What woke [`ClientSession::run_on`].
@@ -690,6 +783,10 @@ enum HostWake {
     /// A second attach completed. Carries the whole thing, because the
     /// session needs the size as well as the link.
     Attached(crate::attach_exchange::Attached),
+    /// A frame arrived on the parked standby: the client has failed over.
+    StandbyFrame(Frame),
+    /// The parked standby's connection is gone.
+    StandbyGone,
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -728,6 +825,11 @@ pub const SHELL_EXITED: &[u8] = b"the shell exited";
 /// Read by the displaced client so it can say it was taken over rather than
 /// reporting silence. Spec §6; the `Displaced` state itself is B4.
 pub const TAKEN_OVER: &[u8] = b"taken over by a newer attach";
+
+/// The close reason for a primary replaced by its own client's standby
+/// (spec §3.5). Not `TAKEN_OVER`: nobody else took anything, and the client
+/// must not read its own failover as a displacement.
+pub const SWITCHED: &[u8] = b"switched to the standby link";
 
 /// Why the client closed a link of its own: it built a better one.
 ///
@@ -4563,6 +4665,250 @@ mod tests {
             panic!("the replaced connection ended with {reason:?}, not an application close");
         };
         assert_eq!(closed.reason.as_ref(), REBUILT);
+    }
+
+    /// A completed standby attach, as the listener hands it to the loop.
+    fn standby_attached(link: Link) -> crate::attach_exchange::Attached {
+        crate::attach_exchange::Attached {
+            link,
+            path: path_of(Rung::StunPunch, 30, 1400, 4, NatType::Unknown),
+            client_size: size(),
+            role: crate::control::Role::Standby,
+        }
+    }
+
+    /// The application close a connection ended with, as its peer saw it,
+    /// within five seconds.
+    async fn closed_as(conn: &quinn::Connection) -> quinn::ConnectionError {
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the connection was never closed")
+    }
+
+    fn closed_with(reason: &quinn::ConnectionError, phrase: &[u8]) -> bool {
+        matches!(
+            reason,
+            quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == phrase
+        )
+    }
+
+    /// A standby is parked, not adopted: the client did not ask to switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_is_parked_and_the_primary_is_left_alone() {
+        let (mut host, _client) = pair("").await;
+        let (standby_host, _standby_client) = crate::link::fixtures::link_pair().await;
+        let primary = host.link.sink.connection().stable_id();
+        let parked = standby_host.sink.connection().stable_id();
+        let mut slot = None;
+
+        host.on_attached(standby_attached(standby_host), &mut slot)
+            .unwrap();
+
+        assert_eq!(
+            slot.as_ref()
+                .map(|l: &Link| l.sink.connection().stable_id()),
+            Some(parked),
+            "the standby was not parked"
+        );
+        assert_eq!(
+            host.link.sink.connection().stable_id(),
+            primary,
+            "parking a standby swapped the primary"
+        );
+        assert!(
+            host.link.sink.connection().close_reason().is_none(),
+            "parking a standby closed the primary"
+        );
+    }
+
+    /// One slot: a newer standby supersedes the parked one, and the one it
+    /// supersedes is closed rather than merely dropped (its control server
+    /// holds the connection open otherwise).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_newer_standby_replaces_the_parked_one_and_closes_it() {
+        let (mut host, _client) = pair("").await;
+        let (older_host, older_client) = crate::link::fixtures::link_pair().await;
+        let (newer_host, _newer_client) = crate::link::fixtures::link_pair().await;
+        let newer = newer_host.sink.connection().stable_id();
+        let mut slot = None;
+        host.on_attached(standby_attached(older_host), &mut slot)
+            .unwrap();
+        assert!(
+            older_client.sink.connection().close_reason().is_none(),
+            "the older standby was closed before anything replaced it"
+        );
+
+        host.on_attached(standby_attached(newer_host), &mut slot)
+            .unwrap();
+
+        assert_eq!(
+            slot.as_ref()
+                .map(|l: &Link| l.sink.connection().stable_id()),
+            Some(newer),
+            "the slot does not hold the newer standby"
+        );
+        let reason = closed_as(older_client.sink.connection()).await;
+        assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+    }
+
+    /// A takeover drops the displaced client's standby. Left parked, it would
+    /// let that client take the session back by failing over onto it,
+    /// without going through ssh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_primary_attach_drops_the_parked_standby() {
+        let (mut host, _client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        let (newcomer_host, _newcomer_client) = crate::link::fixtures::link_pair().await;
+        let newcomer_id = newcomer_host.sink.connection().stable_id();
+        let mut slot = None;
+        host.on_attached(standby_attached(standby_host), &mut slot)
+            .unwrap();
+        assert!(slot.is_some(), "the fixture parked nothing");
+
+        let mut newcomer = standby_attached(newcomer_host);
+        newcomer.role = crate::control::Role::Primary;
+        host.on_attached(newcomer, &mut slot).unwrap();
+
+        assert!(
+            slot.is_none(),
+            "a takeover kept the displaced client's standby"
+        );
+        assert_eq!(
+            host.link.sink.connection().stable_id(),
+            newcomer_id,
+            "the primary attach was not adopted"
+        );
+        let reason = closed_as(standby_client.sink.connection()).await;
+        assert!(is_takeover(&reason), "closed as {reason:?}");
+    }
+
+    /// The old primary is told it was switched away from, not taken over:
+    /// nobody else took anything, and the client must not read its own
+    /// failover as a displacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promoting_the_standby_closes_the_primary_as_switched() {
+        let (mut host, client) = pair("").await;
+        let (standby_host, _standby_client) = crate::link::fixtures::link_pair().await;
+
+        host.adopt_as(standby_host, size(), SWITCHED).unwrap();
+
+        let reason = closed_as(client.link.sink.connection()).await;
+        assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+    }
+
+    /// The first frame on the standby is fed AFTER the reset, and so applies
+    /// on the very turn that promotes it.
+    ///
+    /// The old generation is driven past the frame's sequence number first:
+    /// against it, the client's first post-reset frame is stale and would be
+    /// ignored. So a promotion that fed the frame before resetting would take
+    /// it in as nothing, and this is the test that notices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promoting_the_standby_resets_before_it_feeds_the_first_frame() {
+        let (mut host, mut client) = pair("").await;
+        let (mut standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+
+        // Move the old generation on, a keystroke at a time.
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.input_rx.state().seq() < 4 {
+            assert!(Instant::now() < deadline, "the old generation never moved");
+            client.turn(b" ", &mut out).expect("a keystroke");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            host.turn().expect("a host turn");
+        }
+
+        // The client fails over and types: its first frame, new generation.
+        client
+            .swap_in(standby_client, Instant::now())
+            .expect("swapping onto the standby");
+        client.turn(b"x", &mut out).expect("typing on the standby");
+        let first = tokio::time::timeout(Duration::from_secs(5), standby_host.source.recv())
+            .await
+            .expect("no frame on the standby")
+            .expect("the standby closed");
+        assert!(
+            first.my_state < host.input_rx.state().seq(),
+            "the fixture cannot tell the orders apart: frame {} is not stale \
+             against the old generation at {}",
+            first.my_state,
+            host.input_rx.state().seq()
+        );
+
+        let turn = host
+            .promote_standby(standby_host, first.clone())
+            .expect("promoting the standby");
+
+        assert_eq!(
+            turn.applied, 1,
+            "the first frame on the standby was not applied on the turn that promoted it"
+        );
+        assert_eq!(
+            host.input_rx.ack(),
+            first.my_state,
+            "the host does not acknowledge the standby's first frame"
+        );
+    }
+
+    /// The whole loop: a standby parked through the attach channel is adopted
+    /// when the client's first frame arrives on it, and that frame's typing
+    /// reaches the shell.
+    ///
+    /// The screen text is the evidence. The client's screen restarts blank
+    /// when it swaps, it reads only the standby from then on, and the host
+    /// only sends on a link it has adopted -- so output of the typed command
+    /// on that screen can only have come over the promoted standby. The
+    /// printf's own argument does not contain the marker; only its output
+    /// does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_frame_on_a_standby_adopts_it_and_is_applied() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        let (attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+
+        attach_tx
+            .send(standby_attached(standby_host))
+            .await
+            .expect("the host loop is gone");
+
+        client
+            .swap_in(standby_client, Instant::now())
+            .expect("swapping onto the standby");
+        assert!(!text(client.screen()).contains("standby-ok"));
+
+        let mut out = Vec::new();
+        client
+            .turn(b"printf 'standby-%s\\n' ok\n", &mut out)
+            .expect("typing on the standby");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !text(client.screen()).contains("standby-ok") {
+            assert!(
+                Instant::now() < deadline,
+                "the typing never came back over the standby; screen:\n{}",
+                text(client.screen())
+            );
+            client.turn(&[], &mut out).expect("a client turn");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        // And the session goes on over it, to the shell's own end.
+        client
+            .turn(b"exit 7\n", &mut out)
+            .expect("typing on the standby");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !host_loop.is_finished() {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            // The close ends the client's turns with an error; the host's
+            // status is the thing asserted.
+            let _ = client.turn(&[], &mut out);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert_eq!(
+            host_loop.await.expect("host task").expect("host loop"),
+            7,
+            "the shell did not exit through the standby"
+        );
     }
 
     /// Every word a notice puts on the screen: headline, body and key list.
