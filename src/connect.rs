@@ -253,6 +253,12 @@ pub(crate) struct Established {
     /// Which attach generation this is. Both `seq` counters restart at 1 per
     /// attach, so a rebuild has to name the one it is resuming from.
     pub attach_id: u64,
+    /// What the host said it can do. The session searches for a standby only
+    /// when this contains `FEATURE_STANDBY`.
+    // Read in production only from Task 8 (the standby search); until then
+    // only the tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub host_features: Vec<String>,
 }
 
 /// L4 to L10: one socket, the hello exchange, the ICE ladder and the QUIC
@@ -395,6 +401,7 @@ where
         path,
         session_id: host.session_id,
         attach_id: host.attach_id,
+        host_features: host.features,
     })
 }
 
@@ -472,6 +479,8 @@ struct HostFacts {
     host_spki: HostSpki,
     candidates: Vec<Candidate>,
     nat: NatType,
+    /// What the host said it can do. Not secret.
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for HostFacts {
@@ -489,6 +498,7 @@ impl std::fmt::Debug for HostFacts {
             .field("host_spki", &self.host_spki)
             .field("candidates", &self.candidates)
             .field("nat", &self.nat)
+            .field("features", &self.features)
             .finish_non_exhaustive()
     }
 }
@@ -503,6 +513,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             cert_spki_sha256,
             candidates,
             nat_type,
+            features,
             ..
         } => Ok(HostFacts {
             session_id,
@@ -511,6 +522,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             host_spki: cert_spki_sha256,
             candidates,
             nat: nat_type,
+            features,
         }),
         // The host's own words. It is the only explanation there is for why
         // this connection is not going to happen, and it is the sentence the
@@ -730,6 +742,14 @@ mod tests {
             },
             "the host must carry the client's size out of the exchange, not the size the session already had"
         );
+        assert!(
+            client
+                .host_features
+                .iter()
+                .any(|f| f == oxutrm_proto::FEATURE_STANDBY),
+            "a current host offers a standby: {:?}",
+            client.host_features
+        );
     }
 
     /// Landing in a two-day-old session and being told nothing about it is
@@ -789,6 +809,25 @@ mod tests {
         assert_eq!(facts.host_spki, HostSpki::new([1u8; 32]));
         assert_eq!(facts.nat, NatType::AddressDependent);
         assert_eq!(facts.candidates.len(), 1);
+    }
+
+    #[test]
+    fn the_offer_carries_the_hosts_features_through() {
+        // Before: the fixture's own default is empty, so a `host_facts` that
+        // hardcoded a non-empty answer regardless of the wire would already
+        // be caught here, before the mutated case below is even reached.
+        let before = host_facts(a_host_hello()).expect("a hello is an offer");
+        assert_eq!(before.features, Vec::<String>::new());
+
+        let mut hello = a_host_hello();
+        if let Signal::HostHello { features, .. } = &mut hello {
+            *features = vec![oxutrm_proto::FEATURE_STANDBY.to_string()];
+        }
+        let facts = host_facts(hello).unwrap();
+        assert_eq!(
+            facts.features,
+            vec![oxutrm_proto::FEATURE_STANDBY.to_string()]
+        );
     }
 
     /// A host that gives up says why, and the reason is the only explanation
