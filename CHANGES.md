@@ -94,7 +94,9 @@
 
   The two-uplink network-namespace test the design describes (§7) is not
   written; failover here is covered by the in-process relay test and a hand
-  test on real hardware instead.
+  test on 2026-10-03: a Mac client attached to a Linux host over a
+  split-tunnel VPN kept its session when the VPN was dropped, moving to the
+  standby without ssh. The stall was not timed.
 
 ### Compatibility
 
