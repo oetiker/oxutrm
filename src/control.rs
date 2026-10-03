@@ -14,7 +14,7 @@
 //! conversation as well.
 
 // This runs while a client session owns the screen: nothing here may print,
-// or it lands raw on the painted raw-mode terminal (Task A).
+// or it lands raw on the painted raw-mode terminal.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
 use oxutrm_host::signalling::{read_signal_async, write_signal_async};

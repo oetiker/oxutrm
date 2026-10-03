@@ -35,6 +35,10 @@
 //! its own; two probes seconds apart on an unchanged machine gave 49974 and
 //! 57050. Comparing ports would make every probe a route change.
 
+// This runs while a client session owns the screen: nothing here may print,
+// or it lands raw on the painted raw-mode terminal.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 

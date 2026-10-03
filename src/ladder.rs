@@ -47,7 +47,7 @@
 //! detachability. Nomination ends; the caller takes the socket from here.
 
 // It runs at connect time, which can be before a client session owns a
-// screen, but also as a standby search run WHILE one does (Task A): nothing
+// screen, but also as a standby search run WHILE one does: nothing
 // here may print.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
@@ -531,7 +531,7 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
     let result = birthday_blast(ladder.psk, ladder.role, base, ladder.cfg).await;
     let found = match result {
         Ok(BlastOutcome::Found(found)) => found,
-        // The miss carries its own numbers now (Task A): this text is the
+        // The miss carries its own numbers now: this text is the
         // rung's verdict, printed at connect time before any session owns a
         // screen, so showing them here is still safe.
         Ok(BlastOutcome::Miss(miss)) => return Err(Verdict::Failed(miss.to_string())),
@@ -984,7 +984,7 @@ mod tests {
     }
 
     /// A miss, not a win: `blast`'s `Verdict::Failed` text must carry the
-    /// numbers behind it (Task A), because this is printed at connect time,
+    /// numbers behind it, because this is printed at connect time,
     /// before any session owns a screen -- the one place the numbers may
     /// still show up raw.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,6 +21,10 @@
 //! must never panic and never block beyond a nonblocking UDP bind+connect --
 //! exactly what `route_source` does and nothing more.
 
+// This runs while a client session owns the screen: nothing here may print,
+// or it lands raw on the painted raw-mode terminal.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::net::{IpAddr, SocketAddr};
 
 use oxutrm_net::RemoteFilter;

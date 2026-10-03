@@ -40,7 +40,7 @@
 
 // The client half of this module runs while it owns the screen: nothing on
 // that path may print, or it lands raw on the painted raw-mode terminal
-// (Task A). The one deliberate exception, on the host's own stderr, is
+//. The one deliberate exception, on the host's own stderr, is
 // `#[expect]`-ed at its call site.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 

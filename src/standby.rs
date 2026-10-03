@@ -9,7 +9,7 @@
 //! ends (spec §3.4), which is the price of keeping its path warm.
 
 // This runs while a client session owns the screen: nothing here may print,
-// or it lands raw on the painted raw-mode terminal (Task A). A search's
+// or it lands raw on the painted raw-mode terminal. A search's
 // failure reason is kept on `last_failure`, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
@@ -503,6 +503,7 @@ mod tests {
         let stale = search_at(&mut s, t0 + STANDBY_DELAY);
         let t1 = t0 + STANDBY_DELAY + Duration::from_secs(1);
         s.forget(t1);
+        assert_eq!(s.last_failure(), None, "the fixture started with a reason");
 
         s.not_found(stale, t1, "this must not be kept".to_string());
 

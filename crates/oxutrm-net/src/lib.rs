@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 // A miss or a rejection here must come back as data, never land raw on
-// whoever's screen the caller may own (Task A). Tests print SKIP lines on a
+// whoever's screen the caller may own. Tests print SKIP lines on a
 // host that lacks some fixture, so the deny does not apply to them.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 

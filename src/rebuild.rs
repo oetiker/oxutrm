@@ -13,7 +13,7 @@
 
 // A rebuild attempt runs while the client session it is rebuilding already
 // owns the screen: nothing here may print, or it lands raw on the painted
-// raw-mode terminal (Task A). `AttemptOutcome::Retry`'s reason is shown
+// raw-mode terminal. `AttemptOutcome::Retry`'s reason is shown
 // through the notice, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 

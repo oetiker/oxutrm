@@ -121,9 +121,10 @@ pub fn guessed_ports(base: u16, count: u16) -> Vec<u16> {
 /// Fire authenticated checks from many sockets at many guessed ports, and
 /// return the first socket that gets a valid answer.
 ///
-/// `Ok(BlastOutcome::Miss(_))` means the budget expired without a hole — an
-/// ordinary outcome for this rung, not an error, carrying the numbers behind
-/// it. `Err` means the blast could not start at all.
+/// `Ok(BlastOutcome::Miss(_))` means no hole was found — an ordinary outcome
+/// for this rung, not an error, carrying the numbers behind it. Usually the
+/// budget expired; with `enable_birthday` off nothing is sent and the miss is
+/// all zeros. `Err` means the blast could not start at all.
 pub async fn birthday_blast(
     psk: &Psk,
     role: IceRole,
@@ -225,7 +226,7 @@ pub async fn birthday_blast(
 
     // What was tried. "NAT traversal failed" with no numbers cannot be acted
     // on by whoever has to debug it -- but this no longer prints it: the
-    // caller may own a screen it must not write over (Task A), so the numbers
+    // caller may own a screen it must not write over, so the numbers
     // travel in the return value instead.
     Ok(BlastOutcome::Miss(BlastMiss {
         probes,
@@ -453,25 +454,17 @@ mod tests {
     fn a_miss_carries_its_numbers() {
         let base: SocketAddr = "203.0.113.7:40000".parse().unwrap();
         let miss = BlastMiss {
-            probes: 37,
-            sockets: 4,
-            ports: 32,
+            probes: 3701,
+            sockets: 41,
+            ports: 3202,
             base,
             budget: Duration::from_secs(6),
         };
 
-        assert_eq!(miss.probes, 37);
-        assert_eq!(miss.sockets, 4);
-        assert_eq!(miss.ports, 32);
-        assert_eq!(miss.base, base);
-
-        let shown = miss.to_string();
-        assert!(shown.contains("37"), "probes missing from {shown:?}");
-        assert!(shown.contains('4'), "sockets missing from {shown:?}");
-        assert!(shown.contains("32"), "ports missing from {shown:?}");
-        assert!(
-            shown.contains("203.0.113.7:40000"),
-            "base missing from {shown:?}"
+        assert_eq!(
+            miss.to_string(),
+            "birthday blast found no path: 3701 probes from 41 sockets across \
+             3202 ports around 203.0.113.7:40000 in 6s"
         );
     }
 

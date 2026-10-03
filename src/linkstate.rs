@@ -4,6 +4,10 @@
 //! `Instant` as a parameter rather than reading the clock, which is what lets
 //! the whole state machine be tested without sleeping.
 
+// This runs while a client session owns the screen: nothing here may print,
+// or it lands raw on the painted raw-mode terminal.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::time::{Duration, Instant};
 
 /// How long a reply may be owed before the user is told. Below this a blip
