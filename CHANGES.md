@@ -65,6 +65,30 @@
   cleanly and the box says why, which is the deliberate half of this until the
   askpass work lands. An agent coming back is a real way it resolves.
 
+- **The client keeps a second, warm connection to the session, and fails over
+  to it.** While a link is up, the client builds a standby: a second QUIC
+  connection over whatever path the kernel would route through a different
+  local source address than the primary — a split-tunnel VPN next to the open
+  internet, say. The ten-second QUIC keep-alive that already holds a punched
+  NAT mapping open keeps this one warm too, at no cost while nothing is wrong.
+  When the primary goes silent and the standby still answers, the client fails
+  over to it about three seconds in, with no ssh and no new handshake prompt —
+  never because the standby is faster, only because the primary has stopped
+  answering, and there is no switching back once it has. A host advertises the
+  capability with `features: ["control", "standby"]` in its hello; an older
+  host omits it and the client falls back to the twenty-second ssh rebuild
+  exactly as before.
+
+  The filter that keeps the standby off the primary's own path compares
+  kernel-reported source addresses, not interfaces (`src/egress.rs`): a
+  dual-stack or multi-address NIC can still hand both connections the same
+  physical wire under different addresses, so the standby can share the fate
+  of the primary it was meant to replace. There is no detection for that case.
+
+  The two-uplink network-namespace test the design describes (§7) is not
+  written; failover here is covered by the in-process relay test and a hand
+  test on real hardware instead.
+
 ### Compatibility
 
 - **Both ends have to be upgraded together.** The client now runs
@@ -80,12 +104,11 @@
 ### Changed
 
 - **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
-  carry a `features` list — empty today except for the host, which already
-  advertises `control` and `standby` ahead of the work that reads them.
-  Absent on either side, it is read as "nothing", so an older peer on the
-  other end of the exchange is unaffected and there is no `PROTO_VERSION`
-  bump. Three new signals, `StandbyRequest`, `Probe` and `ProbeAck`, are
-  defined for that same upcoming work and are not sent by anything yet.
+  carry a `features` list — empty today except for the host, which advertises
+  `control` and `standby`. Absent on either side, it is read as "nothing", so
+  an older peer on the other end of the exchange is unaffected and there is no
+  `PROTO_VERSION` bump. Three signals, `StandbyRequest`, `Probe` and
+  `ProbeAck`, are what the standby link above sends over the wire.
 
 ### Fixed
 

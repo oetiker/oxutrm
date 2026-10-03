@@ -18,6 +18,38 @@
 2. **The failover clock** (spec §3.5). The probe is sent on the first lap in `Silent` (2 s after a reply became owed). Failover happens `FAILOVER_GRACE` (1 s) after the probe was *sent*, provided it was answered. That is 3 s after the reply became owed, the spec's `FAILOVER_AFTER`, without a second clock.
 3. **The netns end-to-end test of spec §7 is not in this plan.** The netns harness (`crates/oxutrm-net/tests/netns.rs`) lives in `oxutrm-net` and cannot reach the root crate's session code. A two-uplink topology driving the real binary is its own piece of work. This plan proves the failover with the in-process `Relay` fixture, which really drops packets, plus a hand test on `thinlinc` (Task 10). The netns test is recorded as follow-up work in `CHANGES.md`.
 
+**Deviations accepted during execution (2026-10-03):**
+
+(a) **One stream per control conversation, not spec §2's single control
+stream.** `request_standby` and `probe` (`src/control.rs`) each `open_bi()`
+their own fresh bidirectional stream rather than sharing one persistent
+control stream per link — simpler than multiplexing conversations onto one
+stream, and QUIC streams are cheap.
+
+(b) **The remote filter is enforced at nomination, not before `add_remote`.**
+`IceAgent::add_remote` (`crates/oxutrm-net/src/ice.rs:148`) admits every
+candidate unfiltered; `remote_filter` is applied only in `best_validated`
+(`ice.rs:357`), when a candidate is about to be nominated — so a filtered
+candidate is still tracked and validated, just never chosen.
+
+(c) **Probe retry, and failover while `Recovering` without a rebuild attempt in
+flight, beyond the spec's `Silent`-only failover (§3.5).** `Standby::step`
+(`src/standby.rs`) re-probes after `PROBE_RETRY` on a failed probe rather than
+asking once, and `failover_due` (`src/linkstate.rs`) fires on
+`Phase::is_outage()` — `Silent` or `Recovering` — gated by the caller on no
+rebuild attempt being in flight (ruling B1), rather than `Silent` alone.
+
+(d) **The host promotes the standby through `promote_standby`, adopting and
+feeding the first frame in one call.** `ClientSession`'s host-side counterpart
+(`src/session.rs:723`) resets the sequence counters and processes the
+triggering frame together, rather than as two separately observable steps.
+
+(e) **A superseded parked standby closes with `SUPERSEDED`, not `SWITCHED`.**
+`SWITCHED` (`src/session.rs:837`) means a client's own promoted standby;
+`SUPERSEDED` (`src/session.rs:841`) means a newer standby replaced a parked
+one that was never used — the host tells the two apart (`session.rs:706`) so a
+displaced standby's connection is not misread as a failover that happened.
+
 ## Global Constraints
 
 Every task's requirements include these.
