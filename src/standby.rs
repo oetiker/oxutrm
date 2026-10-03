@@ -4,7 +4,9 @@
 //! State only. The work (searching, probing) runs in spawned tasks that
 //! report back through a channel the session loop holds as a local (C1), and
 //! the loop calls `step` on the laps it already takes. So nothing here holds a
-//! timer: an idle session with a healthy standby costs no wakeups (19cc001).
+//! timer and the loop gains no wakeups (19cc001). The standby link itself
+//! does: like every link, its QUIC keep-alive fires every ten seconds on both
+//! ends (spec §3.4), which is the price of keeping its path warm.
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -17,13 +19,35 @@ use crate::link::Link;
 use crate::linkstate::{
     PROBE_RETRY, Phase, ProbeState, STANDBY_DELAY, failover_due, standby_backoff,
 };
+use crate::session::{REBUILT, SHELL_EXITED, TAKEN_OVER};
+
+/// Why the client closed a standby that a search found for a primary which
+/// has since been replaced. Local, like [`REBUILT`]: the host just drops it.
+const STALE: &[u8] = b"found for a link that has since been replaced";
+
+/// Close a link the standby lets go of. Dropping a `Link` does not close its
+/// connection: its source's tasks hold clones of it.
+fn close(link: &Link, reason: &'static [u8]) {
+    link.sink
+        .connection()
+        .close(quinn::VarInt::from_u32(0), reason);
+}
 
 /// What a spawned search or probe reports back to the loop.
+///
+/// A search's result carries the `search` number `step` handed out with
+/// [`StandbyAction::Search`], so one that outlived the primary it ran over
+/// is recognised as stale (see [`Standby::forget`]).
 pub(crate) enum StandbyEvent {
-    Found(Box<Established>),
+    Found {
+        search: u64,
+        e: Box<Established>,
+    },
     /// The search failed. Why is not kept: the user is told only that there
     /// is no standby (spec §3.7), and the next search asks again anyway.
-    NotFound,
+    NotFound {
+        search: u64,
+    },
     Probed {
         answered: bool,
     },
@@ -34,8 +58,10 @@ pub(crate) enum StandbyEvent {
 pub(crate) enum StandbyAction {
     Nothing,
     /// Spawn `control::request_standby` against the primary, reporting
-    /// `Found`/`NotFound`.
-    Search,
+    /// `Found`/`NotFound` with this `search` number.
+    Search {
+        search: u64,
+    },
     /// Spawn `control::probe` against the standby, reporting `Probed`.
     Probe {
         nonce: u64,
@@ -53,6 +79,10 @@ pub(crate) struct Standby {
     pub(crate) admit_for: fn(SocketAddr) -> Option<RemoteFilter>,
     link: Option<(Link, PathDescription)>,
     searching: bool,
+    /// The number of the search whose result is still wanted. Moved on by
+    /// every search started and by every change of primary, so a result
+    /// from a search that ran over an earlier primary matches nothing.
+    search: u64,
     failures: u32,
     next_search: Instant,
     probe: ProbeState,
@@ -70,6 +100,7 @@ impl Standby {
             admit_for: crate::egress::avoiding_source,
             link: None,
             searching: false,
+            search: 0,
             failures: 0,
             next_search: now + STANDBY_DELAY,
             probe: ProbeState::Idle,
@@ -114,7 +145,10 @@ impl Standby {
             self.probe = ProbeState::Idle;
             if self.link.is_none() && !self.searching && now >= self.next_search {
                 self.searching = true;
-                return StandbyAction::Search;
+                self.search = self.search.wrapping_add(1);
+                return StandbyAction::Search {
+                    search: self.search,
+                };
             }
             return StandbyAction::Nothing;
         }
@@ -142,16 +176,30 @@ impl Standby {
         StandbyAction::Nothing
     }
 
-    /// A search finished with a link.
-    pub(crate) fn found(&mut self, e: Established) {
+    /// A search finished with a link. Returns whether it was kept: a link
+    /// found for a primary that has since been replaced stood by for nothing,
+    /// and is closed rather than dropped (see [`close`]).
+    pub(crate) fn found(&mut self, search: u64, e: Established) -> bool {
+        if search != self.search {
+            close(&e.link, STALE);
+            return false;
+        }
         self.searching = false;
         self.failures = 0;
         self.told_none = false;
         self.link = Some((e.link, e.path));
+        true
     }
 
     /// A search finished without one. Returns whether to tell the user.
-    pub(crate) fn not_found(&mut self, now: Instant) -> bool {
+    ///
+    /// A stale search changes nothing: it most likely failed because the
+    /// primary it ran over was closed under it, which says nothing about the
+    /// path the session has now.
+    pub(crate) fn not_found(&mut self, search: u64, now: Instant) -> bool {
+        if search != self.search {
+            return false;
+        }
         self.searching = false;
         self.backoff(now);
         self.dry_spell_news()
@@ -173,11 +221,21 @@ impl Standby {
 
     /// The standby's connection closed on its own. Returns whether to tell
     /// the user (spec §3.7: the standby is announced when it is lost).
-    pub(crate) fn lost(&mut self, now: Instant) -> bool {
+    ///
+    /// Not when the shell exited or another client took the session over:
+    /// the session is ending, and the primary's close is about to say why.
+    /// Those leave the dry spell unannounced, so a session that does go on
+    /// still hears of it from the next failed search.
+    pub(crate) fn lost(&mut self, now: Instant, reason: &quinn::ConnectionError) -> bool {
         self.link = None;
         self.probe = ProbeState::Idle;
         self.backoff(now);
-        self.dry_spell_news()
+        let ending = matches!(
+            reason,
+            quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == SHELL_EXITED || c.reason.as_ref() == TAKEN_OVER
+        );
+        !ending && self.dry_spell_news()
     }
 
     /// The route to the host moved: an interface that was absent may now be
@@ -188,20 +246,35 @@ impl Standby {
     }
 
     /// Hand the standby over for a failover. After it, a fresh search is due
-    /// once the new primary has settled.
+    /// once the new primary has settled, and a search still running over the
+    /// old primary is disowned.
     pub(crate) fn take_for_failover(&mut self, now: Instant) -> Option<(Link, PathDescription)> {
         self.probe = ProbeState::Idle;
         self.failures = 0;
         self.next_search = now + STANDBY_DELAY;
+        self.new_primary();
         self.link.take()
     }
 
     /// A rebuild over ssh landed. The host dropped our standby when it adopted
-    /// the rebuild, so ours is a corpse.
+    /// the rebuild, so ours is a corpse -- and is closed here, because nothing
+    /// else would: with no idle timeout, a standby whose path is dead never
+    /// hears the host's close, and its socket, tasks and keep-alive timer
+    /// would outlive the session's interest in it for good.
     pub(crate) fn forget(&mut self, now: Instant) {
-        self.link = None;
+        if let Some((l, _)) = self.link.take() {
+            close(&l, REBUILT);
+        }
         self.probe = ProbeState::Idle;
         self.next_search = now + STANDBY_DELAY;
+        self.new_primary();
+    }
+
+    /// The primary changed under any search in flight. Its result is no
+    /// longer wanted, and the next search may start without waiting for it.
+    fn new_primary(&mut self) {
+        self.searching = false;
+        self.search = self.search.wrapping_add(1);
     }
 
     fn backoff(&mut self, now: Instant) {
@@ -248,13 +321,37 @@ mod tests {
         Phase::Silent { since }
     }
 
-    /// A standby, found at `t0`, whose outage has just begun.
+    /// The search `step` starts at `now`, by its number.
+    fn search_at(s: &mut Standby, now: Instant) -> u64 {
+        match s.step(Phase::Live, now, false) {
+            StandbyAction::Search { search } => search,
+            other => panic!("no search started: {other:?}"),
+        }
+    }
+
+    /// A standby, found by a search that settled before `t0`, whose outage
+    /// has just begun.
     async fn with_a_standby(t0: Instant) -> (Standby, Link) {
-        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let mut s = Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            t0.checked_sub(STANDBY_DELAY).expect("a clock this young"),
+        );
+        let search = search_at(&mut s, t0);
         let (e, host) = established().await;
-        s.found(e);
+        assert!(s.found(search, e), "the fixture's search was stale");
         assert!(s.has_link(), "the fixture found nothing");
         (s, host)
+    }
+
+    /// How a connection ends when its far end closes it with `phrase`.
+    async fn closed_by_the_host(phrase: &'static [u8]) -> quinn::ConnectionError {
+        let (host, client) = crate::link::fixtures::link_pair().await;
+        host.sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), phrase);
+        tokio::time::timeout(Duration::from_secs(5), client.sink.connection().closed())
+            .await
+            .expect("the close never arrived")
     }
 
     #[tokio::test]
@@ -267,14 +364,14 @@ mod tests {
             "a session that has a standby searched for another"
         );
 
-        s.lost(t0);
+        s.lost(t0, &quinn::ConnectionError::TimedOut);
 
         assert!(!s.has_link());
         assert_eq!(s.next_search(), t0 + standby_backoff(0));
-        assert_eq!(
+        assert!(matches!(
             s.step(Phase::Live, t0 + standby_backoff(0), false),
-            StandbyAction::Search
-        );
+            StandbyAction::Search { .. }
+        ));
     }
 
     #[test]
@@ -290,10 +387,7 @@ mod tests {
             StandbyAction::Nothing,
             "searched before the first paint had its moment"
         );
-        assert_eq!(
-            s.step(Phase::Live, t0 + STANDBY_DELAY, false),
-            StandbyAction::Search
-        );
+        search_at(&mut s, t0 + STANDBY_DELAY);
         assert_eq!(
             s.step(Phase::Live, t0 + STANDBY_DELAY * 2, false),
             StandbyAction::Nothing,
@@ -305,21 +399,18 @@ mod tests {
     fn a_failed_search_is_reported_once_and_backs_off() {
         let t0 = Instant::now();
         let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
-        assert_eq!(
-            s.step(Phase::Live, t0 + STANDBY_DELAY, false),
-            StandbyAction::Search
-        );
+        let first = search_at(&mut s, t0 + STANDBY_DELAY);
 
         let t1 = t0 + STANDBY_DELAY;
-        assert!(s.not_found(t1), "the first failure was not reported");
+        assert!(s.not_found(first, t1), "the first failure was not reported");
         assert_eq!(s.next_search(), t1 + standby_backoff(0));
-        assert_eq!(
-            s.step(Phase::Live, t1 + standby_backoff(0), false),
-            StandbyAction::Search
-        );
+        let second = search_at(&mut s, t1 + standby_backoff(0));
 
         let t2 = t1 + standby_backoff(0);
-        assert!(!s.not_found(t2), "the same dry spell was reported twice");
+        assert!(
+            !s.not_found(second, t2),
+            "the same dry spell was reported twice"
+        );
         assert_eq!(s.next_search(), t2 + standby_backoff(1));
     }
 
@@ -328,8 +419,8 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
         let t1 = t0 + STANDBY_DELAY;
-        assert_eq!(s.step(Phase::Live, t1, false), StandbyAction::Search);
-        let _ = s.not_found(t1);
+        let search = search_at(&mut s, t1);
+        let _ = s.not_found(search, t1);
         assert_eq!(
             s.step(Phase::Live, t1 + Duration::from_secs(1), false),
             StandbyAction::Nothing,
@@ -338,10 +429,7 @@ mod tests {
 
         s.route_moved(t1 + Duration::from_secs(1));
 
-        assert_eq!(
-            s.step(Phase::Live, t1 + Duration::from_secs(1), false),
-            StandbyAction::Search
-        );
+        search_at(&mut s, t1 + Duration::from_secs(1));
     }
 
     /// The positive case the guards below are measured against.
@@ -470,11 +558,115 @@ mod tests {
     async fn losing_the_standby_is_reported_once() {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
-        assert!(s.lost(t0), "losing the standby went unsaid");
         assert!(
-            !s.not_found(t0 + standby_backoff(0)),
+            s.lost(t0, &quinn::ConnectionError::TimedOut),
+            "losing the standby went unsaid"
+        );
+        let search = search_at(&mut s, t0 + standby_backoff(0));
+        assert!(
+            !s.not_found(search, t0 + standby_backoff(0)),
             "the dry spell that losing it began was reported twice"
         );
+    }
+
+    /// The host closed the standby the moment it adopted the rebuild, but a
+    /// standby whose path is dead never hears that, and with no idle timeout
+    /// it would never end. So forgetting it closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forgetting_the_standby_closes_it() {
+        let t0 = Instant::now();
+        let (mut s, host) = with_a_standby(t0).await;
+        assert!(
+            host.sink.connection().close_reason().is_none(),
+            "the fixture's standby was closed before anything forgot it"
+        );
+
+        s.forget(t0);
+
+        assert!(!s.has_link());
+        let reason = tokio::time::timeout(Duration::from_secs(5), host.sink.connection().closed())
+            .await
+            .expect("the forgotten standby was never closed");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == REBUILT),
+            "closed as {reason:?}"
+        );
+    }
+
+    /// A search still running when a rebuild lands fails as soon as the old
+    /// primary is closed under it. That failure is about a link the session
+    /// no longer has: it must neither say "no standby path" nor push the next
+    /// search out by a backoff.
+    #[test]
+    fn a_search_over_a_replaced_primary_changes_nothing() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let stale = search_at(&mut s, t0 + STANDBY_DELAY);
+        let t1 = t0 + STANDBY_DELAY + Duration::from_secs(1);
+
+        s.forget(t1);
+
+        assert!(
+            !s.not_found(stale, t1),
+            "a search over the replaced primary announced a dry spell"
+        );
+        assert_eq!(
+            s.next_search(),
+            t1 + STANDBY_DELAY,
+            "a search over the replaced primary backed the next one off"
+        );
+        // And the next search is not held up waiting for the stale one.
+        let next = search_at(&mut s, t1 + STANDBY_DELAY);
+        assert_ne!(next, stale);
+        // A current search's failure still counts, so the check above is
+        // not a `not_found` that never reports anything.
+        assert!(s.not_found(next, t1 + STANDBY_DELAY));
+    }
+
+    /// The same after a failover, and a search that lands late is closed
+    /// rather than kept: it stood by for the primary that just died.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_found_for_a_replaced_primary_is_closed_not_kept() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let stale = search_at(&mut s, t0 + STANDBY_DELAY);
+
+        assert!(s.take_for_failover(t0 + STANDBY_DELAY).is_none());
+        let (e, host) = established().await;
+
+        assert!(!s.found(stale, e), "a stale search's link was kept");
+        assert!(!s.has_link());
+        let reason = tokio::time::timeout(Duration::from_secs(5), host.sink.connection().closed())
+            .await
+            .expect("the stale standby was never closed");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == STALE),
+            "closed as {reason:?}"
+        );
+    }
+
+    /// A standby closed because the session is ending -- its shell exited,
+    /// or another client took it over -- is not news: the primary's close is
+    /// about to say why. Nor does it use up the dry spell's one announcement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_closed_by_the_session_ending_goes_unannounced() {
+        for phrase in [TAKEN_OVER, SHELL_EXITED] {
+            let t0 = Instant::now();
+            let (mut s, _host) = with_a_standby(t0).await;
+            let reason = closed_by_the_host(phrase).await;
+
+            assert!(
+                !s.lost(t0, &reason),
+                "announced a standby closed as {:?}",
+                String::from_utf8_lossy(phrase)
+            );
+            let search = search_at(&mut s, t0 + standby_backoff(0));
+            assert!(
+                s.not_found(search, t0 + standby_backoff(0)),
+                "the dry spell went unannounced after a close as {:?}",
+                String::from_utf8_lossy(phrase)
+            );
+        }
     }
 
     #[tokio::test]

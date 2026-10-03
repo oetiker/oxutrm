@@ -700,6 +700,13 @@ impl HostSession {
             }
             crate::control::Role::Standby => {
                 // One slot. A newer standby supersedes the older one.
+                //
+                // Nothing checks that the client which asked for this one is
+                // still the primary's. The listener can finish a standby's
+                // exchange just after a takeover, so the displaced client's
+                // standby may land here. It does no harm: that client exits on
+                // its `TAKEN_OVER` and never sends on it, and the new
+                // client's own first search supersedes it.
                 if let Some(old) = standby.replace(a.link) {
                     old.sink
                         .connection()
@@ -1563,6 +1570,11 @@ impl ClientSession {
         if let Some(rebuild) = self.rebuild.as_mut() {
             rebuild.swapped();
         }
+        // The host dropped the parked standby when it adopted this attach,
+        // so ours is a corpse.
+        if let Some(s) = self.standby.as_mut() {
+            s.forget(now);
+        }
         Ok(())
     }
 
@@ -1927,12 +1939,12 @@ impl ClientSession {
                             // longer arrive because nothing is watching it.
                             conn = self.link.sink.connection().clone();
                             takeover_expected = false;
-                            // The host dropped the parked standby when it
-                            // adopted this attach, so ours is a corpse.
-                            if let Some(s) = self.standby.as_mut() {
-                                s.forget(Instant::now());
-                            }
+                            // `swap_in` has forgotten (and closed) the
+                            // standby, which the host dropped as it adopted
+                            // this attach. A search still running over the
+                            // old primary is disowned with it, and stopped.
                             standby_conn = None;
+                            _search_task = None;
                         }
                         // The network, not the far end. The loop keeps its
                         // cadence and the notice explains the last try.
@@ -1948,19 +1960,20 @@ impl ClientSession {
                         }
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::Found(e)) => {
+                Wake::Standby(crate::standby::StandbyEvent::Found { search, e }) => {
                     let path = e.path.clone();
-                    if let Some(s) = self.standby.as_mut() {
-                        s.found(*e);
+                    if let Some(s) = self.standby.as_mut()
+                        && s.found(search, *e)
+                    {
                         standby_conn = s.connection();
+                        self.announce_standby(Some(&path), out)?;
                     }
-                    self.announce_standby(Some(&path), out)?;
                 }
-                Wake::Standby(crate::standby::StandbyEvent::NotFound) => {
+                Wake::Standby(crate::standby::StandbyEvent::NotFound { search }) => {
                     let tell = self
                         .standby
                         .as_mut()
-                        .is_some_and(|s| s.not_found(Instant::now()));
+                        .is_some_and(|s| s.not_found(search, Instant::now()));
                     if tell {
                         self.announce_standby(None, out)?;
                     }
@@ -1970,22 +1983,16 @@ impl ClientSession {
                         s.probed(answered, Instant::now());
                     }
                 }
-                // Whatever the reason. The ones the host gives a standby
-                // (`SUPERSEDED`, `TAKEN_OVER`) are information, not a reason
-                // to end anything: the primary is untouched. Only the shell's
-                // own exit goes unannounced, since the session is ending with
-                // it and the primary's close is about to say so.
+                // Whatever the reason, the standby is gone and the primary is
+                // untouched: a standby's close is information, not a reason
+                // to end anything. `lost` decides whether it is news.
                 Wake::StandbyClosed(reason) => {
                     standby_conn = None;
                     let tell = self
                         .standby
                         .as_mut()
-                        .is_some_and(|s| s.lost(Instant::now()));
-                    let shell_exited = matches!(
-                        &reason,
-                        quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == SHELL_EXITED
-                    );
-                    if tell && !shell_exited {
+                        .is_some_and(|s| s.lost(Instant::now(), &reason));
+                    if tell {
                         self.announce_standby(None, out)?;
                     }
                 }
@@ -2084,7 +2091,7 @@ impl ClientSession {
                 });
             match action {
                 crate::standby::StandbyAction::Nothing => {}
-                crate::standby::StandbyAction::Search => {
+                crate::standby::StandbyAction::Search { search } => {
                     let primary = self.link.sink.connection().clone();
                     let size = self.size;
                     let s = self.standby.as_ref().expect("it just stepped");
@@ -2096,13 +2103,16 @@ impl ClientSession {
                         // primary's path: no search at all is the safe
                         // answer.
                         let event = match admit_for(primary.remote_address()) {
-                            None => crate::standby::StandbyEvent::NotFound,
+                            None => crate::standby::StandbyEvent::NotFound { search },
                             Some(admit) => {
                                 match crate::control::request_standby(primary, size, cfg, admit)
                                     .await
                                 {
-                                    Ok(e) => crate::standby::StandbyEvent::Found(Box::new(e)),
-                                    Err(_) => crate::standby::StandbyEvent::NotFound,
+                                    Ok(e) => crate::standby::StandbyEvent::Found {
+                                        search,
+                                        e: Box::new(e),
+                                    },
+                                    Err(_) => crate::standby::StandbyEvent::NotFound { search },
                                 }
                             }
                         };
@@ -2131,6 +2141,9 @@ impl ClientSession {
                             .context("failing over to the standby")?;
                         conn = self.link.sink.connection().clone();
                         standby_conn = None;
+                        // `take_for_failover` disowned any search running
+                        // over the old primary; this stops it.
+                        _search_task = None;
                         takeover_expected = false;
                         // Spec §3.5 step 2: the host adopts the standby on
                         // our first frame on it, so that frame goes now.
@@ -5195,6 +5208,27 @@ mod tests {
         }
     }
 
+    /// A client-side standby holding `link`, as the search it started found
+    /// it. Created a settling delay ago, so its first search is due now.
+    fn standby_holding(link: Link) -> crate::standby::Standby {
+        let now = Instant::now();
+        let mut standby = crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            now.checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        );
+        let crate::standby::StandbyAction::Search { search } =
+            standby.step(Phase::Live, now, false)
+        else {
+            panic!("the fixture's standby started no search");
+        };
+        assert!(
+            standby.found(search, standby_established(link)),
+            "the fixture's search was stale"
+        );
+        standby
+    }
+
     /// The terminal the client paints, shared with the test that watches it
     /// while the loop runs in a task of its own.
     #[derive(Clone, Default)]
@@ -5344,6 +5378,100 @@ mod tests {
         }
     }
 
+    /// A rebuild that lands drops the standby: the host closed it as taken
+    /// over when it adopted the rebuild. Ours is closed too, because a
+    /// standby whose path is dead never hears the host's close, and with no
+    /// idle timeout it would otherwise never end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_that_lands_forgets_and_closes_the_standby() {
+        let (_host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        assert!(
+            client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the fixture holds no standby"
+        );
+
+        client
+            .swap_in(rebuilt, Instant::now())
+            .expect("swapping in the rebuilt link");
+
+        assert!(
+            !client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "a landed rebuild left the standby the host had dropped in place"
+        );
+        let reason = closed_as(standby_host.sink.connection()).await;
+        assert!(closed_with(&reason, REBUILT), "closed as {reason:?}");
+    }
+
+    /// The loop watches the standby's connection: when it closes, the
+    /// standby is forgotten and its loss is said once (spec §3.7). The close
+    /// is the host's `SUPERSEDED`, a reason that ends nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_closed_under_a_running_session_is_announced_and_forgotten() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+
+        let (_attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        // A round trip through the shell: the loop is running, laps and all,
+        // and has said nothing about the standby it holds.
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.text().contains("ready-ok") {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never answered; the client painted:\n{}",
+                out.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !out.text().contains("no standby path"),
+            "the standby was reported lost before anything closed it"
+        );
+
+        standby_host
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), SUPERSEDED);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.text().contains("no standby path") {
+            assert!(
+                Instant::now() < deadline,
+                "losing the standby went unsaid; the client painted:\n{}",
+                out.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        typing.write_all(b"exit 7\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 7);
+        assert!(
+            !client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the closed standby is still held"
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+    }
+
     /// Spec §3.5 end to end: the primary goes dark, the standby answers its
     /// probe, and the client carries on over the standby with no ssh anywhere
     /// in the test.
@@ -5363,12 +5491,7 @@ mod tests {
         let standby_id = standby_client.sink.connection().stable_id();
         assert_ne!(standby_id, primary_id);
 
-        let mut standby = crate::standby::Standby::new(
-            crate::attach_exchange::fixtures::stun_free(),
-            Instant::now(),
-        );
-        standby.found(standby_established(standby_client));
-        client.standby = Some(standby);
+        client.standby = Some(standby_holding(standby_client));
 
         let (attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
         let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
