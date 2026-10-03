@@ -98,6 +98,31 @@ Until the askpass work lands, those attempts run `ssh -o BatchMode=yes`: a key
 that needs a passphrase typed cannot be unlocked from under a session that owns
 the screen, so the attempt fails cleanly and the box on screen says why.
 
+While a link is up, the client also looks for a **standby**: a second
+connection to the same session over whatever path the kernel would route
+through a different local address than the primary — the open internet next to
+a split-tunnel VPN, say. It is kept warm by the same ten-second QUIC keep-alive
+that already holds a punched NAT mapping open: one more keep-alive every ten
+seconds on each end. When the primary goes quiet and the standby still answers, the
+client fails over to it in about three seconds, with no ssh — never because
+the standby is faster, only because the primary has stopped answering, and
+there is no switching back once it has.
+
+Finding, losing or switching to a standby is announced once, written into the
+session and then scrolled past by the next repaint — so it turns up in the
+scrollback rather than staying on screen as a persistent status line:
+
+    oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452  ·  standby: IPv4 punched, 38 ms
+    oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452  ·  no standby path
+    oxutrm  switched to standby (IPv4 punched)  ·  38 ms
+
+"no standby path" means the session has no fallback, and the next outage waits
+for the twenty-second rebuild above instead. On a machine with only one way
+out the client keeps looking all the same: the wait between searches grows
+from thirty seconds to five minutes, and a route change brings the next one
+forward. Each search is a full attach exchange with the host: that is why the
+session's attach number climbs on such a machine.
+
 `loopback` runs both halves in one process with no network in between: a shell
 on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.
 It stays the fastest way to exercise the terminal core.
@@ -197,7 +222,17 @@ Real ones, found by testing rather than guessed at:
   is no known reason it would fail, but that is reasoning rather than evidence.
 - **A better path found after connect is lost until the next attach.** QUIC
   migration lets a client change its own *local* address; there is no mechanism
-  to repoint an established connection at a different *remote* address.
+  to repoint an established connection at a different *remote* address. A
+  standby does not change that: it is a second connection over a different
+  local source address, switched to when the primary fails, never because it
+  is faster.
+- **A standby can still share the primary's wire.** The filter that keeps a
+  standby off the primary's path compares the kernel's reported source address
+  for each candidate, not the interface (`src/egress.rs`): a dual-stack or
+  multi-address NIC can route two different source addresses over the very
+  same physical link. A standby admitted that way looks like a different path
+  and is not one — if that link dies, the standby dies with it, and there is
+  nothing left to fail over to.
 - **Under a saturating writer the loop runs slower than its pacing interval.**
   The screen stays current and nothing queues, but a turn costs more than the
   8 ms floor when something like `yes` is running.

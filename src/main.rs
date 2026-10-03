@@ -25,6 +25,8 @@ mod attach_exchange;
 mod candidates;
 mod choose;
 mod connect;
+mod control;
+mod egress;
 mod ladder;
 mod link;
 mod linkstate;
@@ -34,6 +36,7 @@ mod rebuild;
 mod roam;
 mod serve;
 mod session;
+mod standby;
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::BorrowedFd;

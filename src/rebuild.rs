@@ -11,6 +11,12 @@
 //! answer from the far end ends the loop, and anything else is worth trying
 //! again. See [`AttemptOutcome`].
 
+// A rebuild attempt runs while the client session it is rebuilding already
+// owns the screen: nothing here may print, or it lands raw on the painted
+// raw-mode terminal. `AttemptOutcome::Retry`'s reason is shown
+// through the notice, not printed.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
 use oxutrm_net::NetConfig;
 use oxutrm_proto::{Choice, Signal, TermSize};
@@ -181,7 +187,7 @@ async fn one_attempt(
     }
 
     let (reader, writer) = channel.halves();
-    match establish(reader, writer, size, cfg).await {
+    match establish(reader, writer, size, cfg, None).await {
         Ok(established) => AttemptOutcome::Landed(Box::new(established)),
         Err(e) => classify(target, &e),
     }

@@ -193,10 +193,14 @@ async fn main() -> anyhow::Result<()> {
                 birthday_budget: std::time::Duration::from_secs(8),
                 ..NetConfig::default()
             };
+            // This is a test tool that owns no terminal screen, so printing
+            // the miss itself (rather than just discarding it) is fine here.
             match oxutrm_net::birthday_blast(&psk, IceRole::Controlling, base, &cfg).await? {
-                Some(r) => println!("blast found remote={} probes={}", r.remote, r.probes),
-                None => {
-                    println!("blast none");
+                oxutrm_net::BlastOutcome::Found(r) => {
+                    println!("blast found remote={} probes={}", r.remote, r.probes);
+                }
+                oxutrm_net::BlastOutcome::Miss(miss) => {
+                    println!("blast none: {miss}");
                     std::process::exit(1);
                 }
             }

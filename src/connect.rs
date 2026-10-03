@@ -20,6 +20,7 @@ use crate::ladder::nominate;
 use crate::link::Link;
 use crate::rebuild::Rebuild;
 use crate::session::ClientSession;
+use crate::standby::Standby;
 
 /// `oxutrm <ssh-target>`: L1 to L14.
 ///
@@ -165,7 +166,7 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
 
     // L4 to L10.
     let (reader, writer) = channel.halves();
-    let established = establish(reader, writer, size, &cfg).await?;
+    let established = establish(reader, writer, size, &cfg, None).await?;
 
     // Before raw mode, on the ordinary terminal. Two things at once:
     //
@@ -195,8 +196,14 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // whichever session actually resulted -- which for `Choice::New` is an id
     // the client had no way to guess in advance.
     let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
+    let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
         .context("preparing the client session")?;
+    // Spec §2.1: only a host that said it can park a standby is asked for
+    // one. An older host would read the request as a stray line and drop it.
+    if standby {
+        session = session.with_standby(Standby::new(cfg.clone(), std::time::Instant::now()));
+    }
 
     // L12. The SECOND of the two lines a session opens with, and the last.
     //
@@ -253,6 +260,14 @@ pub(crate) struct Established {
     /// Which attach generation this is. Both `seq` counters restart at 1 per
     /// attach, so a rebuild has to name the one it is resuming from.
     pub attach_id: u64,
+    /// What the host said it can do. The session searches for a standby only
+    /// when this contains `FEATURE_STANDBY`; see [`offers_standby`].
+    pub host_features: Vec<String>,
+}
+
+/// Whether a host's hello offered a standby (spec §2.1).
+pub(crate) fn offers_standby(features: &[String]) -> bool {
+    features.iter().any(|f| f == oxutrm_proto::FEATURE_STANDBY)
 }
 
 /// L4 to L10: one socket, the hello exchange, the ICE ladder and the QUIC
@@ -274,6 +289,7 @@ pub(crate) async fn establish<R, W>(
     writer: W,
     size: TermSize,
     cfg: &NetConfig,
+    admit_remote: Option<oxutrm_net::RemoteFilter>,
 ) -> Result<Established>
 where
     R: tokio::io::AsyncBufRead + Unpin + Send,
@@ -313,6 +329,8 @@ where
             nat_type: nat,
             caps: detect_caps(),
             size,
+            // The client offers nothing; the host decides.
+            features: vec![],
         },
     )
     .await
@@ -339,6 +357,7 @@ where
                     cfg,
                     local: candidates,
                     remote: host.candidates,
+                    admit_remote,
                 },
                 &mut in_rx,
                 &learned_tx,
@@ -393,6 +412,7 @@ where
         path,
         session_id: host.session_id,
         attach_id: host.attach_id,
+        host_features: host.features,
     })
 }
 
@@ -470,6 +490,8 @@ struct HostFacts {
     host_spki: HostSpki,
     candidates: Vec<Candidate>,
     nat: NatType,
+    /// What the host said it can do. Not secret.
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for HostFacts {
@@ -487,6 +509,7 @@ impl std::fmt::Debug for HostFacts {
             .field("host_spki", &self.host_spki)
             .field("candidates", &self.candidates)
             .field("nat", &self.nat)
+            .field("features", &self.features)
             .finish_non_exhaustive()
     }
 }
@@ -501,6 +524,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             cert_spki_sha256,
             candidates,
             nat_type,
+            features,
             ..
         } => Ok(HostFacts {
             session_id,
@@ -509,6 +533,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             host_spki: cert_spki_sha256,
             candidates,
             nat: nat_type,
+            features,
         }),
         // The host's own words. It is the only explanation there is for why
         // this connection is not going to happen, and it is the sentence the
@@ -550,6 +575,19 @@ mod tests {
             enable_birthday: false,
             ..Default::default()
         }
+    }
+
+    /// The gate `connect` uses before it gives the session a standby. The
+    /// call site itself needs a real ssh and terminal, so the helper is what
+    /// is tested.
+    #[test]
+    fn no_standby_is_searched_for_when_the_host_did_not_offer_one() {
+        assert!(!offers_standby(&[]));
+        assert!(!offers_standby(&["control".to_string()]));
+        assert!(offers_standby(&[
+            "control".to_string(),
+            "standby".to_string()
+        ]));
     }
 
     /// The offer step itself, end to end: read it, decide, answer it.
@@ -698,6 +736,7 @@ mod tests {
                     rows: 40,
                 },
                 &cfg,
+                None,
             ),
         )
         .await
@@ -727,6 +766,14 @@ mod tests {
                 rows: 40
             },
             "the host must carry the client's size out of the exchange, not the size the session already had"
+        );
+        assert!(
+            client
+                .host_features
+                .iter()
+                .any(|f| f == oxutrm_proto::FEATURE_STANDBY),
+            "a current host offers a standby: {:?}",
+            client.host_features
         );
     }
 
@@ -777,6 +824,7 @@ mod tests {
             nat_type: NatType::AddressDependent,
             bound_port: 5000,
             detachable: true,
+            features: vec![],
         }
     }
 
@@ -786,6 +834,25 @@ mod tests {
         assert_eq!(facts.host_spki, HostSpki::new([1u8; 32]));
         assert_eq!(facts.nat, NatType::AddressDependent);
         assert_eq!(facts.candidates.len(), 1);
+    }
+
+    #[test]
+    fn the_offer_carries_the_hosts_features_through() {
+        // Before: the fixture's own default is empty, so a `host_facts` that
+        // hardcoded a non-empty answer regardless of the wire would already
+        // be caught here, before the mutated case below is even reached.
+        let before = host_facts(a_host_hello()).expect("a hello is an offer");
+        assert_eq!(before.features, Vec::<String>::new());
+
+        let mut hello = a_host_hello();
+        if let Signal::HostHello { features, .. } = &mut hello {
+            *features = vec![oxutrm_proto::FEATURE_STANDBY.to_string()];
+        }
+        let facts = host_facts(hello).unwrap();
+        assert_eq!(
+            facts.features,
+            vec![oxutrm_proto::FEATURE_STANDBY.to_string()]
+        );
     }
 
     /// A host that gives up says why, and the reason is the only explanation

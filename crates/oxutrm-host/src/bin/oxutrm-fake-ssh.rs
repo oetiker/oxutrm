@@ -193,6 +193,7 @@ fn host_hello(attach_id: u64, proto: u32) -> Signal {
         // The host's INTENT only. The outcome is settled by the nominated
         // rung, long after this message is written.
         detachable: true,
+        features: vec![],
     }
 }
 

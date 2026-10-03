@@ -38,6 +38,12 @@
 //! under it because a different client reattached, and down-converting on the
 //! host would permanently degrade the state for every future client.
 
+// The client half of this module runs while it owns the screen: nothing on
+// that path may print, or it lands raw on the painted raw-mode terminal.
+// The one deliberate exception, on the host's own stderr, is
+// `#[expect]`-ed at its call site.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
@@ -246,7 +252,17 @@ impl HostSession {
                 // here once hid a deadlock for a whole day.
                 Err(e) => {
                     turn.rejected += 1;
-                    eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
+                    #[cfg_attr(
+                        not(test),
+                        expect(
+                            clippy::print_stderr,
+                            reason = "the host daemon's own stderr, from turn_at on \
+                                      HostSession; never a client's screen"
+                        )
+                    )]
+                    {
+                        eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
+                    }
                 }
             }
         }
@@ -413,7 +429,9 @@ impl HostSession {
     /// [`HostSession::run`], plus a second inbound connection completing an
     /// attach exchange elsewhere in the process. Carries the whole
     /// [`crate::attach_exchange::Attached`] rather than just the [`Link`],
-    /// because [`HostSession::adopt`] needs the size as well.
+    /// because [`HostSession::adopt`] needs the size and
+    /// [`HostSession::on_attached`] the role: a primary is adopted at once, a
+    /// standby is parked until the client's first frame arrives on it.
     ///
     /// The descriptors are duplicated out of the terminal before the loop so
     /// the arms borrow locals rather than `self`, which is what lets the body
@@ -443,17 +461,34 @@ impl HostSession {
 
         // A frame taken off the source by the select, owed to the next turn.
         let mut pending: Option<Frame> = None;
+        // The client's parked standby (spec §3.5): a link held, not used,
+        // until the client's first frame arrives on it. A local rather than a
+        // field so the arm watching it borrows the loop, not `self` (C1).
+        let mut standby: Option<Link> = None;
+        // A standby whose first frame has arrived, owed to the next turn with
+        // that frame. `promote_standby` does the reset and the feed together,
+        // in that order.
+        let mut promote: Option<(Link, Frame)> = None;
         // The exit wake fired but `child_exited` disagreed. It is edge
         // triggered and will not fire twice, so re-check on a timer instead of
         // trusting the hint — the same rule that keeps PTY EOF out of this.
         let mut recheck_child = false;
 
         loop {
-            let turn = match pending.take() {
-                None => self.turn()?,
-                Some(frame) => self.turn_with(Some(frame))?,
+            let turn = match (promote.take(), pending.take()) {
+                // `pending` is always empty here: a lap sets one or the other.
+                (Some((link, first)), _) => self
+                    .promote_standby(link, first)
+                    .context("switching to the standby")?,
+                (None, None) => self.turn()?,
+                (None, Some(frame)) => self.turn_with(Some(frame))?,
             };
             if let Some(code) = turn.exited {
+                // Closed, not dropped: its control server holds the
+                // connection open for as long as it is not.
+                if let Some(parked) = standby.take() {
+                    close_as_exited(parked.sink.connection(), code);
+                }
                 self.finish(code).await;
                 return Ok(code);
             }
@@ -519,16 +554,28 @@ impl HostSession {
                 // arm rather than making it hot — the same reason there is no
                 // `conn.closed()` arm above.
                 Some(a) = attaches.recv() => HostWake::Attached(a),
+                // A parked standby carries nothing until the client fails
+                // over onto it, so this arm is quiet until it matters. A
+                // closed one yields `None` once, and is then un-parked.
+                f = async { standby.as_mut().expect("armed").source.recv().await },
+                    if standby.is_some() => match f {
+                        Some(frame) => HostWake::StandbyFrame(frame),
+                        None => HostWake::StandbyGone,
+                    },
             };
 
             match wake {
                 HostWake::Frame(frame) => pending = Some(frame),
                 HostWake::Exit => recheck_child = true,
                 HostWake::Pty | HostWake::Due => {}
-                HostWake::Attached(a) => {
-                    self.adopt(a.link, a.client_size)
-                        .context("adopting a second attach")?;
+                HostWake::Attached(a) => self.on_attached(a, &mut standby)?,
+                HostWake::StandbyFrame(frame) => {
+                    let link = standby.take().expect("the arm was armed");
+                    promote = Some((link, frame));
                 }
+                // Its connection is already closed, which is what ended the
+                // source; there is nothing left to close.
+                HostWake::StandbyGone => standby = None,
             }
         }
     }
@@ -580,11 +627,7 @@ impl HostSession {
     /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
     /// decoration. See its own note.
     pub fn close(&self, code: i32) {
-        let code = u32::try_from(code).unwrap_or(255);
-        self.link
-            .sink
-            .connection()
-            .close(quinn::VarInt::from_u32(code), SHELL_EXITED);
+        close_as_exited(self.link.sink.connection(), code);
     }
 
     /// The authoritative screen, for tests. Nothing in the session loop reads
@@ -600,13 +643,20 @@ impl HostSession {
     /// first datagram of the new attach is a full state. `screen_stale` is
     /// what forces that snapshot on the next turn.
     pub fn adopt(&mut self, link: Link, size: TermSize) -> Result<()> {
+        self.adopt_as(link, size, TAKEN_OVER)
+    }
+
+    /// [`HostSession::adopt`], closing the displaced link with `reason`:
+    /// [`TAKEN_OVER`] for a newer attach, [`SWITCHED`] for the client's own
+    /// standby.
+    pub fn adopt_as(&mut self, link: Link, size: TermSize, reason: &'static [u8]) -> Result<()> {
         // Close the displaced connection FIRST, and say why. A displaced
         // client that is merely dropped reports silence, which is the one
         // thing that did not happen.
         self.link
             .sink
             .connection()
-            .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
+            .close(quinn::VarInt::from_u32(0), reason);
 
         self.link = link;
         // `resize`, not `self.size = size`. The field means "the size the
@@ -640,6 +690,73 @@ impl HostSession {
         self.last_heard = Instant::now();
         Ok(())
     }
+
+    /// One completed attach, by role. `standby` is the loop's local slot.
+    ///
+    /// Every link this lets go of is closed, and with a reason: a dropped
+    /// link is not closed at all, because its control server holds a handle
+    /// to the connection for as long as the connection is open.
+    pub(crate) fn on_attached(
+        &mut self,
+        a: crate::attach_exchange::Attached,
+        standby: &mut Option<Link>,
+    ) -> Result<()> {
+        match a.role {
+            crate::control::Role::Primary => {
+                // A takeover. The standby belongs to the displaced client, and
+                // leaving it parked would let that client take the session back
+                // by failing over onto it, without going through ssh.
+                if let Some(old) = standby.take() {
+                    old.sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
+                }
+                self.adopt(a.link, a.client_size)
+                    .context("adopting a second attach")
+            }
+            crate::control::Role::Standby => {
+                // One slot. A newer standby supersedes the older one.
+                //
+                // Nothing checks that the client which asked for this one is
+                // still the primary's. The listener can finish a standby's
+                // exchange just after a takeover, so the displaced client's
+                // standby may land here. It does no harm: that client exits on
+                // its `TAKEN_OVER` and never sends on it. It stays parked
+                // until a standby the new client finds supersedes it, or the
+                // next primary attach drops it.
+                if let Some(old) = standby.replace(a.link) {
+                    old.sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), SUPERSEDED);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The client has failed over: its first frame arrived on the parked
+    /// standby. Adopt the standby, then take that frame in, in one turn.
+    ///
+    /// Reset first, THEN feed. `adopt_as` restarts the input receiver at a
+    /// fresh generation, and the client's first frame after its own reset
+    /// belongs to that generation. Fed first, it would meet the old
+    /// generation's receiver, be taken for a stale frame and thrown away.
+    ///
+    /// The size is the session's current one. The client's frame carries its
+    /// real size in `InputState`, and `turn_at` reconciles it.
+    pub(crate) fn promote_standby(&mut self, link: Link, first: Frame) -> Result<Turn> {
+        let size = self.size;
+        self.adopt_as(link, size, SWITCHED)?;
+        self.turn_with(Some(first))
+    }
+}
+
+/// Close `conn` saying the shell exited, with `code` as its status.
+///
+/// A code outside `u32` cannot come from a shell; see [`HostSession::close`].
+fn close_as_exited(conn: &quinn::Connection, code: i32) {
+    let code = u32::try_from(code).unwrap_or(255);
+    conn.close(quinn::VarInt::from_u32(code), SHELL_EXITED);
 }
 
 /// What woke [`ClientSession::run_on`].
@@ -659,6 +776,10 @@ enum Wake {
     Due,
     /// A rebuild attempt finished, one way or another.
     Rebuilt(AttemptOutcome),
+    /// A standby search or probe reported back.
+    Standby(crate::standby::StandbyEvent),
+    /// The standby's connection closed, with this reason.
+    StandbyClosed(quinn::ConnectionError),
     Closed(quinn::ConnectionError),
     /// A readiness that turned out to be nothing. Costs one lap.
     Nothing,
@@ -690,6 +811,10 @@ enum HostWake {
     /// A second attach completed. Carries the whole thing, because the
     /// session needs the size as well as the link.
     Attached(crate::attach_exchange::Attached),
+    /// A frame arrived on the parked standby: the client has failed over.
+    StandbyFrame(Frame),
+    /// The parked standby's connection is gone.
+    StandbyGone,
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -720,7 +845,8 @@ async fn keys_readable<K: AsRawFd>(
 ///
 /// QUIC already carries a reason phrase, so distinguishing them costs nothing
 /// on the wire. This is the only phrase [`exit_code`] accepts, and
-/// [`HostSession::close`] is the only place that sends it.
+/// [`close_as_exited`] is the only place that sends it: for the session link
+/// (through [`HostSession::close`]) and for a parked standby at exit.
 pub const SHELL_EXITED: &[u8] = b"the shell exited";
 
 /// Why a link was closed because another one arrived.
@@ -728,6 +854,15 @@ pub const SHELL_EXITED: &[u8] = b"the shell exited";
 /// Read by the displaced client so it can say it was taken over rather than
 /// reporting silence. Spec §6; the `Displaced` state itself is B4.
 pub const TAKEN_OVER: &[u8] = b"taken over by a newer attach";
+
+/// The close reason for a primary replaced by its own client's standby
+/// (spec §3.5). Not `TAKEN_OVER`: nobody else took anything, and the client
+/// must not read its own failover as a displacement.
+pub const SWITCHED: &[u8] = b"switched to the standby link";
+
+/// The close reason for a parked standby replaced by a newer one. Not
+/// `SWITCHED`: nothing switched to it, it was never used at all.
+pub const SUPERSEDED: &[u8] = b"superseded by a newer standby";
 
 /// Why the client closed a link of its own: it built a better one.
 ///
@@ -819,6 +954,9 @@ pub struct ClientSession {
     /// produced anything. Cleared when the phase leaves `Recovering`, so a
     /// later outage never opens by reporting an older one's reason.
     last_failure: Option<String>,
+    /// The standby link, and the search for one (spec §3). `None` for a
+    /// host that did not offer one; see [`ClientSession::with_standby`].
+    standby: Option<crate::standby::Standby>,
 }
 
 impl ClientSession {
@@ -879,7 +1017,15 @@ impl ClientSession {
             probed_at: None,
             rebuild,
             last_failure: None,
+            standby: None,
         })
+    }
+
+    /// Search for, and fail over onto, a standby (spec §3). Only for a host
+    /// that offered one; see `connect::offers_standby`.
+    pub(crate) fn with_standby(mut self, s: crate::standby::Standby) -> ClientSession {
+        self.standby = Some(s);
+        self
     }
 
     /// Tell the user what connection they got — once, and then be quiet.
@@ -922,6 +1068,73 @@ impl ClientSession {
         self.renderer.invalidate();
         self.announced = Some(path.clone());
         Ok(true)
+    }
+
+    /// Say that a standby exists, or that none could be found or it was lost
+    /// (spec §3.7): the path line, with the standby added to it.
+    ///
+    /// The caller says it once per change; `Standby` keeps track of which
+    /// dry spell has already been reported.
+    fn announce_standby<W: Write>(
+        &mut self,
+        standby: Option<&PathDescription>,
+        out: &mut W,
+    ) -> Result<()> {
+        // The primary's own line, as `announce` printed it. A session that
+        // never announced its path (only the tests' fixtures) says just the
+        // name.
+        let primary = self
+            .announced
+            .as_ref()
+            .map_or_else(|| "oxutrm".to_string(), status_line);
+        let line = match standby {
+            Some(p) => format!(
+                "{primary}  \u{b7}  standby: {}, {} ms",
+                oxutrm_client::rung_label(p),
+                p.rtt_ms
+            ),
+            None => format!("{primary}  \u{b7}  no standby path"),
+        };
+        self.say_mid_session(&line, out)
+            .context("announcing the standby")
+    }
+
+    /// Say that the session now runs over the standby, and remember its path
+    /// as the one announced, so a later `announce` compares against it.
+    fn announce_failover<W: Write>(&mut self, path: &PathDescription, out: &mut W) -> Result<()> {
+        let line = format!(
+            "oxutrm  switched to standby ({})  \u{b7}  {} ms",
+            oxutrm_client::rung_label(path),
+            path.rtt_ms
+        );
+        self.say_mid_session(&line, out)
+            .context("announcing the failover")?;
+        self.announced = Some(path.clone());
+        Ok(())
+    }
+
+    /// One line written over a session in progress, and the screen painted
+    /// straight back.
+    ///
+    /// `\r\n` and not `writeln!`: the terminal is in raw mode, where a bare
+    /// `\n` moves down without returning, so the line after it would start
+    /// mid-row. And the repaint now rather than on the next frame: the line
+    /// was written outside the renderer's model, over whatever a full-screen
+    /// program had painted, and on a quiet session the next frame may be a
+    /// long way off.
+    ///
+    /// Said plainly, because it is easy to assume otherwise: a full repaint
+    /// clears the screen, so the line does not stay on it. It survives only
+    /// where writing it scrolled the terminal, into the scrollback. What this
+    /// guarantees is that the screen is never left corrupted by it.
+    fn say_mid_session<W: Write>(&mut self, line: &str, out: &mut W) -> Result<()> {
+        write!(out, "{line}\r\n").context("writing to the terminal")?;
+        self.renderer.invalidate();
+        self.renderer
+            .render(out, self.screen_rx.state())
+            .context("painting the screen again")?;
+        out.flush().context("flushing the terminal")?;
+        Ok(())
     }
 
     /// One turn: send `input`, apply what arrived, repaint if it changed.
@@ -1368,13 +1581,44 @@ impl ClientSession {
     /// What the phase DOES get is a fresh schedule, and that is not a detail:
     /// see [`LinkState::rebuilt`] for the self-displacing loop it prevents.
     fn swap_in(&mut self, link: Link, now: Instant) -> Result<()> {
+        self.swap_in_as(link, now, REBUILT)?;
+        // Whatever we displaced, we have now displaced. A `TAKEN_OVER` after
+        // this point belongs to somebody else.
+        if let Some(rebuild) = self.rebuild.as_mut() {
+            rebuild.swapped();
+        }
+        // The host dropped the parked standby when it adopted this attach,
+        // so ours is a corpse.
+        if let Some(s) = self.standby.as_mut() {
+            s.forget(now);
+        }
+        Ok(())
+    }
+
+    /// [`ClientSession::swap_in`], closing the old link with `reason`:
+    /// [`REBUILT`] for a rebuild, [`SWITCHED`] for a failover onto the
+    /// standby (spec §3.5).
+    ///
+    /// The rebuild's displacement latch is NOT cleared here, and that is the
+    /// difference that matters (ruling B1). A failover is not our rebuild
+    /// landing: an ssh attempt started before it may still reach the host
+    /// and close this new link as taken over, and that close has to be read
+    /// as our own doing, not as the end of the session. The latch is cleared
+    /// when frames make the phase `Live` again (`Rebuild::stood_down`), or by
+    /// a rebuild that lands.
+    pub(crate) fn swap_in_as(
+        &mut self,
+        link: Link,
+        now: Instant,
+        reason: &'static [u8],
+    ) -> Result<()> {
         // Closed first, and with a reason, for the same reason `adopt` closes
         // the displaced one with `TAKEN_OVER`: a connection that is merely
         // dropped is indistinguishable from one that went quiet.
         self.link
             .sink
             .connection()
-            .close(quinn::VarInt::from_u32(0), REBUILT);
+            .close(quinn::VarInt::from_u32(0), reason);
 
         self.link = link;
 
@@ -1400,11 +1644,6 @@ impl ClientSession {
         // A full backoff before another attempt, and the old link's failures
         // left behind with it.
         self.link_state.rebuilt(now);
-        // Whatever we displaced, we have now displaced. A `TAKEN_OVER` after
-        // this point belongs to somebody else.
-        if let Some(rebuild) = self.rebuild.as_mut() {
-            rebuild.swapped();
-        }
         Ok(())
     }
 
@@ -1586,6 +1825,24 @@ impl ClientSession {
         // at the end of it.
         let mut takeover_expected = false;
 
+        // Where standby searches and probes report back. A local, for the
+        // reason `outcomes` is one (C1). Two deep: at most one search and one
+        // probe are ever in flight.
+        let (standby_tx, mut standby_rx) =
+            tokio::sync::mpsc::channel::<crate::standby::StandbyEvent>(2);
+        // The standby's connection, watched for closing. A local for the same
+        // reason `conn` is, and seeded here because a standby may already be
+        // in place when the loop starts.
+        let mut standby_conn: Option<quinn::Connection> = self
+            .standby
+            .as_ref()
+            .and_then(crate::standby::Standby::connection);
+        // The search and the probe in flight. Held so they end with the loop:
+        // dropping a `JoinHandle` detaches its task, and a search left running
+        // would go on holding the primary and a socket of its own.
+        let mut _search_task: Option<crate::attach_exchange::AbortOnDrop> = None;
+        let mut _probe_task: Option<crate::attach_exchange::AbortOnDrop> = None;
+
         let mut winch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
@@ -1625,6 +1882,11 @@ impl ClientSession {
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
                 Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
+                Some(event) = standby_rx.recv() => Wake::Standby(event),
+                // Quiet until the standby goes away; a closed connection is
+                // ready for ever, which is why the handler disarms it.
+                reason = async { standby_conn.as_ref().expect("armed").closed().await },
+                    if standby_conn.is_some() => Wake::StandbyClosed(reason),
                 reason = conn.closed(), if !takeover_expected => Wake::Closed(reason),
             };
 
@@ -1694,6 +1956,12 @@ impl ClientSession {
                             // longer arrive because nothing is watching it.
                             conn = self.link.sink.connection().clone();
                             takeover_expected = false;
+                            // `swap_in` has forgotten (and closed) the
+                            // standby, which the host dropped as it adopted
+                            // this attach. A search still running over the
+                            // old primary is disowned with it, and stopped.
+                            standby_conn = None;
+                            _search_task = None;
                         }
                         // The network, not the far end. The loop keeps its
                         // cadence and the notice explains the last try.
@@ -1707,6 +1975,42 @@ impl ClientSession {
                         AttemptOutcome::Definite(why) => {
                             return Err(anyhow::anyhow!("this session cannot be resumed: {why}"));
                         }
+                    }
+                }
+                Wake::Standby(crate::standby::StandbyEvent::Found { search, e }) => {
+                    let path = e.path.clone();
+                    if let Some(s) = self.standby.as_mut()
+                        && s.found(search, *e)
+                    {
+                        standby_conn = s.connection();
+                        self.announce_standby(Some(&path), out)?;
+                    }
+                }
+                Wake::Standby(crate::standby::StandbyEvent::NotFound { search, reason }) => {
+                    let tell = self
+                        .standby
+                        .as_mut()
+                        .is_some_and(|s| s.not_found(search, Instant::now(), reason));
+                    if tell {
+                        self.announce_standby(None, out)?;
+                    }
+                }
+                Wake::Standby(crate::standby::StandbyEvent::Probed { answered }) => {
+                    if let Some(s) = self.standby.as_mut() {
+                        s.probed(answered, Instant::now());
+                    }
+                }
+                // Whatever the reason, the standby is gone and the primary is
+                // untouched: a standby's close is information, not a reason
+                // to end anything. `lost` decides whether it is news.
+                Wake::StandbyClosed(reason) => {
+                    standby_conn = None;
+                    let tell = self
+                        .standby
+                        .as_mut()
+                        .is_some_and(|s| s.lost(Instant::now(), &reason));
+                    if tell {
+                        self.announce_standby(None, out)?;
                     }
                 }
                 // The link is gone, but what already arrived over it is not.
@@ -1770,7 +2074,14 @@ impl ClientSession {
             // is told nothing about the rebind, because a rebind that has not
             // restored contact yet is not something the client can honestly
             // report.
-            let _ = self.follow_route(now);
+            //
+            // A moved route is also news for the standby search (spec §3.1):
+            // an interface that was absent may now be present.
+            if self.follow_route(now)
+                && let Some(s) = self.standby.as_mut()
+            {
+                s.route_moved(now);
+            }
 
             // The `bool` is for the tests, which hold the clock still and ask
             // whether a prod was due. The loop does not care: it prods or it
@@ -1782,6 +2093,90 @@ impl ClientSession {
             // done about it. After the probe, too -- a rebind is the cheaper
             // of the two ways back and costs no ssh at all.
             self.rebuild_step(now, &outcomes_tx);
+
+            // The standby (spec §3). After the rebuild step, so an attempt
+            // started on this very lap already counts as running: nothing is
+            // failed over onto while one is (ruling B1). The step decides and
+            // the loop acts, so nothing spawned here borrows `self`.
+            let rebuild_running = self.rebuild.as_ref().is_some_and(Rebuild::is_running);
+            let phase = self.link_state.phase_now();
+            let action = self
+                .standby
+                .as_mut()
+                .map_or(crate::standby::StandbyAction::Nothing, |s| {
+                    s.step(phase, now, rebuild_running)
+                });
+            match action {
+                crate::standby::StandbyAction::Nothing => {}
+                crate::standby::StandbyAction::Search { search } => {
+                    let primary = self.link.sink.connection().clone();
+                    let size = self.size;
+                    let s = self.standby.as_ref().expect("it just stepped");
+                    let (cfg, admit_for) = (s.cfg.clone(), s.admit_for);
+                    let tx = standby_tx.clone();
+                    let task = tokio::spawn(async move {
+                        // No filter means the primary's own route could not
+                        // be read, and a search without one could land on the
+                        // primary's path: no search at all is the safe
+                        // answer.
+                        let event = match admit_for(primary.remote_address()) {
+                            None => crate::standby::StandbyEvent::NotFound {
+                                search,
+                                reason: "the primary's own route could not be read, \
+                                         so no search could run safely"
+                                    .to_string(),
+                            },
+                            Some(admit) => {
+                                match crate::control::request_standby(primary, size, cfg, admit)
+                                    .await
+                                {
+                                    Ok(e) => crate::standby::StandbyEvent::Found {
+                                        search,
+                                        e: Box::new(e),
+                                    },
+                                    Err(e) => crate::standby::StandbyEvent::NotFound {
+                                        search,
+                                        reason: format!("{e:#}"),
+                                    },
+                                }
+                            }
+                        };
+                        let _ = tx.send(event).await;
+                    });
+                    _search_task = Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
+                }
+                crate::standby::StandbyAction::Probe { nonce } => {
+                    if let Some(standby) = self.standby.as_ref().and_then(|s| s.connection()) {
+                        let tx = standby_tx.clone();
+                        let task = tokio::spawn(async move {
+                            let answered = crate::control::probe(standby, nonce).await;
+                            let _ = tx
+                                .send(crate::standby::StandbyEvent::Probed { answered })
+                                .await;
+                        });
+                        _probe_task =
+                            Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
+                    }
+                }
+                crate::standby::StandbyAction::FailOver => {
+                    if let Some((link, path)) =
+                        self.standby.as_mut().and_then(|s| s.take_for_failover(now))
+                    {
+                        self.swap_in_as(link, now, SWITCHED)
+                            .context("failing over to the standby")?;
+                        conn = self.link.sink.connection().clone();
+                        standby_conn = None;
+                        // `take_for_failover` disowned any search running
+                        // over the old primary; this stops it.
+                        _search_task = None;
+                        takeover_expected = false;
+                        // Spec §3.5 step 2: the host adopts the standby on
+                        // our first frame on it, so that frame goes now.
+                        self.turn(&[], out)?;
+                        self.announce_failover(&path, out)?;
+                    }
+                }
+            }
 
             // The next WAKE-UP, which is a different thing from `due()`, and
             // conflating the two is a busy loop rather than an optimisation.
@@ -1863,10 +2258,7 @@ impl ClientSession {
     /// the new address as the baseline, so the mistake is made once and not
     /// once a second.
     fn follow_route(&mut self, now: Instant) -> bool {
-        if !matches!(
-            self.link_state.phase_now(),
-            Phase::Silent { .. } | Phase::Recovering { .. }
-        ) {
+        if !self.link_state.phase_now().is_outage() {
             // The pace belongs to one outage, not to the session. Left set
             // across a return to `Live`, `probed_at` would also swallow the
             // FIRST probe of the next outage whenever that outage began within
@@ -1975,8 +2367,7 @@ mod tests {
     // other modules, so the route pace has to be named explicitly.
     use crate::roam::ROUTE_PROBE_EVERY;
     use oxutrm_host::ssh::SshLauncher;
-    use oxutrm_net::{generate_cert, quic_client, quic_server};
-    use oxutrm_proto::{ClientSpki, HostSpki, NatType, Rung};
+    use oxutrm_proto::{NatType, Rung};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -2003,10 +2394,6 @@ mod tests {
             rtt_ms,
             mtu,
         }
-    }
-
-    async fn udp() -> Arc<tokio::net::UdpSocket> {
-        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
     }
 
     /// A host and a client joined by a real QUIC connection on loopback.
@@ -2082,51 +2469,13 @@ mod tests {
 
     /// `pair`, with a blackholeable relay in the middle.
     async fn pair_through_relay(shell: &str) -> (HostSession, ClientSession, Relay) {
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
-
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _stun) =
-            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-                .await
-                .unwrap();
-
-        let relay = relay_to(host_addr).await;
-
-        let client_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let accepting = tokio::spawn(async move {
-            let incoming = host_ep.accept().await.expect("an inbound connection");
-            let conn = incoming.await.expect("a completed handshake");
-            (conn, host_ep)
-        });
-
+        let listening = crate::link::fixtures::listening().await;
+        let relay = relay_to(listening.addr).await;
         // The client's peer is the RELAY, which is the whole point.
-        let (client_conn, client_ep, _cstun) = quic_client(
-            &client_sock,
-            relay.addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (host_conn, host_ep) = accepting.await.unwrap();
+        let (host_link, client_link) = listening.dial("127.0.0.1:0", relay.addr).await;
 
-        let host = HostSession::spawn(
-            "/bin/sh",
-            size(),
-            200,
-            Link::new(host_conn, host_ep, host_sock),
-        )
-        .unwrap();
-        let client = ClientSession::new(
-            size(),
-            caps(),
-            Link::new(client_conn, client_ep, client_sock),
-            None,
-        )
-        .unwrap();
+        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
+        let client = ClientSession::new(size(), caps(), client_link, None).unwrap();
 
         let mut host = host;
         host.term.write_input(shell.as_bytes()).unwrap();
@@ -2142,50 +2491,12 @@ mod tests {
         shell: &str,
         rebuild: Option<Rebuild>,
     ) -> (HostSession, ClientSession) {
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        // The client now has an identity of its own, and the host has to be
-        // told about it before it can listen at all.
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
+        let listening = crate::link::fixtures::listening().await;
+        let addr = listening.addr;
+        let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _stun) =
-            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-                .await
-                .unwrap();
-
-        let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
-        let accepting = tokio::spawn(async move {
-            let incoming = host_ep.accept().await.expect("an inbound connection");
-            let conn = incoming.await.expect("a completed handshake");
-            (conn, host_ep)
-        });
-
-        let (client_conn, client_ep, _cstun) = quic_client(
-            &client_sock,
-            host_addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (host_conn, host_ep) = accepting.await.unwrap();
-
-        let host = HostSession::spawn(
-            "/bin/sh",
-            size(),
-            200,
-            Link::new(host_conn, host_ep, host_sock),
-        )
-        .unwrap();
-        let client = ClientSession::new(
-            size(),
-            caps(),
-            Link::new(client_conn, client_ep, client_sock),
-            rebuild,
-        )
-        .unwrap();
+        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
+        let client = ClientSession::new(size(), caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
         // the script is fed as input instead, which is also how a real session
@@ -2849,33 +3160,10 @@ mod tests {
             cols: 200,
             rows: 60,
         };
-        let (cert, key, fingerprint) = generate_cert().unwrap();
-        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
-        let host_sock = udp().await;
-        let host_addr = host_sock.local_addr().unwrap();
-        let (host_ep, _permit, _s) = quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
-            .await
-            .unwrap();
-        let client_sock = udp().await;
-        let accepting = tokio::spawn(async move {
-            let inc = host_ep.accept().await.unwrap();
-            (inc.await.unwrap(), host_ep)
-        });
-        let (cc, ce, _cs) = quic_client(
-            &client_sock,
-            host_addr,
-            HostSpki::new(fingerprint),
-            client_cert,
-            client_key,
-        )
-        .await
-        .unwrap();
-        let (hc, he) = accepting.await.unwrap();
+        let (host_link, client_link) = crate::link::fixtures::link_pair().await;
 
-        let mut host =
-            HostSession::spawn("/bin/sh", big, 200, Link::new(hc, he, host_sock)).unwrap();
-        let mut client =
-            ClientSession::new(big, caps(), Link::new(cc, ce, client_sock), None).unwrap();
+        let mut host = HostSession::spawn("/bin/sh", big, 200, host_link).unwrap();
+        let mut client = ClientSession::new(big, caps(), client_link, None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.
         host.term
@@ -4667,6 +4955,691 @@ mod tests {
             panic!("the replaced connection ended with {reason:?}, not an application close");
         };
         assert_eq!(closed.reason.as_ref(), REBUILT);
+    }
+
+    /// A completed standby attach, as the listener hands it to the loop.
+    fn standby_attached(link: Link) -> crate::attach_exchange::Attached {
+        crate::attach_exchange::Attached {
+            link,
+            path: path_of(Rung::StunPunch, 30, 1400, 4, NatType::Unknown),
+            client_size: size(),
+            role: crate::control::Role::Standby,
+        }
+    }
+
+    /// The application close a connection ended with, as its peer saw it,
+    /// within five seconds.
+    async fn closed_as(conn: &quinn::Connection) -> quinn::ConnectionError {
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the connection was never closed")
+    }
+
+    fn closed_with(reason: &quinn::ConnectionError, phrase: &[u8]) -> bool {
+        matches!(
+            reason,
+            quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == phrase
+        )
+    }
+
+    /// A standby is parked, not adopted: the client did not ask to switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_is_parked_and_the_primary_is_left_alone() {
+        let (mut host, _client) = pair("").await;
+        let (standby_host, _standby_client) = crate::link::fixtures::link_pair().await;
+        let primary = host.link.sink.connection().stable_id();
+        let parked = standby_host.sink.connection().stable_id();
+        let mut slot = None;
+
+        host.on_attached(standby_attached(standby_host), &mut slot)
+            .unwrap();
+
+        assert_eq!(
+            slot.as_ref()
+                .map(|l: &Link| l.sink.connection().stable_id()),
+            Some(parked),
+            "the standby was not parked"
+        );
+        assert_eq!(
+            host.link.sink.connection().stable_id(),
+            primary,
+            "parking a standby swapped the primary"
+        );
+        assert!(
+            host.link.sink.connection().close_reason().is_none(),
+            "parking a standby closed the primary"
+        );
+    }
+
+    /// One slot: a newer standby supersedes the parked one, and the one it
+    /// supersedes is closed rather than merely dropped (its control server
+    /// holds the connection open otherwise).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_newer_standby_replaces_the_parked_one_and_closes_it() {
+        let (mut host, _client) = pair("").await;
+        let (older_host, older_client) = crate::link::fixtures::link_pair().await;
+        let (newer_host, _newer_client) = crate::link::fixtures::link_pair().await;
+        let newer = newer_host.sink.connection().stable_id();
+        let mut slot = None;
+        host.on_attached(standby_attached(older_host), &mut slot)
+            .unwrap();
+        assert!(
+            older_client.sink.connection().close_reason().is_none(),
+            "the older standby was closed before anything replaced it"
+        );
+
+        host.on_attached(standby_attached(newer_host), &mut slot)
+            .unwrap();
+
+        assert_eq!(
+            slot.as_ref()
+                .map(|l: &Link| l.sink.connection().stable_id()),
+            Some(newer),
+            "the slot does not hold the newer standby"
+        );
+        let reason = closed_as(older_client.sink.connection()).await;
+        assert!(closed_with(&reason, SUPERSEDED), "closed as {reason:?}");
+    }
+
+    /// A takeover drops the displaced client's standby. Left parked, it would
+    /// let that client take the session back by failing over onto it,
+    /// without going through ssh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_primary_attach_drops_the_parked_standby() {
+        let (mut host, _client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        let (newcomer_host, _newcomer_client) = crate::link::fixtures::link_pair().await;
+        let newcomer_id = newcomer_host.sink.connection().stable_id();
+        let mut slot = None;
+        host.on_attached(standby_attached(standby_host), &mut slot)
+            .unwrap();
+        assert!(slot.is_some(), "the fixture parked nothing");
+
+        let mut newcomer = standby_attached(newcomer_host);
+        newcomer.role = crate::control::Role::Primary;
+        host.on_attached(newcomer, &mut slot).unwrap();
+
+        assert!(
+            slot.is_none(),
+            "a takeover kept the displaced client's standby"
+        );
+        assert_eq!(
+            host.link.sink.connection().stable_id(),
+            newcomer_id,
+            "the primary attach was not adopted"
+        );
+        let reason = closed_as(standby_client.sink.connection()).await;
+        assert!(is_takeover(&reason), "closed as {reason:?}");
+    }
+
+    /// The old primary is told it was switched away from, not taken over:
+    /// nobody else took anything, and the client must not read its own
+    /// failover as a displacement.
+    ///
+    /// Driven through `promote_standby`, which is what the loop calls. The
+    /// client keeps its old link open (no `swap_in`), so the close observed
+    /// on it can only be the host's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promoting_the_standby_closes_the_primary_as_switched() {
+        let (mut host, client) = pair("").await;
+        let (mut standby_host, mut standby_client) = crate::link::fixtures::link_pair().await;
+        // Any frame: only its arrival matters here, not whether it applies.
+        standby_client.sink.send(&Frame {
+            my_state: 1,
+            from_state: 0,
+            ack_state: 0,
+            flags: 0,
+            payload: Vec::new(),
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), standby_host.source.recv())
+            .await
+            .expect("no frame on the standby")
+            .expect("the standby closed");
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the old primary was closed before the promotion"
+        );
+
+        host.promote_standby(standby_host, first)
+            .expect("promoting the standby");
+
+        let reason = closed_as(client.link.sink.connection()).await;
+        assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+    }
+
+    /// The first frame on the standby is fed AFTER the reset, and so applies
+    /// on the very turn that promotes it.
+    ///
+    /// The old generation is driven past the frame's sequence number first:
+    /// against it, the client's first post-reset frame is stale and would be
+    /// ignored. So a promotion that fed the frame before resetting would take
+    /// it in as nothing, and this is the test that notices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promoting_the_standby_resets_before_it_feeds_the_first_frame() {
+        let (mut host, mut client) = pair("").await;
+        let (mut standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+
+        // Move the old generation on, a keystroke at a time.
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.input_rx.state().seq() < 4 {
+            assert!(Instant::now() < deadline, "the old generation never moved");
+            client.turn(b" ", &mut out).expect("a keystroke");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            host.turn().expect("a host turn");
+        }
+
+        // The client fails over and types: its first frame, new generation.
+        client
+            .swap_in(standby_client, Instant::now())
+            .expect("swapping onto the standby");
+        client.turn(b"x", &mut out).expect("typing on the standby");
+        let first = tokio::time::timeout(Duration::from_secs(5), standby_host.source.recv())
+            .await
+            .expect("no frame on the standby")
+            .expect("the standby closed");
+        assert!(
+            first.my_state < host.input_rx.state().seq(),
+            "the fixture cannot tell the orders apart: frame {} is not stale \
+             against the old generation at {}",
+            first.my_state,
+            host.input_rx.state().seq()
+        );
+
+        let turn = host
+            .promote_standby(standby_host, first.clone())
+            .expect("promoting the standby");
+
+        assert_eq!(
+            turn.applied, 1,
+            "the first frame on the standby was not applied on the turn that promoted it"
+        );
+        assert_eq!(
+            host.input_rx.ack(),
+            first.my_state,
+            "the host does not acknowledge the standby's first frame"
+        );
+    }
+
+    /// The whole loop: a standby parked through the attach channel is adopted
+    /// when the client's first frame arrives on it, and that frame's typing
+    /// reaches the shell.
+    ///
+    /// The screen text is the evidence. The client's screen restarts blank
+    /// when it swaps, it reads only the standby from then on, and the host
+    /// only sends on a link it has adopted -- so output of the typed command
+    /// on that screen can only have come over the promoted standby. The
+    /// printf's own argument does not contain the marker; only its output
+    /// does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_frame_on_a_standby_adopts_it_and_is_applied() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        let (attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+
+        attach_tx
+            .send(standby_attached(standby_host))
+            .await
+            .expect("the host loop is gone");
+
+        client
+            .swap_in(standby_client, Instant::now())
+            .expect("swapping onto the standby");
+        assert!(!text(client.screen()).contains("standby-ok"));
+
+        let mut out = Vec::new();
+        client
+            .turn(b"printf 'standby-%s\\n' ok\n", &mut out)
+            .expect("typing on the standby");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !text(client.screen()).contains("standby-ok") {
+            assert!(
+                Instant::now() < deadline,
+                "the typing never came back over the standby; screen:\n{}",
+                text(client.screen())
+            );
+            client.turn(&[], &mut out).expect("a client turn");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        // And the session goes on over it, to the shell's own end.
+        client
+            .turn(b"exit 7\n", &mut out)
+            .expect("typing on the standby");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !host_loop.is_finished() {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            // The close ends the client's turns with an error; the host's
+            // status is the thing asserted.
+            let _ = client.turn(&[], &mut out);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert_eq!(
+            host_loop.await.expect("host task").expect("host loop"),
+            7,
+            "the shell did not exit through the standby"
+        );
+    }
+
+    /// A completed client-side standby, as a search hands it to the session.
+    fn standby_established(link: Link) -> crate::connect::Established {
+        crate::connect::Established {
+            link,
+            path: path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown),
+            session_id: String::new(),
+            attach_id: 0,
+            host_features: vec![],
+        }
+    }
+
+    /// A client-side standby holding `link`, as the search it started found
+    /// it. Created a settling delay ago, so its first search is due now.
+    fn standby_holding(link: Link) -> crate::standby::Standby {
+        let now = Instant::now();
+        let mut standby = crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            now.checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        );
+        let crate::standby::StandbyAction::Search { search } =
+            standby.step(Phase::Live, now, false)
+        else {
+            panic!("the fixture's standby started no search");
+        };
+        assert!(
+            standby.found(search, standby_established(link)),
+            "the fixture's search was stale"
+        );
+        standby
+    }
+
+    /// The terminal the client paints, shared with the test that watches it
+    /// while the loop runs in a task of its own.
+    #[derive(Clone, Default)]
+    struct SharedOut(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedOut {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl Write for SharedOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Spec §3.7: the path line gains the standby. Written mid-session, so it
+    /// ends in `\r\n` (raw mode has no output processing) and the screen is
+    /// painted again straight after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_found_standby_is_added_to_the_path_line() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
+                &mut out,
+            )
+            .expect("announce");
+        let before = String::from_utf8(out.clone()).unwrap();
+        assert!(!before.contains("standby"), "got {before:?}");
+        out.clear();
+
+        let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
+        client
+            .announce_standby(Some(&standby), &mut out)
+            .expect("announce the standby");
+
+        let line = "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  standby: IPv4 punched, 38 ms\r\n";
+        let got = String::from_utf8_lossy(&out);
+        assert!(got.starts_with(line), "got {got:?}");
+        assert!(
+            out.len() > line.len(),
+            "nothing was painted over the line: the screen is left scrolled by it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_standby_is_said_on_the_path_line() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
+                &mut out,
+            )
+            .expect("announce");
+        out.clear();
+
+        client
+            .announce_standby(None, &mut out)
+            .expect("announce no standby");
+
+        let line =
+            "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  no standby path\r\n";
+        let got = String::from_utf8_lossy(&out);
+        assert!(got.starts_with(line), "got {got:?}");
+        assert!(out.len() > line.len(), "nothing was painted over the line");
+    }
+
+    /// The failover says where it went, and the path it went to is then the
+    /// announced one: announcing it again is silence, not a "migrated" line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_announces_the_standby_it_switched_to() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
+                &mut out,
+            )
+            .expect("announce");
+        out.clear();
+        let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
+
+        client
+            .announce_failover(&standby, &mut out)
+            .expect("announce the failover");
+
+        let line = "oxutrm  switched to standby (IPv4 punched)  \u{b7}  38 ms\r\n";
+        let got = String::from_utf8_lossy(&out);
+        assert!(got.starts_with(line), "got {got:?}");
+        assert!(out.len() > line.len(), "nothing was painted over the line");
+        out.clear();
+        assert!(
+            !client.announce(&standby, &mut out).expect("announce"),
+            "the failover did not record the path it switched to: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Ruling B1. A failover is not a rebuild landing: an ssh attempt that
+    /// started before it may still reach the host and close this link as
+    /// taken over, and that close must still be read as our own doing. So the
+    /// latch survives a failover, while the old link is closed as switched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failover_keeps_the_rebuild_latch_and_closes_the_old_link_as_switched() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert!(
+            session
+                .rebuild
+                .as_ref()
+                .is_some_and(Rebuild::may_have_displaced_us),
+            "the fixture never latched"
+        );
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        let displaced = host.link.sink.connection().clone();
+
+        session
+            .swap_in_as(standby_client, Instant::now(), SWITCHED)
+            .expect("failing over");
+
+        assert!(
+            session
+                .rebuild
+                .as_ref()
+                .is_some_and(Rebuild::may_have_displaced_us),
+            "the failover cleared the latch: the attempt still in flight would \
+             now end the session when it lands"
+        );
+        let reason = closed_as(&displaced).await;
+        assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// A rebuild that lands drops the standby: the host closed it as taken
+    /// over when it adopted the rebuild. Ours is closed too, because a
+    /// standby whose path is dead never hears the host's close, and with no
+    /// idle timeout it would otherwise never end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_that_lands_forgets_and_closes_the_standby() {
+        let (_host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        assert!(
+            client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the fixture holds no standby"
+        );
+
+        client
+            .swap_in(rebuilt, Instant::now())
+            .expect("swapping in the rebuilt link");
+
+        assert!(
+            !client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "a landed rebuild left the standby the host had dropped in place"
+        );
+        let reason = closed_as(standby_host.sink.connection()).await;
+        assert!(closed_with(&reason, REBUILT), "closed as {reason:?}");
+    }
+
+    /// The loop watches the standby's connection: when it closes, the
+    /// standby is forgotten and its loss is said once (spec §3.7). The close
+    /// is the host's `SUPERSEDED`, a reason that ends nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_closed_under_a_running_session_is_announced_and_forgotten() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+
+        let (_attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        // A round trip through the shell: the loop is running, laps and all,
+        // and has said nothing about the standby it holds.
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.text().contains("ready-ok") {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never answered; the client painted:\n{}",
+                out.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !out.text().contains("no standby path"),
+            "the standby was reported lost before anything closed it"
+        );
+
+        standby_host
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), SUPERSEDED);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.text().contains("no standby path") {
+            assert!(
+                Instant::now() < deadline,
+                "losing the standby went unsaid; the client painted:\n{}",
+                out.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        typing.write_all(b"exit 7\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 7);
+        assert!(
+            !client.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the closed standby is still held"
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+    }
+
+    /// Spec §3.5 end to end: the primary goes dark, the standby answers its
+    /// probe, and the client carries on over the standby with no ssh anywhere
+    /// in the test.
+    ///
+    /// The exit status is the evidence: `exit 7` is typed while the primary
+    /// is blackholed, so only the standby can carry it to the shell and the
+    /// status back. The final link's identity says which one did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dead_primary_fails_over_onto_an_answering_standby() {
+        let (mut host, mut client, relay) = pair_through_relay("").await;
+        let primary_id = client.link.sink.connection().stable_id();
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        // The probe is answered by the standby's own control server. Its door
+        // is never knocked on.
+        let (door_tx, _door_rx) = tokio::sync::mpsc::channel(1);
+        crate::control::serve_control(standby_host.sink.connection().clone(), door_tx);
+        let standby_id = standby_client.sink.connection().stable_id();
+        assert_ne!(standby_id, primary_id);
+
+        client.standby = Some(standby_holding(standby_client));
+
+        let (attach_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+        attach_tx
+            .send(standby_attached(standby_host))
+            .await
+            .expect("the host loop is gone");
+
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        relay.blackhole(true);
+        // Sent while the phase is still `Live`, so a reply is owed and the
+        // silence is noticed. The bytes themselves are lost with the swap.
+        typing.write_all(b"true\n").expect("type");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        typing.write_all(b"exit 7\n").expect("type");
+
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .unwrap_or_else(|_| panic!("the client never finished; it painted:\n{}", out.text()))
+            .expect("client task");
+        assert_eq!(
+            code.expect("the client loop failed"),
+            7,
+            "the shell's exit did not come back while the primary was dark"
+        );
+        assert_eq!(
+            client.link.sink.connection().stable_id(),
+            standby_id,
+            "the session did not end on the standby"
+        );
+        assert!(
+            out.text().contains("switched to standby"),
+            "the failover was not announced: {}",
+            out.text()
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+    }
+
+    /// The search, end to end through the doors `serve` opens: the request
+    /// goes out on the FIRST link's control stream, runs the real exchange
+    /// through the listener, is parked by the host, and is announced by the
+    /// client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_is_found_over_the_first_links_control_stream() {
+        let (mut host, mut client) = pair("").await;
+        let primary_id = client.link.sink.connection().stable_id();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let listener =
+            tokio::net::UnixListener::bind(dir.path().join("sock")).expect("binding the socket");
+        let start =
+            crate::attach_exchange::fixtures::fresh_meta("00112233445566778899aabbccddeeff");
+        let guard = Arc::new(
+            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
+        );
+        let meta = Arc::new(tokio::sync::Mutex::new(start));
+        let (door_task, mut attach_rx) = crate::serve::open_doors(
+            listener,
+            guard,
+            Arc::clone(&meta),
+            crate::attach_exchange::fixtures::stun_free(),
+            host.link.sink.connection().clone(),
+        );
+        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+
+        // Due at once rather than after the settling delay. Loopback is the
+        // primary's own path, so the real filter would rightly refuse every
+        // candidate this test has: this one admits them.
+        let mut standby = crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now()
+                .checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        );
+        standby.admit_for = |_| Some(Arc::new(|_| true));
+        client.standby = Some(standby);
+
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.text().contains("standby: ") {
+            assert!(
+                Instant::now() < deadline,
+                "no standby was announced; the client painted:\n{}",
+                out.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            meta.lock().await.attach_id,
+            1,
+            "the host did not run an exchange for the standby"
+        );
+
+        typing.write_all(b"exit 7\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 7);
+        assert_eq!(
+            client.link.sink.connection().stable_id(),
+            primary_id,
+            "finding a standby moved the session off the primary"
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+        crate::listener::close_the_door(door_task).await;
     }
 
     /// Every word a notice puts on the screen: headline, body and key list.

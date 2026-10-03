@@ -65,6 +65,39 @@
   cleanly and the box says why, which is the deliberate half of this until the
   askpass work lands. An agent coming back is a real way it resolves.
 
+- **The client keeps a second, warm connection to the session, and fails over
+  to it.** While a link is up, the client builds a standby: a second QUIC
+  connection over whatever path the kernel would route through a different
+  local source address than the primary — a split-tunnel VPN next to the open
+  internet, say. The ten-second QUIC keep-alive that already holds a punched
+  NAT mapping open keeps this one warm too: one more keep-alive every ten
+  seconds on each end, and nothing else while nothing is wrong.
+  When the primary goes silent and the standby still answers, the client fails
+  over to it about three seconds in, with no ssh and no new handshake prompt —
+  never because the standby is faster, only because the primary has stopped
+  answering, and there is no switching back once it has. A host advertises the
+  capability with `features: ["control", "standby"]` in its hello; an older
+  host omits it and the client falls back to the twenty-second ssh rebuild
+  exactly as before.
+
+  The filter that keeps the standby off the primary's own path compares
+  kernel-reported source addresses, not interfaces (`src/egress.rs`): a
+  dual-stack or multi-address NIC can still hand both connections the same
+  physical wire under different addresses, so the standby can share the fate
+  of the primary it was meant to replace. There is no detection for that case.
+
+  A machine with only one way out (a single IPv4 uplink, say) never finds a
+  standby, but it keeps looking: each search runs a full attach exchange on
+  both ends, STUN included, and moves the session's attach number on. After
+  the first few the searches settle at one every five minutes, so on such a
+  machine the attach number `--list` shows climbs by about twelve an hour.
+
+  The two-uplink network-namespace test the design describes (§7) is not
+  written; failover here is covered by the in-process relay test and a hand
+  test on 2026-10-03: a Mac client attached to a Linux host over a
+  split-tunnel VPN kept its session when the VPN was dropped, moving to the
+  standby without ssh. The stall was not timed.
+
 ### Compatibility
 
 - **Both ends have to be upgraded together.** The client now runs
@@ -79,7 +112,23 @@
 
 ### Changed
 
+- **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
+  carry a `features` list — empty today except for the host, which advertises
+  `control` and `standby`. Absent on either side, it is read as "nothing", so
+  an older peer on the other end of the exchange is unaffected and there is no
+  `PROTO_VERSION` bump. Three signals, `StandbyRequest`, `Probe` and
+  `ProbeAck`, are what the standby link above sends over the wire.
+
 ### Fixed
+
+- **A standby search's diagnostics no longer garble the screen.** Each standby
+  search runs the full connection ladder, birthday blast included, so on a
+  machine whose blast misses this printed over the painted raw-mode screen on
+  every search during an outage. The blast's miss now carries its numbers back
+  as data instead of printing them; a connect-time failure (before any session
+  owns a screen) still shows them, in the rung's own failure text. A lint now
+  denies `print_stderr`/`print_stdout` in the modules on a client session's
+  in-session path, so this cannot come back unnoticed.
 
 - **Reattaching no longer needs `loginctl enable-linger`.** A detached session
   outlives your login on most systems, but the directory it registered itself

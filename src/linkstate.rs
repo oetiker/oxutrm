@@ -4,6 +4,10 @@
 //! `Instant` as a parameter rather than reading the clock, which is what lets
 //! the whole state machine be tested without sleeping.
 
+// This runs while a client session owns the screen: nothing here may print,
+// or it lands raw on the painted raw-mode terminal.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::time::{Duration, Instant};
 
 /// How long a reply may be owed before the user is told. Below this a blip
@@ -90,6 +94,81 @@ pub enum Phase {
         next_try: Instant,
     },
     Confirming,
+}
+
+impl Phase {
+    /// Whether the primary is not currently answering.
+    ///
+    /// `Confirming` is not an outage: a frame already came back, and the
+    /// phase is only waiting on the user to say what to do with what was
+    /// typed blind. Neither is `Live`. This is the predicate the failover
+    /// decision (`failover_due`, below) and the route-follow decision
+    /// (`session.rs`'s `follow_route`) share; other code that happens to
+    /// look similar, such as the notice box's rebuild check, may have its
+    /// own reasons to draw the same line and is not implied by this doc.
+    pub fn is_outage(&self) -> bool {
+        matches!(self, Phase::Silent { .. } | Phase::Recovering { .. })
+    }
+}
+
+/// How long after sending an answered probe the client fails over.
+///
+/// The probe goes out on the first lap in `Silent`, which is `SILENT_AFTER`
+/// after a reply became owed, so failover lands at `SILENT_AFTER` plus this:
+/// three seconds, the spec's `FAILOVER_AFTER` (§3.5). The second is there so a
+/// primary that was only blipping gets to answer first, since failing over
+/// costs a full-state snapshot and a new standby search.
+pub const FAILOVER_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a probe may take before the standby counts as not answering.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long after a failed probe the next one may go, within one outage.
+pub const PROBE_RETRY: Duration = Duration::from_secs(5);
+
+/// How long after a link is up before a standby is searched for, so the
+/// search never competes with the first paint (spec §3.1).
+pub const STANDBY_DELAY: Duration = Duration::from_secs(5);
+
+/// The wait before standby search number `failures + 1`.
+pub fn standby_backoff(failures: u32) -> Duration {
+    Duration::from_secs(match failures {
+        0 => 30,
+        1 => 60,
+        2 => 120,
+        _ => 300,
+    })
+}
+
+/// Where this outage's probe of the standby stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeState {
+    Idle,
+    Pending { sent: Instant },
+    Answered { sent: Instant },
+    Failed { at: Instant },
+}
+
+/// Whether to fail over onto the standby now.
+///
+/// Only while the primary is not answering, and only on an answer from the
+/// standby, never on the absence of one: failing over onto a standby that
+/// is also dead would trade a connection that might revive for one that has
+/// already been seen not to.
+///
+/// Failing over while `Recovering` is allowed here: an answer that lands
+/// after the 20 s rebuild escalation is still an answer. But `Recovering` can
+/// also mean a rebuild attempt is in flight, and landing that attempt would
+/// have the host adopt it as the primary and close the standby this just
+/// promoted as `TAKEN_OVER` -- so the caller (`Standby::step`) is responsible
+/// for not failing over while a rebuild attempt is running; this function
+/// does not know about rebuilds and does not gate on them.
+pub fn failover_due(phase: Phase, probe: ProbeState, now: Instant) -> bool {
+    let outage = phase.is_outage();
+    match probe {
+        ProbeState::Answered { sent } => outage && now.duration_since(sent) >= FAILOVER_GRACE,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1132,5 +1211,65 @@ mod tests {
             }
             other => panic!("expected Recovering, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failover_waits_for_the_grace_after_an_answered_probe() {
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+        let answered = ProbeState::Answered { sent: t0 };
+        assert!(!failover_due(
+            silent,
+            answered,
+            t0 + FAILOVER_GRACE - Duration::from_millis(1)
+        ));
+        assert!(failover_due(silent, answered, t0 + FAILOVER_GRACE));
+    }
+
+    #[test]
+    fn failover_needs_an_answer() {
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+        let late = t0 + Duration::from_secs(60);
+        for p in [
+            ProbeState::Idle,
+            ProbeState::Pending { sent: t0 },
+            ProbeState::Failed { at: t0 },
+        ] {
+            assert!(!failover_due(silent, p, late), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_before_the_grace_ends_cancels_the_failover() {
+        // `Live` is what a frame on the primary produces. However the probe
+        // went, a primary that answered is not failed over from.
+        let t0 = Instant::now();
+        assert!(!failover_due(
+            Phase::Live,
+            ProbeState::Answered { sent: t0 },
+            t0 + FAILOVER_GRACE
+        ));
+    }
+
+    #[test]
+    fn recovering_still_fails_over() {
+        // An answer that lands after the 20 s escalation is still an answer.
+        let t0 = Instant::now();
+        let rec = Phase::Recovering {
+            attempt: 0,
+            next_try: t0,
+        };
+        assert!(failover_due(
+            rec,
+            ProbeState::Answered { sent: t0 },
+            t0 + FAILOVER_GRACE
+        ));
+    }
+
+    #[test]
+    fn the_standby_backoff_climbs_and_then_holds() {
+        let s: Vec<u64> = (0..6).map(|n| standby_backoff(n).as_secs()).collect();
+        assert_eq!(s, vec![30, 60, 120, 300, 300, 300]);
     }
 }

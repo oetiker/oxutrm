@@ -25,6 +25,7 @@ use tokio::io::AsyncWrite;
 
 use crate::accept::accept_one;
 use crate::candidates::{inbound_candidates, outbound_candidates};
+use crate::control::Role;
 use crate::ladder::nominate;
 use crate::link::Link;
 
@@ -35,6 +36,20 @@ pub(crate) struct Attached {
     pub path: PathDescription,
     /// The client's terminal size, from its `ClientHello`.
     pub client_size: TermSize,
+    /// What this attach is for. Always [`Role::Primary`] out of
+    /// [`run_attach_exchange`], which does not know its caller's intent and
+    /// must not need to; the listener overwrites it with the role of the way
+    /// the attach came in.
+    pub role: Role,
+}
+
+/// Aborts a spawned task when dropped, tying its life to its owner's.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// R4 to R10: a fresh certificate, the STUN/ICE ladder, the hello exchange and
@@ -117,6 +132,17 @@ where
         let r = outbound_candidates(&mut stdout, &mut learned_rx).await;
         (stdout, r)
     });
+    // The pumps live no longer than this exchange. Dropping a `JoinHandle`
+    // detaches the task rather than cancelling it, and this future IS dropped
+    // from outside: by the listener's `ATTACH_TIMEOUT`, and whenever a socket
+    // attach pre-empts a standby's exchange. Without this the inbound pump
+    // would keep the reader, and the pipe, until the peer's next line. On the
+    // ordinary path both tasks are over before these drop, so aborting them
+    // then changes nothing.
+    let _pumps = (
+        AbortOnDrop(inbound.abort_handle()),
+        AbortOnDrop(outbound.abort_handle()),
+    );
 
     let nomination = nominate(
         Arc::clone(&socket),
@@ -127,6 +153,9 @@ where
             cfg,
             local: candidates,
             remote: client.candidates,
+            // The host never filters: the client is Controlling and the only
+            // side that nominates.
+            admit_remote: None,
         },
         &mut in_rx,
         &learned_tx,
@@ -183,6 +212,7 @@ where
         link: Link::new(connection, endpoint, nomination.socket),
         path,
         client_size: client.size,
+        role: Role::Primary,
     })
 }
 
@@ -268,6 +298,10 @@ fn host_hello(
         nat_type,
         bound_port,
         detachable: true,
+        features: vec![
+            oxutrm_proto::FEATURE_CONTROL.to_string(),
+            oxutrm_proto::FEATURE_STANDBY.to_string(),
+        ],
     }
 }
 
@@ -321,12 +355,16 @@ where
     }
 }
 
+/// Fixtures more than one module's tests need: this module's own, the
+/// listener's, and anything else that runs an attach exchange.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
+    use oxutrm_host::registry::SessionMeta;
+    use oxutrm_net::NetConfig;
+    use oxutrm_proto::TermSize;
 
     /// A session record as R4 finds it, before any attach.
-    fn fresh_meta(session_id: &str) -> SessionMeta {
+    pub(crate) fn fresh_meta(session_id: &str) -> SessionMeta {
         SessionMeta {
             session_id: session_id.to_owned(),
             attach_id: 0,
@@ -346,8 +384,11 @@ mod tests {
     /// configuration — not a test reaching the internet for a check that has
     /// nothing to do with STUN. It is also what makes these tests fast and
     /// deterministic: with a gather budget in play, "the exchange has
-    /// finished" and "the test looked" stop being reliably ordered.
-    fn stun_free() -> NetConfig {
+    /// finished" and "the test looked" stop being reliably ordered, which is
+    /// how a listener guard once passed under an injected bug — it read
+    /// `meta.json` while the exchange was still probing. Without STUN an
+    /// attempt on a closed pipe fails at once.
+    pub(crate) fn stun_free() -> NetConfig {
         NetConfig {
             stun_servers: vec![],
             enable_port_mapping: false,
@@ -355,6 +396,12 @@ mod tests {
             ..Default::default()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     /// R11 is the caller's, not the exchange's.
     ///
@@ -447,6 +494,78 @@ mod tests {
         client.abort();
     }
 
+    /// An exchange dropped from outside mid-race takes its candidate pumps
+    /// with it.
+    ///
+    /// The listener drops a standby's exchange whenever a socket attach
+    /// pre-empts it, and `ATTACH_TIMEOUT` drops any exchange that runs too
+    /// long. Both pumps are spawned tasks, and dropping a `JoinHandle`
+    /// detaches rather than cancels: the inbound pump owns the reader and
+    /// would go on waiting for the peer's next line, holding the pipe open,
+    /// until the pipe failed on its own — on a silent control stream, never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exchange_dropped_mid_race_stops_its_candidate_pumps() {
+        let within = std::time::Duration::from_secs(10);
+        // The client's one candidate is a socket this test holds, so the
+        // ladder's first check landing on it proves the race is under way —
+        // and the pumps are spawned just before the race starts.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a peer socket");
+        let mut hello = a_client_hello();
+        if let Signal::ClientHello { candidates, .. } = &mut hello {
+            *candidates = vec![Candidate {
+                addr: peer.local_addr().expect("the peer's address"),
+                kind: CandidateKind::Host,
+                priority: 1,
+            }];
+        }
+
+        let (theirs, ours) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(ours);
+        let exchange = tokio::spawn(async move {
+            let mut meta = fresh_meta("pumps");
+            let _ =
+                run_attach_exchange(tokio::io::BufReader::new(r), w, &mut meta, &stun_free()).await;
+        });
+
+        let (tr, mut tw) = tokio::io::split(theirs);
+        let mut tr = tokio::io::BufReader::new(tr);
+        let offer = oxutrm_host::signalling::read_signal_async(&mut tr)
+            .await
+            .expect("the host's offer");
+        assert!(matches!(offer, Signal::HostHello { .. }), "{offer:?}");
+        oxutrm_host::signalling::write_signal_async(&mut tw, &hello)
+            .await
+            .expect("the client's hello");
+
+        // Before: the race is running, so both pumps exist.
+        let mut buf = [0u8; 1500];
+        tokio::time::timeout(within, peer.recv_from(&mut buf))
+            .await
+            .expect("the ladder never checked the client's candidate")
+            .expect("receiving the check");
+
+        // Dropped from outside, as the listener does. `tw` is held: a peer
+        // that hung up would end the inbound pump for its own reasons.
+        exchange.abort();
+        let _ = exchange.await;
+
+        // After: nothing holds the host's end of the pipe any more, so ours
+        // reads to its end. Whatever the host wrote before is drained first.
+        let drained = tokio::time::timeout(within, async {
+            let mut sink = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut tr, &mut sink).await
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the exchange was dropped and its pipe is still held: a candidate \
+             pump outlived it"
+        );
+        drop(tw);
+    }
+
     // ---- the hello exchange, and the order that is its whole content ---------
 
     use oxutrm_proto::CandidateKind;
@@ -487,6 +606,7 @@ mod tests {
                 cols: 132,
                 rows: 43,
             },
+            features: vec![],
         }
     }
 

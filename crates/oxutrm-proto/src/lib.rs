@@ -125,6 +125,11 @@ pub use types::{
 /// is what `check_version` already does.
 pub const PROTO_VERSION: u32 = 2;
 
+/// The host serves a control stream on every link (spec §2).
+pub const FEATURE_CONTROL: &str = "control";
+/// The host parks a standby link on request (spec §3).
+pub const FEATURE_STANDBY: &str = "standby";
+
 #[derive(thiserror::Error, Debug)]
 pub enum ProtoError {
     #[error("protocol version mismatch: peer {peer}, ours {ours}")]

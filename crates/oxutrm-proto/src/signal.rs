@@ -112,6 +112,12 @@ pub enum Signal {
         /// session that daemonized on intent and then landed on rung 4 would
         /// have closed the very SSH descriptors it needs to carry its data.
         detachable: bool,
+        /// What this host can do beyond the base exchange. Absent on a host
+        /// from before P1, which is what `default` is for: an old peer omits
+        /// it, a new peer reads that as "nothing", and no `PROTO_VERSION`
+        /// bump is needed (spec §2.1).
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// host -> client, and it comes BEFORE `HostHello`.
     ///
@@ -149,6 +155,12 @@ pub enum Signal {
         nat_type: NatType,
         caps: TerminalCaps,
         size: TermSize,
+        /// What this client can do beyond the base exchange. Absent on a
+        /// client from before P1, for the same reason `HostHello`'s
+        /// `features` is `default`: an old peer omits it, a new peer reads
+        /// that as "nothing".
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// Either direction, repeatable until the link is up.
     CandidateUpdate {
@@ -160,6 +172,17 @@ pub enum Signal {
     },
     Failed {
         reason: String,
+    },
+    /// client -> host, first line on a control stream: run an attach exchange
+    /// over this stream and park the result as a standby (spec §3.2).
+    StandbyRequest,
+    /// client -> host on a standby's control stream. Answered without
+    /// adopting anything: a sync frame is what adopts (spec §3.4).
+    Probe {
+        nonce: u64,
+    },
+    ProbeAck {
+        nonce: u64,
     },
 }
 
@@ -261,8 +284,8 @@ pub fn read_signal<R: std::io::BufRead>(r: &mut R) -> Result<Signal, ProtoError>
 mod tests {
     use super::*;
     use crate::{
-        Candidate, CandidateKind, NatType, PROTO_VERSION, PathDescription, ProtoError, Rung,
-        TermSize, TerminalCaps,
+        Candidate, CandidateKind, FEATURE_STANDBY, NatType, PROTO_VERSION, PathDescription,
+        ProtoError, Rung, TermSize, TerminalCaps,
     };
     use std::io::BufReader;
 
@@ -296,6 +319,7 @@ mod tests {
                 nat_type: NatType::EndpointIndependent,
                 bound_port: 443,
                 detachable: true,
+                features: vec![],
             },
             Signal::ClientHello {
                 proto: PROTO_VERSION,
@@ -310,6 +334,7 @@ mod tests {
                     cols: 120,
                     rows: 40,
                 },
+                features: vec![],
             },
             Signal::CandidateUpdate {
                 candidates: vec![cand],
@@ -1081,5 +1106,51 @@ mod tests {
         .expect("an offer encodes");
         assert!(!line.contains("\"pid\""), "pid must not travel: {line}");
         assert!(!line.contains("\"boot\""), "boot must not travel: {line}");
+    }
+
+    // ---- features, and the three signals for a standby ----
+
+    #[test]
+    fn a_hello_without_features_parses_as_none() {
+        // A host from before P1 sends no `features` key at all. Built by removing
+        // the key from a current hello, so the test cannot drift from the real
+        // field set.
+        let hello = Signal::HostHello {
+            proto: PROTO_VERSION,
+            session_id: "00112233445566778899aabbccddeeff".to_string(),
+            attach_id: 1,
+            cert_spki_sha256: HostSpki::new([7; 32]),
+            psk: Psk::new([9; 32]),
+            candidates: vec![],
+            nat_type: NatType::Unknown,
+            bound_port: 443,
+            detachable: true,
+            features: vec![FEATURE_STANDBY.to_string()],
+        };
+        let mut value = serde_json::to_value(&hello).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("features")
+            .expect("the field is on the wire");
+        let old: Signal = serde_json::from_value(value).unwrap();
+        match old {
+            Signal::HostHello { features, .. } => assert!(features.is_empty()),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_standby_signals_round_trip() {
+        for s in [
+            Signal::StandbyRequest,
+            Signal::Probe { nonce: 42 },
+            Signal::ProbeAck { nonce: 42 },
+        ] {
+            let mut line = Vec::new();
+            write_signal(&mut line, &s).unwrap();
+            let back = read_signal(&mut &line[..]).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{s:?}"));
+        }
     }
 }

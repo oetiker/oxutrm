@@ -35,6 +35,7 @@ fn host_hello_with_proto(attach_id: u64, proto: u32) -> Signal {
         nat_type: NatType::EndpointIndependent,
         bound_port: 443,
         detachable: true,
+        features: vec![],
     }
 }
 
@@ -56,6 +57,7 @@ fn client_hello() -> Signal {
             term_name: "xterm-256color".to_string(),
         },
         size: TermSize { cols: 80, rows: 24 },
+        features: vec![],
     }
 }
 

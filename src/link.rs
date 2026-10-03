@@ -51,6 +51,10 @@
 //! one datagram would not fit in a socket buffer is the same mistake as
 //! disconnecting because one diff failed to apply.
 
+// This module runs while a client session owns the screen: nothing here may
+// print, or it lands raw on the painted raw-mode terminal.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -108,9 +112,11 @@ pub struct FrameSink {
     /// The stream currently being written, if any. Dropping the sender tells
     /// the writer task to reset rather than finish.
     in_flight: Option<InFlight>,
-    /// Whether the "this peer has datagrams off" warning has been printed.
-    /// Once per sink, not once per frame: the condition is permanent for the
-    /// life of a connection, so repeating it would bury everything else.
+    /// Whether this peer has ever been found to have datagrams off. Set once
+    /// per sink, not once per frame: the condition is permanent for the life
+    /// of a connection. Read by [`FrameSink::warned_no_datagrams`] for the
+    /// coming status popup; never printed (a client's stderr is the terminal
+    /// it paints).
     warned_no_datagrams: bool,
 }
 
@@ -162,6 +168,16 @@ impl FrameSink {
             in_flight: None,
             warned_no_datagrams: false,
         }
+    }
+
+    /// Whether this peer has ever been found to have datagrams off, for the
+    /// coming status popup.
+    ///
+    /// Wired by the status popup (sub-project B, Ctrl-\ UI); until then
+    /// nothing outside tests reads it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn warned_no_datagrams(&self) -> bool {
+        self.warned_no_datagrams
     }
 
     /// Send one frame, choosing the channel by size.
@@ -219,17 +235,16 @@ impl FrameSink {
     /// Both ends of oxutrm set both datagram buffer sizes, so reaching here
     /// means either that config grew a hole (`oxutrm_net::quic` documents how
     /// easily: omit one of the two lines and datagrams vanish silently) or the
-    /// peer is not oxutrm. Say so once, out loud, and keep returning a
-    /// non-fatal outcome — a send failure still never ends a session.
+    /// peer is not oxutrm. Note it once (see [`FrameSink::warned_no_datagrams`])
+    /// and keep returning a non-fatal outcome — a send failure still never
+    /// ends a session.
+    ///
+    /// This used to say so with an `eprintln!`, which was the same bug as the
+    /// one `rejected_total` and `Standby::last_failure` exist to avoid: a
+    /// client's stderr IS the terminal it paints, so printing here would
+    /// desynchronise the renderer's model over a painted raw-mode screen.
     fn no_datagrams(&mut self) -> SendOutcome {
-        if !self.warned_no_datagrams {
-            self.warned_no_datagrams = true;
-            eprintln!(
-                "oxutrm: this peer advertised no QUIC datagram support, so no screen \
-                 state can be sent. Nothing will be displayed until the connection is \
-                 replaced."
-            );
-        }
+        self.warned_no_datagrams = true;
         SendOutcome::DatagramsDisabled
     }
 
@@ -549,6 +564,96 @@ impl Link {
     }
 }
 
+/// Real [`Link`]s on loopback, for tests of anything that rides on one: the
+/// session loops, the control stream, the standby.
+///
+/// Built with `oxutrm_net`'s own `quic_server`/`quic_client`, so both ends are
+/// pinned exactly as in production. The one knob is where the client dials,
+/// which is what lets a test put a relay it can blackhole in the middle.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use oxutrm_net::{generate_cert, quic_client, quic_server};
+    use oxutrm_proto::{ClientSpki, HostSpki};
+    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::Link;
+
+    /// A host end bound on loopback and accepting exactly one connection,
+    /// which no client has dialled yet.
+    pub(crate) struct Listening {
+        /// Where the host is bound. A relay forwards to this.
+        pub addr: SocketAddr,
+        host_sock: Arc<tokio::net::UdpSocket>,
+        host_fp: [u8; 32],
+        client_cert: CertificateDer<'static>,
+        client_key: PrivateKeyDer<'static>,
+        accepting: tokio::task::JoinHandle<(quinn::Connection, quinn::Endpoint)>,
+    }
+
+    /// Bind a host end on loopback and start accepting on it.
+    pub(crate) async fn listening() -> Listening {
+        let (cert, key, host_fp) = generate_cert().unwrap();
+        // The client has an identity of its own, and the host has to be told
+        // about it before it can listen at all.
+        let (client_cert, client_key, client_fp) = generate_cert().unwrap();
+
+        let host_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = host_sock.local_addr().unwrap();
+        let (host_ep, _permit, _stun) =
+            quic_server(&host_sock, cert, key, ClientSpki::new(client_fp))
+                .await
+                .unwrap();
+        let accepting = tokio::spawn(async move {
+            let incoming = host_ep.accept().await.expect("an inbound connection");
+            let conn = incoming.await.expect("a completed handshake");
+            (conn, host_ep)
+        });
+        Listening {
+            addr,
+            host_sock,
+            host_fp,
+            client_cert,
+            client_key,
+            accepting,
+        }
+    }
+
+    impl Listening {
+        /// Dial the host from a socket bound at `client_bind`, sending to
+        /// `to`: the host's own [`Listening::addr`], or a relay in front of
+        /// it. Returns `(host, client)`.
+        pub(crate) async fn dial(self, client_bind: &str, to: SocketAddr) -> (Link, Link) {
+            let client_sock = Arc::new(tokio::net::UdpSocket::bind(client_bind).await.unwrap());
+            let (client_conn, client_ep, _cstun) = quic_client(
+                &client_sock,
+                to,
+                HostSpki::new(self.host_fp),
+                self.client_cert,
+                self.client_key,
+            )
+            .await
+            .unwrap();
+            let (host_conn, host_ep) = self.accepting.await.unwrap();
+            (
+                Link::new(host_conn, host_ep, self.host_sock),
+                Link::new(client_conn, client_ep, client_sock),
+            )
+        }
+    }
+
+    /// A host link and a client link joined directly on loopback, as
+    /// `(host, client)`. Keep both for as long as the connection is wanted:
+    /// each owns its end's endpoint and socket.
+    pub(crate) async fn link_pair() -> (Link, Link) {
+        let host = listening().await;
+        let addr = host.addr;
+        host.dial("127.0.0.1:0", addr).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +933,10 @@ mod tests {
             sink.connection().max_datagram_size().is_none(),
             "this test needs a peer that disabled datagrams"
         );
+        assert!(
+            !sink.warned_no_datagrams(),
+            "the warning latched before anything was ever sent"
+        );
 
         // A frame that would comfortably fit a datagram.
         let outcome = sink.send(&small(1));
@@ -835,6 +944,11 @@ mod tests {
             outcome,
             SendOutcome::DatagramsDisabled,
             "a small frame on a datagram-less path came back as {outcome:?}"
+        );
+        assert!(
+            sink.warned_no_datagrams(),
+            "sending over a datagram-less path did not latch the flag the \
+             coming status popup reads"
         );
         // And an oversized one gets the same answer: the path is unusable, not
         // selectively usable.
