@@ -44,7 +44,7 @@ pub(crate) struct Attached {
 }
 
 /// Aborts a spawned task when dropped, tying its life to its owner's.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

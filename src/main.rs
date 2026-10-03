@@ -36,6 +36,7 @@ mod rebuild;
 mod roam;
 mod serve;
 mod session;
+mod standby;
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::BorrowedFd;

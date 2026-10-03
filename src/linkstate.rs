@@ -114,11 +114,19 @@ impl Phase {
 /// three seconds, the spec's `FAILOVER_AFTER` (§3.5). The second is there so a
 /// primary that was only blipping gets to answer first, since failing over
 /// costs a full-state snapshot and a new standby search.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
 pub const FAILOVER_GRACE: Duration = Duration::from_secs(1);
 
+/// How long a probe may take before the standby counts as not answering.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long after a failed probe the next one may go, within one outage.
+pub const PROBE_RETRY: Duration = Duration::from_secs(5);
+
+/// How long after a link is up before a standby is searched for, so the
+/// search never competes with the first paint (spec §3.1).
+pub const STANDBY_DELAY: Duration = Duration::from_secs(5);
+
 /// The wait before standby search number `failures + 1`.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
 pub fn standby_backoff(failures: u32) -> Duration {
     Duration::from_secs(match failures {
         0 => 30,
@@ -130,7 +138,6 @@ pub fn standby_backoff(failures: u32) -> Duration {
 
 /// Where this outage's probe of the standby stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
 pub enum ProbeState {
     Idle,
     Pending { sent: Instant },
@@ -149,10 +156,9 @@ pub enum ProbeState {
 /// after the 20 s rebuild escalation is still an answer. But `Recovering` can
 /// also mean a rebuild attempt is in flight, and landing that attempt would
 /// have the host adopt it as the primary and close the standby this just
-/// promoted as `TAKEN_OVER` -- so the CALLER (Task 8) is responsible for not
-/// failing over while a rebuild attempt is running; this function does not
-/// know about rebuilds and does not gate on them.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
+/// promoted as `TAKEN_OVER` -- so the caller (`Standby::step`) is responsible
+/// for not failing over while a rebuild attempt is running; this function
+/// does not know about rebuilds and does not gate on them.
 pub fn failover_due(phase: Phase, probe: ProbeState, now: Instant) -> bool {
     let outage = phase.is_outage();
     match probe {

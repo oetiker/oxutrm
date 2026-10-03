@@ -20,6 +20,7 @@ use crate::ladder::nominate;
 use crate::link::Link;
 use crate::rebuild::Rebuild;
 use crate::session::ClientSession;
+use crate::standby::Standby;
 
 /// `oxutrm <ssh-target>`: L1 to L14.
 ///
@@ -195,8 +196,14 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // whichever session actually resulted -- which for `Choice::New` is an id
     // the client had no way to guess in advance.
     let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
+    let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
         .context("preparing the client session")?;
+    // Spec §2.1: only a host that said it can park a standby is asked for
+    // one. An older host would read the request as a stray line and drop it.
+    if standby {
+        session = session.with_standby(Standby::new(cfg.clone(), std::time::Instant::now()));
+    }
 
     // L12. The SECOND of the two lines a session opens with, and the last.
     //
@@ -254,11 +261,13 @@ pub(crate) struct Established {
     /// attach, so a rebuild has to name the one it is resuming from.
     pub attach_id: u64,
     /// What the host said it can do. The session searches for a standby only
-    /// when this contains `FEATURE_STANDBY`.
-    // Read in production only from Task 8 (the standby search); until then
-    // only the tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// when this contains `FEATURE_STANDBY`; see [`offers_standby`].
     pub host_features: Vec<String>,
+}
+
+/// Whether a host's hello offered a standby (spec §2.1).
+pub(crate) fn offers_standby(features: &[String]) -> bool {
+    features.iter().any(|f| f == oxutrm_proto::FEATURE_STANDBY)
 }
 
 /// L4 to L10: one socket, the hello exchange, the ICE ladder and the QUIC
@@ -566,6 +575,19 @@ mod tests {
             enable_birthday: false,
             ..Default::default()
         }
+    }
+
+    /// The gate `connect` uses before it gives the session a standby. The
+    /// call site itself needs a real ssh and terminal, so the helper is what
+    /// is tested.
+    #[test]
+    fn no_standby_is_searched_for_when_the_host_did_not_offer_one() {
+        assert!(!offers_standby(&[]));
+        assert!(!offers_standby(&["control".to_string()]));
+        assert!(offers_standby(&[
+            "control".to_string(),
+            "standby".to_string()
+        ]));
     }
 
     /// The offer step itself, end to end: read it, decide, answer it.

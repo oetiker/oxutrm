@@ -150,25 +150,13 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         oxutrm_host::check_socket_path_length(&path)?;
         let listener = tokio::net::UnixListener::bind(&path)
             .with_context(|| format!("binding the session socket at {}", path.display()))?;
-
-        let (attach_tx, attach_rx) = tokio::sync::mpsc::channel(1);
-        // The door: standby requests from the control streams, served by the
-        // same loop as the socket. The first link's control server is started
-        // here, where the sender exists; every later link's is started by the
-        // listener as it hands the link over.
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        crate::control::serve_control(attached.link.sink.connection().clone(), door_tx.clone());
-        let task = tokio::spawn(crate::listener::serve_attaches(
+        Some(open_doors(
             listener,
             std::sync::Arc::clone(&guard),
             std::sync::Arc::clone(&meta),
             cfg,
-            crate::listener::ATTACH_TIMEOUT,
-            door_rx,
-            door_tx,
-            attach_tx,
-        ));
-        Some((task, attach_rx))
+            attached.link.sink.connection().clone(),
+        ))
     } else {
         // No socket, so no listener to run a standby's exchange. Such a
         // session (rung 4, whose QUIC runs inside ssh) has nothing a standby
@@ -199,4 +187,39 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     };
     drop(guard);
     code.map(|_| ())
+}
+
+/// The two ways into a severed session after its first attach: the Unix
+/// socket, and the door that the first link's control stream knocks on.
+///
+/// Returns the listener task and where completed attaches arrive. A function
+/// of its own so the first link's control server, which nothing else starts,
+/// can be reached from a test: every later link's is started by the listener
+/// as it hands the link over.
+pub(crate) fn open_doors(
+    listener: tokio::net::UnixListener,
+    guard: std::sync::Arc<oxutrm_host::RegistryGuard>,
+    meta: std::sync::Arc<tokio::sync::Mutex<SessionMeta>>,
+    cfg: NetConfig,
+    first: quinn::Connection,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
+) {
+    let (attach_tx, attach_rx) = tokio::sync::mpsc::channel(1);
+    // The door: standby requests from the control streams, served by the
+    // same loop as the socket.
+    let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
+    crate::control::serve_control(first, door_tx.clone());
+    let task = tokio::spawn(crate::listener::serve_attaches(
+        listener,
+        guard,
+        meta,
+        cfg,
+        crate::listener::ATTACH_TIMEOUT,
+        door_rx,
+        door_tx,
+        attach_tx,
+    ));
+    (task, attach_rx)
 }

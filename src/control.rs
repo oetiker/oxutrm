@@ -9,6 +9,9 @@
 //! `StandbyRequest` hands the stream to the session's door, where the ordinary
 //! attach exchange runs over it; `Probe` is answered in place, for as long as
 //! the stream stays open. Anything else is dropped.
+//!
+//! The client's half is [`request_standby`] and [`probe`], one stream per
+//! conversation as well.
 
 use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_proto::Signal;
@@ -57,6 +60,69 @@ pub(crate) fn serve_control_without_door(conn: quinn::Connection) -> tokio::task
     let (door, closed) = tokio::sync::mpsc::channel(1);
     drop(closed);
     serve_control(conn, door)
+}
+
+/// Longest a whole standby search may take, from opening the stream to the
+/// host's verdict. Every step inside `establish` has its own budget; this is
+/// the outer wall, as `ATTACH_TIMEOUT` is for the host. It matters more here
+/// than it looks: the primary has no idle timeout, so a request sent into a
+/// path that has just gone dark is never answered and never fails either.
+pub(crate) const SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Ask the host, over the primary, for a standby, and run the ordinary client
+/// exchange over the same stream (spec §3.2).
+///
+/// `admit` is the filter the standby's ladder nominates through: in the
+/// session, [`crate::egress::avoiding_source`] for the primary's remote.
+pub(crate) async fn request_standby(
+    primary: quinn::Connection,
+    size: oxutrm_proto::TermSize,
+    cfg: oxutrm_net::NetConfig,
+    admit: oxutrm_net::RemoteFilter,
+) -> anyhow::Result<crate::connect::Established> {
+    use anyhow::Context as _;
+    let search = async {
+        let (mut send, recv) = primary
+            .open_bi()
+            .await
+            .context("opening a control stream")?;
+        write_signal_async(&mut send, &Signal::StandbyRequest)
+            .await
+            .context("asking for a standby")?;
+        crate::connect::establish(
+            tokio::io::BufReader::new(recv),
+            send,
+            size,
+            &cfg,
+            Some(admit),
+        )
+        .await
+    };
+    tokio::time::timeout(SEARCH_DEADLINE, search)
+        .await
+        .context("the standby search ran out of time")?
+}
+
+/// Does the far end of `conn` answer right now?
+///
+/// A fresh stream per probe. Opening one on a dead path succeeds locally,
+/// since stream ids are ours to allocate, and it is the timeout that decides.
+pub(crate) async fn probe(conn: quinn::Connection, nonce: u64) -> bool {
+    let attempt = async {
+        let (mut send, recv) = conn.open_bi().await.ok()?;
+        write_signal_async(&mut send, &Signal::Probe { nonce })
+            .await
+            .ok()?;
+        let mut reader = tokio::io::BufReader::new(recv);
+        match read_signal_async(&mut reader).await.ok()? {
+            Signal::ProbeAck { nonce: n } if n == nonce => Some(()),
+            _ => None,
+        }
+    };
+    matches!(
+        tokio::time::timeout(crate::linkstate::PROBE_TIMEOUT, attempt).await,
+        Ok(Some(()))
+    )
 }
 
 async fn one_stream(
@@ -187,6 +253,121 @@ mod tests {
             .expect("the control server stopped serving after a stray stream")
             .expect("the door's sender is gone");
         assert_eq!(req.role, Role::Standby);
+    }
+
+    /// A host side that serves control streams and runs every standby request
+    /// through the real exchange, returning what it produced.
+    fn host_door(
+        host_conn: quinn::Connection,
+    ) -> tokio::sync::oneshot::Receiver<crate::attach_exchange::Attached> {
+        let (door_tx, mut door_rx) = tokio::sync::mpsc::channel(1);
+        serve_control(host_conn, door_tx);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let req: DoorRequest = door_rx.recv().await.expect("a request");
+            let mut meta = crate::attach_exchange::fixtures::fresh_meta(SESSION);
+            let cfg = crate::attach_exchange::fixtures::stun_free();
+            if let Ok(mut a) =
+                crate::attach_exchange::run_attach_exchange(req.reader, req.writer, &mut meta, &cfg)
+                    .await
+            {
+                a.role = req.role;
+                let _ = done_tx.send(a);
+            }
+        });
+        done_rx
+    }
+
+    const SESSION: &str = "00112233445566778899aabbccddeeff";
+
+    fn small() -> oxutrm_proto::TermSize {
+        oxutrm_proto::TermSize { cols: 40, rows: 10 }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_search_lands_a_second_connection_to_the_same_host() {
+        let (host, client) = link_pair().await;
+        let done = host_door(host.sink.connection().clone());
+        let cfg = crate::attach_exchange::fixtures::stun_free();
+        let primary = client.sink.connection().clone();
+
+        let est = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            request_standby(primary.clone(), small(), cfg, std::sync::Arc::new(|_| true)),
+        )
+        .await
+        .expect("the search hung")
+        .expect("the standby landed");
+        let attached = done.await.expect("the host completed its side");
+
+        assert_eq!(attached.role, Role::Standby);
+        assert_eq!(
+            est.session_id, SESSION,
+            "the standby reached another session"
+        );
+        assert_ne!(
+            est.link.sink.connection().stable_id(),
+            primary.stable_id(),
+            "the standby is the primary"
+        );
+        assert!(
+            primary.close_reason().is_none(),
+            "the search disturbed the primary"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_standby_search_honours_the_filter() {
+        let (host, client) = link_pair().await;
+        let _done = host_door(host.sink.connection().clone());
+        let mut cfg = crate::attach_exchange::fixtures::stun_free();
+        cfg.gather_timeout = std::time::Duration::from_millis(800);
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            request_standby(
+                client.sink.connection().clone(),
+                small(),
+                cfg,
+                std::sync::Arc::new(|_| false),
+            ),
+        )
+        .await
+        .expect("the search hung");
+        let Err(e) = r else {
+            panic!("landed a standby on a forbidden path");
+        };
+        let why = format!("{e:#}");
+        assert!(
+            why.contains("no rung of the ladder reached the host"),
+            "the search failed, but not because the filter left it no path: {why}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_of_a_served_link_is_answered() {
+        let (host, client) = link_pair().await;
+        let _server = serve_control_without_door(host.sink.connection().clone());
+        assert!(probe(client.sink.connection().clone(), 5).await);
+        // And again, on a fresh stream: one probe per conversation.
+        assert!(probe(client.sink.connection().clone(), 6).await);
+    }
+
+    /// Nobody answers: the connection is up, but no control server reads the
+    /// stream. The probe must come back `false` on its own clock rather than
+    /// wait for a reply that is never written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_nobody_answers_times_out_as_unanswered() {
+        let (_host, client) = link_pair().await;
+        let started = std::time::Instant::now();
+        let answered = tokio::time::timeout(
+            crate::linkstate::PROBE_TIMEOUT * 3,
+            probe(client.sink.connection().clone(), 5),
+        )
+        .await
+        .expect("the probe waited past its own timeout");
+        assert!(!answered);
+        assert!(started.elapsed() >= crate::linkstate::PROBE_TIMEOUT);
     }
 
     /// Rung 4 advertises a control stream like every other link, so it has to

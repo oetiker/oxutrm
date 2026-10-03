@@ -17,9 +17,9 @@
 //! That is a known limit, not a bug: the standby simply behaves as if it
 //! had never been found, which is the same outcome as never finding one.
 //!
-//! This filter is consulted synchronously from `IceAgent`'s poll loop (Task
-//! 3), so it must never panic and never block beyond a nonblocking UDP
-//! bind+connect -- exactly what `route_source` does and nothing more.
+//! This filter is consulted synchronously from `IceAgent`'s poll loop, so it
+//! must never panic and never block beyond a nonblocking UDP bind+connect --
+//! exactly what `route_source` does and nothing more.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -31,9 +31,6 @@ use oxutrm_net::RemoteFilter;
 /// `None` when the primary's own route cannot be read. A standby search is
 /// then pointless rather than dangerous (it could end up on the primary's own
 /// path), so the caller skips it and says there is no standby.
-///
-/// Unused until Task 8 wires this into the standby's ICE setup.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 8
 pub(crate) fn avoiding_source(primary_remote: SocketAddr) -> Option<RemoteFilter> {
     let baseline = crate::roam::route_source(primary_remote).ok()?;
     Some(std::sync::Arc::new(move |remote| {
