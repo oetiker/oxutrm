@@ -14,7 +14,7 @@
 
 **Deviations from the spec, decided while planning:**
 
-1. **The egress test compares source addresses, not interface names** (spec §3.3). `crate::roam::route_source` already asks the kernel which local address it would use for a peer, sending nothing. Two paths leave through different interfaces exactly when their source addresses differ, so this needs no `netdev` lookup.
+1. **The egress test compares source addresses, not interface names** (spec §3.3). `crate::roam::route_source` already asks the kernel which local address it would use for a peer, sending nothing, so this needs no `netdev` lookup. Different source addresses do not guarantee different interfaces: a dual-stack or multi-address NIC yields two source addresses over the same wire, so a standby may share the primary's interface (ruling S6; named as a known limit in `CHANGES.md` and the README).
 2. **The failover clock** (spec §3.5). The probe is sent on the first lap in `Silent` (2 s after a reply became owed). Failover happens `FAILOVER_GRACE` (1 s) after the probe was *sent*, provided it was answered. That is 3 s after the reply became owed, the spec's `FAILOVER_AFTER`, without a second clock.
 3. **The netns end-to-end test of spec §7 is not in this plan.** The netns harness (`crates/oxutrm-net/tests/netns.rs`) lives in `oxutrm-net` and cannot reach the root crate's session code. A two-uplink topology driving the real binary is its own piece of work. This plan proves the failover with the in-process `Relay` fixture, which really drops packets, plus a hand test on `thinlinc` (Task 10). The netns test is recorded as follow-up work in `CHANGES.md`.
 

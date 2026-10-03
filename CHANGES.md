@@ -70,7 +70,8 @@
   connection over whatever path the kernel would route through a different
   local source address than the primary — a split-tunnel VPN next to the open
   internet, say. The ten-second QUIC keep-alive that already holds a punched
-  NAT mapping open keeps this one warm too, at no cost while nothing is wrong.
+  NAT mapping open keeps this one warm too: one more keep-alive every ten
+  seconds on each end, and nothing else while nothing is wrong.
   When the primary goes silent and the standby still answers, the client fails
   over to it about three seconds in, with no ssh and no new handshake prompt —
   never because the standby is faster, only because the primary has stopped
@@ -84,6 +85,12 @@
   dual-stack or multi-address NIC can still hand both connections the same
   physical wire under different addresses, so the standby can share the fate
   of the primary it was meant to replace. There is no detection for that case.
+
+  A machine with only one way out (a single IPv4 uplink, say) never finds a
+  standby, but it keeps looking: each search runs a full attach exchange on
+  both ends, STUN included, and moves the session's attach number on. After
+  the first few the searches settle at one every five minutes, so on such a
+  machine the attach number `--list` shows climbs by about twelve an hour.
 
   The two-uplink network-namespace test the design describes (§7) is not
   written; failover here is covered by the in-process relay test and a hand

@@ -102,8 +102,8 @@ While a link is up, the client also looks for a **standby**: a second
 connection to the same session over whatever path the kernel would route
 through a different local address than the primary — the open internet next to
 a split-tunnel VPN, say. It is kept warm by the same ten-second QUIC keep-alive
-that already holds a punched NAT mapping open, at no extra cost while nothing
-is wrong. When the primary goes quiet and the standby still answers, the
+that already holds a punched NAT mapping open: one more keep-alive every ten
+seconds on each end. When the primary goes quiet and the standby still answers, the
 client fails over to it in about three seconds, with no ssh — never because
 the standby is faster, only because the primary has stopped answering, and
 there is no switching back once it has.
@@ -117,7 +117,10 @@ scrollback rather than staying on screen as a persistent status line:
     oxutrm  switched to standby (IPv4 punched)  ·  38 ms
 
 "no standby path" means the session has no fallback, and the next outage waits
-for the twenty-second rebuild above instead.
+for the twenty-second rebuild above instead. On a machine with only one way
+out the client keeps looking all the same, at most once every five minutes,
+and each search is a full attach exchange with the host: that is why the
+session's attach number climbs on such a machine.
 
 `loopback` runs both halves in one process with no network in between: a shell
 on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.
@@ -216,8 +219,12 @@ Real ones, found by testing rather than guessed at:
   blast against it. No topology yet NATs *both* ends simultaneously. The ladder
   is symmetric by construction and candidate exchange runs both ways, so there
   is no known reason it would fail, but that is reasoning rather than evidence.
-- **A better path found after connect is used only as a standby.** The client
-  switches to it when the link fails, never because it is faster.
+- **A better path found after connect is lost until the next attach.** QUIC
+  migration lets a client change its own *local* address; there is no mechanism
+  to repoint an established connection at a different *remote* address. A
+  standby does not change that: it is a second connection over a different
+  local source address, switched to when the primary fails, never because it
+  is faster.
 - **A standby can still share the primary's wire.** The filter that keeps a
   standby off the primary's path compares the kernel's reported source address
   for each candidate, not the interface (`src/egress.rs`): a dual-stack or
