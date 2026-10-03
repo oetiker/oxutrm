@@ -8,6 +8,11 @@
 //! does: like every link, its QUIC keep-alive fires every ten seconds on both
 //! ends (spec §3.4), which is the price of keeping its path warm.
 
+// This runs while a client session owns the screen: nothing here may print,
+// or it lands raw on the painted raw-mode terminal (Task A). A search's
+// failure reason is kept on `last_failure`, not printed.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -43,10 +48,13 @@ pub(crate) enum StandbyEvent {
         search: u64,
         e: Box<Established>,
     },
-    /// The search failed. Why is not kept: the user is told only that there
-    /// is no standby (spec §3.7), and the next search asks again anyway.
+    /// The search failed. The user is still told only that there is no
+    /// standby (spec §3.7), and the next search asks again anyway -- but the
+    /// reason is kept on [`Standby::last_failure`] for the coming status
+    /// popup, rather than thrown away.
     NotFound {
         search: u64,
+        reason: String,
     },
     Probed {
         answered: bool,
@@ -91,6 +99,10 @@ pub(crate) struct Standby {
     /// Whether "no standby path" has been said for the current dry spell, so
     /// it is said once, not after every failed search.
     told_none: bool,
+    /// Why the last search failed, for the coming status popup. Cleared the
+    /// moment a search succeeds; never printed (spec §3.7 says only "no
+    /// standby path").
+    last_failure: Option<String>,
 }
 
 impl Standby {
@@ -107,6 +119,7 @@ impl Standby {
             probing: false,
             nonce: 0,
             told_none: false,
+            last_failure: None,
         }
     }
 
@@ -118,6 +131,15 @@ impl Standby {
     #[cfg(test)]
     pub(crate) fn next_search(&self) -> Instant {
         self.next_search
+    }
+
+    /// Why the last search failed, kept for the status popup.
+    ///
+    /// Wired by the status popup (sub-project B, Ctrl-\ UI); until then
+    /// nothing outside tests reads it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_failure(&self) -> Option<&str> {
+        self.last_failure.as_deref()
     }
 
     /// The standby's connection, for the loop's `closed()` arm and for
@@ -187,20 +209,22 @@ impl Standby {
         self.searching = false;
         self.failures = 0;
         self.told_none = false;
+        self.last_failure = None;
         self.link = Some((e.link, e.path));
         true
     }
 
     /// A search finished without one. Returns whether to tell the user.
     ///
-    /// A stale search changes nothing: it most likely failed because the
-    /// primary it ran over was closed under it, which says nothing about the
-    /// path the session has now.
-    pub(crate) fn not_found(&mut self, search: u64, now: Instant) -> bool {
+    /// A stale search changes nothing, `reason` included: it most likely
+    /// failed because the primary it ran over was closed under it, which says
+    /// nothing about the path the session has now.
+    pub(crate) fn not_found(&mut self, search: u64, now: Instant, reason: String) -> bool {
         if search != self.search {
             return false;
         }
         self.searching = false;
+        self.last_failure = Some(reason);
         self.backoff(now);
         self.dry_spell_news()
     }
@@ -402,16 +426,91 @@ mod tests {
         let first = search_at(&mut s, t0 + STANDBY_DELAY);
 
         let t1 = t0 + STANDBY_DELAY;
-        assert!(s.not_found(first, t1), "the first failure was not reported");
+        assert!(
+            s.not_found(first, t1, "no path".to_string()),
+            "the first failure was not reported"
+        );
         assert_eq!(s.next_search(), t1 + standby_backoff(0));
         let second = search_at(&mut s, t1 + standby_backoff(0));
 
         let t2 = t1 + standby_backoff(0);
         assert!(
-            !s.not_found(second, t2),
+            !s.not_found(second, t2, "no path".to_string()),
             "the same dry spell was reported twice"
         );
         assert_eq!(s.next_search(), t2 + standby_backoff(1));
+    }
+
+    /// A `NotFound` with a reason is kept for the status popup (not yet
+    /// wired), not told to the user directly (spec §3.7 still says only "no
+    /// standby path").
+    #[test]
+    fn a_not_found_with_a_reason_sets_last_failure() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let search = search_at(&mut s, t0 + STANDBY_DELAY);
+        assert_eq!(
+            s.last_failure(),
+            None,
+            "a reason appeared before any search failed"
+        );
+
+        s.not_found(
+            search,
+            t0 + STANDBY_DELAY,
+            "the standby search ran out of time".to_string(),
+        );
+
+        assert_eq!(
+            s.last_failure(),
+            Some("the standby search ran out of time"),
+            "the failure's reason was dropped rather than kept"
+        );
+    }
+
+    /// A later `Found` is good news, and a stale reason from the dry spell
+    /// before it must not linger in the box.
+    #[tokio::test]
+    async fn a_later_found_clears_last_failure() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let search = search_at(&mut s, t0 + STANDBY_DELAY);
+        s.not_found(search, t0 + STANDBY_DELAY, "no path".to_string());
+        assert!(
+            s.last_failure().is_some(),
+            "the fixture's failure was not set"
+        );
+
+        let next_at = s.next_search();
+        let next = search_at(&mut s, next_at);
+        let (e, _host) = established().await;
+        assert!(s.found(next, e), "the fixture's search was stale");
+
+        assert_eq!(
+            s.last_failure(),
+            None,
+            "a standby was found, but the old dry spell's reason was still shown"
+        );
+    }
+
+    /// A stale `NotFound` -- one whose search has already been disowned,
+    /// because the primary it ran over is gone -- says nothing about the
+    /// current primary and must not overwrite its box.
+    #[test]
+    fn a_stale_not_found_does_not_set_last_failure() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let stale = search_at(&mut s, t0 + STANDBY_DELAY);
+        let t1 = t0 + STANDBY_DELAY + Duration::from_secs(1);
+        s.forget(t1);
+
+        s.not_found(stale, t1, "this must not be kept".to_string());
+
+        assert_eq!(
+            s.last_failure(),
+            None,
+            "a stale search's reason was kept as if it were current"
+        );
     }
 
     #[test]
@@ -420,7 +519,7 @@ mod tests {
         let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
         let t1 = t0 + STANDBY_DELAY;
         let search = search_at(&mut s, t1);
-        let _ = s.not_found(search, t1);
+        let _ = s.not_found(search, t1, "no path".to_string());
         assert_eq!(
             s.step(Phase::Live, t1 + Duration::from_secs(1), false),
             StandbyAction::Nothing,
@@ -564,7 +663,7 @@ mod tests {
         );
         let search = search_at(&mut s, t0 + standby_backoff(0));
         assert!(
-            !s.not_found(search, t0 + standby_backoff(0)),
+            !s.not_found(search, t0 + standby_backoff(0), "no path".to_string()),
             "the dry spell that losing it began was reported twice"
         );
     }
@@ -607,7 +706,7 @@ mod tests {
         s.forget(t1);
 
         assert!(
-            !s.not_found(stale, t1),
+            !s.not_found(stale, t1, "this must not be kept".to_string()),
             "a search over the replaced primary announced a dry spell"
         );
         assert_eq!(
@@ -620,7 +719,7 @@ mod tests {
         assert_ne!(next, stale);
         // A current search's failure still counts, so the check above is
         // not a `not_found` that never reports anything.
-        assert!(s.not_found(next, t1 + STANDBY_DELAY));
+        assert!(s.not_found(next, t1 + STANDBY_DELAY, "no path".to_string()));
     }
 
     /// The same after a failover, and a search that lands late is closed
@@ -662,7 +761,7 @@ mod tests {
             );
             let search = search_at(&mut s, t0 + standby_backoff(0));
             assert!(
-                s.not_found(search, t0 + standby_backoff(0)),
+                s.not_found(search, t0 + standby_backoff(0), "no path".to_string()),
                 "the dry spell went unannounced after a close as {:?}",
                 String::from_utf8_lossy(phrase)
             );

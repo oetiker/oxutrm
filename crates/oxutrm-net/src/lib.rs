@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// A miss or a rejection here must come back as data, never land raw on
+// whoever's screen the caller may own (Task A). Tests print SKIP lines on a
+// host that lacks some fixture, so the deny does not apply to them.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
 //! Getting a datagram from one end to the other when both ends are behind NAT.
 //!
@@ -48,7 +52,7 @@ mod stunmsg;
 mod stunserver;
 mod tls;
 
-pub use birthday::{BirthdayResult, birthday_blast, guessed_ports};
+pub use birthday::{BirthdayResult, BlastMiss, BlastOutcome, birthday_blast, guessed_ports};
 pub use candidates::{ice_priority, is_link_local, local_candidates, local_candidates_filtered};
 pub use config::NetConfig;
 pub use demux::{STUN_HEADER_LEN, STUN_MAGIC_COOKIE, is_stun};

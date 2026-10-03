@@ -51,6 +51,10 @@
 //! one datagram would not fit in a socket buffer is the same mistake as
 //! disconnecting because one diff failed to apply.
 
+// This module runs while a client session owns the screen: nothing here may
+// print, or it lands raw on the painted raw-mode terminal (Task A).
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -108,9 +112,11 @@ pub struct FrameSink {
     /// The stream currently being written, if any. Dropping the sender tells
     /// the writer task to reset rather than finish.
     in_flight: Option<InFlight>,
-    /// Whether the "this peer has datagrams off" warning has been printed.
-    /// Once per sink, not once per frame: the condition is permanent for the
-    /// life of a connection, so repeating it would bury everything else.
+    /// Whether this peer has ever been found to have datagrams off. Set once
+    /// per sink, not once per frame: the condition is permanent for the life
+    /// of a connection. Read by [`FrameSink::warned_no_datagrams`] for the
+    /// coming status popup; never printed (a client's stderr is the terminal
+    /// it paints).
     warned_no_datagrams: bool,
 }
 
@@ -162,6 +168,16 @@ impl FrameSink {
             in_flight: None,
             warned_no_datagrams: false,
         }
+    }
+
+    /// Whether this peer has ever been found to have datagrams off, for the
+    /// coming status popup.
+    ///
+    /// Wired by the status popup (sub-project B, Ctrl-\ UI); until then
+    /// nothing outside tests reads it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn warned_no_datagrams(&self) -> bool {
+        self.warned_no_datagrams
     }
 
     /// Send one frame, choosing the channel by size.
@@ -219,17 +235,16 @@ impl FrameSink {
     /// Both ends of oxutrm set both datagram buffer sizes, so reaching here
     /// means either that config grew a hole (`oxutrm_net::quic` documents how
     /// easily: omit one of the two lines and datagrams vanish silently) or the
-    /// peer is not oxutrm. Say so once, out loud, and keep returning a
-    /// non-fatal outcome — a send failure still never ends a session.
+    /// peer is not oxutrm. Note it once (see [`FrameSink::warned_no_datagrams`])
+    /// and keep returning a non-fatal outcome — a send failure still never
+    /// ends a session.
+    ///
+    /// This used to say so with an `eprintln!`, which was the same bug as the
+    /// one `rejected_total` and `Standby::last_failure` exist to avoid: a
+    /// client's stderr IS the terminal it paints, so printing here would
+    /// desynchronise the renderer's model over a painted raw-mode screen.
     fn no_datagrams(&mut self) -> SendOutcome {
-        if !self.warned_no_datagrams {
-            self.warned_no_datagrams = true;
-            eprintln!(
-                "oxutrm: this peer advertised no QUIC datagram support, so no screen \
-                 state can be sent. Nothing will be displayed until the connection is \
-                 replaced."
-            );
-        }
+        self.warned_no_datagrams = true;
         SendOutcome::DatagramsDisabled
     }
 
@@ -918,6 +933,10 @@ mod tests {
             sink.connection().max_datagram_size().is_none(),
             "this test needs a peer that disabled datagrams"
         );
+        assert!(
+            !sink.warned_no_datagrams(),
+            "the warning latched before anything was ever sent"
+        );
 
         // A frame that would comfortably fit a datagram.
         let outcome = sink.send(&small(1));
@@ -925,6 +944,11 @@ mod tests {
             outcome,
             SendOutcome::DatagramsDisabled,
             "a small frame on a datagram-less path came back as {outcome:?}"
+        );
+        assert!(
+            sink.warned_no_datagrams(),
+            "sending over a datagram-less path did not latch the flag the \
+             coming status popup reads"
         );
         // And an oversized one gets the same answer: the path is unusable, not
         // selectively usable.

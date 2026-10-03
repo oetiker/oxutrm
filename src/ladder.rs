@@ -46,12 +46,17 @@
 //! It does not build a QUIC endpoint, print a status line, or decide
 //! detachability. Nomination ends; the caller takes the socket from here.
 
+// It runs at connect time, which can be before a client session owns a
+// screen, but also as a standby search run WHILE one does (Task A): nothing
+// here may print.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use oxutrm_host::LadderPlan;
-use oxutrm_net::{IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
+use oxutrm_net::{BlastOutcome, IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
 use oxutrm_proto::{Candidate, CandidateKind, NatType, Psk, Rung};
 
 /// The path the ladder settled on, and the socket it belongs to.
@@ -525,13 +530,11 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
 
     let result = birthday_blast(ladder.psk, ladder.role, base, ladder.cfg).await;
     let found = match result {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            return Err(Verdict::Failed(format!(
-                "no hole found around {base} within {:?}",
-                ladder.cfg.birthday_budget
-            )));
-        }
+        Ok(BlastOutcome::Found(found)) => found,
+        // The miss carries its own numbers now (Task A): this text is the
+        // rung's verdict, printed at connect time before any session owns a
+        // screen, so showing them here is still safe.
+        Ok(BlastOutcome::Miss(miss)) => return Err(Verdict::Failed(miss.to_string())),
         Err(e) => return Err(Verdict::Failed(format!("the blast could not start: {e}"))),
     };
 
@@ -978,6 +981,41 @@ mod tests {
             got.probes > 0,
             "a win with no probes reported hides the cost"
         );
+    }
+
+    /// A miss, not a win: `blast`'s `Verdict::Failed` text must carry the
+    /// numbers behind it (Task A), because this is printed at connect time,
+    /// before any session owns a screen -- the one place the numbers may
+    /// still show up raw.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blast_miss_reports_its_numbers_in_the_failed_verdict() {
+        // Nothing answers at this base, so the budget runs out.
+        let base: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let ladder = Ladder {
+            psk: &PSK,
+            role: IceRole::Controlling,
+            nat: NatType::Symmetric,
+            cfg: &NetConfig {
+                enable_birthday: true,
+                birthday_sockets: 2,
+                birthday_ports: 4,
+                birthday_budget: Duration::from_millis(300),
+                ..cfg(120)
+            },
+            local: vec![],
+            remote: vec![candidate(&base.to_string(), CandidateKind::ServerReflexive)],
+            admit_remote: None,
+        };
+
+        let verdict = blast(&ladder, 0)
+            .await
+            .expect_err("nothing answers at this base");
+        let Verdict::Failed(why) = verdict else {
+            panic!("a miss must read as failed, got {verdict:?}");
+        };
+        assert!(why.contains("2 sockets"), "{why}");
+        assert!(why.contains("4 ports"), "{why}");
+        assert!(why.contains(&base.to_string()), "{why}");
     }
 
     /// The birthday blast nominates without going through

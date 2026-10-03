@@ -52,6 +52,40 @@ impl std::fmt::Debug for BirthdayResult {
     }
 }
 
+/// The numbers behind a blast that ran its course without punching a hole.
+///
+/// An ordinary outcome for this rung, not an error -- but "NAT traversal
+/// failed" with no numbers is unactionable for whoever has to debug it, so
+/// this carries what was actually tried. It does not print itself: whoever
+/// owns the screen decides what, if anything, to show.
+#[derive(Debug)]
+pub struct BlastMiss {
+    pub probes: u32,
+    pub sockets: usize,
+    pub ports: usize,
+    pub base: SocketAddr,
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for BlastMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "birthday blast found no path: {} probes from {} sockets across \
+             {} ports around {} in {:?}",
+            self.probes, self.sockets, self.ports, self.base, self.budget
+        )
+    }
+}
+
+/// What a blast finished with.
+pub enum BlastOutcome {
+    /// A hole was punched.
+    Found(BirthdayResult),
+    /// The budget ran out without one -- an ordinary outcome, not an error.
+    Miss(BlastMiss),
+}
+
 /// Guessed ports, walking outward from the peer's observed base port.
 ///
 /// Outward rather than upward because a symmetric NAT's next allocation is
@@ -87,16 +121,23 @@ pub fn guessed_ports(base: u16, count: u16) -> Vec<u16> {
 /// Fire authenticated checks from many sockets at many guessed ports, and
 /// return the first socket that gets a valid answer.
 ///
-/// `Ok(None)` means the budget expired without a hole — an ordinary outcome
-/// for this rung, not an error. `Err` means the blast could not start at all.
+/// `Ok(BlastOutcome::Miss(_))` means the budget expired without a hole — an
+/// ordinary outcome for this rung, not an error, carrying the numbers behind
+/// it. `Err` means the blast could not start at all.
 pub async fn birthday_blast(
     psk: &Psk,
     role: IceRole,
     peer_base: SocketAddr,
     cfg: &NetConfig,
-) -> anyhow::Result<Option<BirthdayResult>> {
+) -> anyhow::Result<BlastOutcome> {
     if !cfg.enable_birthday {
-        return Ok(None);
+        return Ok(BlastOutcome::Miss(BlastMiss {
+            probes: 0,
+            sockets: 0,
+            ports: 0,
+            base: peer_base,
+            budget: cfg.birthday_budget,
+        }));
     }
     anyhow::ensure!(
         cfg.birthday_sockets > 0 && cfg.birthday_ports > 0,
@@ -158,7 +199,7 @@ pub async fn birthday_blast(
         {
             let (idx, remote) = found;
             let socket = into_std(&sockets, idx)?;
-            return Ok(Some(BirthdayResult {
+            return Ok(BlastOutcome::Found(BirthdayResult {
                 socket,
                 remote,
                 probes,
@@ -174,7 +215,7 @@ pub async fn birthday_blast(
             listen_round(&sockets, &creds, inbound, outbound, &mut buf, LISTEN_SLICE).await
         {
             let socket = into_std(&sockets, idx)?;
-            return Ok(Some(BirthdayResult {
+            return Ok(BlastOutcome::Found(BirthdayResult {
                 socket,
                 remote,
                 probes,
@@ -182,17 +223,17 @@ pub async fn birthday_blast(
         }
     }
 
-    // Say what was tried. "NAT traversal failed" with no numbers cannot be
-    // acted on by whoever has to debug it.
-    eprintln!(
-        "oxutrm: birthday blast found no path: {probes} probes from {} sockets \
-         across {} ports around {} in {:?}",
-        sockets.len(),
-        ports.len(),
-        peer_base,
-        cfg.birthday_budget
-    );
-    Ok(None)
+    // What was tried. "NAT traversal failed" with no numbers cannot be acted
+    // on by whoever has to debug it -- but this no longer prints it: the
+    // caller may own a screen it must not write over (Task A), so the numbers
+    // travel in the return value instead.
+    Ok(BlastOutcome::Miss(BlastMiss {
+        probes,
+        sockets: sockets.len(),
+        ports: ports.len(),
+        base: peer_base,
+        budget: cfg.birthday_budget,
+    }))
 }
 
 /// Poll every socket once for a valid answer. Returns which socket, and who
@@ -368,10 +409,15 @@ mod tests {
         let base = SocketAddr::new(peer_addr.ip(), peer_addr.port().wrapping_sub(3));
 
         let cfg = cfg(4, 32, 4000);
-        let got = birthday_blast(&PSK, IceRole::Controlling, base, &cfg)
+        let outcome = birthday_blast(&PSK, IceRole::Controlling, base, &cfg)
             .await
-            .expect("the blast must not error")
-            .expect("the hole was inside the range and must have been found");
+            .expect("the blast must not error");
+        let got = match outcome {
+            BlastOutcome::Found(r) => r,
+            BlastOutcome::Miss(m) => {
+                panic!("the hole was inside the range and must have been found: {m}")
+            }
+        };
 
         assert_eq!(got.remote, peer_addr, "found the wrong peer");
         assert!(got.probes > 0, "reported a find without probing");
@@ -389,11 +435,44 @@ mod tests {
     async fn the_blast_finds_a_hole_sitting_exactly_on_the_base() {
         let (_peer, peer_addr) = lurking_peer(0).await;
         let cfg = cfg(2, 8, 3000);
-        let got = birthday_blast(&PSK, IceRole::Controlling, peer_addr, &cfg)
+        let outcome = birthday_blast(&PSK, IceRole::Controlling, peer_addr, &cfg)
             .await
-            .expect("no error")
-            .expect("the base was correct");
+            .expect("no error");
+        let got = match outcome {
+            BlastOutcome::Found(r) => r,
+            BlastOutcome::Miss(m) => panic!("the base was correct: {m}"),
+        };
         assert_eq!(got.remote, peer_addr);
+    }
+
+    /// A miss carries the numbers behind it -- this is the whole point of
+    /// `BlastMiss` existing at all, rather than a bare `None`: whoever owns
+    /// the screen decides what to do with them, which the miss cannot do for
+    /// itself by printing.
+    #[test]
+    fn a_miss_carries_its_numbers() {
+        let base: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let miss = BlastMiss {
+            probes: 37,
+            sockets: 4,
+            ports: 32,
+            base,
+            budget: Duration::from_secs(6),
+        };
+
+        assert_eq!(miss.probes, 37);
+        assert_eq!(miss.sockets, 4);
+        assert_eq!(miss.ports, 32);
+        assert_eq!(miss.base, base);
+
+        let shown = miss.to_string();
+        assert!(shown.contains("37"), "probes missing from {shown:?}");
+        assert!(shown.contains('4'), "sockets missing from {shown:?}");
+        assert!(shown.contains("32"), "ports missing from {shown:?}");
+        assert!(
+            shown.contains("203.0.113.7:40000"),
+            "base missing from {shown:?}"
+        );
     }
 
     /// And it must give up cleanly rather than hanging when there is nothing
@@ -413,7 +492,23 @@ mod tests {
         .expect("the budget must be honoured, not merely intended")
         .expect("giving up is an ordinary outcome, not an error");
 
-        assert!(got.is_none());
+        let miss = match got {
+            BlastOutcome::Miss(m) => m,
+            BlastOutcome::Found(_) => panic!("found a hole where none exists"),
+        };
+        assert_eq!(miss.base, base, "the miss named the wrong base");
+        assert_eq!(
+            miss.budget, cfg.birthday_budget,
+            "the miss named the wrong budget"
+        );
+        assert_eq!(
+            miss.sockets, cfg.birthday_sockets as usize,
+            "the miss named the wrong socket count"
+        );
+        assert_eq!(
+            miss.ports, cfg.birthday_ports as usize,
+            "the miss named the wrong port count"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the wall-clock cap did not hold: {:?}",
@@ -433,7 +528,7 @@ mod tests {
         let got = birthday_blast(&PSK, IceRole::Controlling, base, &cfg)
             .await
             .expect("no error");
-        assert!(got.is_none());
+        assert!(matches!(got, BlastOutcome::Miss(_)));
     }
 
     #[tokio::test]
@@ -485,7 +580,7 @@ mod tests {
             .await
             .expect("no error");
         assert!(
-            got.is_none(),
+            matches!(got, BlastOutcome::Miss(_)),
             "a stranger's answer was accepted as a punched hole"
         );
     }

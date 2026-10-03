@@ -119,6 +119,15 @@
 
 ### Fixed
 
+- **A standby search's diagnostics no longer garble the screen.** Each standby
+  search runs the full connection ladder, birthday blast included, so on a
+  machine whose blast misses this printed over the painted raw-mode screen on
+  every search during an outage. The blast's miss now carries its numbers back
+  as data instead of printing them; a connect-time failure (before any session
+  owns a screen) still shows them, in the rung's own failure text. A lint now
+  denies `print_stderr`/`print_stdout` in the modules on a client session's
+  in-session path, so this cannot come back unnoticed.
+
 - **Reattaching no longer needs `loginctl enable-linger`.** A detached session
   outlives your login on most systems, but the directory it registered itself
   in — `/run/user/<uid>` — does not, so oxutrm used to record sessions in your

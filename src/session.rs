@@ -38,6 +38,12 @@
 //! under it because a different client reattached, and down-converting on the
 //! host would permanently degrade the state for every future client.
 
+// The client half of this module runs while it owns the screen: nothing on
+// that path may print, or it lands raw on the painted raw-mode terminal
+// (Task A). The one deliberate exception, on the host's own stderr, is
+// `#[expect]`-ed at its call site.
+#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
+
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
@@ -246,7 +252,17 @@ impl HostSession {
                 // here once hid a deadlock for a whole day.
                 Err(e) => {
                     turn.rejected += 1;
-                    eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
+                    #[cfg_attr(
+                        not(test),
+                        expect(
+                            clippy::print_stderr,
+                            reason = "the host daemon's own stderr, from turn_at on \
+                                      HostSession; never a client's screen"
+                        )
+                    )]
+                    {
+                        eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
+                    }
                 }
             }
         }
@@ -1970,11 +1986,11 @@ impl ClientSession {
                         self.announce_standby(Some(&path), out)?;
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::NotFound { search }) => {
+                Wake::Standby(crate::standby::StandbyEvent::NotFound { search, reason }) => {
                     let tell = self
                         .standby
                         .as_mut()
-                        .is_some_and(|s| s.not_found(search, Instant::now()));
+                        .is_some_and(|s| s.not_found(search, Instant::now(), reason));
                     if tell {
                         self.announce_standby(None, out)?;
                     }
@@ -2104,7 +2120,12 @@ impl ClientSession {
                         // primary's path: no search at all is the safe
                         // answer.
                         let event = match admit_for(primary.remote_address()) {
-                            None => crate::standby::StandbyEvent::NotFound { search },
+                            None => crate::standby::StandbyEvent::NotFound {
+                                search,
+                                reason: "the primary's own route could not be read, \
+                                         so no search could run safely"
+                                    .to_string(),
+                            },
                             Some(admit) => {
                                 match crate::control::request_standby(primary, size, cfg, admit)
                                     .await
@@ -2113,7 +2134,10 @@ impl ClientSession {
                                         search,
                                         e: Box::new(e),
                                     },
-                                    Err(_) => crate::standby::StandbyEvent::NotFound { search },
+                                    Err(e) => crate::standby::StandbyEvent::NotFound {
+                                        search,
+                                        reason: format!("{e:#}"),
+                                    },
                                 }
                             }
                         };
