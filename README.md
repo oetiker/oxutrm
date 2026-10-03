@@ -118,8 +118,9 @@ scrollback rather than staying on screen as a persistent status line:
 
 "no standby path" means the session has no fallback, and the next outage waits
 for the twenty-second rebuild above instead. On a machine with only one way
-out the client keeps looking all the same, at most once every five minutes,
-and each search is a full attach exchange with the host: that is why the
+out the client keeps looking all the same: the wait between searches grows
+from thirty seconds to five minutes, and a route change brings the next one
+forward. Each search is a full attach exchange with the host: that is why the
 session's attach number climbs on such a machine.
 
 `loopback` runs both halves in one process with no network in between: a shell

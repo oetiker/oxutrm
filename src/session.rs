@@ -705,8 +705,9 @@ impl HostSession {
                 // still the primary's. The listener can finish a standby's
                 // exchange just after a takeover, so the displaced client's
                 // standby may land here. It does no harm: that client exits on
-                // its `TAKEN_OVER` and never sends on it, and the new
-                // client's own first search supersedes it.
+                // its `TAKEN_OVER` and never sends on it. It stays parked
+                // until a standby the new client finds supersedes it, or the
+                // next primary attach drops it.
                 if let Some(old) = standby.replace(a.link) {
                     old.sink
                         .connection()
