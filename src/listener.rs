@@ -480,7 +480,7 @@ mod tests {
             .await
             .expect("connecting to the session socket");
         let (cr, cw) = stream.into_split();
-        let _primary = tokio::time::timeout(
+        let primary = tokio::time::timeout(
             within,
             crate::connect::establish(tokio::io::BufReader::new(cr), cw, size, &stun_free(), None),
         )
@@ -509,7 +509,7 @@ mod tests {
             .await
             .unwrap();
         let (cr, cw) = tokio::io::split(client_side);
-        let _standby = tokio::time::timeout(
+        let standby = tokio::time::timeout(
             within,
             crate::connect::establish(tokio::io::BufReader::new(cr), cw, size, &stun_free(), None),
         )
@@ -525,6 +525,27 @@ mod tests {
             Role::Standby,
             "a standby came out of the door as a takeover: it would displace \
              the live link and end the client"
+        );
+
+        // Every link handed over carries a control server of its own. On the
+        // standby it answers the probe failover waits on; on the primary it
+        // takes the next standby request. Nothing in this test starts one, so
+        // only the listener can be answering. And a link with no server is
+        // not answered, so the probe itself cannot pass on its own.
+        let (_unserved_host, unserved) = crate::link::fixtures::link_pair().await;
+        assert!(
+            !crate::control::probe(unserved.sink.connection().clone(), 1).await,
+            "a link with no control server answered a probe"
+        );
+        assert!(
+            crate::control::probe(standby.link.sink.connection().clone(), 2).await,
+            "the standby the listener handed over answers no probe: failover \
+             would never fire"
+        );
+        assert!(
+            crate::control::probe(primary.link.sink.connection().clone(), 3).await,
+            "the primary the listener handed over answers no probe, so it \
+             cannot carry the next standby request either"
         );
         task.abort();
     }
