@@ -7422,4 +7422,223 @@ mod tests {
              {applied} of them applied"
         );
     }
+
+    /// Spec §7, end to end: the link goes dark under a running session, the
+    /// popup opens by itself and says so on the screen, and when the link
+    /// comes back it says that too -- with nothing written to the terminal
+    /// outside the renderer at any point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_outage_raises_the_popup_and_its_end_is_reported() {
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+        assert!(
+            !screen_of(&out, BIG).contains("SILENT"),
+            "the popup was up before the outage"
+        );
+
+        relay.blackhole(true);
+        // Sent while the phase is still `Live`, so a reply is owed and the
+        // silence is noticed.
+        typing.write_all(b"true\n").expect("type");
+        wait_for_screen(&out, BIG, "\u{25cf} SILENT", Duration::from_secs(10)).await;
+
+        relay.blackhole(false);
+        wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(20)).await;
+
+        // The lingering popup takes every key; it closes by itself after
+        // `LINGER`, and only then does typing reach the shell.
+        wait_off_screen(&out, BIG, "LIVE again", Duration::from_secs(10)).await;
+        typing.write_all(b"exit 4\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; the screen was:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 4);
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 4);
+
+        let link: Vec<String> = client
+            .activity
+            .entries()
+            .filter(|e| e.kind == crate::activity::Kind::Link)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(link.first().map(String::as_str), Some("silent"), "{link:?}");
+        assert!(
+            link.get(1)
+                .is_some_and(|t| t.starts_with("live again via this link, outage ")),
+            "{link:?}"
+        );
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
+        );
+    }
+
+    /// Review focus 2 and 3, end to end: the user closes the outage popup
+    /// and types blind; the popup stays shut for the rest of that outage,
+    /// and when the link answers it opens on the question, whose bare `s`
+    /// delivers the typing to the shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blind_typing_after_closing_the_popup_is_asked_about_and_sent() {
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+
+        relay.blackhole(true);
+        typing.write_all(b"true\n").expect("type");
+        wait_for_screen(&out, BIG, "\u{25cf} SILENT", Duration::from_secs(10)).await;
+
+        close_the_popup(&mut typing, &out, BIG).await;
+        typing
+            .write_all(b"printf 'blind-%s\\n' ok\n")
+            .expect("type");
+        // Ten laps at least, all in the outage the popup was closed in:
+        // none of them may open it again.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !screen_of(&out, BIG).contains("SILENT"),
+            "the popup opened itself again for the outage it was closed in:\n{}",
+            screen_of(&out, BIG)
+        );
+        assert!(
+            !screen_of(&out, BIG).contains("blind-ok"),
+            "blind typing reached the shell during the outage"
+        );
+
+        relay.blackhole(false);
+        // The question shows the typing as typed (`blind-%s`); `blind-ok`
+        // appears only once the shell has run it.
+        wait_for_screen(
+            &out,
+            BIG,
+            "deliver what you typed?",
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            !screen_of(&out, BIG).contains("blind-ok"),
+            "the typing was delivered before it was asked about"
+        );
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, BIG, "blind-ok", Duration::from_secs(10)).await;
+        wait_off_screen(
+            &out,
+            BIG,
+            "deliver what you typed?",
+            Duration::from_secs(10),
+        )
+        .await;
+
+        typing.write_all(b"exit 6\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; the screen was:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 6);
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 6);
+
+        let input: Vec<String> = client
+            .activity
+            .entries()
+            .filter(|e| e.kind == crate::activity::Kind::Input)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(input, ["held input sent (23 bytes)"]);
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
+        );
+    }
+
+    /// A quick double `Ctrl-\` is one literal `Ctrl-\` for the remote
+    /// program, through the real keyboard path. `stty -isig -echo` makes the
+    /// shell's `cat -v` print exactly what arrives, once: two literals would
+    /// read `^\^\`, none would read nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quick_double_ctrl_backslash_reaches_the_shell_as_one_literal() {
+        let (mut host, mut client) = pair("").await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        // `ready-ok` is printed after `stty` has run, so once it is on the
+        // screen nothing typed afterwards can be eaten as a signal.
+        typing
+            .write_all(b"stty -isig -echo; printf 'ready-%s\\n' ok; cat -v\n")
+            .expect("type");
+        wait_for_screen(&out, size(), "ready-ok", Duration::from_secs(10)).await;
+        assert!(
+            !screen_of(&out, size()).contains("^\\"),
+            "a literal arrived before it was typed"
+        );
+
+        // One read: both presses carry the same timestamp, well inside the
+        // window.
+        typing
+            .write_all(&[CTRL_BACKSLASH, CTRL_BACKSLASH, b'\n'])
+            .expect("type");
+        wait_for_screen(&out, size(), "^\\", Duration::from_secs(10)).await;
+
+        // EOF ends `cat`; `-isig` leaves VEOF working.
+        typing.write_all(b"\x04exit 5\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 5);
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 5);
+
+        let screen = text(client.screen());
+        assert!(screen.lines().any(|l| l.trim_end() == "^\\"), "{screen}");
+        assert!(!screen.contains("^\\^\\"), "two literals arrived: {screen}");
+        assert!(client.shown.is_none(), "the double press left the popup up");
+    }
 }
