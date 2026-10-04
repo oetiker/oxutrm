@@ -252,12 +252,28 @@ impl LogFile {
         let bytes = format!("{line}\n");
         let len = self.file.metadata()?.len();
         if len > 0 && len + bytes.len() as u64 > self.cap {
-            std::fs::rename(&self.path, rotated(&self.path))?;
-            self.file = append(&self.path)?;
+            self.rotate()?;
         }
         // One write of the whole line: with O_APPEND, two clients appending
         // at once cannot interleave inside it.
         self.file.write_all(bytes.as_bytes())
+    }
+}
+
+impl LogFile {
+    /// Move client.log to client.log.1 and carry on in a fresh client.log.
+    ///
+    /// No client.log to move means another client sharing the file passed
+    /// the cap at the same moment and renamed it first: a lost race, and the
+    /// rotation it wanted has happened. The log carries on in whatever
+    /// client.log is there now, or a new one.
+    fn rotate(&mut self) -> std::io::Result<()> {
+        match std::fs::rename(&self.path, rotated(&self.path)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            other => other?,
+        }
+        self.file = append(&self.path)?;
+        Ok(())
     }
 }
 
@@ -552,6 +568,48 @@ mod tests {
                 .unwrap()
                 .ends_with("link second\n")
         );
+    }
+
+    /// Final review, Minor 3. Two clients pass the cap at once and the other
+    /// one renames client.log first: our rename finds no client.log. That
+    /// is a lost race, not a broken file -- the rotation it wanted has
+    /// happened -- so the log carries on in the new client.log. Reached
+    /// through `rotate` because nothing single-threaded can rename the file
+    /// between `write_line`'s check and its rename.
+    #[test]
+    fn a_rotation_that_lost_the_race_carries_on_in_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/oxutrm/client.log");
+        let rotated = dir.path().join("state/oxutrm/client.log.1");
+        let mut log = LogFile::open(path.clone(), LOG_CAP).unwrap();
+        log.write_line("ours, before").unwrap();
+        std::fs::rename(&path, &rotated).unwrap();
+        assert!(!path.exists(), "the race was not set up");
+
+        log.rotate()
+            .expect("a lost rotation race turned logging off");
+        log.write_line("ours, after").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "ours, before\n",
+            "the winner's rotated file was touched"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours, after\n");
+    }
+
+    /// The race tolerance is for the missing name only: any other rename
+    /// failure is still a failure.
+    #[test]
+    fn a_rotation_that_fails_otherwise_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/oxutrm/client.log");
+        let mut log = LogFile::open(path.clone(), LOG_CAP).unwrap();
+        // A non-empty directory in the rotated name's place: rename fails,
+        // and not with "not found".
+        std::fs::create_dir_all(dir.path().join("state/oxutrm/client.log.1/x")).unwrap();
+        let e = log.rotate().expect_err("a rename into a directory worked");
+        assert_ne!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
     }
 
     /// A read-only home, a missing one, a path component that is a file: the
