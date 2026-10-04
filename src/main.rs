@@ -36,6 +36,9 @@ mod link;
 mod linkstate;
 mod listener;
 mod loopback;
+// Sampled and shown by the session in Task 6, which removes this attribute.
+#[cfg_attr(not(test), allow(dead_code))]
+mod quality;
 mod rebuild;
 mod roam;
 mod serve;
