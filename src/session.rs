@@ -5663,21 +5663,7 @@ mod tests {
     /// the session has ended and can point at `oxutrm host --list`; the box
     /// has room to say what a key DOES, and that stays true either way.
     fn assert_claims_nothing_it_cannot_see(shown: &str) {
-        let lower = shown.to_lowercase();
-        assert!(
-            !lower.contains("safe"),
-            "claimed the session is safe, which the client cannot know: {shown}"
-        );
-        assert!(
-            !lower.contains("retry") && !lower.contains("reconnect"),
-            "phase 1 promised a reconnection that does not exist: {shown}"
-        );
-        for claim in ["keeps running", "still running", "is running"] {
-            assert!(
-                !lower.contains(claim),
-                "asserted the shell's state, which the client cannot see: {shown}"
-            );
-        }
+        crate::view::assert_claims_nothing_it_cannot_see(shown);
     }
 
     /// Ctrl-\, the prefix layer 1 listens for. `linkstate`'s own copy is

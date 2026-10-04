@@ -48,6 +48,9 @@ mod standby;
 // attribute.
 #[cfg_attr(not(test), allow(dead_code))]
 mod ui;
+// Built by the session from Task 6, which removes this attribute.
+#[cfg_attr(not(test), allow(dead_code))]
+mod view;
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::BorrowedFd;
