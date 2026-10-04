@@ -1,9 +1,9 @@
 //! The activity log: what oxutrm did to keep the session alive.
 //!
-//! Kept twice: a ring of the last [`RING`] entries for the status popup, and
-//! a size-capped file for afterwards. The network crates never log -- they
-//! return reasons -- and the session records them here. [`Activity::record`]
-//! is the only way in.
+//! Kept twice: a ring of the last [`RING`] entries for the status popup
+//! (details give way first when it is full), and a size-capped file for
+//! afterwards. The network crates never log -- they return reasons -- and
+//! the session records them here. [`Activity::record`] is the only way in.
 //!
 //! Times in the file are UTC. The root crate forbids `unsafe`, std has no
 //! time zone, and UTC is unambiguous on any machine that reads the file.
@@ -178,10 +178,18 @@ impl Activity {
         self.ring.iter()
     }
 
+    /// The ring is full at [`RING`]: the oldest detail gives way first, so
+    /// the steps of a long outage -- never shown -- cannot push out what
+    /// the popup lists. The newest entry is never the one to go, because
+    /// a repeat folds into it. With no other detail, the oldest goes.
     fn push(&mut self, e: Entry) {
         self.ring.push_back(e);
         while self.ring.len() > RING {
-            self.ring.pop_front();
+            let older = self.ring.len() - 1;
+            match self.ring.iter().take(older).position(|e| e.detail) {
+                Some(i) => self.ring.remove(i),
+                None => self.ring.pop_front(),
+            };
         }
     }
 
@@ -465,6 +473,65 @@ mod tests {
         assert_eq!(a.entries().len(), RING);
         assert_eq!(a.entries().next().unwrap().text, "e-050");
         assert_eq!(a.entries().next_back().unwrap().text, "e-249");
+    }
+
+    /// Review M1. A long outage records a step every few seconds and the
+    /// popup shows none of them: in a full ring the oldest detail gives way
+    /// first, so twenty minutes of attempts do not push out the outages
+    /// and searches the popup lists. Order is kept.
+    #[test]
+    fn a_full_ring_lets_a_detail_go_before_a_shown_entry() {
+        let mut a = Activity::new();
+        for i in 0..50 {
+            a.record_at(Kind::Standby, &format!("shown-{i:02}"), at(T + i));
+        }
+        for i in 0..300 {
+            a.record_entry(
+                Kind::Rebuild,
+                &format!("attempt {i:03} started"),
+                None,
+                true,
+                at(T + 100 + i),
+            );
+        }
+        assert_eq!(a.entries().len(), RING);
+        let shown: Vec<String> = a
+            .entries()
+            .filter(|e| !e.detail)
+            .map(|e| e.text.clone())
+            .collect();
+        let want: Vec<String> = (0..50).map(|i| format!("shown-{i:02}")).collect();
+        assert_eq!(shown, want, "a shown entry gave way to a detail");
+        let details: Vec<String> = a
+            .entries()
+            .filter(|e| e.detail)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(
+            details.first().map(String::as_str),
+            Some("attempt 150 started")
+        );
+        assert_eq!(
+            details.last().map(String::as_str),
+            Some("attempt 299 started")
+        );
+        // Oldest first still: every shown entry here is older than every
+        // detail, and stays in front of them.
+        assert!(a.entries().take(50).all(|e| !e.detail), "{:?}", texts(&a));
+
+        // With no detail left to let go, the oldest shown entry goes.
+        let mut b = Activity::new();
+        b.record_entry(Kind::Link, "a detail", None, true, at(T));
+        for i in 0..RING as u64 {
+            b.record_at(Kind::Standby, &format!("s-{i:03}"), at(T + 1 + i));
+        }
+        assert!(
+            b.entries().all(|e| !e.detail),
+            "the detail outlived a shown entry"
+        );
+        b.record_at(Kind::Standby, "newest", at(T + 1_000));
+        assert_eq!(b.entries().len(), RING);
+        assert_eq!(b.entries().next().unwrap().text, "s-001");
     }
 
     /// A reason is a remote's stderr. Escaped and cut to its first line when
