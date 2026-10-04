@@ -762,6 +762,8 @@ enum Wake {
     Winch,
     /// The pacing deadline came round.
     Due,
+    /// Time for the splash's next frame.
+    SplashFrame,
     /// A rebuild attempt finished, one way or another.
     Rebuilt(AttemptOutcome),
     /// A standby search or probe reported back.
@@ -816,6 +818,18 @@ async fn keys_readable<K: AsRawFd>(
 ) -> std::io::Result<tokio::io::unix::AsyncFdReadyMutGuard<'_, K>> {
     match keys {
         Some(k) => k.readable_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next tick of the splash's frame timer, or never once the splash is
+/// down and the timer gone. A function for the reason [`keys_readable`] is
+/// one: the arm borrows exactly the local.
+async fn splash_tick(frames: &mut Option<tokio::time::Interval>) {
+    match frames {
+        Some(i) => {
+            i.tick().await;
+        }
         None => std::future::pending().await,
     }
 }
@@ -926,7 +940,9 @@ pub struct ClientSession {
     /// a quiet session.
     rejected_total: u64,
     /// What is drawn as layer 1, so an unchanged popup is not laid out again
-    /// every lap. Mirrors the overlay exactly: `None` means no overlay.
+    /// every lap. Mirrors the overlay exactly -- `None` means no overlay --
+    /// except while the startup splash is up: then the overlay is the
+    /// splash, and this is what goes back when it ends.
     shown: Option<PopupView>,
     /// The popup's state, and where keystrokes go.
     ui: Ui,
@@ -966,6 +982,23 @@ pub struct ClientSession {
     outage: OutageNotes,
     /// The zone the popup's log shows its times in: the system's, read once.
     zone: jiff::tz::TimeZone,
+    /// The startup splash, while it shows. Armed only by
+    /// [`ClientSession::with_splash`], which only a fresh connect calls, and
+    /// never armed again once it ends: a recovery inside the loop is the same
+    /// session, so it cannot bring it back.
+    splash: Option<Splash>,
+}
+
+/// The startup splash while it shows; the picture is
+/// [`oxutrm_client::splash`]'s.
+struct Splash {
+    seed: u64,
+    /// When the first frame was painted: `None` until the loop's first lap,
+    /// so the time ssh and the banner took is not counted against it.
+    started: Option<Instant>,
+    /// The frame and screen size last handed to the renderer, so a lap that
+    /// would paint the same picture paints nothing.
+    painted: Option<(u32, TermSize)>,
 }
 
 /// What one outage came to, gathered while it lasts.
@@ -1084,7 +1117,78 @@ impl ClientSession {
             outage: OutageNotes::default(),
             // Read once: a laptop that changes zone shows the old one's HH:MM until reattach.
             zone: jiff::tz::TimeZone::system(),
+            splash: None,
         })
+    }
+
+    /// Open with the startup splash, drawn from `seed`. For a fresh connect
+    /// only, and only on a screen it fits ([`oxutrm_client::splash::fits`]);
+    /// elsewhere this does nothing.
+    ///
+    /// The first frame goes on the renderer here, before anything is
+    /// painted at all: the host's first screen may be what wakes the loop
+    /// first, and it has to land under the splash rather than flash up
+    /// ahead of it. Its clock starts on the loop's first lap.
+    pub(crate) fn with_splash(mut self, seed: u64) -> ClientSession {
+        if oxutrm_client::splash::fits(self.size) {
+            self.renderer
+                .set_overlay(Some(oxutrm_client::splash::splash(
+                    Duration::ZERO,
+                    self.size,
+                    seed,
+                )));
+            self.splash = Some(Splash {
+                seed,
+                started: None,
+                // Not painted yet: on the renderer is not on the screen.
+                painted: None,
+            });
+        }
+        self
+    }
+
+    /// Take the splash down, if it is up, putting back whatever layer 1
+    /// should show instead. Reports whether it was up: the caller repaints.
+    fn end_splash(&mut self) -> bool {
+        if self.splash.take().is_none() {
+            return false;
+        }
+        self.renderer
+            .set_overlay(self.shown.as_ref().map(|v| layout_popup(v, self.size)));
+        true
+    }
+
+    /// One lap of the splash at `now`, while it is up: paint the frame `now`
+    /// falls on if it is not already painted, or end it once it has been
+    /// held long enough and the host's first screen is there to show
+    /// instead. Reports whether it is still up.
+    fn splash_lap<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        use oxutrm_client::splash::{frame_of, settled, splash};
+        let first_screen = self.screen_rx.applied_kinds() != (0, 0);
+        let size = self.size;
+        let Some(s) = self.splash.as_mut() else {
+            return Ok(false);
+        };
+        let elapsed = now.saturating_duration_since(*s.started.get_or_insert(now));
+        if settled(elapsed) && first_screen {
+            self.end_splash();
+            self.renderer
+                .render(out, self.screen_rx.state())
+                .context("painting the screen after the splash")?;
+            out.flush().context("flushing the terminal")?;
+            return Ok(false);
+        }
+        let frame = frame_of(elapsed);
+        if s.painted != Some((frame, size)) {
+            s.painted = Some((frame, size));
+            self.renderer
+                .set_overlay(Some(splash(elapsed, size, s.seed)));
+            self.renderer
+                .render(out, self.screen_rx.state())
+                .context("painting the splash")?;
+            out.flush().context("flushing the terminal")?;
+        }
+        Ok(true)
     }
 
     /// Search for, and fail over onto, a standby (spec §3). Only for a host
@@ -1353,6 +1457,9 @@ impl ClientSession {
 
     /// One read from the keyboard, sent wherever it belongs.
     ///
+    /// Any key first takes the startup splash down, and is then routed as
+    /// if it had never been up.
+    ///
     /// The popup decides ([`Ui::keys`]): while it is shown every key is its
     /// own and nothing is sent or held; while it is closed, `Ctrl-\` opens
     /// it and every other byte goes to the host untouched -- or, while the
@@ -1375,6 +1482,15 @@ impl ClientSession {
         now: Instant,
         out: &mut W,
     ) -> Result<Option<i32>> {
+        // Any key ends the splash, and then goes wherever it would have gone
+        // without it: the splash never costs a keystroke. Repainted here and
+        // not on the next lap, so the key's echo lands on the real screen.
+        if self.end_splash() {
+            self.renderer
+                .render(out, self.screen_rx.state())
+                .context("painting the screen after the splash")?;
+            out.flush().context("flushing the terminal")?;
+        }
         let phase = self.link_state.phase_now();
         let routed = self.ui.keys(keys, phase, now);
         if !routed.to_host.is_empty() {
@@ -1453,6 +1569,33 @@ impl ClientSession {
             None => {}
         }
         self.ui.visible(phase).then(|| self.view(phase, now))
+    }
+
+    /// Layer 1 for one lap at `now`: the popup, or the splash while it is
+    /// up. A method rather than the body of the loop so a test drives
+    /// exactly what ships.
+    ///
+    /// The popup is laid out again only when the view actually changed, so
+    /// an open popup with nothing new costs one comparison per lap. An
+    /// outage that opens it while the splash is up ends the splash: what is
+    /// wrong with the link matters more than the logo.
+    fn layer_one<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<()> {
+        let view = self.popup_at(now);
+        self.sample_quality(now);
+        let ended = view.is_some() && self.end_splash();
+        if !ended && self.splash_lap(now, out)? {
+            return Ok(());
+        }
+        if view != self.shown || ended {
+            self.renderer
+                .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
+            self.shown = view;
+            self.renderer
+                .render(out, self.screen_rx.state())
+                .context("painting the popup")?;
+            out.flush().context("flushing the terminal")?;
+        }
+        Ok(())
     }
 
     /// What the popup says at `now`.
@@ -1839,6 +1982,22 @@ impl ClientSession {
         if let Some(v) = self.shown.as_ref() {
             self.renderer.set_overlay(Some(layout_popup(v, size)));
         }
+        // The splash is laid out for a screen too, so the frame that was
+        // showing is drawn again at the new size -- now, because the turn
+        // that follows a resize paints -- or the splash ends if it no longer
+        // fits.
+        if let Some(s) = self.splash.as_mut() {
+            if !oxutrm_client::splash::fits(size) {
+                self.end_splash();
+            } else {
+                // Frame 0 is what `with_splash` put up before any lap.
+                let frame = s.painted.map_or(0, |(frame, _)| frame);
+                s.painted = s.painted.map(|(frame, _)| (frame, size));
+                let at = oxutrm_client::splash::FRAME * frame;
+                self.renderer
+                    .set_overlay(Some(oxutrm_client::splash::splash(at, size, s.seed)));
+            }
+        }
 
         // Carried on the next diff, and worth going immediately: the shell is
         // drawing at the wrong width until it lands.
@@ -2013,6 +2172,15 @@ impl ClientSession {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
 
+        // The splash's frame timer: the one timer that exists only while
+        // something is animating, and gone with the splash. A local, polled
+        // through `splash_tick`, for the reason `outcomes` is one (C1).
+        let mut splash_frames = self.splash.is_some().then(|| {
+            let mut i = tokio::time::interval(oxutrm_client::splash::FRAME);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            i
+        });
+
         let mut buf = [0u8; 8192];
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
@@ -2047,6 +2215,7 @@ impl ClientSession {
                 Some(frame) = self.link.source.recv() => Wake::Frame(frame),
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
+                () = splash_tick(&mut splash_frames) => Wake::SplashFrame,
                 Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 // Quiet until the standby goes away; a closed connection is
@@ -2107,6 +2276,8 @@ impl ClientSession {
                 Wake::Due => {
                     self.turn(&[], out)?;
                 }
+                // Layer 1 below paints the frame.
+                Wake::SplashFrame => {}
                 // A rebuild attempt finished.
                 Wake::Rebuilt(outcome) => {
                     if let Some(rebuild) = self.rebuild.as_mut() {
@@ -2187,19 +2358,12 @@ impl ClientSession {
                 }
             }
 
-            // Layer 1. Laid out again only when the view actually changed, so
-            // an open popup with nothing new costs one comparison per lap.
             let now = Instant::now();
-            let view = self.popup_at(now);
-            self.sample_quality(now);
-            if view != self.shown {
-                self.renderer
-                    .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
-                self.shown = view;
-                self.renderer
-                    .render(out, self.screen_rx.state())
-                    .context("painting the popup")?;
-                out.flush().context("flushing the terminal")?;
+            self.layer_one(now, out)?;
+            // The splash's timer goes with it: once it is down, no timer is
+            // left that the session did not have before.
+            if self.splash.is_none() {
+                splash_frames = None;
             }
 
             // Follow the route if it moved. Inside the loop rather than on a
@@ -8153,5 +8317,402 @@ mod tests {
             "not exactly one literal on the final screen: {screen}"
         );
         assert!(client.shown.is_none(), "the double press left the popup up");
+    }
+
+    // ---- the startup splash ------------------------------------------------
+
+    /// Whether a terminal fed `out` shows any braille dot: the splash's art
+    /// and snow are braille, and nothing the fixtures' shell prints is.
+    fn splash_on_screen(out: &[u8], size: TermSize) -> bool {
+        crate::loopback::fixtures::replay(out, size)
+            .iter()
+            .any(|l| l.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)))
+    }
+
+    /// A session at `size` with the splash armed, the way `connect` builds
+    /// one, and the first frame of it painted at `t`.
+    async fn with_splash_at(
+        size: TermSize,
+        t: Instant,
+        out: &mut Vec<u8>,
+    ) -> (HostSession, ClientSession) {
+        let (host, session) = pair_sized("/bin/sh", size).await;
+        let mut session = session.with_splash(7);
+        session.layer_one(t, out).expect("the first lap");
+        (host, session)
+    }
+
+    /// Let the host's first screen reach the client and be applied.
+    async fn first_frame(host: &mut HostSession, session: &mut ClientSession, out: &mut Vec<u8>) {
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(session).await;
+        session.turn(&[], out).expect("a pacing lap");
+        assert!(
+            session.screen_rx.applied_kinds() != (0, 0),
+            "the fixture applied no frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_splash_is_the_first_thing_painted() {
+        let mut out = Vec::new();
+        let (_host, session) = with_splash_at(BIG, Instant::now(), &mut out).await;
+        assert!(session.splash.is_some());
+        assert!(
+            splash_on_screen(&out, BIG),
+            "the first lap painted no splash"
+        );
+    }
+
+    /// The host's first screen can be what wakes the loop first, before
+    /// any lap of layer 1 has run. It must land under the splash, not flash
+    /// up on its own ahead of it.
+    #[tokio::test]
+    async fn a_screen_painted_before_the_first_lap_is_already_under_the_splash() {
+        let (mut host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7);
+        let mut out = Vec::new();
+
+        first_frame(&mut host, &mut session, &mut out).await;
+
+        assert!(!out.is_empty(), "the frame painted nothing");
+        assert!(
+            splash_on_screen(&out, BIG),
+            "the remote screen was painted before the splash"
+        );
+    }
+
+    /// Any key ends it at once, and the key is not swallowed: it goes on to
+    /// the shell exactly as it would have without the splash. Synchronous:
+    /// the splash has to be gone by the time the key is routed, not on some
+    /// later lap.
+    #[tokio::test]
+    async fn a_key_ends_the_splash_and_reaches_the_shell() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        assert_eq!(session.route_keys_at(b"x", t, &mut out).unwrap(), None);
+
+        assert!(session.splash.is_none(), "the key left the splash up");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the key"
+        );
+        assert!(
+            spoken(&session).ends_with(b"x"),
+            "the key that ended the splash never reached the shell: {:?}",
+            spoken(&session)
+        );
+        // And no later lap brings it back.
+        session
+            .layer_one(t + Duration::from_millis(100), &mut out)
+            .unwrap();
+        assert!(!splash_on_screen(&out, BIG), "the splash came back");
+    }
+
+    /// Ctrl-\ under the splash does what it always does -- opens the popup,
+    /// which takes over the screen -- rather than being eaten by it.
+    #[tokio::test]
+    async fn ctrl_backslash_under_the_splash_opens_the_popup() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        session
+            .route_keys_at(&[CTRL_BACKSLASH], t, &mut out)
+            .unwrap();
+        session.layer_one(t, &mut out).unwrap();
+
+        assert!(session.splash.is_none());
+        assert!(session.shown.is_some(), "Ctrl-\\ opened no popup");
+        let screen = crate::loopback::fixtures::replay(&out, BIG).join("\n");
+        assert!(screen.contains("q quit"), "no popup on screen:\n{screen}");
+    }
+
+    #[tokio::test]
+    async fn the_splash_is_skipped_below_34x20() {
+        for (size, shown) in [
+            (TermSize { cols: 34, rows: 20 }, true),
+            (TermSize { cols: 33, rows: 20 }, false),
+            (TermSize { cols: 34, rows: 19 }, false),
+        ] {
+            let mut out = Vec::new();
+            let (_host, session) = with_splash_at(size, Instant::now(), &mut out).await;
+            assert_eq!(session.splash.is_some(), shown, "at {size:?}");
+            assert_eq!(splash_on_screen(&out, size), shown, "at {size:?}");
+        }
+    }
+
+    /// The interference settles and the logo is held; then the remote
+    /// screen. Not a moment before, even with the host's screen in hand.
+    #[tokio::test]
+    async fn the_splash_ends_after_the_hold_once_the_host_has_painted() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (mut host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        first_frame(&mut host, &mut session, &mut out).await;
+        let end = oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES
+            + oxutrm_client::splash::HOLD;
+
+        session
+            .layer_one(t + end - Duration::from_millis(1), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_some(),
+            "the splash ended before its hold did"
+        );
+        assert!(splash_on_screen(&out, BIG));
+
+        session.layer_one(t + end, &mut out).unwrap();
+        assert!(session.splash.is_none(), "the splash outlived its hold");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash ended and is still on the screen"
+        );
+    }
+
+    /// A host slow to send its first screen leaves the clean logo up rather
+    /// than a blank terminal.
+    #[tokio::test]
+    async fn the_logo_stays_until_the_hosts_first_screen_arrives() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (mut host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        // The host is answering -- an outage would replace the splash with
+        // the popup, which is another test -- but no screen has come yet.
+        let late = t + Duration::from_millis(2_400);
+        session.note_heard(late);
+        session.layer_one(late, &mut out).unwrap();
+        assert!(
+            session.splash.is_some(),
+            "the splash ended with nothing to show beneath it"
+        );
+        assert!(splash_on_screen(&out, BIG));
+
+        first_frame(&mut host, &mut session, &mut out).await;
+        session
+            .layer_one(t + Duration::from_millis(2_450), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_none(),
+            "the host's screen arrived and the logo stayed"
+        );
+        assert!(!splash_on_screen(&out, BIG));
+    }
+
+    /// An outage starting under the splash: the popup replaces it.
+    #[tokio::test]
+    async fn an_outage_replaces_the_splash_with_the_popup() {
+        let t = Instant::now();
+        let (_host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7);
+        let mut out = Vec::new();
+        session.note_heard(t);
+        session.note_sent(t);
+        session.layer_one(t, &mut out).unwrap();
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        session
+            .layer_one(t + Duration::from_secs(3), &mut out)
+            .unwrap();
+
+        assert!(session.splash.is_none(), "the splash survived the outage");
+        assert!(session.shown.is_some(), "the outage raised no popup");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen around the popup"
+        );
+    }
+
+    /// A one-shot owned by the fresh connect: a failover later in the
+    /// session -- the recovery a running loop goes through -- does not
+    /// bring it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_splash_does_not_come_back_after_a_failover() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        session.route_keys_at(b"x", t, &mut out).unwrap();
+        assert!(session.splash.is_none());
+
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        assert!(session.fail_over(t, &mut out).expect("failing over"));
+        let mark = out.len();
+        session
+            .layer_one(t + Duration::from_millis(100), &mut out)
+            .unwrap();
+
+        assert!(
+            session.splash.is_none(),
+            "the failover armed the splash again"
+        );
+        assert!(
+            !splash_on_screen(&out[mark..], BIG) && !splash_on_screen(&out, BIG),
+            "the splash was painted again after the failover"
+        );
+    }
+
+    /// The splash's own guard of the project rule: it is painted by the
+    /// renderer and nothing else. The banner is the one thing outside it,
+    /// and finding exactly the banner shows the check can see a stray.
+    #[tokio::test]
+    async fn the_splash_is_painted_only_through_the_renderer() {
+        let t = Instant::now();
+        let (mut host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7);
+        let mut out = Vec::new();
+        let path = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        session.announce(&path, &mut out).expect("the banner");
+
+        for ms in [0, 40, 80, 400, 900] {
+            session
+                .layer_one(t + Duration::from_millis(ms), &mut out)
+                .unwrap();
+        }
+        first_frame(&mut host, &mut session, &mut out).await;
+        assert!(
+            splash_on_screen(&out, BIG),
+            "no splash was painted to check"
+        );
+        session.route_keys_at(b"x", t, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&outside_renderer(&out)),
+            format!("{}\n", status_line(&path)),
+            "the splash wrote outside the renderer"
+        );
+    }
+
+    /// The whole thing through the real loop, nobody typing: it shows, and
+    /// it goes by itself once the hold is over.
+    ///
+    /// **What this does NOT guard, stated because it was checked:** the
+    /// frame timer. With it removed this still passes, because the pacing
+    /// deadline wakes the loop every `rtt / 2` clamped to 8..100 ms, and on
+    /// loopback that is every 8 ms. The timer is for a real link, where the
+    /// loop wakes ten times a second and the interference would run at a
+    /// third of its rate; `splash_tick` is tested on its own below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_loop_shows_the_splash_and_takes_it_down_by_itself() {
+        let (mut host, session) = pair_sized("", BIG).await;
+        let mut client = session.with_splash(7);
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let out = SharedOut::default();
+        let mut painted = out.clone();
+        let client_loop = tokio::spawn(async move { client.run_on(keys, &mut painted).await });
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        while !splash_on_screen(&out.bytes(), BIG) {
+            assert!(Instant::now() < deadline, "the loop painted no splash");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The hold ends 2.3 s after the first frame; a second to spare.
+        let deadline = start + Duration::from_millis(3_500);
+        while splash_on_screen(&out.bytes(), BIG) {
+            assert!(Instant::now() < deadline, "the splash never went by itself");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        typing.write_all(b"exit 3\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 3);
+        let _ = host_loop.await;
+    }
+
+    /// A resize under the splash lays it out for the new screen, or ends it
+    /// once the screen is too small for it.
+    #[tokio::test]
+    async fn a_resize_lays_the_splash_out_again_or_ends_it() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        // The settled logo: no noise, so the layout is all there is to see.
+        let settled = oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES;
+        session.layer_one(t + settled, &mut out).unwrap();
+
+        let wider = TermSize {
+            cols: 100,
+            rows: 30,
+        };
+        session.resize(wider);
+        assert!(
+            session.splash.is_some(),
+            "a resize that fits ended the splash"
+        );
+        // What the turn after a resize paints, from scratch. The remote
+        // screen is still BIG's until the host redraws, so the splash is
+        // clipped to it; the art sits where the NEW screen centres it.
+        let mut fresh = Vec::new();
+        session.renderer.invalidate();
+        session
+            .renderer
+            .render(&mut fresh, session.screen_rx.state())
+            .unwrap();
+        let painted: Vec<String> = crate::loopback::fixtures::replay(&fresh, BIG)
+            .iter()
+            .map(|l| l.trim_end().to_owned())
+            .collect();
+        let rows = |size: TermSize| -> Vec<String> {
+            let o = oxutrm_client::splash::splash(settled, size, 7);
+            o.cells
+                .chunks(usize::from(o.cols))
+                .take(usize::from(BIG.rows))
+                .map(|r| {
+                    r.iter()
+                        .take(usize::from(BIG.cols))
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_ne!(
+            rows(wider),
+            rows(BIG),
+            "the two layouts cannot be told apart"
+        );
+        assert_eq!(
+            painted,
+            rows(wider),
+            "the splash kept the old screen's layout"
+        );
+
+        let small = TermSize { cols: 33, rows: 30 };
+        session.resize(small);
+        assert!(
+            session.splash.is_none(),
+            "the splash outlived a screen too small for it"
+        );
+    }
+
+    /// The splash's timer arm: a tick about every frame while it is armed,
+    /// and never once it is gone -- a retired timer that still fired would
+    /// be a timer left running for the rest of the session.
+    #[tokio::test]
+    async fn the_splash_tick_fires_while_armed_and_never_once_gone() {
+        let mut armed = Some(tokio::time::interval(oxutrm_client::splash::FRAME));
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), splash_tick(&mut armed))
+                .await
+                .expect("an armed timer did not tick");
+        }
+        let mut gone = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), splash_tick(&mut gone))
+                .await
+                .is_err(),
+            "a retired timer ticked"
+        );
     }
 }

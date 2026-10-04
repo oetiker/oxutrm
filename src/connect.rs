@@ -212,7 +212,13 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
             LogFile::open_default(),
             target,
             &established.session_id,
-        ));
+        ))
+        // The startup splash, painted by the session's own loop through the
+        // renderer once raw mode is on -- never earlier, where ssh may still
+        // be asking for a passphrase. Here and nowhere else: a rebuild or a
+        // failover happens inside the running session and never comes back
+        // through this function.
+        .with_splash(splash_seed());
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     if standby {
@@ -243,6 +249,15 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // on a terminal still in raw mode climbs diagonally down the screen.
     drop(raw);
     code
+}
+
+/// A seed for the splash's interference: it only has to differ from one
+/// connect to the next, so the clock and the process id will do.
+fn splash_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    (u64::from(std::process::id()) << 32) ^ u64::from(nanos)
 }
 
 /// The first of the two lines a session opens with, printed before raw mode.

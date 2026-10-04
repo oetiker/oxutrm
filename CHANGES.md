@@ -117,6 +117,17 @@
   flight cannot answer it. `c config` and `s sessions` are shown dimmed; they
   come later.
 
+- **A session opens with the oxutrm logo.** Once the terminal is in raw
+  mode, a fresh connect shows the ox head tuning in like a badly received
+  TV — about 0.8 s of snow, torn rows and flicker across the whole screen,
+  settling into the logo with the name under it, held for 1.5 s — and then
+  your remote screen. Any key ends it at once and still goes to the remote
+  program, so it never costs waiting; an outage starting meanwhile replaces it
+  with the status popup, and a host slow to send its first screen keeps the
+  logo up rather than a blank terminal. It is drawn in your terminal's own
+  text colour, only on a fresh connect (never after a rebuild or a failover),
+  and not at all on a screen smaller than 34x20.
+
 - **What oxutrm does to keep a session alive is logged.** Outages and their
   end, standby searches, finds and losses, probes and failovers, rebuild
   attempts and why they failed, held input sent or dropped: each is appended
