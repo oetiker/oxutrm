@@ -913,8 +913,8 @@ pub struct ClientSession {
     link: Link,
     size: TermSize,
     last_send: Option<Instant>,
-    /// The primary's path: the one `announce` printed, until a failover or a
-    /// landed rebuild replaces it.
+    /// The primary's path: the one `announce` printed, until a migration, a
+    /// failover or a landed rebuild replaces it.
     path: Option<PathDescription>,
     /// Whether the host is still answering, and what the user is told.
     link_state: LinkState,
@@ -1041,14 +1041,22 @@ impl ClientSession {
         self
     }
 
+    /// Keep the activity log in `activity` -- the one with the file, which
+    /// `connect` opens -- instead of the ring-only log `new` starts with.
+    pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
+        self.activity = activity;
+        self
+    }
+
     /// Tell the user what connection they got — once, and then be quiet.
     ///
     /// Spec §10.3: oxutrm never does anything clever silently. On connect this
     /// prints one line. Called again with the same path it prints **nothing**,
     /// which is what makes the silence a property rather than an accident.
-    /// Called again with a different path it announces the migration briefly,
-    /// because walking from Wi-Fi to mobile should be explained rather than
-    /// mysterious.
+    /// Called again with a different path it records the migration in the
+    /// activity log, where the popup shows it: walking from Wi-Fi to mobile
+    /// should be explained rather than mysterious, and the session owns the
+    /// screen by then.
     ///
     /// Rung 4 reads as a warning, and that is not decoration: a session inside
     /// the SSH connection cannot daemonize and cannot be reattached, so
@@ -1063,16 +1071,18 @@ impl ClientSession {
             return Ok(false);
         }
 
-        let line = match &self.path {
-            None => status_line(path),
-            // A migration, not a fresh connect.
-            Some(_) => format!(
-                "oxutrm  path migrated \u{2192} {}  \u{b7}  {} ms",
-                oxutrm_client::rung_label(path),
-                path.rtt_ms
-            ),
-        };
-        writeln!(out, "{line}").context("announcing the path")?;
+        if self.path.is_some() {
+            // A migration, not a fresh connect. The session owns the screen
+            // by now, so it goes to the activity log, not the terminal.
+            self.activity.record(
+                Kind::Link,
+                &format!("path migrated \u{2192} {}", oxutrm_client::rung_label(path)),
+            );
+            self.path = Some(path.clone());
+            return Ok(true);
+        }
+
+        writeln!(out, "{}", status_line(path)).context("announcing the path")?;
         out.flush().context("flushing the terminal")?;
 
         // The line was written outside the renderer's model of the screen, so
@@ -1081,73 +1091,6 @@ impl ClientSession {
         self.renderer.invalidate();
         self.path = Some(path.clone());
         Ok(true)
-    }
-
-    /// Say that a standby exists, or that none could be found or it was lost
-    /// (spec §3.7): the path line, with the standby added to it.
-    ///
-    /// The caller says it once per change; `Standby` keeps track of which
-    /// dry spell has already been reported.
-    fn announce_standby<W: Write>(
-        &mut self,
-        standby: Option<&PathDescription>,
-        out: &mut W,
-    ) -> Result<()> {
-        // The primary's own line, as `announce` printed it. A session that
-        // never announced its path (only the tests' fixtures) says just the
-        // name.
-        let primary = self
-            .path
-            .as_ref()
-            .map_or_else(|| "oxutrm".to_string(), status_line);
-        let line = match standby {
-            Some(p) => format!(
-                "{primary}  \u{b7}  standby: {}, {} ms",
-                oxutrm_client::rung_label(p),
-                p.rtt_ms
-            ),
-            None => format!("{primary}  \u{b7}  no standby path"),
-        };
-        self.say_mid_session(&line, out)
-            .context("announcing the standby")
-    }
-
-    /// Say that the session now runs over the standby, and remember its path
-    /// as the one announced, so a later `announce` compares against it.
-    fn announce_failover<W: Write>(&mut self, path: &PathDescription, out: &mut W) -> Result<()> {
-        let line = format!(
-            "oxutrm  switched to standby ({})  \u{b7}  {} ms",
-            oxutrm_client::rung_label(path),
-            path.rtt_ms
-        );
-        self.say_mid_session(&line, out)
-            .context("announcing the failover")?;
-        self.path = Some(path.clone());
-        Ok(())
-    }
-
-    /// One line written over a session in progress, and the screen painted
-    /// straight back.
-    ///
-    /// `\r\n` and not `writeln!`: the terminal is in raw mode, where a bare
-    /// `\n` moves down without returning, so the line after it would start
-    /// mid-row. And the repaint now rather than on the next frame: the line
-    /// was written outside the renderer's model, over whatever a full-screen
-    /// program had painted, and on a quiet session the next frame may be a
-    /// long way off.
-    ///
-    /// Said plainly, because it is easy to assume otherwise: a full repaint
-    /// clears the screen, so the line does not stay on it. It survives only
-    /// where writing it scrolled the terminal, into the scrollback. What this
-    /// guarantees is that the screen is never left corrupted by it.
-    fn say_mid_session<W: Write>(&mut self, line: &str, out: &mut W) -> Result<()> {
-        write!(out, "{line}\r\n").context("writing to the terminal")?;
-        self.renderer.invalidate();
-        self.renderer
-            .render(out, self.screen_rx.state())
-            .context("painting the screen again")?;
-        out.flush().context("flushing the terminal")?;
-        Ok(())
     }
 
     /// One turn: send `input`, apply what arrived, repaint if it changed.
@@ -1374,9 +1317,18 @@ impl ClientSession {
             Some(Command::Quit) => return Ok(Some(0)),
             Some(Command::SendHeld) => {
                 let held = self.link_state.take_held();
+                self.activity.record(
+                    Kind::Input,
+                    &format!("held input sent ({} bytes)", held.len()),
+                );
                 self.turn(&held, out)?;
             }
-            Some(Command::DropHeld) => self.link_state.drop_held(),
+            Some(Command::DropHeld) => {
+                let n = self.link_state.held().len();
+                self.link_state.drop_held();
+                self.activity
+                    .record(Kind::Input, &format!("held input dropped ({n} bytes)"));
+            }
             None => {}
         }
         Ok(None)
@@ -1507,7 +1459,7 @@ impl ClientSession {
             return;
         };
 
-        let Phase::Recovering { next_try, .. } = phase else {
+        let Phase::Recovering { attempt, next_try } = phase else {
             // `stood_down` and not a bare `cancel`: the displacing latch
             // belongs to the outage too. Left set, the next `TAKEN_OVER` on
             // this link -- somebody else attaching, an hour later, over a
@@ -1528,6 +1480,153 @@ impl ClientSession {
         }
         rebuild.begin(size, outcomes.clone());
         self.link_state.begin_attempt(now);
+        self.activity.record(
+            Kind::Rebuild,
+            &format!("attempt {} started", attempt.saturating_add(1)),
+        );
+    }
+
+    /// A rebuild attempt failed for a reason worth retrying.
+    fn rebuild_failed(&mut self, why: String, now: Instant) {
+        if let Phase::Recovering { attempt, .. } = self.link_state.phase_now() {
+            self.activity.record(
+                Kind::Rebuild,
+                &format!("attempt {} failed: {why}", attempt.saturating_add(1)),
+            );
+        }
+        self.link_state.attempt_failed(now);
+        // Kept for the popup's recovering section.
+        self.last_failure = Some(why);
+    }
+
+    /// A rebuild attempt landed: its link replaces the one that stopped
+    /// answering, and its path and attach are the session's from here.
+    fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        self.swap_in(e.link, now)?;
+        if let Some(id) = self.identity.as_mut() {
+            id.attach_id = e.attach_id;
+        }
+        self.activity.record(
+            Kind::Rebuild,
+            &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
+        );
+        self.path = Some(e.path);
+        Ok(())
+    }
+
+    /// Swap the standby in for a primary that stopped answering (spec §3.5).
+    /// Returns whether there was one to swap in.
+    fn fail_over<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        let Some(e) = self.standby.as_mut().and_then(|s| s.take_for_failover(now)) else {
+            return Ok(false);
+        };
+        self.swap_in_as(e.link, now, SWITCHED)
+            .context("failing over to the standby")?;
+        // Spec §3.5 step 2: the host adopts the standby on our first frame
+        // on it, so that frame goes now.
+        self.turn(&[], out)?;
+        if let Some(id) = self.identity.as_mut() {
+            id.attach_id = e.attach_id;
+        }
+        self.activity.record(
+            Kind::Failover,
+            &format!(
+                "switched to standby ({})",
+                oxutrm_client::rung_label(&e.path)
+            ),
+        );
+        self.path = Some(e.path);
+        Ok(true)
+    }
+
+    /// One standby decision (see [`crate::standby::Standby::step`]), with
+    /// what it starts recorded. The loop acts on the returned action.
+    ///
+    /// "probing standby" is recorded for the first probe of an outage only:
+    /// a probe that keeps failing is retried every `PROBE_RETRY`, and an
+    /// entry per retry would alternate with its "probe failed" so that
+    /// nothing folds, and a long outage would push everything useful out of
+    /// the ring. Only a probe from `Idle` is a first one; a retry comes from
+    /// `Failed`.
+    fn standby_step(
+        &mut self,
+        phase: Phase,
+        now: Instant,
+        rebuild_running: bool,
+    ) -> crate::standby::StandbyAction {
+        let Some(s) = self.standby.as_mut() else {
+            return crate::standby::StandbyAction::Nothing;
+        };
+        let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
+        let action = s.step(phase, now, rebuild_running);
+        match action {
+            crate::standby::StandbyAction::Search { .. } => {
+                self.activity.record(Kind::Standby, "search started");
+            }
+            crate::standby::StandbyAction::Probe { .. } if first_probe => {
+                self.activity.record(Kind::Failover, "probing standby");
+            }
+            _ => {}
+        }
+        action
+    }
+
+    /// A standby search or probe reported back. Returns the connection the
+    /// loop should watch for closing, when a search found one that was kept.
+    fn on_standby_event(
+        &mut self,
+        event: crate::standby::StandbyEvent,
+        now: Instant,
+    ) -> Option<quinn::Connection> {
+        let s = self.standby.as_mut()?;
+        match event {
+            crate::standby::StandbyEvent::Found { search, e } => {
+                let path = e.path.clone();
+                if !s.found(search, *e) {
+                    return None;
+                }
+                let watch = s.connection();
+                self.activity.record(
+                    Kind::Standby,
+                    &format!(
+                        "found {}, {} ms",
+                        oxutrm_client::rung_label(&path),
+                        path.rtt_ms
+                    ),
+                );
+                watch
+            }
+            crate::standby::StandbyEvent::NotFound { search, reason } => {
+                let text = format!("not found: {reason}");
+                if s.not_found(search, now, reason) {
+                    self.activity.record(Kind::Standby, &text);
+                }
+                None
+            }
+            crate::standby::StandbyEvent::Probed { answered } => {
+                if s.probed(answered, now) {
+                    self.activity.record(
+                        Kind::Failover,
+                        if answered {
+                            "probe answered"
+                        } else {
+                            "probe failed"
+                        },
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// The standby's connection closed. Whatever the reason, the primary is
+    /// untouched: a standby's close is information, not a reason to end
+    /// anything.
+    fn on_standby_closed(&mut self, reason: &quinn::ConnectionError, now: Instant) {
+        if self.standby.as_mut().is_some_and(|s| s.lost(now, reason)) {
+            self.activity
+                .record(Kind::Standby, &format!("lost: {reason}"));
+        }
     }
 
     /// Put a freshly rebuilt link in place of the one that stopped answering.
@@ -1912,7 +2011,7 @@ impl ClientSession {
                     }
                     match outcome {
                         AttemptOutcome::Landed(established) => {
-                            self.swap_in(established.link, Instant::now())
+                            self.rebuild_landed(*established, Instant::now())
                                 .context("swapping in the rebuilt link")?;
                             // Both of these belong to the link that has just
                             // been replaced: the arm has to watch the new
@@ -1929,10 +2028,7 @@ impl ClientSession {
                         }
                         // The network, not the far end. The loop keeps its
                         // cadence and the popup explains the last try.
-                        AttemptOutcome::Retry(why) => {
-                            self.link_state.attempt_failed(Instant::now());
-                            self.last_failure = Some(why);
-                        }
+                        AttemptOutcome::Retry(why) => self.rebuild_failed(why, Instant::now()),
                         // An answer, and repeating the question gets the same
                         // one. `run_connect` prints this after the raw guard
                         // is dropped and exits non-zero.
@@ -1941,41 +2037,16 @@ impl ClientSession {
                         }
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::Found { search, e }) => {
-                    let path = e.path.clone();
-                    if let Some(s) = self.standby.as_mut()
-                        && s.found(search, *e)
-                    {
-                        standby_conn = s.connection();
-                        self.announce_standby(Some(&path), out)?;
+                Wake::Standby(event) => {
+                    if let Some(watch) = self.on_standby_event(event, Instant::now()) {
+                        standby_conn = Some(watch);
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::NotFound { search, reason }) => {
-                    let tell = self
-                        .standby
-                        .as_mut()
-                        .is_some_and(|s| s.not_found(search, Instant::now(), reason));
-                    if tell {
-                        self.announce_standby(None, out)?;
-                    }
-                }
-                Wake::Standby(crate::standby::StandbyEvent::Probed { answered }) => {
-                    if let Some(s) = self.standby.as_mut() {
-                        s.probed(answered, Instant::now());
-                    }
-                }
-                // Whatever the reason, the standby is gone and the primary is
-                // untouched: a standby's close is information, not a reason
-                // to end anything. `lost` decides whether it is news.
+                // Whatever the reason, the standby is gone; `lost` decides
+                // whether it is worth recording.
                 Wake::StandbyClosed(reason) => {
                     standby_conn = None;
-                    let tell = self
-                        .standby
-                        .as_mut()
-                        .is_some_and(|s| s.lost(Instant::now(), &reason));
-                    if tell {
-                        self.announce_standby(None, out)?;
-                    }
+                    self.on_standby_closed(&reason, Instant::now());
                 }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
@@ -2065,12 +2136,7 @@ impl ClientSession {
             // the loop acts, so nothing spawned here borrows `self`.
             let rebuild_running = self.rebuild.as_ref().is_some_and(Rebuild::is_running);
             let phase = self.link_state.phase_now();
-            let action = self
-                .standby
-                .as_mut()
-                .map_or(crate::standby::StandbyAction::Nothing, |s| {
-                    s.step(phase, now, rebuild_running)
-                });
+            let action = self.standby_step(phase, now, rebuild_running);
             match action {
                 crate::standby::StandbyAction::Nothing => {}
                 crate::standby::StandbyAction::Search { search } => {
@@ -2124,21 +2190,13 @@ impl ClientSession {
                     }
                 }
                 crate::standby::StandbyAction::FailOver => {
-                    if let Some((link, path)) =
-                        self.standby.as_mut().and_then(|s| s.take_for_failover(now))
-                    {
-                        self.swap_in_as(link, now, SWITCHED)
-                            .context("failing over to the standby")?;
+                    if self.fail_over(now, out)? {
                         conn = self.link.sink.connection().clone();
                         standby_conn = None;
                         // `take_for_failover` disowned any search running
                         // over the old primary; this stops it.
                         _search_task = None;
                         takeover_expected = false;
-                        // Spec §3.5 step 2: the host adopts the standby on
-                        // our first frame on it, so that frame goes now.
-                        self.turn(&[], out)?;
-                        self.announce_failover(&path, out)?;
                     }
                 }
             }
@@ -2468,12 +2526,28 @@ mod tests {
         shell: &str,
         rebuild: Option<Rebuild>,
     ) -> (HostSession, ClientSession) {
+        pair_on_sized(client_bind, shell, rebuild, size()).await
+    }
+
+    /// `pair`, with host and client both at `size` from the start, so no
+    /// resize is in flight when a test begins.
+    async fn pair_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession) {
+        pair_on_sized("127.0.0.1:0", shell, None, size).await
+    }
+
+    /// `pair_on`, at `size`.
+    async fn pair_on_sized(
+        client_bind: &str,
+        shell: &str,
+        rebuild: Option<Rebuild>,
+        size: TermSize,
+    ) -> (HostSession, ClientSession) {
         let listening = crate::link::fixtures::listening().await;
         let addr = listening.addr;
         let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
-        let client = ClientSession::new(size(), caps(), client_link, rebuild).unwrap();
+        let host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let client = ClientSession::new(size, caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
         // the script is fed as input instead, which is also how a real session
@@ -3587,28 +3661,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_path_change_announces_itself() {
-        let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-
-        client
-            .announce(
-                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
-                &mut out,
-            )
-            .expect("first");
-        out.clear();
-
-        // Walking from Wi-Fi to mobile should be explained, not mysterious.
-        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
-        assert!(client.announce(&better, &mut out).expect("second"));
-        let line = String::from_utf8(out).unwrap();
-        assert!(line.contains("migrated"), "got {line:?}");
-        assert!(line.contains("IPv6 direct"), "got {line:?}");
-        assert!(line.contains("11 ms"), "got {line:?}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn rung_four_reads_as_a_warning() {
         // A session inside the SSH connection cannot daemonize and cannot be
         // reattached. Degrading to it silently would remove both properties
@@ -4458,7 +4510,10 @@ mod tests {
         let before = sent(&session);
         let mut out = Vec::new();
         session.turn(b"x", &mut out).expect("a turn that sends");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Bounded well inside a second: the log's ages are read off the wall
+        // clock, and a wait that crossed a real second could move one and
+        // fail the comparison below for a reason it is not about.
+        let deadline = Instant::now() + Duration::from_millis(500);
         while sent(&session) == before {
             assert!(
                 Instant::now() < deadline,
@@ -5204,30 +5259,37 @@ mod tests {
     }
 
     /// A completed client-side standby, as a search hands it to the session.
+    /// Also the shape a rebuild's `Established` has. The attach id is not
+    /// the fixtures' zero, so a test can see it carried over.
     fn standby_established(link: Link) -> crate::connect::Established {
         crate::connect::Established {
             link,
             path: path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown),
             session_id: String::new(),
-            attach_id: 0,
+            attach_id: 2,
             host_features: vec![],
         }
     }
 
-    /// A client-side standby holding `link`, as the search it started found
-    /// it. Created a settling delay ago, so its first search is due now.
-    fn standby_holding(link: Link) -> crate::standby::Standby {
-        let now = Instant::now();
-        let mut standby = crate::standby::Standby::new(
+    /// A standby, with the search it started at `now`. Created a settling
+    /// delay before `now`, so that search is due at once.
+    fn standby_searching(now: Instant) -> (crate::standby::Standby, u64) {
+        let mut s = crate::standby::Standby::new(
             crate::attach_exchange::fixtures::stun_free(),
             now.checked_sub(crate::linkstate::STANDBY_DELAY)
                 .expect("a clock this young"),
         );
-        let crate::standby::StandbyAction::Search { search } =
-            standby.step(Phase::Live, now, false)
+        let crate::standby::StandbyAction::Search { search } = s.step(Phase::Live, now, false)
         else {
             panic!("the fixture's standby started no search");
         };
+        (s, search)
+    }
+
+    /// A client-side standby holding `link`, as the search it started found
+    /// it.
+    fn standby_holding(link: Link) -> crate::standby::Standby {
+        let (mut standby, search) = standby_searching(Instant::now());
         assert!(
             standby.found(search, standby_established(link)),
             "the fixture's search was stale"
@@ -5241,10 +5303,6 @@ mod tests {
     struct SharedOut(Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl SharedOut {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-
         fn bytes(&self) -> Vec<u8> {
             self.0.lock().unwrap().clone()
         }
@@ -5282,6 +5340,59 @@ mod tests {
         }
     }
 
+    /// Close the popup the way a user does, before typing to the shell:
+    /// while it is shown it takes every key. The Esc goes alone and the
+    /// next write waits for the popup to be gone, so the client reads it as
+    /// a lone Esc and not as the start of an escape sequence.
+    async fn close_the_popup(typing: &mut impl Write, out: &SharedOut, size: TermSize) {
+        typing.write_all(&[ESCAPE]).expect("type");
+        wait_off_screen(out, size, "q quit", Duration::from_secs(10)).await;
+    }
+
+    /// What reached the terminal outside the renderer. `Renderer::render`
+    /// wraps every non-empty write in synchronized output
+    /// (`ESC[?2026h` ... `ESC[?2026l`), so anything between those blocks
+    /// was written by something else.
+    fn outside_renderer(out: &[u8]) -> Vec<u8> {
+        const BEGIN: &[u8] = b"\x1b[?2026h";
+        const END: &[u8] = b"\x1b[?2026l";
+        let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+        let mut rest = out;
+        let mut stray = Vec::new();
+        while !rest.is_empty() {
+            let Some(begin) = find(rest, BEGIN) else {
+                stray.extend_from_slice(rest);
+                break;
+            };
+            stray.extend_from_slice(&rest[..begin]);
+            let inside = &rest[begin + BEGIN.len()..];
+            let Some(end) = find(inside, END) else {
+                stray.extend_from_slice(&rest[begin..]);
+                break;
+            };
+            rest = &inside[end + END.len()..];
+        }
+        stray
+    }
+
+    /// The helper has to be able to see a stray, or every assertion made
+    /// with it is a guard that cannot fail.
+    #[test]
+    fn outside_renderer_finds_what_is_written_between_the_renderers_blocks() {
+        assert_eq!(
+            outside_renderer(b"x\x1b[?2026hA\x1b[?2026ly\r\n"),
+            b"xy\r\n"
+        );
+        assert!(outside_renderer(b"\x1b[?2026hA\x1b[?2026l\x1b[?2026hB\x1b[?2026l").is_empty());
+    }
+
+    fn last_entry(c: &ClientSession) -> Option<(Kind, String)> {
+        c.activity
+            .entries()
+            .next_back()
+            .map(|e| (e.kind, e.text.clone()))
+    }
+
     impl Write for SharedOut {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -5292,64 +5403,160 @@ mod tests {
         }
     }
 
-    /// Spec §3.7: the path line gains the standby. Written mid-session, so it
-    /// ends in `\r\n` (raw mode has no output processing) and the screen is
-    /// painted again straight after it.
+    /// Spec §5.2: what used to be a line written over the session is an
+    /// entry in the activity log. The handler has no terminal to write to.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_found_standby_is_added_to_the_path_line() {
+    async fn a_found_standby_is_recorded() {
         let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-        client
-            .announce(
-                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
-                &mut out,
-            )
-            .expect("announce");
-        let before = String::from_utf8(out.clone()).unwrap();
-        assert!(!before.contains("standby"), "got {before:?}");
-        out.clear();
+        let now = Instant::now();
+        let (standby, search) = standby_searching(now);
+        client.standby = Some(standby);
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
 
-        let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
-        client
-            .announce_standby(Some(&standby), &mut out)
-            .expect("announce the standby");
+        let watch = client.on_standby_event(
+            crate::standby::StandbyEvent::Found {
+                search,
+                e: Box::new(standby_established(standby_client)),
+            },
+            now,
+        );
 
-        let line = "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  standby: IPv4 punched, 38 ms\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
         assert!(
-            out.len() > line.len(),
-            "nothing was painted over the line: the screen is left scrolled by it"
+            watch.is_some(),
+            "the loop was not handed the standby to watch"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "found IPv4 punched, 38 ms".to_string()))
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn no_standby_is_said_on_the_path_line() {
+    async fn a_failed_search_is_recorded_with_its_reason_and_a_stale_one_is_not() {
         let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-        client
-            .announce(
-                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
-                &mut out,
-            )
-            .expect("announce");
-        out.clear();
+        let now = Instant::now();
+        let (standby, search) = standby_searching(now);
+        client.standby = Some(standby);
 
-        client
-            .announce_standby(None, &mut out)
-            .expect("announce no standby");
+        client.on_standby_event(
+            crate::standby::StandbyEvent::NotFound {
+                search: search + 7,
+                reason: "stale".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "a stale search's failure was recorded"
+        );
 
-        let line =
-            "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  no standby path\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
-        assert!(out.len() > line.len(), "nothing was painted over the line");
+        client.on_standby_event(
+            crate::standby::StandbyEvent::NotFound {
+                search,
+                reason: "no path".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "not found: no path".to_string()))
+        );
     }
 
-    /// The failover says where it went, and the path it went to is then the
-    /// announced one: announcing it again is silence, not a "migrated" line.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failover_announces_the_standby_it_switched_to() {
+    async fn a_lost_standby_is_recorded() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
+
+        client.on_standby_closed(&quinn::ConnectionError::TimedOut, Instant::now());
+
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "lost: timed out".to_string()))
+        );
+        assert!(!client.standby.as_ref().is_some_and(|s| s.has_link()));
+    }
+
+    /// A search the loop starts is recorded as it starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_search_started_is_recorded() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let now = Instant::now();
+        client.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            now.checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        ));
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
+
+        let action = client.standby_step(Phase::Live, now, false);
+
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Search { .. }),
+            "no search started: {action:?}"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "search started".to_string()))
+        );
+    }
+
+    /// A probe failing every `PROBE_RETRY` through a long outage is one
+    /// "probing standby" and one folded failure, not two alternating
+    /// entries every five seconds that push everything useful out of the
+    /// ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_outage_records_its_probing_once_and_folds_its_failures() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+
+        for at in [t0, t0 + crate::linkstate::PROBE_RETRY] {
+            let action = client.standby_step(silent, at, false);
+            assert!(
+                matches!(action, crate::standby::StandbyAction::Probe { .. }),
+                "no probe at {:?}: {action:?}",
+                at - t0
+            );
+            client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: false }, at);
+        }
+
+        let log: Vec<(Kind, String, u32)> = client
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.text.clone(), e.repeats))
+            .collect();
+        assert_eq!(
+            log,
+            vec![
+                (Kind::Failover, "probing standby".to_string(), 0),
+                (Kind::Failover, "probe failed".to_string(), 1),
+            ]
+        );
+    }
+
+    /// The failover is recorded, writes nothing to the terminal but the
+    /// renderer's output, and the path it went to becomes the session's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_is_recorded_and_the_path_follows_it() {
         let (_host, mut client) = pair("sleep 30\n").await;
         let mut out = Vec::new();
         client
@@ -5359,22 +5566,219 @@ mod tests {
             )
             .expect("announce");
         out.clear();
+        client.identity = Some(Identity {
+            target: "bastion".into(),
+            session_id: "f0".repeat(16),
+            attach_id: 5,
+        });
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+
+        assert!(
+            client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+
+        assert_eq!(
+            last_entry(&client),
+            Some((
+                Kind::Failover,
+                "switched to standby (IPv4 punched)".to_string()
+            ))
+        );
+        assert!(
+            outside_renderer(&out).is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&outside_renderer(&out))
+        );
+        assert_eq!(
+            client.identity.as_ref().map(|i| i.attach_id),
+            Some(2),
+            "the attach id stayed the old link's"
+        );
         let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
-
-        client
-            .announce_failover(&standby, &mut out)
-            .expect("announce the failover");
-
-        let line = "oxutrm  switched to standby (IPv4 punched)  \u{b7}  38 ms\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
-        assert!(out.len() > line.len(), "nothing was painted over the line");
-        out.clear();
         assert!(
             !client.announce(&standby, &mut out).expect("announce"),
-            "the failover did not record the path it switched to: {:?}",
+            "the failover did not record the path it switched to"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_with_no_standby_does_nothing() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        assert!(
+            !client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+        assert_eq!(client.activity.entries().len(), 0);
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// The migration branch of `announce` used to print; the session owns the
+    /// screen by then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_migration_is_recorded_not_printed() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
+                &mut out,
+            )
+            .expect("first");
+        assert!(!out.is_empty(), "the connect line was not printed");
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the connect line was recorded"
+        );
+        out.clear();
+
+        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        assert!(client.announce(&better, &mut out).expect("second"));
+
+        assert!(
+            out.is_empty(),
+            "the migration was written over the session: {:?}",
             String::from_utf8_lossy(&out)
         );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Link, "path migrated \u{2192} IPv6 direct".to_string()))
+        );
+    }
+
+    /// Spec §5.2, synchronously: once the session owns the screen, the
+    /// events that used to write a line over it -- held input sent, a path
+    /// migration, a failover -- reach the terminal only as the renderer's
+    /// output. The connect banner, written before, is the one thing outside
+    /// it, and finding exactly the banner shows the check can see a stray.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_the_banner_only_the_renderer_writes_to_the_terminal() {
+        let (_host, mut client) = with_confirming_popup(b"make test\r").await;
+        let mut out = Vec::new();
+        let first = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        client.announce(&first, &mut out).expect("the banner");
+        let banner = format!("{}\n", status_line(&first));
+        assert_eq!(String::from_utf8_lossy(&outside_renderer(&out)), banner);
+
+        client
+            .route_keys(b"s", &mut out)
+            .expect("sending the held input");
+        let migrated = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
+        assert!(client.announce(&migrated, &mut out).expect("a migration"));
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        assert!(
+            client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+
+        let texts: Vec<String> = client.activity.entries().map(|e| e.text.clone()).collect();
+        for event in ["held input sent", "path migrated", "switched to standby"] {
+            assert!(
+                texts.iter().any(|t| t.starts_with(event)),
+                "{event:?} never happened, so it proves nothing: {texts:?}"
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&outside_renderer(&out)),
+            banner,
+            "written outside the renderer after the banner"
+        );
+    }
+
+    #[tokio::test]
+    async fn sending_or_dropping_held_input_is_recorded() {
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
+        let mut out = Vec::new();
+        assert!(
+            !session.activity.entries().any(|e| e.kind == Kind::Input),
+            "the fixture recorded input"
+        );
+        session.route_keys(b"s", &mut out).unwrap();
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input sent (10 bytes)".to_string()))
+        );
+
+        let (_host, mut session) = with_confirming_popup(b"rm -rf /tmp/x\r").await;
+        session.route_keys(b"d", &mut out).unwrap();
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input dropped (14 bytes)".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_attempt_and_its_failure_are_recorded() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            !session.activity.entries().any(|e| e.kind == Kind::Rebuild),
+            "the fixture recorded a rebuild"
+        );
+
+        session.rebuild_step(entered, &tx);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Rebuild, "attempt 1 started".to_string()))
+        );
+
+        session.rebuild_failed(
+            "ssh exited with status 255".to_string(),
+            entered + Duration::from_secs(1),
+        );
+        assert_eq!(
+            last_entry(&session),
+            Some((
+                Kind::Rebuild,
+                "attempt 1 failed: ssh exited with status 255".to_string()
+            ))
+        );
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Recovering { attempt: 1, .. }
+        ));
+        assert_eq!(
+            session.last_failure.as_deref(),
+            Some("ssh exited with status 255")
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_landed_rebuild_is_recorded_and_its_path_and_attach_become_the_sessions() {
+        let (_host, mut client) = pair("").await;
+        client.identity = Some(Identity {
+            target: "bastion".into(),
+            session_id: "f0".repeat(16),
+            attach_id: 5,
+        });
+        assert!(client.path.is_none(), "the fixture already had a path");
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+
+        client
+            .rebuild_landed(standby_established(rebuilt), Instant::now())
+            .expect("landing");
+
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Rebuild, "landed via IPv4 punched".to_string()))
+        );
+        assert_eq!(client.path.as_ref().map(|p| p.rtt_ms), Some(38));
+        assert_eq!(client.identity.as_ref().map(|i| i.attach_id), Some(2));
     }
 
     /// Ruling B1. A failover is not a rebuild landing: an ssh attempt that
@@ -5448,11 +5852,12 @@ mod tests {
     }
 
     /// The loop watches the standby's connection: when it closes, the
-    /// standby is forgotten and its loss is said once (spec §3.7). The close
-    /// is the host's `SUPERSEDED`, a reason that ends nothing.
+    /// standby is forgotten and its loss is recorded (spec §5.1), which the
+    /// popup's log shows. The close is the host's `SUPERSEDED`, a reason that
+    /// ends nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_standby_closed_under_a_running_session_is_announced_and_forgotten() {
-        let (mut host, mut client) = pair("").await;
+    async fn a_standby_closed_under_a_running_session_is_recorded_and_forgotten() {
+        let (mut host, mut client) = pair_sized("", BIG).await;
         let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         client.standby = Some(standby_holding(standby_client));
 
@@ -5468,22 +5873,18 @@ mod tests {
             }
         });
 
-        // A round trip through the shell: the loop is running, laps and all,
-        // and has said nothing about the standby it holds.
+        // A round trip through the shell: the loop is running, laps and all.
         typing
             .write_all(b"printf 'ready-%s\\n' ok\n")
             .expect("type");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !out.text().contains("ready-ok") {
-            assert!(
-                Instant::now() < deadline,
-                "the shell never answered; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+
+        // Losing a standby is not an outage, so nothing opens the popup by
+        // itself: open it by hand, as a curious user would.
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
         assert!(
-            !out.text().contains("no standby path"),
+            !screen_of(&out, BIG).contains("lost:"),
             "the standby was reported lost before anything closed it"
         );
 
@@ -5491,16 +5892,10 @@ mod tests {
             .sink
             .connection()
             .close(quinn::VarInt::from_u32(0), SUPERSEDED);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !out.text().contains("no standby path") {
-            assert!(
-                Instant::now() < deadline,
-                "losing the standby went unsaid; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_screen(&out, BIG, "lost:", Duration::from_secs(10)).await;
 
+        // The open popup takes every key: close it, then talk to the shell.
+        close_the_popup(&mut typing, &out, BIG).await;
         typing.write_all(b"exit 7\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
@@ -5510,6 +5905,12 @@ mod tests {
         assert!(
             !client.standby.as_ref().is_some_and(|s| s.has_link()),
             "the closed standby is still held"
+        );
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
     }
@@ -5522,9 +5923,10 @@ mod tests {
     /// is blackholed, so only the standby can carry it to the shell and the
     /// status back. The final link's identity says which one did.
     ///
-    /// The popup opens for the outage and says when the link is back; the
-    /// test reads that off the replayed screen, waits for the popup to close
-    /// by itself, and only then types `exit 7`.
+    /// The popup opens for the outage and shows the failover in its log;
+    /// the test reads that off the replayed screen, then waits for the popup
+    /// to say the link is back and to close by itself, and only then types
+    /// `exit 7`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dead_primary_fails_over_onto_an_answering_standby() {
         let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
@@ -5560,7 +5962,8 @@ mod tests {
         // Sent while the phase is still `Live`, so a reply is owed and the
         // silence is noticed. The bytes themselves are lost with the swap.
         typing.write_all(b"true\n").expect("type");
-        // Answering on the standby. Typed before the first frame arrives on
+        wait_for_screen(&out, BIG, "switched to standby", Duration::from_secs(15)).await;
+        // And answering on it. Typed before the first frame arrives on
         // it, `exit 7` would be held for the `Confirming` question and never
         // reach the shell.
         wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(15)).await;
@@ -5572,7 +5975,12 @@ mod tests {
 
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
-            .unwrap_or_else(|_| panic!("the client never finished; it painted:\n{}", out.text()))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; it showed:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
             .expect("client task");
         assert_eq!(
             code.expect("the client loop failed"),
@@ -5584,21 +5992,22 @@ mod tests {
             standby_id,
             "the session did not end on the standby"
         );
+        let stray = outside_renderer(&out.bytes());
         assert!(
-            out.text().contains("switched to standby"),
-            "the failover was not announced: {}",
-            out.text()
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
     }
 
     /// The search, end to end through the doors `serve` opens: the request
     /// goes out on the FIRST link's control stream, runs the real exchange
-    /// through the listener, is parked by the host, and is announced by the
-    /// client.
+    /// through the listener, is parked by the host, and is recorded by the
+    /// client, whose popup shows it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_standby_is_found_over_the_first_links_control_stream() {
-        let (mut host, mut client) = pair("").await;
+        let (mut host, mut client) = pair_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let dir = tempfile::tempdir().expect("a scratch directory");
         let listener =
@@ -5640,21 +6049,19 @@ mod tests {
             }
         });
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !out.text().contains("standby: ") {
-            assert!(
-                Instant::now() < deadline,
-                "no standby was announced; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // A found standby is not an outage, so nothing opens the popup by
+        // itself: open it by hand and watch its log.
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
+        wait_for_screen(&out, BIG, "found ", Duration::from_secs(20)).await;
         assert_eq!(
             meta.lock().await.attach_id,
             1,
             "the host did not run an exchange for the standby"
         );
 
+        // The open popup takes every key: close it, then talk to the shell.
+        close_the_popup(&mut typing, &out, BIG).await;
         typing.write_all(b"exit 7\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
@@ -5665,6 +6072,13 @@ mod tests {
             client.link.sink.connection().stable_id(),
             primary_id,
             "finding a standby moved the session off the primary"
+        );
+        assert!(
+            client
+                .activity
+                .entries()
+                .any(|e| e.kind == Kind::Standby && e.text.starts_with("found ")),
+            "the standby was shown but not recorded"
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
         crate::listener::close_the_door(door_task).await;

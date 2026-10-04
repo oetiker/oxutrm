@@ -224,6 +224,22 @@ impl LogFile {
         Ok(LogFile { path, file, cap })
     }
 
+    /// `$XDG_STATE_HOME/oxutrm/client.log`, else
+    /// `~/.local/state/oxutrm/client.log`, capped at [`LOG_CAP`].
+    ///
+    /// No test calls it: it would write into the home of whoever runs the
+    /// tests. It is [`state_path`] and [`LogFile::open`], which are.
+    pub(crate) fn open_default() -> std::io::Result<LogFile> {
+        let path = state_path(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "neither XDG_STATE_HOME nor HOME names a directory",
+                )
+            })?;
+        LogFile::open(path, LOG_CAP)
+    }
+
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         // Another client sharing the file may have rotated it, leaving our
         // handle on client.log.1. Appending there would take it past the
