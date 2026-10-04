@@ -7473,7 +7473,12 @@ mod tests {
             })
             .expect("client task");
         assert_eq!(code.expect("the client loop failed"), 4);
-        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 4);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 4);
 
         let link: Vec<String> = client
             .activity
@@ -7574,15 +7579,30 @@ mod tests {
             })
             .expect("client task");
         assert_eq!(code.expect("the client loop failed"), 6);
-        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 6);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 6);
 
-        let input: Vec<String> = client
+        // Activity folds identical entries, so a second send would show as
+        // `repeats == 1`, not as a second entry.
+        let input: Vec<(String, u32)> = client
             .activity
             .entries()
             .filter(|e| e.kind == crate::activity::Kind::Input)
-            .map(|e| e.text.clone())
+            .map(|e| (e.text.clone(), e.repeats))
             .collect();
-        assert_eq!(input, ["held input sent (23 bytes)"]);
+        assert_eq!(input, [("held input sent (23 bytes)".to_string(), 0)]);
+        // The shell ran the held line exactly once: counted on the final
+        // screen, after everything that could have run it a second time.
+        let final_screen = text(client.screen());
+        assert_eq!(
+            final_screen.matches("blind-ok").count(),
+            1,
+            "the held line did not run exactly once:\n{final_screen}"
+        );
         let stray = outside_renderer(&out.bytes());
         assert!(
             stray.is_empty(),
@@ -7634,11 +7654,21 @@ mod tests {
             .expect("the client never finished")
             .expect("client task");
         assert_eq!(code.expect("the client loop failed"), 5);
-        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 5);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 5);
 
         let screen = text(client.screen());
         assert!(screen.lines().any(|l| l.trim_end() == "^\\"), "{screen}");
         assert!(!screen.contains("^\\^\\"), "two literals arrived: {screen}");
+        assert_eq!(
+            screen.matches("^\\").count(),
+            1,
+            "not exactly one literal on the final screen: {screen}"
+        );
         assert!(client.shown.is_none(), "the double press left the popup up");
     }
 }
