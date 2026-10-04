@@ -491,8 +491,52 @@ mod tests {
         assert!(short.contains("make test"), "{short}");
         assert!(short.contains("q quit"), "the key bar was clipped: {short}");
         assert!(
+            !short.contains("event-"),
+            "the body was not exhausted, a log entry is shown: {short}"
+        );
+        assert!(
             !short.contains("silent for 6s"),
             "nothing gave way: {short}"
+        );
+    }
+
+    /// The sections run marker, held, recovering, status, standby, sparkline,
+    /// log, top to bottom. Wide log entries mean a log drawn first would show
+    /// past the shorter section rows, so drawing order is guarded too.
+    #[test]
+    fn the_sections_run_in_the_documented_order() {
+        let v = PopupView {
+            held: vec!["HELD-LINE".to_string()],
+            recovering: vec!["RECOVERING-LINE".to_string()],
+            status: vec!["STATUS-LINE".to_string()],
+            standby: vec!["STANDBY-LINE".to_string()],
+            log: (1..=30)
+                .map(|i| format!("{:.<40} LOG-ENTRY-{i:02}", ""))
+                .collect(),
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        let find = |what: &str| {
+            (0..o.rows)
+                .find(|&r| row(&o, r).contains(what))
+                .unwrap_or_else(|| panic!("no {what:?} in: {text}"))
+        };
+        let spark = (0..o.rows)
+            .find(|&r| row(&o, r).contains(SPARK_LABEL))
+            .unwrap_or_else(|| panic!("no sparkline row in: {text}"));
+        let order = [
+            find("SILENT"),
+            find("HELD-LINE"),
+            find("RECOVERING-LINE"),
+            find("STATUS-LINE"),
+            find("STANDBY-LINE"),
+            spark,
+            find("LOG-ENTRY"),
+        ];
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "rows {order:?} are not strictly increasing: {text}"
         );
     }
 
