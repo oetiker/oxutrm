@@ -1488,15 +1488,28 @@ impl ClientSession {
 
     /// A rebuild attempt failed for a reason worth retrying.
     fn rebuild_failed(&mut self, why: String, now: Instant) {
+        self.record_attempt_failed(&why);
+        self.link_state.attempt_failed(now);
+        // Kept for the popup's recovering section.
+        self.last_failure = Some(why);
+    }
+
+    /// The log entry for a failed rebuild attempt, retried or not.
+    fn record_attempt_failed(&mut self, why: &str) {
         if let Phase::Recovering { attempt, .. } = self.link_state.phase_now() {
             self.activity.record(
                 Kind::Rebuild,
                 &format!("attempt {} failed: {why}", attempt.saturating_add(1)),
             );
         }
-        self.link_state.attempt_failed(now);
-        // Kept for the popup's recovering section.
-        self.last_failure = Some(why);
+    }
+
+    /// A rebuild attempt got an answer that repeating the question will not
+    /// change. The session ends with it, so the log says how: the error is
+    /// what `run_connect` prints once the raw guard is dropped.
+    fn rebuild_refused(&mut self, why: &str) -> anyhow::Error {
+        self.record_attempt_failed(why);
+        anyhow::anyhow!("this session cannot be resumed: {why}")
     }
 
     /// A rebuild attempt landed: its link replaces the one that stopped
@@ -1522,9 +1535,8 @@ impl ClientSession {
         };
         self.swap_in_as(e.link, now, SWITCHED)
             .context("failing over to the standby")?;
-        // Spec §3.5 step 2: the host adopts the standby on our first frame
-        // on it, so that frame goes now.
-        self.turn(&[], out)?;
+        // Recorded before the first frame goes: the switch has happened, and
+        // a turn that errors must not leave it out of the log.
         if let Some(id) = self.identity.as_mut() {
             id.attach_id = e.attach_id;
         }
@@ -1536,18 +1548,22 @@ impl ClientSession {
             ),
         );
         self.path = Some(e.path);
+        // Spec §3.5 step 2: the host adopts the standby on our first frame
+        // on it, so that frame goes now.
+        self.turn(&[], out)?;
         Ok(true)
     }
 
     /// One standby decision (see [`crate::standby::Standby::step`]), with
     /// what it starts recorded. The loop acts on the returned action.
     ///
-    /// "probing standby" is recorded for the first probe of an outage only:
-    /// a probe that keeps failing is retried every `PROBE_RETRY`, and an
-    /// entry per retry would alternate with its "probe failed" so that
-    /// nothing folds, and a long outage would push everything useful out of
-    /// the ring. Only a probe from `Idle` is a first one; a retry comes from
-    /// `Failed`.
+    /// "probing standby" is recorded for the first probe since the probe
+    /// state was last reset to `Idle` (a rebuild attempt or a forgotten
+    /// answer resets it, so it can recur within one outage): a probe that
+    /// keeps failing is retried every `PROBE_RETRY`, and an entry per retry
+    /// would alternate with its "probe failed" so that nothing folds, and a
+    /// long outage would push everything useful out of the ring. Only a
+    /// probe from `Idle` is a first one; a retry comes from `Failed`.
     fn standby_step(
         &mut self,
         phase: Phase,
@@ -2033,7 +2049,7 @@ impl ClientSession {
                         // one. `run_connect` prints this after the raw guard
                         // is dropped and exits non-zero.
                         AttemptOutcome::Definite(why) => {
-                            return Err(anyhow::anyhow!("this session cannot be resumed: {why}"));
+                            return Err(self.rebuild_refused(&why));
                         }
                     }
                 }
@@ -5756,6 +5772,85 @@ mod tests {
         if let Some(r) = session.rebuild.as_mut() {
             r.cancel();
         }
+    }
+
+    /// The attempt that ends the session is the last line of the file, so
+    /// it must say how it ended (spec §5.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_definite_rebuild_failure_is_recorded_before_the_session_ends() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Rebuild, "attempt 1 started".to_string()))
+        );
+
+        let err = session.rebuild_refused("the host no longer knows this session");
+
+        assert_eq!(
+            last_entry(&session),
+            Some((
+                Kind::Rebuild,
+                "attempt 1 failed: the host no longer knows this session".to_string()
+            ))
+        );
+        assert_eq!(
+            err.to_string(),
+            "this session cannot be resumed: the host no longer knows this session"
+        );
+        assert_eq!(
+            session.last_failure, None,
+            "a definite answer is not a retry"
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// A probe's answer is recorded; a stale one (the probe it answers is no
+    /// longer pending) is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_answer_is_recorded_and_a_stale_one_is_not() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "a probe nobody sent was recorded"
+        );
+
+        let action = client.standby_step(silent, t0, false);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "no probe started: {action:?}"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Failover, "probing standby".to_string()))
+        );
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Failover, "probe answered".to_string()))
+        );
+        let before = client.activity.entries().len();
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            client.activity.entries().len(),
+            before,
+            "a stale answer was recorded"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
