@@ -21,6 +21,7 @@ use crate::link::Link;
 use crate::rebuild::Rebuild;
 use crate::session::ClientSession;
 use crate::standby::Standby;
+use crate::view::Identity;
 
 /// `oxutrm <ssh-target>`: L1 to L14.
 ///
@@ -198,7 +199,12 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
     let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
-        .context("preparing the client session")?;
+        .context("preparing the client session")?
+        .with_identity(Identity {
+            target: target.to_owned(),
+            session_id: established.session_id.clone(),
+            attach_id: established.attach_id,
+        });
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     if standby {

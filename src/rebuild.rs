@@ -14,7 +14,7 @@
 // A rebuild attempt runs while the client session it is rebuilding already
 // owns the screen: nothing here may print, or it lands raw on the painted
 // raw-mode terminal. `AttemptOutcome::Retry`'s reason is shown
-// through the notice, not printed.
+// through the popup, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
@@ -27,7 +27,7 @@ use crate::connect::{Established, HostRefused, establish, read_offer};
 ///
 /// Raw mode is held and the screen belongs to the renderer, so a passphrase
 /// prompt would fight it for the terminal. `BatchMode=yes` turns that into a
-/// clean failure the notice can explain instead. The real answer is B3's
+/// clean failure the popup can explain instead. The real answer is B3's
 /// askpass; until then this is the deliberate, legible degradation the spec
 /// asks for.
 const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
@@ -38,7 +38,7 @@ const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 /// connection and then says nothing -- a hung registry read, a stalled NFS
 /// home directory, an ssh that connected and never ran the command. Without
 /// this the task stays alive for ever, `Rebuild::is_running` stays true, the
-/// loop starts no further attempt, and the notice sits at "next try in 0s"
+/// loop starts no further attempt, and the popup sits at "next try in 0s"
 /// permanently. The feature dead-ends at the exact moment it is needed, and
 /// the link it would otherwise fall back on is by definition the dead one.
 ///
@@ -68,7 +68,7 @@ pub(crate) enum AttemptOutcome {
     /// which is built on every lap of a loop that runs at the pacing rate. One
     /// allocation per successful rebuild is not a cost anybody can measure.
     Landed(Box<Established>),
-    /// Worth trying again, with the reason kept for the notice.
+    /// Worth trying again, with the reason kept for the popup.
     Retry(String),
     /// Not worth trying again, in the far end's own words where there are any.
     Definite(String),
@@ -331,7 +331,7 @@ impl Drop for Rebuild {
     ///
     /// The loop cancels on every path it takes itself, so this is about the
     /// paths it does not take: the quit key pressed while `Recovering` --
-    /// which is the key the notice on screen is offering at that exact moment
+    /// which is the key the popup is offering at that exact moment
     /// -- the shell exiting mid-attempt, and any error returned out of
     /// `run_on`. Today all of those end with the runtime being dropped
     /// normally, which happens to take the task down with it. That is one
@@ -379,7 +379,7 @@ fn classify(target: &str, err: &anyhow::Error) -> AttemptOutcome {
     // ssh dying, no reply, the ladder finding no rung, the QUIC handshake
     // failing: all of it is a network that may be back in eight seconds.
     // `{:#}` keeps the whole context chain on one line, which is what the
-    // notice has room for.
+    // popup has room for.
     AttemptOutcome::Retry(format!("{err:#}"))
 }
 
@@ -573,7 +573,7 @@ mod tests {
             // `classify` returns for everything that is not one of the two
             // definite cases, so a `classify` that had stopped reading its
             // argument at all would satisfy `Retry(_)`. What this has to show
-            // is that the sentence reaching the notice is the one ssh gave.
+            // is that the sentence reaching the popup is the one ssh gave.
             AttemptOutcome::Retry(why) => assert!(
                 why.contains("Network is unreachable"),
                 "the reason ssh gave was thrown away: {why}"
@@ -646,7 +646,7 @@ mod tests {
                 );
                 assert!(
                     why.contains("bastion.example.net"),
-                    "the notice has to name what could not be reached: {why}"
+                    "the popup has to name what could not be reached: {why}"
                 );
             }
             other => panic!("expected a Retry naming the deadline, got {other:?}"),

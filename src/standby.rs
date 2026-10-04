@@ -50,8 +50,8 @@ pub(crate) enum StandbyEvent {
     },
     /// The search failed. The user is still told only that there is no
     /// standby (spec §3.7), and the next search asks again anyway -- but the
-    /// reason is kept on [`Standby::last_failure`] for the coming status
-    /// popup, rather than thrown away.
+    /// reason is kept on [`Standby::last_failure`] for the popup's standby
+    /// block, rather than thrown away.
     NotFound {
         search: u64,
         reason: String,
@@ -99,7 +99,7 @@ pub(crate) struct Standby {
     /// Whether "no standby path" has been said for the current dry spell, so
     /// it is said once, not after every failed search.
     told_none: bool,
-    /// Why the last search failed, for the coming status popup. Cleared the
+    /// Why the last search failed, for the popup's standby block. Cleared the
     /// moment a search succeeds; never printed (spec §3.7 says only "no
     /// standby path").
     last_failure: Option<String>,
@@ -128,18 +128,32 @@ impl Standby {
         self.link.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn next_search(&self) -> Instant {
         self.next_search
     }
 
-    /// Why the last search failed, kept for the status popup.
-    ///
-    /// Wired by the status popup (sub-project B, Ctrl-\ UI); until then
-    /// nothing outside tests reads it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Why the last search failed, for the popup's standby block.
     pub(crate) fn last_failure(&self) -> Option<&str> {
         self.last_failure.as_deref()
+    }
+
+    /// The standby's path, while there is one.
+    pub(crate) fn path(&self) -> Option<&PathDescription> {
+        self.link.as_ref().map(|(_, p)| p)
+    }
+
+    /// quinn's round-trip estimate on the standby's own connection.
+    pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
+        self.link.as_ref().map(|(l, _)| l.sink.connection().rtt())
+    }
+
+    pub(crate) fn probe(&self) -> ProbeState {
+        self.probe
+    }
+
+    /// Whether a search is running now.
+    pub(crate) fn searching(&self) -> bool {
+        self.searching
     }
 
     /// The standby's connection, for the loop's `closed()` arm and for
@@ -441,9 +455,24 @@ mod tests {
         assert_eq!(s.next_search(), t2 + standby_backoff(1));
     }
 
-    /// A `NotFound` with a reason is kept for the status popup (not yet
-    /// wired), not told to the user directly (spec §3.7 still says only "no
-    /// standby path").
+    #[tokio::test]
+    async fn the_popup_can_read_what_the_standby_is_doing() {
+        let t0 = Instant::now();
+        let mut fresh = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        assert!(fresh.path().is_none() && fresh.rtt().is_none() && !fresh.searching());
+        search_at(&mut fresh, t0 + STANDBY_DELAY);
+        assert!(fresh.searching());
+
+        let (s, _host) = with_a_standby(t0).await;
+        assert_eq!(s.path().map(|p| p.rtt_ms), Some(38));
+        assert!(s.rtt().is_some());
+        assert_eq!(s.probe(), ProbeState::Idle);
+        assert!(!s.searching());
+    }
+
+    /// A `NotFound` with a reason is kept for the popup's standby block, not
+    /// told to the user directly (spec §3.7 still says only "no standby
+    /// path").
     #[test]
     fn a_not_found_with_a_reason_sets_last_failure() {
         let t0 = Instant::now();
@@ -469,7 +498,7 @@ mod tests {
     }
 
     /// A later `Found` is good news, and a stale reason from the dry spell
-    /// before it must not linger in the box.
+    /// before it must not linger in the popup.
     #[tokio::test]
     async fn a_later_found_clears_last_failure() {
         let t0 = Instant::now();
