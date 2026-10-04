@@ -6,9 +6,8 @@ expression: "text_of(&layout_popup(&view(), TermSize { cols: 40, rows: 12 }))"
 │ ● SILENT   silent 6 s            │
 │ standby probe   probing…         │
 │ ssh rebuild     in 14 s          │
-│ rtt   —  (30–52)  ▄▆ █           │
+│ rtt   —  (30–52)            ▄▆ █ │
 │ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s    │
-│                                  │
 ├──────────────────────────────────┤
 │ q quit  c config                 │
 ╰──────────────────────────────────╯

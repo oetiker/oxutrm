@@ -168,9 +168,10 @@
   standby (IPv4 punched)` — in local time, with identical lines folded into
   `×N` and a long line wrapping under its own text. Every step of the outage
   is still in `client.log`, unchanged and in UTC, followed by that summary
-  line. A failed standby search shows only the first part of its reason; the
-  file has all of it. The attach id, the average RTT and the cumulative
-  sent/lost counts are no longer shown.
+  line. A standby search that finds nothing says `no second path found`; the
+  file keeps the full reason, rung by rung. The box is only as tall as what it
+  has to say, so a short log leaves no empty rows. The attach id, the average
+  RTT and the cumulative sent/lost counts are no longer shown.
 
 - **The box that appeared during an outage is the popup now.** What it said —
   how long the host has been silent, what was typed blind, the rebuild attempt

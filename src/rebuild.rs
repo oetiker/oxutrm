@@ -41,8 +41,9 @@ const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 /// home directory, an ssh that connected and never ran the command. Without
 /// this the task stays alive for ever, `Rebuild::is_running` stays true, the
 /// loop starts no further attempt, and the popup's `ssh rebuild` row counts
-/// one attempt's running time up for ever. The feature dead-ends at the exact moment it is needed, and
-/// the link it would otherwise fall back on is by definition the dead one.
+/// one attempt's running time up for ever. The feature dead-ends at the
+/// exact moment it is needed, and the link it would otherwise fall back on
+/// is by definition the dead one.
 ///
 /// **Two minutes, and it is deliberately the largest number in the picture.**
 /// Every step inside an attempt already has the right budget for itself, and

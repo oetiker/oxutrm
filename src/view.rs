@@ -42,7 +42,9 @@ pub(crate) struct StandbyFacts<'a> {
     pub(crate) probe: ProbeState,
     pub(crate) searching: bool,
     pub(crate) next_search: Instant,
-    pub(crate) last_failure: Option<&'a str>,
+    /// Whether the last search found nothing. Its reason is for the file:
+    /// the popup says only [`NO_SECOND_PATH`].
+    pub(crate) last_search_failed: bool,
 }
 
 /// The ssh rebuild, for a session that has one to fall back on.
@@ -51,6 +53,9 @@ pub(crate) struct RebuildFacts<'a> {
     pub(crate) running_since: Option<Instant>,
     /// Why the last attempt failed.
     pub(crate) last_failure: Option<&'a str>,
+    /// Whether the standby was switched in and, so far, that ended the
+    /// outage: an attempt still shown would be one begun before the switch.
+    pub(crate) switched: bool,
 }
 
 pub(crate) struct Facts<'a> {
@@ -142,12 +147,16 @@ pub(crate) fn byte_count(n: usize) -> String {
     }
 }
 
+/// What the popup says of a standby search that found nothing, whatever
+/// the reason. The reason names rungs of the connection ladder and what
+/// each one hit, which means something in client.log, where all of it goes,
+/// and nothing to someone glancing at the popup.
+pub(crate) const NO_SECOND_PATH: &str = "no second path found";
+
 /// The front of a reason, up to its first `: `, made legible and short.
 ///
-/// A standby search's reason is a chain -- "no rung of the ladder reached
-/// the host: no usable path to the host. Every rung, in order: ..." -- whose
-/// first link says what happened and whose rest is for the file, where the
-/// whole of it still goes.
+/// A lost standby's reason is a chain whose first link says what happened
+/// and whose rest is for the file, where the whole of it still goes.
 pub(crate) fn first_clause(reason: &str) -> String {
     summarised(reason.split(": ").next().unwrap_or(reason))
 }
@@ -236,6 +245,12 @@ fn attempts(f: &Facts<'_>) -> Vec<Row> {
         return rows;
     };
     let label = "ssh rebuild";
+    if r.switched {
+        // An attempt begun before the switch may still run (ruling B1),
+        // but the outage no longer waits on it.
+        rows.push(Row::new(label, "not needed \u{b7} switched to standby"));
+        return rows;
+    }
     match f.phase {
         Phase::Silent { since } => rows.push(Row::new(
             label,
@@ -379,10 +394,8 @@ fn standby(s: &StandbyFacts<'_>, now: Instant) -> Vec<String> {
             clock(s.next_search.saturating_duration_since(now))
         )),
     }
-    if s.path.is_none()
-        && let Some(why) = s.last_failure
-    {
-        rows.push(format!("last search: {}", first_clause(why)));
+    if s.path.is_none() && s.last_search_failed {
+        rows.push(format!("last search: {NO_SECOND_PATH}"));
     }
     rows
 }
@@ -556,7 +569,7 @@ mod tests {
             probe: ProbeState::Idle,
             searching: false,
             next_search: secs(t, 270),
-            last_failure: None,
+            last_search_failed: false,
         }
     }
 
@@ -821,6 +834,7 @@ mod tests {
                 rebuild: Some(RebuildFacts {
                     running_since: running,
                     last_failure: Some("ssh exited"),
+                    switched: false,
                 }),
                 ..facts(&q, &a, phase, t + Duration::from_millis(ms))
             })
@@ -831,16 +845,31 @@ mod tests {
             next_try: t + Duration::from_secs(10),
         };
         for (phase, running) in [(silent, None), (recovering, None), (recovering, Some(t))] {
-            assert_eq!(
+            let (before, same, after) = (
                 at(phase, running, 2_100),
                 at(phase, running, 2_900),
-                "{phase:?} {running:?}"
-            );
-            assert_ne!(
-                at(phase, running, 2_100),
                 at(phase, running, 3_100),
-                "{phase:?} {running:?}"
             );
+            assert_eq!(before, same, "{phase:?} {running:?}");
+            // And each clock does move at the whole second: row by row, so
+            // the header's `silent N s` turning over cannot stand in for a
+            // probe retry or an attempt clock that never moved. Only the
+            // reason row under a failed attempt has no clock.
+            assert_ne!(before.header, after.header, "{phase:?} {running:?}");
+            let clocked: Vec<_> = before
+                .attempts
+                .iter()
+                .zip(&after.attempts)
+                .filter(|(b, _)| !b.label.is_empty())
+                .collect();
+            assert_eq!(clocked.len(), 2, "{phase:?} {running:?}: {before:?}");
+            for (b, a) in clocked {
+                assert_ne!(
+                    b.text, a.text,
+                    "{} did not move: {phase:?} {running:?}",
+                    b.label
+                );
+            }
         }
     }
 
@@ -1029,43 +1058,50 @@ mod tests {
         );
     }
 
-    /// Review focus 6: the reason is the far end's own words. Only its first
-    /// clause is shown; the file has the rest.
+    /// A search that found nothing says so in the user's words. Its reason
+    /// -- which rung hit what, partly the far end's own words -- is for
+    /// client.log and never reaches a cell.
     #[test]
-    fn a_search_failure_from_the_far_end_is_shown_escaped_and_short() {
+    fn a_failed_search_says_no_second_path_was_found() {
         let t = Instant::now();
         let (q, a) = (Quality::new(t), Activity::new());
-        let last = |why: &'static str| {
-            let s = StandbyFacts {
-                last_failure: Some(why),
-                ..standby(None, t)
-            };
+        let rows = |failed: bool| {
             build(&Facts {
-                standby: Some(s),
+                standby: Some(StandbyFacts {
+                    last_search_failed: failed,
+                    ..standby(None, t)
+                }),
                 ..facts(&q, &a, Phase::Live, t)
             })
             .standby
-            .last()
-            .cloned()
-            .unwrap()
         };
-        let hostile = last("\u{1b}[2Jgone\u{9b}1m\nsecond line");
-        assert!(hostile.starts_with("last search: ^[[2Jgone"), "{hostile:?}");
+        assert_eq!(
+            rows(true),
+            [
+                "none \u{b7} next search in 4 m 30 s",
+                "last search: no second path found"
+            ]
+        );
+        assert_eq!(rows(false), ["none \u{b7} next search in 4 m 30 s"]);
+    }
+
+    /// A lost standby's reason is the far end's own words: only its first
+    /// clause reaches the popup, escaped; the file has the rest.
+    #[test]
+    fn a_first_clause_is_cut_at_its_colon_and_escaped() {
+        assert_eq!(first_clause("closed by peer: 0: gone"), "closed by peer");
+        assert_eq!(first_clause("timed out"), "timed out");
+        let hostile = first_clause("\u{1b}[2Jgone\u{9b}1m\nsecond line");
+        assert!(hostile.starts_with("^[[2Jgone"), "{hostile:?}");
         assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
         assert!(!hostile.contains("second line"), "{hostile:?}");
-        assert_eq!(
-            last(
-                "no rung of the ladder reached the host: no usable path to the host. \
-                 Every rung, in order:"
-            ),
-            "last search: no rung of the ladder reached the host"
-        );
     }
 
     fn rebuild_facts(running_since: Option<Instant>) -> RebuildFacts<'static> {
         RebuildFacts {
             running_since,
             last_failure: None,
+            switched: false,
         }
     }
 
@@ -1140,6 +1176,7 @@ mod tests {
                 rebuild: Some(RebuildFacts {
                     running_since: running,
                     last_failure: failure,
+                    switched: false,
                 }),
                 ..facts(
                     &q,
@@ -1171,6 +1208,41 @@ mod tests {
             rebuild(0, None, None),
             [pair("ssh rebuild", "attempt 1 in 4 s")]
         );
+    }
+
+    /// Review M2. Once the standby is switched in, an ssh attempt begun
+    /// before the switch may still be running, but it is not what the
+    /// outage is waiting on: its row says so instead of showing it as the
+    /// current attempt -- with a number the switch has reset.
+    #[test]
+    fn after_a_switch_the_rebuild_row_shows_no_attempt_as_current() {
+        let t = Instant::now();
+        let (q, a) = (Quality::new(t), Activity::new());
+        let now = secs(t, 40);
+        for (phase, running) in [
+            (
+                Phase::Recovering {
+                    attempt: 0,
+                    next_try: secs(t, 48),
+                },
+                Some(secs(t, 30)),
+            ),
+            (Phase::Silent { since: t }, None),
+        ] {
+            let rows = attempts_at(Facts {
+                rebuild: Some(RebuildFacts {
+                    running_since: running,
+                    last_failure: Some("ssh exited"),
+                    switched: true,
+                }),
+                ..facts(&q, &a, phase, now)
+            });
+            assert_eq!(
+                rows,
+                [pair("ssh rebuild", "not needed \u{b7} switched to standby")],
+                "{phase:?}"
+            );
+        }
     }
 
     /// Outside an outage there is nothing being recovered.
@@ -1304,6 +1376,7 @@ mod tests {
                 rebuild: Some(RebuildFacts {
                     running_since: None,
                     last_failure: Some("ssh exited"),
+                    switched: false,
                 }),
                 ..facts(&q, &a, phase, secs(t, 1))
             });
@@ -1376,7 +1449,7 @@ mod tests {
         a.record_entry(
             Kind::Standby,
             "not found: the host gave up: no usable path to the host.",
-            Some("standby not found: the host gave up"),
+            Some(NO_SECOND_PATH),
             false,
             at(22, 59),
         );
@@ -1408,10 +1481,7 @@ mod tests {
             path: Some(&p),
             standby: Some(StandbyFacts {
                 next_search: now + Duration::from_secs(23),
-                last_failure: Some(
-                    "no rung of the ladder reached the host: no usable path to the host. \
-                     Every rung, in order:"
-                ),
+                last_search_failed: true,
                 ..standby(None, t)
             }),
             ..facts(&q, &a, Phase::Live, now)

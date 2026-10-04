@@ -179,7 +179,9 @@ connections. The header reads "<path> · up <age> · link <N>".
 - the standby's path label (`rung_label`) and its own `rtt()`,
 - "searching…" or "next search in <N> s" / "<m> m <s> s" (from
   `next_search`),
-- `last_failure`: its first clause (up to the first `: `), escaped.
+- after a failed search, `last search: no second path found`. The reason
+  (which rung hit what) goes to client.log only: it is ladder vocabulary,
+  and the popup says what it means to the user.
 
 Its probe state (`ProbeState`) is shown in the outage's attempts block
 instead (§6).
@@ -213,7 +215,9 @@ to the file exactly as before.
 
 - If the newest entry has the same `kind`, `text`, `shown` and `detail`, its
   `repeats` is incremented and its time updated; nothing is added.
-- Otherwise a new entry is pushed; beyond `RING` (200) the oldest is dropped.
+- Otherwise a new entry is pushed; beyond `RING` (200) the oldest detail is
+  dropped, or the oldest entry when no detail but the newest is left. A long
+  outage's steps are never shown, so they must not push out what is.
 
 **One line per outage** (2026-10-04). Every step of an outage is a detail:
 `link silent`, `link live again …`, the `failover` entries, the `rebuild`
@@ -229,6 +233,13 @@ outage 96.3 s → switched to standby (IPv4 punched) after 1 failed ssh attempt
 outage 3.2 s → came back by itself
 ```
 
+A path label with its own parenthesis is not nested: `switched to standby
+(IPv4 punched, birthday, 412 probes)`. An ssh attempt begun before a switch
+to the standby may still run and fail after it (ruling B1); that failure is
+not counted, because the outage did not wait through it -- unless a new
+attempt has to begin after the switch, or a rebuild lands, in which case the
+switch did not end the outage and every failure counts.
+
 The file's line carries the kind once (`… outage 8.1 s → …`). An outage that
 never ends (the session dies in it) leaves only its details.
 
@@ -238,7 +249,7 @@ records them. Events:
 | Kind | Text (shape); *details in italics*; [popup wording] where it differs |
 |---|---|
 | `link` | *silent* · *live again via <path>, outage <N.N> s* · path migrated → <path> |
-| `standby` | *search started* · found <path>, <N> ms [standby found …] · not found: <reason> [standby not found: <first clause>] · lost: <reason> [standby lost: <first clause>] |
+| `standby` | *search started* · found <path>, <N> ms [standby found …] · not found: <reason> [no second path found] · lost: <reason> [standby lost: <first clause>] |
 | `failover` | *probing standby* · *probe answered / failed* · *switched to standby (<path>)* |
 | `rebuild` | *attempt <N> started* · *attempt <N> failed: <reason>* · *landed via <path>* |
 | `input` | held input sent (<N> bytes) · held input dropped (<N> bytes) |
@@ -279,7 +290,7 @@ first call), which is written before the session owns the screen.
 
 Revised 2026-10-04 after the hand test. A live view after a failover, and
 the top of an outage with an ssh attempt running, at 80×24 (both pinned as
-snapshots in `src/view.rs`; the live view's empty rows are left out here):
+snapshots in `src/view.rs`). The box is as tall as its content:
 
 ```
 ╭ oxutrm · thinlinc · 3ff1218f ────────────────────────────────────────╮
@@ -288,12 +299,12 @@ snapshots in `src/view.rs`; the live view's empty rows are left out here):
 │ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s                                        │
 ├ standby ─────────────────────────────────────────────────────────────┤
 │ none · next search in 23 s                                           │
-│ last search: no rung of the ladder reached the host                  │
+│ last search: no second path found                                    │
 ├ recent ──────────────────────────────────────────────────────────────┤
 │ 22:53  outage 96.3 s → switched to standby (IPv4 punched) after 1    │
 │        failed ssh attempt                                            │
 │ 22:59  outage 8.1 s → switched to standby (IPv4 punched)             │
-│ 22:59  standby not found: the host gave up                           │
+│ 22:59  no second path found                                          │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Esc close  q quit  c config  s sessions                              │
 ╰──────────────────────────────────────────────────────────────────────╯
@@ -325,12 +336,15 @@ snapshots in `src/view.rs`; the live view's empty rows are left out here):
     <N> s` while one is in flight (its start from `Rebuild::running_since`);
     `attempt <N> failed · next in <N> s` between attempts, then a row with
     no label carrying the reason (`summarised`); `attempt 1 in <N> s` before
-    the first. Attempt numbers are 1-based;
+    the first; `not needed · switched to standby` once the standby has been
+    switched in, since an attempt still running then was begun before the
+    switch. Attempt numbers are 1-based;
 - **held**: the held text (`render_held`) with `s send` / `d drop` -- the
   Confirming question -- or, during an outage, `<N> bytes typed since -
   kept, not sent`;
 - **rtt** row: `rtt   <N> ms  (<min>–<max>)`, `—` for the whole outage, with
-  the sparkline filling the rest of the same row;
+  the sparkline filling the rest of the same row, the newest sample at the
+  right edge (with fewer samples than cells, the gap is on the left);
 - **quality** rows: `loss  <N.N> %  ↑ <rate>  ↓ <rate>`, and
   `screen frames rejected: <N>` when there are any;
 - **standby** section (§4), when the host offered a standby;
@@ -339,8 +353,9 @@ snapshots in `src/view.rs`; the live view's empty rows are left out here):
   the details are gone) fold into one with ` ×N`, summing the ring's own
   repeats, at the latest time. The zone is read once per session
   (`jiff::tz::TimeZone::system()`, the root crate forbids `unsafe` and std
-  has no time zone); the view takes it as a parameter so tests use UTC or a
-  fixed offset. client.log stays UTC;
+  has no time zone), so a laptop that changes zone mid-session shows the old
+  zone's times until it reattaches; the view takes it as a parameter so tests
+  use UTC or a fixed offset. client.log stays UTC;
 - the **key bar**.
 
 `ClientSession` builds it each lap. As with today's notice
@@ -353,7 +368,8 @@ otherwise.
 `layout_popup(&PopupView, TermSize) -> Overlay` uses ratatui `Block`,
 `Paragraph` and `Sparkline`:
 
-- width `min(cols − 4, 72)`, height `min(rows − 2, 24)`, centred;
+- width `min(cols − 4, 72)`; height what the content needs, at most
+  `min(rows − 2, 24)`, so a short log leaves no empty rows; centred;
 - top to bottom: header, attempts, held, rtt, quality, then `├ standby ─┤`
   and its rows, `├ recent ─┤` and the log, and a plain `├───┤` above the key
   bar, which has the last row. The rules are drawn into the border;
@@ -363,8 +379,10 @@ otherwise.
   give way oldest first;
 - **short screens** give way in this order of priority: header, held (the
   question survives), attempts, rtt, quality, the plain rule, the standby
-  section, the log. A rule costs a row and is drawn only with at least one
-  row of its section under it;
+  section, the log. While there is held text the header keeps to one row,
+  cut rather than wrapped, so a long live header cannot push the typed bytes
+  out from under the Confirming question. A rule costs a row and is drawn
+  only with at least one row of its section under it;
 - below `MIN_BOX` (20×6): today's single reverse-video line on row 0,
   reading `oxutrm: <state marker text>`, or under `Confirming` the question
   and its keys.
@@ -404,8 +422,11 @@ against "what else could produce this value?".
   laid out, as snapshots of a live view and an outage view at 80×24.
 - **Session level** (existing `pair_through_relay`, `keyboard()`, `drive`):
   blackholing the link raises the popup overlay, and no byte reaches `out`
-  outside the renderer's output; after a failover the log holds
-  "switched to standby", the popup lingers, then closes.
+  outside the renderer's output; after a failover the ring and client.log
+  hold "switched to standby" as a detail, the popup's log shows the outage
+  line, and the popup lingers, then closes. An outage driven from its silence
+  to its end -- by a failover, a landed rebuild, or by itself -- leaves one
+  shown `outage` line and every step before it a detail.
 
 ---
 

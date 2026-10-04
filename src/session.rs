@@ -979,8 +979,25 @@ struct OutageNotes {
     /// How it ended, when something oxutrm did ended it: `None` is a
     /// primary that came back by itself.
     ended: Option<String>,
-    /// How many ssh attempts failed before it ended.
+    /// How many ssh attempts failed during it.
     failed_attempts: u32,
+    /// `failed_attempts` when the standby was switched in, while that
+    /// switch is what ended the outage. An attempt begun before the switch
+    /// may still be running (ruling B1) and fail after it; that failure is
+    /// not one the outage waited through, so the summary counts to here.
+    /// Cleared again if a rebuild lands or a new attempt has to begin: then
+    /// the switch did not end it after all.
+    failed_at_switch: Option<u32>,
+}
+
+/// `label` in parentheses, for a summary: a path label that has a
+/// parenthesis of its own (`IPv4 punched (birthday, 412 probes)`) has it
+/// turned into a comma, so the summary does not nest them.
+fn in_parens(label: &str) -> String {
+    match label.strip_suffix(')').and_then(|l| l.split_once(" (")) {
+        Some((head, tail)) => format!("({head}, {tail})"),
+        None => format!("({label})"),
+    }
 }
 
 impl OutageNotes {
@@ -992,7 +1009,7 @@ impl OutageNotes {
             length.as_secs_f64(),
             self.ended.as_deref().unwrap_or("came back by itself")
         );
-        match self.failed_attempts {
+        match self.failed_at_switch.unwrap_or(self.failed_attempts) {
             0 => {}
             1 => text.push_str(" after 1 failed ssh attempt"),
             n => text.push_str(&format!(" after {n} failed ssh attempts")),
@@ -1065,6 +1082,7 @@ impl ClientSession {
             last_failure: None,
             standby: None,
             outage: OutageNotes::default(),
+            // Read once: a laptop that changes zone shows the old one's HH:MM until reattach.
             zone: jiff::tz::TimeZone::system(),
         })
     }
@@ -1449,7 +1467,7 @@ impl ClientSession {
             probe: s.probe(),
             searching: s.searching(),
             next_search: s.next_search(),
-            last_failure: s.last_failure(),
+            last_search_failed: s.last_failure().is_some(),
         });
         crate::view::build(&Facts {
             identity: self.identity.as_ref(),
@@ -1463,6 +1481,7 @@ impl ClientSession {
             rebuild: self.rebuild.as_ref().map(|r| RebuildFacts {
                 running_since: r.running_since(),
                 last_failure: self.last_failure.as_deref(),
+                switched: self.outage.failed_at_switch.is_some(),
             }),
             held: self.link_state.held(),
             held_full: self.link_state.held_is_full(),
@@ -1540,6 +1559,9 @@ impl ClientSession {
         }
         rebuild.begin(size, outcomes.clone(), now);
         self.link_state.begin_attempt(now);
+        // An attempt after a switch: the standby did not answer either, and
+        // the outage goes on.
+        self.outage.failed_at_switch = None;
         self.activity.record_detail(
             Kind::Rebuild,
             &format!("attempt {} started", attempt.saturating_add(1)),
@@ -1582,9 +1604,10 @@ impl ClientSession {
             &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
         );
         self.outage.ended = Some(format!(
-            "rebuilt over ssh ({})",
-            oxutrm_client::rung_label(&e.path)
+            "rebuilt over ssh {}",
+            in_parens(&oxutrm_client::rung_label(&e.path))
         ));
+        self.outage.failed_at_switch = None;
         self.path = Some(e.path);
         Ok(())
     }
@@ -1599,12 +1622,11 @@ impl ClientSession {
             .context("failing over to the standby")?;
         // Recorded before the first frame goes: the switch has happened, and
         // a turn that errors must not leave it out of the log.
-        let switched = format!(
-            "switched to standby ({})",
-            oxutrm_client::rung_label(&e.path)
-        );
-        self.activity.record_detail(Kind::Failover, &switched);
-        self.outage.ended = Some(switched);
+        let label = oxutrm_client::rung_label(&e.path);
+        self.activity
+            .record_detail(Kind::Failover, &format!("switched to standby ({label})"));
+        self.outage.ended = Some(format!("switched to standby {}", in_parens(&label)));
+        self.outage.failed_at_switch = Some(self.outage.failed_attempts);
         self.path = Some(e.path);
         // Spec §3.5 step 2: the host adopts the standby on our first frame
         // on it, so that frame goes now.
@@ -1671,10 +1693,12 @@ impl ClientSession {
                 watch
             }
             crate::standby::StandbyEvent::NotFound { search, reason } => {
+                // The file keeps the whole reason; the popup says what it
+                // means to the user, not which rungs of the ladder failed.
                 let text = format!("not found: {reason}");
-                let shown = format!("standby not found: {}", crate::view::first_clause(&reason));
                 if s.not_found(search, now, reason) {
-                    self.activity.record_shown(Kind::Standby, &text, &shown);
+                    self.activity
+                        .record_shown(Kind::Standby, &text, crate::view::NO_SECOND_PATH);
                 }
                 None
             }
@@ -5623,6 +5647,10 @@ mod tests {
             last_entry(&client),
             Some((Kind::Standby, "search started".to_string()))
         );
+        assert!(
+            client.activity.entries().all(|e| e.detail),
+            "a search starting shows in the popup's log"
+        );
     }
 
     /// A probe failing every `PROBE_RETRY` through a long outage is one
@@ -5658,6 +5686,10 @@ mod tests {
                 (Kind::Failover, "probing standby".to_string(), 0),
                 (Kind::Failover, "probe failed".to_string(), 1),
             ]
+        );
+        assert!(
+            client.activity.entries().all(|e| e.detail),
+            "a probe's step shows in the popup's log"
         );
     }
 
@@ -6802,6 +6834,189 @@ mod tests {
         );
     }
 
+    /// The popup's log of one outage, from its silence to its end: each
+    /// entry's kind, popup wording and detail flag.
+    fn shown_log(session: &ClientSession) -> Vec<(Kind, String, bool)> {
+        session
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.shown.clone(), e.detail))
+            .collect()
+    }
+
+    /// Every entry but the last is a detail with the words `steps` gives,
+    /// and the last is the shown `outage` line `summary`.
+    fn assert_one_line_per_outage(session: &ClientSession, steps: &[&str], summary: &str) {
+        let log = shown_log(session);
+        let (last, before) = log.split_last().expect("nothing was recorded");
+        assert_eq!(
+            last,
+            &(Kind::Outage, summary.to_string(), false),
+            "{log:#?}"
+        );
+        let words: Vec<&str> = before.iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(words, steps, "{log:#?}");
+        assert!(
+            before.iter().all(|e| e.2),
+            "a step of the outage shows in the popup: {log:#?}"
+        );
+    }
+
+    /// Review I2, failover. Driven from the silence through the probe, a
+    /// failed attempt and the switch to the frame on the standby: what the
+    /// outage noted reaches its summary, and every step is a detail. The
+    /// attempt that was running fails after the switch (review M2) and is
+    /// not counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_ended_by_a_failover_is_one_line_and_its_steps_are_details() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+
+        let action = session.standby_step(session.link_state.phase_now(), entered, false);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "no probe: {action:?}"
+        );
+        session.on_standby_event(
+            crate::standby::StandbyEvent::Probed { answered: true },
+            s(0),
+        );
+        session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
+        let mut out = Vec::new();
+        assert!(session.fail_over(s(2), &mut out).expect("failing over"));
+        session.rebuild_failed("ssh exited".to_string(), s(3));
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        assert_one_line_per_outage(
+            &session,
+            &[
+                "silent",
+                "probing standby",
+                "probe answered",
+                "attempt 1 failed: ssh exited with status 255",
+                "switched to standby (IPv4 punched)",
+                "attempt 1 failed: ssh exited",
+                "live again via IPv4 punched, outage 24.0 s",
+            ],
+            "outage 24.0 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt",
+        );
+    }
+
+    /// Review I2, rebuild. The same, ended by an ssh attempt that landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_ended_by_a_rebuild_is_one_line_and_its_steps_are_details() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        session
+            .rebuild_landed(standby_established(rebuilt), s(2))
+            .expect("landing");
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        assert_one_line_per_outage(
+            &session,
+            &[
+                "silent",
+                "attempt 1 failed: ssh exited with status 255",
+                "landed via IPv4 punched",
+                "live again via IPv4 punched, outage 24.0 s",
+            ],
+            "outage 24.0 s \u{2192} rebuilt over ssh (IPv4 punched) after 1 failed ssh attempt",
+        );
+    }
+
+    /// Review I2, by itself. The primary answers again after two attempts
+    /// failed: the summary still counts them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_that_ended_by_itself_still_counts_its_failed_attempts() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        session.rebuild_failed("ssh exited".to_string(), s(1));
+        session.rebuild_failed("ssh exited".to_string(), s(2));
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        let log = shown_log(&session);
+        assert_eq!(
+            log.last(),
+            Some(&(
+                Kind::Outage,
+                "outage 24.0 s \u{2192} came back by itself after 2 failed ssh attempts"
+                    .to_string(),
+                false
+            )),
+            "{log:#?}"
+        );
+        assert!(log[..log.len() - 1].iter().all(|e| e.2), "{log:#?}");
+    }
+
+    /// Review M2. A switch that did not end the outage -- the standby never
+    /// answered and a new attempt had to begin -- counts the failures after
+    /// it after all, and the rebuild row shows the new attempt again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_attempt_after_a_switch_undoes_the_switch_in_the_notes() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(s(0), &tx);
+        let mut out = Vec::new();
+        assert!(session.fail_over(s(1), &mut out).expect("failing over"));
+        let row = |session: &ClientSession, at| {
+            session
+                .view(session.link_state.phase_now(), at)
+                .attempts
+                .into_iter()
+                .find(|r| r.label == "ssh rebuild")
+                .map(|r| r.text)
+        };
+        assert_eq!(
+            row(&session, s(1)).as_deref(),
+            Some("not needed \u{b7} switched to standby"),
+            "the attempt begun before the switch shows as current"
+        );
+
+        // The old attempt fails after the switch; no frame comes on the
+        // standby, and the next attempt begins.
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+        session.rebuild_failed("ssh exited".to_string(), s(2));
+        assert_eq!(session.outage.failed_at_switch, Some(0));
+        let next = match session.link_state.phase_now() {
+            Phase::Recovering { next_try, .. } => next_try,
+            other => panic!("not recovering: {other:?}"),
+        };
+        session.rebuild_step(next, &tx);
+        assert_eq!(session.outage.failed_at_switch, None);
+        assert!(
+            row(&session, next).is_some_and(|t| t.contains("running")),
+            "{:?}",
+            row(&session, next)
+        );
+        assert_eq!(
+            session.outage.summary(Duration::from_secs(30)).1,
+            "outage 30.0 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
     /// How an outage ended, in the words of the one line that sums it up.
     #[test]
     fn an_outage_summary_says_how_it_ended_and_what_failed_first() {
@@ -6809,6 +7024,7 @@ mod tests {
         let notes = |ended: Option<&str>, failed_attempts| OutageNotes {
             ended: ended.map(str::to_string),
             failed_attempts,
+            failed_at_switch: None,
         };
         assert_eq!(
             notes(None, 0).summary(len).1,
@@ -6829,6 +7045,37 @@ mod tests {
                 .1,
             "outage 96.3 s \u{2192} rebuilt over ssh (IPv6 direct) after 3 failed ssh attempts"
         );
+        // Review M2: a failure after the switch that ended it is not one the
+        // outage waited through.
+        assert_eq!(
+            OutageNotes {
+                failed_at_switch: Some(1),
+                ..notes(Some("switched to standby (IPv4 punched)"), 2)
+            }
+            .summary(len)
+            .1,
+            "outage 96.3 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+        );
+    }
+
+    /// Review M6: a path label with a parenthesis of its own is not nested
+    /// in the summary's.
+    #[test]
+    fn a_summary_does_not_nest_parentheses() {
+        assert_eq!(in_parens("IPv4 punched"), "(IPv4 punched)");
+        assert_eq!(
+            in_parens("IPv4 punched (birthday, 412 probes)"),
+            "(IPv4 punched, birthday, 412 probes)"
+        );
+        assert_eq!(
+            in_parens("IPv6 punched (port mapped)"),
+            "(IPv6 punched, port mapped)"
+        );
+        let birthday = path_of(Rung::Birthday, 38, 1400, 412, NatType::Unknown);
+        assert_eq!(
+            in_parens(&oxutrm_client::rung_label(&birthday)),
+            "(IPv4 punched, birthday, 412 probes)"
+        );
     }
 
     /// A new outage starts its notes over: the last one's ending is not
@@ -6843,6 +7090,7 @@ mod tests {
         session.outage = OutageNotes {
             ended: Some("switched to standby (IPv4 punched)".to_string()),
             failed_attempts: 2,
+            failed_at_switch: Some(1),
         };
         session.popup_at(t + Duration::from_secs(3));
         assert_eq!(session.outage, OutageNotes::default());
