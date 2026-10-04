@@ -1330,15 +1330,15 @@ impl ClientSession {
                 let held = self.link_state.take_held();
                 self.activity.record(
                     Kind::Input,
-                    &format!("held input sent ({} bytes)", held.len()),
+                    &format!("held input sent ({})", crate::view::byte_count(held.len())),
                 );
                 self.turn(&held, out)?;
             }
             Some(Command::DropHeld) => {
-                let n = self.link_state.held().len();
+                let n = crate::view::byte_count(self.link_state.held().len());
                 self.link_state.drop_held();
                 self.activity
-                    .record(Kind::Input, &format!("held input dropped ({n} bytes)"));
+                    .record(Kind::Input, &format!("held input dropped ({n})"));
             }
             None => {}
         }
@@ -5739,6 +5739,20 @@ mod tests {
         assert_eq!(
             last_entry(&session),
             Some((Kind::Input, "held input dropped (14 bytes)".to_string()))
+        );
+
+        // Final review, Minor 6: one byte is "1 byte" in the log too.
+        let (_host, mut session) = with_confirming_popup(b"y").await;
+        answer(&mut session, b"s", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input sent (1 byte)".to_string()))
+        );
+        let (_host, mut session) = with_confirming_popup(b"n").await;
+        answer(&mut session, b"d", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input dropped (1 byte)".to_string()))
         );
     }
 

@@ -68,6 +68,7 @@ pub(crate) struct Facts<'a> {
 pub(crate) fn build(f: &Facts<'_>) -> PopupView {
     let (marker, marker_text) = marker(f);
     PopupView {
+        line: line(f.phase, &marker_text),
         title: f.identity.map_or_else(
             || "oxutrm".to_string(),
             |i| format!("oxutrm \u{b7} {}", legible(&i.target)),
@@ -87,9 +88,35 @@ pub(crate) fn build(f: &Facts<'_>) -> PopupView {
     }
 }
 
+/// The one line a screen too small for the box shows, longest first. Under
+/// `Confirming` every key is the question's until it is answered, so the
+/// line carries the question and, at the least, the keys that answer it.
+fn line(phase: Phase, marker_text: &str) -> Vec<String> {
+    let marker = format!("oxutrm: {marker_text}");
+    if phase != Phase::Confirming {
+        return vec![marker];
+    }
+    let keys = "s send / d drop";
+    vec![
+        format!("{marker} \u{b7} send typed input? {keys}"),
+        format!("oxutrm: send typed input? {keys}"),
+        format!("send typed input? {keys}"),
+        keys.to_string(),
+    ]
+}
+
 /// How the primary is reached, in the words the connect line used.
 pub(crate) fn path_label(path: Option<&PathDescription>) -> String {
     path.map_or_else(|| "this link".to_string(), rung_label)
+}
+
+/// A count of bytes, singular for one: `1 byte`, `10 bytes`.
+pub(crate) fn byte_count(n: usize) -> String {
+    if n == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{n} bytes")
+    }
 }
 
 /// A duration in its largest whole unit: `12s`, `4m`, `3h`.
@@ -128,7 +155,7 @@ fn held(f: &Facts<'_>) -> Vec<String> {
         Phase::Confirming => {
             let mut rows = vec![
                 "the host is answering again - deliver what you typed?".to_string(),
-                format!("You typed {n} bytes while offline:"),
+                format!("You typed {} while offline:", byte_count(n)),
                 render_held(f.held),
             ];
             if f.held_full {
@@ -142,7 +169,7 @@ fn held(f: &Facts<'_>) -> Vec<String> {
         // for the cap: one they hear about afterwards is one they could not
         // act on.
         phase if phase.is_outage() && n > 0 => {
-            let mut rows = vec![format!("{n} bytes typed since - kept, not sent")];
+            let mut rows = vec![format!("{} typed since - kept, not sent", byte_count(n))];
             if f.held_full {
                 rows.push("The buffer is full; later keys are not being kept.".to_string());
             }
@@ -331,6 +358,7 @@ pub(crate) fn words(v: &PopupView) -> String {
                 .cloned(),
         )
         .chain(v.keys.iter().map(|k| format!("{} {}", k.key, k.label)))
+        .chain(v.line.iter().cloned())
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -510,6 +538,36 @@ mod tests {
                 "{phase:?}"
             );
         }
+    }
+
+    fn single_row(v: &PopupView, cols: u16) -> String {
+        let o = oxutrm_client::layout_popup(v, oxutrm_proto::TermSize { cols, rows: 5 });
+        assert_eq!(o.rows, 1, "not the single-line fallback at {cols}x5");
+        o.cells
+            .iter()
+            .map(|c| c.text.to_string())
+            .collect::<String>()
+    }
+
+    /// Final review, Minor 1. Below the minimum box the popup is one line,
+    /// and under `Confirming` every key is swallowed until `s` or `d`: the
+    /// line must say so, at the narrowest fallback size too.
+    #[test]
+    fn below_the_minimum_the_question_still_shows_its_answer_keys() {
+        let t = Instant::now();
+        let (q, a) = (Quality::new(t), Activity::new());
+        let live = build(&facts(&q, &a, Phase::Live, t));
+        assert_eq!(single_row(&live, 19).trim_end(), "oxutrm: \u{25cf} LIVE");
+
+        let ask = build(&Facts {
+            held: b"make test\r",
+            ..facts(&q, &a, Phase::Confirming, t)
+        });
+        assert_eq!(single_row(&ask, 19).trim_end(), "s send / d drop");
+        assert_eq!(
+            single_row(&ask, 79).trim_end(),
+            "oxutrm: \u{25cf} LIVE \u{b7} send typed input? s send / d drop"
+        );
     }
 
     #[test]
@@ -835,6 +893,31 @@ mod tests {
                 "make test\u{21b5}",
             ]
         );
+    }
+
+    /// Final review, Minor 6: one byte is "1 byte", in both held texts.
+    #[test]
+    fn one_held_byte_is_one_byte() {
+        let t = Instant::now();
+        let (q, a) = (Quality::new(t), Activity::new());
+        let kept = build(&Facts {
+            held: b"x",
+            ..facts(&q, &a, Phase::Silent { since: t }, t)
+        });
+        assert_eq!(kept.held, ["1 byte typed since - kept, not sent"]);
+        let ask = build(&Facts {
+            held: b"x",
+            ..facts(&q, &a, Phase::Confirming, t)
+        });
+        assert_eq!(
+            ask.held.get(1).map(String::as_str),
+            Some("You typed 1 byte while offline:")
+        );
+        let two = build(&Facts {
+            held: b"xy",
+            ..facts(&q, &a, Phase::Silent { since: t }, t)
+        });
+        assert_eq!(two.held, ["2 bytes typed since - kept, not sent"]);
     }
 
     /// Every bar carries the dimmed `c config`; every bar but the

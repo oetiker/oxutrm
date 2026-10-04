@@ -93,6 +93,10 @@ pub struct PopupView {
     /// The activity log, oldest first.
     pub log: Vec<String>,
     pub keys: Vec<KeyHint>,
+    /// What a screen below [`MIN_BOX`] shows on its one line, longest
+    /// first: the first that fits the width is used, and the last is cut
+    /// when none does. Empty means `oxutrm: <marker_text>`.
+    pub line: Vec<String>,
 }
 
 /// Lay the popup out for this screen, as cells ready to composite.
@@ -270,8 +274,20 @@ fn key_line(keys: &[KeyHint]) -> Line<'static> {
 fn single_line(v: &PopupView, size: TermSize) -> Overlay {
     let area = Rect::new(0, 0, size.cols.max(1), 1);
     let mut buf = Buffer::empty(area);
+    let marker = [format!("oxutrm: {}", v.marker_text)];
+    let texts = if v.line.is_empty() {
+        &marker[..]
+    } else {
+        &v.line[..]
+    };
+    let text = texts
+        .iter()
+        .find(|t| Line::from(t.as_str()).width() <= usize::from(area.width))
+        .or(texts.last())
+        .cloned()
+        .unwrap_or_default();
     Paragraph::new(Line::from(Span::styled(
-        format!("oxutrm: {}", v.marker_text),
+        text,
         Style::default().add_modifier(Modifier::REVERSED),
     )))
     .render(area, &mut buf);
@@ -393,6 +409,7 @@ mod tests {
                     enabled: false,
                 },
             ],
+            line: vec![],
         }
     }
 
@@ -620,6 +637,31 @@ mod tests {
             text_of(&o)
         );
         assert!(o.cells[0].attrs.contains(Attrs::INVERSE));
+    }
+
+    /// Final review, Minor 1: a single line that has something to ask
+    /// shows the longest of its texts that fits, so a narrow screen keeps
+    /// the keys rather than the start of a sentence.
+    #[test]
+    fn the_single_line_shows_the_longest_text_that_fits() {
+        let v = PopupView {
+            line: vec![
+                "oxutrm: \u{25cf} LIVE \u{b7} send typed input? s send / d drop".to_string(),
+                "s send / d drop".to_string(),
+            ],
+            ..view()
+        };
+        let wide = layout_popup(&v, TermSize { cols: 80, rows: 5 });
+        assert_eq!(
+            row(&wide, 0).trim_end(),
+            "oxutrm: \u{25cf} LIVE \u{b7} send typed input? s send / d drop"
+        );
+        let narrow = layout_popup(&v, TermSize { cols: 19, rows: 5 });
+        assert_eq!(row(&narrow, 0).trim_end(), "s send / d drop");
+        assert!(narrow.cells[0].attrs.contains(Attrs::INVERSE));
+        // Nothing fits: the last is cut, as the marker always was.
+        let tiny = layout_popup(&v, TermSize { cols: 6, rows: 5 });
+        assert_eq!(row(&tiny, 0), "s send");
     }
 
     /// A terminal reports 1x1 transiently while some emulators tear down.
