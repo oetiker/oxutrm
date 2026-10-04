@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, edition 2024, MSRV 1.96. `ratatui` 0.30.2 (`Block`, `Paragraph`, `Sparkline` — all available under the workspace's `std`-only feature set), `quinn` 0.11.11 with the vendored `quinn-proto` 0.11.17, `tokio`, `insta` (dev, already a workspace dependency), `tempfile` (dev, already in the root crate).
 
-**Spec:** `docs/superpowers/specs/2026-10-03-status-popup-design.md` (all of it). Read it before Task 1. Where this plan and the spec disagree, the spec wins, except for the deviations listed below. Background: `docs/superpowers/specs/2026-09-25-standby-and-rendezvous-design.md` §3.7 (the lines this retires).
+**Spec:** `docs/superpowers/specs/2026-10-03-status-popup-design.md` (all of it). Read it before Task 1. Where this plan and the spec disagree, the spec wins, except for the deviations listed below; the decisions of 2026-10-04 are in the spec now. Background: `docs/superpowers/specs/2026-09-25-standby-and-rendezvous-design.md` §3.7 (the lines this retires).
 
 **Baseline:** `make check` on `main` at `d1ab924`. It was not run while this plan was written. Run it first; if it fails, stop and report before Task 1.
 
@@ -18,49 +18,35 @@
 - `ratatui::widgets::{Sparkline, SparklineBar}` is re-exported unconditionally in ratatui 0.30.2. `Sparkline::data` takes any `IntoIterator<Item: Into<SparklineBar>>`, and `Option<u64>` converts, `None` being an absent bar drawn with `absent_value_symbol` (default `" "`). `max(u64)` sets the scale.
 - `quinn::ConnectionError::TimedOut` displays as `timed out`.
 
+**Decided with the user, 2026-10-04** (after reviewing this plan's first draft; spec updated in `c604963`):
+
+- **While the popup is shown, every key belongs to it**, whatever opened it and whatever the link is doing; nothing typed into it is held or sent. `Esc` or `Ctrl-\` closes it (a `Ctrl-\` within 500 ms of the press that opened it also sends one literal `0x1c`); `q` quits; `c` and `s` are dimmed and do nothing in B; under `Confirming`, `s` sends and `d` drops the held input, and nothing closes the popup until one of them is pressed; any other key does nothing, but turns `Auto` or `Lingering` into `Open`, which stays. There is no pass-through of unknown keys while the link is `Live`.
+- **Closing during an outage is allowed.** The outage is then marked dismissed and the popup does not open itself again until a new outage begins; what is typed meanwhile is held exactly as before (`hold_keys`, `MAX_HELD`), and when the link returns with held input the popup opens in `Confirming`.
+- **While closed, `Ctrl-\` opens the popup in every phase**, and no other prefix commands remain: the `Ctrl-\ q` / `Ctrl-\ s` / `Ctrl-\ d` of the old notice go away.
+- **Times in the log file are UTC** (`2026-10-04T12:34:56Z`), which spec §5.3 now says; no new dependency. The popup shows **ages** instead of clock times (`12s`, `4m`, `3h`), so no time zone is needed on screen either; the status row reads "link 2 of this session, up 14m" rather than "since <time>". The fold suffix is `(repeated N× since HH:MM)` in UTC.
+
+This withdraws the first draft's deviations on keys (`Ctrl-\`-prefixed commands while typing is held, no closing by hand during an outage, typing that closes a lingering popup and reaches the host, and the dimmed `c`/`s` only in the healthy bar) and on local time.
+
 **Deviations from the spec, decided while planning:**
 
-1. **While typing is being held, the popup's commands take the `Ctrl-\` prefix** (spec §3.2 says bare `q`, and bare `s`/`d` under `Confirming`). §3.2 also says that in an outage "the key is held exactly as today", and the two cannot both hold: someone typing blind into a dead screen types `q`, `s`, `d` and `Esc` as ordinary letters, and a bare `q` would quit the client in the middle of `squeue`, a bare `s` would answer `Confirming`'s question with half a word (the exact defect the old `heard` comment records), and a lone `Esc` from vim would close the popup instead of being kept. So the rule is: **bare letters are popup commands only while the link is `Live`** — nothing typed can be lost then, because any other key closes the popup and goes to the host. While bytes are held (`Silent`, `Recovering`, `Confirming`) every bare byte is typing, and commands are `Ctrl-\ q`, and under `Confirming` `Ctrl-\ s` / `Ctrl-\ d` — today's keys, unchanged. The key bar says so in each phase.
-2. **The popup cannot be closed by hand during an outage.** It follows from 1: `Esc` and a lone `Ctrl-\` are typing then. The popup is the only thing saying the screen is frozen; it stays up until the link answers.
-3. **`Lingering` and keys** (§3.1 says any key turns it into `Open`; §3.2 says that with the link `Live` a non-popup key closes the popup and goes to the host). Resolved in favour of §3.2's "typing never disappears into a popup by accident": in `Lingering`, `Esc` and `Ctrl-\` close, `q` quits, the popup's own letters `c` and `s` turn it into `Open` (it stops counting down), and any other key closes it and goes to the host. A key typed during the outage itself turns `Auto` into `Open` (§3.1's "any key"), so a popup the user touched does not close on its own afterwards.
-4. **Times in the log file are UTC (`2026-10-04T12:34:56Z`), not local** (§5.3 says "RFC 3339 local time"). The root crate is `#![forbid(unsafe_code)]`, `activity.rs` is "std only", and std has no time zone: local time needs `localtime_r` (unsafe) or a new dependency outside the contract's table. UTC is valid RFC 3339 and unambiguous. The popup shows **ages** instead of clock times (`12s`, `4m`, `3h`), so no time zone is needed on screen either; the status row reads "link 2 of this session, up 14m" rather than "since <time>". The fold suffix is `(repeated N× since HH:MM)` in UTC.
-5. **A folded run in the file:** the first occurrence is written at once (a crash loses nothing); when the run ends — a different entry arrives, or the `Activity` is dropped at session end — one more line is written for it, `<time of last> <tag> <kind> <text> (repeated N× since HH:MM)`, where N counts the repeats after the first.
-6. **Where the held and recovering sections go** (§6 lists them; its layout paragraph does not place them): directly under the marker, above the status block. They are what the old notice said and what the user may have to act on, so on a short screen they are the last body sections to be clipped. The key bar always keeps the last row.
-7. **The standby's "say it once per dry spell" (`told_none`) is retired.** It existed for the mid-session line. `Standby::not_found` now returns whether the result was for the search still wanted, and every such failure is recorded; identical consecutive reasons fold. `Standby::lost` returns whether the loss is worth recording (not when the session is ending).
-8. **`activity.rs` uses `oxutrm_client::summarised`** to escape and shorten what it records (§2 says "std only"). §2 also says remote text is escaped "with the existing `legible`/`summarised` helpers", which live in the client crate; one escaper is better than two.
-9. **`c config` / `s sessions` appear dimmed only in the healthy-link key bar.** In the outage and `Confirming` bars, `c` and `s` are typing (deviation 1), and showing them there would invite pressing them.
-
-## Global Constraints
-
-Every task's requirements include these.
-
-- **`make check` is the gate** (fmt check, clippy `-D warnings`, tests, parallelism capped at 4). Never a bare `cargo test`. A single test: `cargo test --workspace --jobs 4 <name> -- --test-threads 4`. Run the gate as `make check > "${TMPDIR:-/tmp}/oxutrm-check.log" 2>&1; echo "make check exit: $?"` and then read the log (piping into `tail` loses the exit code).
-- **Every task ends with an injection step:** break the thing deliberately, watch the new test fail, restore. Of each test ask "what else could produce the value this test asserts?", and put a before-assertion beside every after-assertion where it matters.
-- **No `#[allow(dead_code)]`.** An item used only by a later task gets `#[cfg_attr(not(test), allow(dead_code))]` with a comment naming the wiring task, which removes it; test-only helpers are `#[cfg(test)]`. Such an item must still be called from a test, or `clippy --all-targets` fails. In this plan the new root-crate modules carry the attribute on their `mod` line in `src/main.rs`.
-- **No new timer that fires while nothing is happening** (commit `19cc001`). Sampling, lingering and repaint decisions ride on laps the client loop already takes (it re-arms its deadline at `now + pacing_interval()`, at most 100 ms).
-- **The loops' `select!` arms borrow locals, never `self`** (constraint C1).
-- **In-session client modules carry `#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]`** (commits `674bed7`, `668a73a`). `popup.rs`, `activity.rs`, `quality.rs`, `ui.rs` and `view.rs` get it too.
-- **Nothing on the in-session path writes to the terminal except the renderer.** The connect banner, printed by `announce` before the session owns the screen, is the one line left.
-- **Text that came from a remote side is escaped** (`legible` / `summarised`) before it is shown or written to the file.
-- **`src/main.rs` is `#![forbid(unsafe_code)]`; `oxutrm-host` must not depend on `oxutrm-net`.**
-- **A rejected frame must never disconnect, a send failure must never end a session, and a logging failure never ends or disturbs a session.**
-- **`max_idle_timeout` is `None`:** any wait on a stream or connection needs its own bound.
-- **English for all code and comments. Comments must stay true** — a comment that outlives its truth is this project's signature defect — and **describe the code, not the task that wrote it** (no "Task 6" in a comment, except the dead-code attributes, which the named task deletes).
-- **Commits:** conventional subjects; every message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- **One `CHANGES.md` entry for the feature, under `## Unreleased`**, using the file's real headings (`### New`, `### Changed`, `### Fixed`, `### Compatibility`), in the last task.
-- **Tests use a STUN-free `NetConfig`** (`crate::attach_exchange::fixtures::stun_free()`, or the session tests' `stunless()`). Session-level tests use the existing fixtures (`pair`, `pair_through_relay`, `crate::link::fixtures::link_pair`, `keyboard()`, `drive`, `SharedOut`, with `run_carries_typing_to_the_shell_and_its_exit_code_back` as the model). **Retransmission heals ordering bugs in end-to-end tests — prove ordering synchronously** (call the method, inspect the state) and use the e2e tests for composition.
+1. **A folded run in the file:** the first occurrence is written at once (a crash loses nothing); when the run ends — a different entry arrives, or the `Activity` is dropped at session end — one more line is written for it, `<time of last> <tag> <kind> <text> (repeated N× since HH:MM)`, where N counts the repeats after the first.
+2. **Where the held and recovering sections go** (§6 lists them; its layout paragraph does not place them): directly under the marker, above the status block. They are what the old notice said and what the user may have to act on, so on a short screen they are the last body sections to be clipped. The key bar always keeps the last row.
+3. **The standby's "say it once per dry spell" (`told_none`) is retired.** It existed for the mid-session line. `Standby::not_found` now returns whether the result was for the search still wanted, and every such failure is recorded; identical consecutive reasons fold. `Standby::lost` returns whether the loss is worth recording (not when the session is ending).
+4. **`activity.rs` uses `oxutrm_client::summarised`** to escape and shorten what it records (§2 says "std only"). §2 also says remote text is escaped "with the existing `legible`/`summarised` helpers", which live in the client crate; one escaper is better than two.
+5. **The `Confirming` key bar shows the dimmed `c config` but not the dimmed `s sessions`** (the user asked for both in every bar). Under `Confirming`, `s` is "send", and a bar reading `s send … s sessions` would offer one key for two things. Every other bar carries both.
 
 ## Review Focus
 
-The five inputs the spec implies but does not spell out that are most likely to bite a person using this. Each has a test in the task named.
+The inputs the spec implies but does not spell out that are most likely to bite a person using this. Each has a test in the task named.
 
-1. **Someone typing blind into a dead screen** — `q`, `s`, `d`, a lone `Esc` from vim, arrow keys. Everything must be held, nothing must quit, send or close. *Task 4: `bare_letters_and_esc_are_typing_while_the_link_is_down`, `an_arrow_key_in_an_outage_is_held_whole`.*
-2. **An arrow key or other escape sequence pressed while the popup is open on a healthy link** — it must reach the remote program whole and close the popup, not be eaten as `Esc` plus stray bytes. *Task 4: `a_lone_esc_closes_but_an_escape_sequence_passes_through`.*
-3. **The terminal resized while the popup is up, including below the minimum box** — the popup is laid out again for the new size, down to the one-line fallback. *Task 6: `a_resize_lays_the_popup_out_again_for_the_new_screen` (24×8 and 19×5).*
-4. **A log file that cannot be written** — read-only or missing home, a path component that is a file, the file replaced under a running client. The session goes on, the popup says so once. *Task 2: `a_log_file_that_cannot_be_opened_leaves_one_entry_and_the_ring_goes_on`, `a_log_file_that_fails_mid_session_is_dropped_quietly`.*
-5. **Remote text with control bytes or of any length** — a search's failure reason or ssh stderr reaching the popup and the file. *Task 2: `a_recorded_text_is_escaped_and_cut_to_one_line`; Task 5: `a_search_failure_from_the_far_end_is_shown_escaped_and_short`.*
+1. **A lone `Esc` versus an escape sequence while the popup is shown** — a lone `Esc` closes it; an arrow key, or application-keypad `1` (`ESC O q`, whose `q` must not quit), is one key that does nothing and never reaches the host. *Task 4: `a_lone_esc_closes_but_an_escape_sequence_does_nothing`.*
+2. **An outage closed by hand must not open the popup again** — not on the next lap, not when `Silent` becomes `Recovering`; the next outage does open it, and typing meanwhile is held, `q`, `s`, `d`, `Esc` and arrow keys included. *Task 4: `a_closed_outage_does_not_reopen_itself_until_a_new_one`, `closing_the_outage_popup_holds_what_is_typed_after`; Task 6: `typing_after_closing_the_outage_popup_is_held_and_not_sent`.*
+3. **Held input after a hand-closed outage reaches `Confirming`** — the link answers, the popup opens with the question, and only `s`, `d` or `q` leave it. *Task 4: `held_input_after_a_closed_outage_is_asked_about`, `confirming_cannot_be_closed_until_it_is_answered`; Task 6: `held_input_after_a_closed_outage_opens_the_question`; Task 8: `blind_typing_after_closing_the_popup_is_asked_about_and_sent`.*
+4. **The terminal resized while the popup is up, including below the minimum box** — the popup is laid out again for the new size, down to the one-line fallback. *Task 6: `a_resize_lays_the_popup_out_again_for_the_new_screen` (24×8 and 19×5).*
+5. **A log file that cannot be written** — read-only or missing home, a path component that is a file, the file replaced under a running client. The session goes on, the popup says so once. *Task 2: `a_log_file_that_cannot_be_opened_leaves_one_entry_and_the_ring_goes_on`, `a_log_file_that_fails_mid_session_is_dropped_quietly`.*
+6. **Remote text with control bytes or of any length** — a search's failure reason or ssh stderr reaching the popup and the file. *Task 2: `a_recorded_text_is_escaped_and_cut_to_one_line`; Task 5: `a_search_failure_from_the_far_end_is_shown_escaped_and_short`.*
 
-A sixth that is close behind and also has a test: **two clients appending to the same log and rotating it** (Task 2: `a_rotation_by_another_client_is_followed_and_the_cap_holds`).
+Close behind, each with a test: **typing into the popup an outage opened goes nowhere, and its `q` quits** — the cost of the 2026-10-04 decision, accepted by the user (Task 4: `typing_into_the_outage_popup_is_neither_held_nor_sent`, `q_quits_whatever_opened_the_popup`); and **two clients appending to the same log and rotating it** (Task 2: `a_rotation_by_another_client_is_followed_and_the_cap_holds`).
 
 ## File Structure
 
@@ -397,7 +383,7 @@ mod tests {
             log: (1..=30).map(|i| format!("event-{i:02}")).collect(),
             keys: vec![
                 KeyHint {
-                    key: "Ctrl-\\ q".to_string(),
+                    key: "q".to_string(),
                     label: "quit".to_string(),
                     enabled: true,
                 },
@@ -458,7 +444,7 @@ mod tests {
         let o = layout_popup(&view(), TermSize { cols: 80, rows: 24 });
         assert!(row(&o, 1).contains("\u{25cf} SILENT"), "{}", text_of(&o));
         assert!(!row(&o, 1).contains("quit"), "{}", text_of(&o));
-        assert!(row(&o, o.rows - 2).contains("Ctrl-\\ q quit"), "{}", text_of(&o));
+        assert!(row(&o, o.rows - 2).contains("q quit"), "{}", text_of(&o));
         assert!(row(&o, o.rows - 2).contains("c config"), "{}", text_of(&o));
     }
 
@@ -488,7 +474,7 @@ mod tests {
 
         let short = text_of(&layout_popup(&v, TermSize { cols: 40, rows: 8 }));
         assert!(short.contains("make test"), "{short}");
-        assert!(short.contains("Ctrl-\\ q"), "the key bar was clipped: {short}");
+        assert!(short.contains("q quit"), "the key bar was clipped: {short}");
         assert!(!short.contains("silent for 6s"), "nothing gave way: {short}");
     }
 
@@ -676,7 +662,7 @@ pub fn layout_popup(v: &PopupView, size: TermSize) -> Overlay {
 Run: `INSTA_UPDATE=always cargo test --workspace --jobs 4 popup:: -- --test-threads 4`
 Expected: PASS, and three new files under `crates/oxutrm-client/src/snapshots/` (`oxutrm_client__popup__tests__snapshot_80x24.snap` etc.).
 
-Open each `.snap` and check by eye before committing — a snapshot accepted unread guards nothing: 80×24 is a rounded 72×22 box titled ` oxutrm · bastion `, `● SILENT` on its first inner row, the two status rows, the standby row, an `rtt ` row with three bars and a gap, `event-NN` lines ending with `event-30`, and `Ctrl-\ q quit  c config` on the last inner row; 40×12 is the same, narrower, with fewer log lines; 19×5 is one row reading `oxutrm: ● SILENT`.
+Open each `.snap` and check by eye before committing — a snapshot accepted unread guards nothing: 80×24 is a rounded 72×22 box titled ` oxutrm · bastion `, `● SILENT` on its first inner row, the two status rows, the standby row, an `rtt ` row with three bars and a gap, `event-NN` lines ending with `event-30`, and `q quit  c config` on the last inner row; 40×12 is the same, narrower, with fewer log lines; 19×5 is one row reading `oxutrm: ● SILENT`.
 
 Then run without `INSTA_UPDATE`: `cargo test --workspace --jobs 4 popup:: -- --test-threads 4` — Expected: PASS.
 
@@ -1750,6 +1736,31 @@ EOF
 
 `linkstate.rs` is **not** touched in this task; its own prefix handling is folded away in Task 6, when the session switches over. Until then both exist, and only `linkstate`'s is live.
 
+**The key model** (spec §3.2, user decision 2026-10-04). While the popup is **shown** — `mode != Closed`, or the phase is `Confirming` — every key belongs to it, whatever opened it and whatever the link is doing; nothing typed into it is held or sent. While it is **closed**, `Ctrl-\` opens it in every phase, and every other byte goes to the host on a `Live` link and to the held buffer during an outage. There are no other prefix commands.
+
+**Transitions.** "Shown" and "closed" as above; "outage" is `Phase::is_outage()` (`Silent`, `Recovering`). `dismissed` is a private flag: the current outage was closed by hand.
+
+| From | Event | To | Effect |
+|---|---|---|---|
+| `Closed` (link `Live`/outage) | `Ctrl-\` | `Open { pressed: Some(now) }` | nothing sent or held; the rest of the read goes to the popup |
+| `Closed`, link `Live` | any other byte | `Closed` | byte to the host |
+| `Closed`, outage | any other byte | `Closed` | byte held |
+| `Closed`, not `dismissed` | tick: outage | `Auto` | first lap of a new outage: `WentSilent`, `dismissed = false` |
+| `Closed`, `dismissed` | tick: the same outage (`Silent` or `Recovering`) | `Closed` | — |
+| `Open` | tick: outage | `Open` | nothing jumps |
+| `Auto` | tick: `Live` | `Lingering { since: now, outage }` | `Back { outage }` |
+| `Auto` | tick: `Confirming` | `Auto` (shown) | `Back { outage }` |
+| `Lingering` | tick: `Live`, `LINGER` passed | `Closed` | — |
+| `Lingering` | tick: a new outage | `Auto` | `WentSilent` |
+| shown, not `Confirming` | `Esc` (a read that is exactly `0x1b`) | `Closed` | `dismissed = true` if outage |
+| shown, not `Confirming` | `Ctrl-\` | `Closed` | `dismissed = true` if outage; within `DOUBLE_PRESS` of the press that opened it, one `0x1c` goes where a closed popup sends it (host if `Live`, held if outage) |
+| shown | `q` | unchanged | `Quit`; the read ends |
+| shown, `Confirming` | `s` / `d` | unchanged | `SendHeld` / `DropHeld`; the read ends |
+| shown, `Confirming` | `Esc`, `Ctrl-\` | unchanged | nothing: the question must be answered first |
+| shown | anything else (`c`, `s` outside `Confirming`, an escape sequence, letters) | `Auto`/`Lingering` → `Open { pressed: None }`, else unchanged | nothing |
+
+An escape sequence is `0x1b` in a read that is not exactly `0x1b`: from that byte to the end of the read is one key the popup has no use for (application-keypad `1` is `ESC O q`, and its `q` must not quit).
+
 - [ ] **Step 1: Declare the module**
 
 In `src/main.rs`, after `mod standby;`:
@@ -1774,6 +1785,10 @@ mod tests {
         Phase::Silent { since: t }
     }
 
+    fn recovering(t: Instant) -> Phase {
+        Phase::Recovering { attempt: 0, next_try: t }
+    }
+
     fn ms(t: Instant, n: u64) -> Instant {
         t + Duration::from_millis(n)
     }
@@ -1792,6 +1807,21 @@ mod tests {
         ui
     }
 
+    fn lingering_at(t: Instant) -> Ui {
+        let mut ui = auto_at(t);
+        ui.tick(Phase::Live, ms(t, 100));
+        assert!(matches!(ui.mode(), Mode::Lingering { .. }));
+        ui
+    }
+
+    /// An outage whose popup the user closed by hand.
+    fn dismissed_at(t: Instant) -> Ui {
+        let mut ui = auto_at(t);
+        assert_eq!(ui.keys(&[ESC], silent(t), t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed);
+        ui
+    }
+
     fn host(bytes: &[u8]) -> Routed {
         Routed { to_host: bytes.to_vec(), ..Routed::default() }
     }
@@ -1804,7 +1834,7 @@ mod tests {
         Routed { command: Some(c), ..Routed::default() }
     }
 
-    // ---- a healthy link -------------------------------------------------
+    // ---- closed, healthy link ------------------------------------------
 
     #[test]
     fn typing_on_a_healthy_link_passes_through_untouched() {
@@ -1855,45 +1885,103 @@ mod tests {
     #[test]
     fn a_popup_not_opened_by_ctrl_backslash_has_no_double_press() {
         let t = Instant::now();
-        let mut ui = auto_at(t);
-        ui.tick(Phase::Live, ms(t, 100));
-        assert!(matches!(ui.mode(), Mode::Lingering { .. }));
+        let mut ui = lingering_at(t);
         assert_eq!(ui.keys(&[PREFIX], Phase::Live, ms(t, 150)), Routed::default());
         assert_eq!(ui.mode(), Mode::Closed);
     }
 
-    /// Typing never disappears into a popup by accident.
+    // ---- shown: every key is the popup's ---------------------------------
+
+    /// Nothing typed into the popup goes anywhere, and it stays open.
     #[test]
-    fn any_other_key_closes_the_popup_and_reaches_the_host() {
-        let mut ui = open_at(Instant::now());
-        assert_eq!(ui.keys(b"xyz", Phase::Live, Instant::now()), host(b"xyz"));
+    fn every_key_belongs_to_the_open_popup() {
+        let t = Instant::now();
+        let mut ui = open_at(t);
+        assert_eq!(ui.keys(b"ls -l\r", Phase::Live, ms(t, 10)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) }, "typing closed the popup");
+        assert!(ui.visible(Phase::Live));
+    }
+
+    /// Review focus 1. A lone `Esc` closes; an arrow key, or application
+    /// keypad `1` (`ESC O q`), is one key the popup ignores -- its `q`
+    /// must not quit and its bytes must not reach the host.
+    #[test]
+    fn a_lone_esc_closes_but_an_escape_sequence_does_nothing() {
+        let t = Instant::now();
+        let mut ui = open_at(t);
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
         assert_eq!(ui.mode(), Mode::Closed);
+
+        for sequence in [&b"\x1b[A"[..], b"\x1bOq"] {
+            let mut ui = open_at(t);
+            assert_eq!(ui.keys(sequence, Phase::Live, t), Routed::default(), "{sequence:?}");
+            assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) }, "{sequence:?} closed the popup");
+
+            let mut ui = auto_at(t);
+            assert_eq!(ui.keys(sequence, silent(t), t), Routed::default(), "{sequence:?}");
+            assert_eq!(ui.mode(), Mode::Open { pressed: None }, "{sequence:?} did not touch the popup");
+        }
     }
 
     #[test]
-    fn a_lone_esc_closes_but_an_escape_sequence_passes_through() {
-        let mut ui = open_at(Instant::now());
-        assert_eq!(ui.keys(&[ESC], Phase::Live, Instant::now()), Routed::default());
-        assert_eq!(ui.mode(), Mode::Closed);
-
-        let mut ui = open_at(Instant::now());
-        assert_eq!(ui.keys(b"\x1b[A", Phase::Live, Instant::now()), host(b"\x1b[A"));
-        assert_eq!(ui.mode(), Mode::Closed);
-    }
-
-    #[test]
-    fn q_quits_while_open() {
-        let mut ui = open_at(Instant::now());
-        assert_eq!(ui.keys(b"q", Phase::Live, Instant::now()), command(Command::Quit));
+    fn q_quits_whatever_opened_the_popup() {
+        let t = Instant::now();
+        assert_eq!(open_at(t).keys(b"q", Phase::Live, t), command(Command::Quit));
+        assert_eq!(auto_at(t).keys(b"q", silent(t), t), command(Command::Quit));
+        assert_eq!(auto_at(t).keys(b"q", recovering(t), t), command(Command::Quit));
+        assert_eq!(lingering_at(t).keys(b"q", Phase::Live, ms(t, 200)), command(Command::Quit));
+        assert_eq!(Ui::new().keys(b"q", Phase::Confirming, t), command(Command::Quit));
     }
 
     #[test]
     fn c_and_s_are_offered_later_and_do_nothing_now() {
+        let t = Instant::now();
         for key in [b'c', b's'] {
-            let mut ui = open_at(Instant::now());
-            assert_eq!(ui.keys(&[key], Phase::Live, Instant::now()), Routed::default());
+            let mut ui = open_at(t);
+            assert_eq!(ui.keys(&[key], Phase::Live, t), Routed::default());
             assert!(matches!(ui.mode(), Mode::Open { .. }), "{}", key as char);
+
+            let mut ui = auto_at(t);
+            assert_eq!(ui.keys(&[key], silent(t), t), Routed::default(), "{} under an outage", key as char);
         }
+    }
+
+    #[test]
+    fn send_and_drop_are_commands_only_under_confirming() {
+        let t = Instant::now();
+        for (key, want) in [(b's', Command::SendHeld), (b'd', Command::DropHeld)] {
+            assert_eq!(Ui::new().keys(&[key], Phase::Confirming, t), command(want));
+            assert_eq!(
+                auto_at(t).keys(&[key], silent(t), t),
+                Routed::default(),
+                "{} was honoured under an outage",
+                key as char
+            );
+            assert_eq!(open_at(t).keys(&[key], Phase::Live, t), Routed::default());
+        }
+    }
+
+    #[test]
+    fn confirming_forces_the_popup_visible() {
+        let ui = Ui::new();
+        assert!(!ui.visible(Phase::Live));
+        assert!(ui.visible(Phase::Confirming));
+    }
+
+    /// The held input is waiting on an answer: neither `Esc` nor `Ctrl-\`
+    /// closes the question, and a quick second `Ctrl-\` sends no literal
+    /// ahead of the input it is about.
+    #[test]
+    fn confirming_cannot_be_closed_until_it_is_answered() {
+        let t = Instant::now();
+        let mut ui = Ui::new();
+        assert_eq!(ui.keys(&[ESC], Phase::Confirming, t), Routed::default());
+        assert_eq!(ui.keys(&[PREFIX], Phase::Confirming, t), Routed::default());
+        assert!(ui.visible(Phase::Confirming), "the question was closed unanswered");
+
+        let mut ui = open_at(t);
+        assert_eq!(ui.keys(&[PREFIX], Phase::Confirming, ms(t, 10)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) });
     }
 
     // ---- outages -------------------------------------------------------
@@ -1939,39 +2027,21 @@ mod tests {
     #[test]
     fn a_new_outage_while_lingering_reopens_it_as_an_outage() {
         let t = Instant::now();
-        let mut ui = auto_at(t);
-        ui.tick(Phase::Live, ms(t, 100));
+        let mut ui = lingering_at(t);
         assert_eq!(ui.tick(silent(ms(t, 200)), ms(t, 2_200)), Some(LinkChange::WentSilent));
         assert_eq!(ui.mode(), Mode::Auto);
     }
 
+    /// Typing into the popup an outage opened goes nowhere: not held, not
+    /// sent, and the popup stays up.
     #[test]
-    fn in_an_outage_typing_is_held_not_sent() {
+    fn typing_into_the_outage_popup_is_neither_held_nor_sent() {
         let t = Instant::now();
-        let mut ui = auto_at(t);
-        assert_eq!(ui.keys(b"make test\r", silent(t), t), hold(b"make test\r"));
-    }
-
-    /// Review focus 1. Someone typing blind types `q`, `s`, `d` and `Esc` as
-    /// letters; none of them may quit, send, drop or close.
-    #[test]
-    fn bare_letters_and_esc_are_typing_while_the_link_is_down() {
-        let t = Instant::now();
-        for phase in [silent(t), Phase::Recovering { attempt: 0, next_try: t }] {
+        for phase in [silent(t), recovering(t)] {
             let mut ui = auto_at(t);
-            assert_eq!(ui.keys(b"squeue -d", phase, t), hold(b"squeue -d"), "{phase:?}");
-            assert_eq!(ui.keys(&[ESC], phase, t), hold(&[ESC]), "{phase:?}");
+            assert_eq!(ui.keys(b"make test\r", phase, t), Routed::default(), "{phase:?}");
             assert!(ui.visible(phase), "the popup closed under {phase:?}");
         }
-        let mut ui = Ui::new();
-        assert_eq!(ui.keys(b"sd", Phase::Confirming, t), hold(b"sd"));
-    }
-
-    #[test]
-    fn an_arrow_key_in_an_outage_is_held_whole() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        assert_eq!(ui.keys(b"\x1b[A", silent(t), t), hold(b"\x1b[A"));
     }
 
     /// The popup a user touched does not close on its own afterwards.
@@ -1979,7 +2049,7 @@ mod tests {
     fn a_key_typed_during_the_outage_keeps_the_popup_open_after_it() {
         let t = Instant::now();
         let mut ui = auto_at(t);
-        ui.keys(b"x", silent(t), t);
+        assert_eq!(ui.keys(b"x", silent(t), t), Routed::default());
         assert_eq!(ui.mode(), Mode::Open { pressed: None });
         ui.tick(Phase::Live, ms(t, 100));
         ui.tick(Phase::Live, ms(t, 100) + LINGER);
@@ -1987,97 +2057,96 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backslash_q_quits_in_an_outage_and_keeps_what_came_before() {
+    fn a_lingering_popup_is_kept_by_any_key_and_closed_by_its_own() {
         let t = Instant::now();
-        let mut ui = auto_at(t);
-        let r = ui.keys(b"ab\x1cq", silent(t), t);
-        assert_eq!(r, Routed { to_hold: b"ab".to_vec(), command: Some(Command::Quit), ..Routed::default() });
-    }
-
-    #[test]
-    fn send_and_drop_are_commands_only_under_confirming() {
-        let t = Instant::now();
-        for (key, want) in [(b's', Command::SendHeld), (b'd', Command::DropHeld)] {
-            let mut ui = Ui::new();
-            assert_eq!(ui.keys(&[PREFIX, key], Phase::Confirming, t), command(want));
-
-            let mut ui = auto_at(t);
-            assert_eq!(
-                ui.keys(&[PREFIX, key], silent(t), t),
-                hold(&[PREFIX, key]),
-                "Ctrl-\\ {} was honoured under an outage",
-                key as char
-            );
-        }
-        let mut ui = Ui::new();
-        assert_eq!(ui.keys(&[PREFIX, b'q'], Phase::Confirming, t), command(Command::Quit));
-    }
-
-    #[test]
-    fn a_prefix_split_across_two_reads_still_commands() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        assert_eq!(ui.keys(b"x\x1c", silent(t), t), hold(b"x"));
-        assert_eq!(ui.keys(b"q", silent(t), t), command(Command::Quit));
-    }
-
-    #[test]
-    fn an_unknown_key_after_the_prefix_is_held_with_the_prefix() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        assert_eq!(ui.keys(b"\x1cz", silent(t), t), hold(b"\x1cz"));
-    }
-
-    /// A `Ctrl-\` whose letter never came belongs to what was showing when
-    /// it was typed. Carried into `Confirming`, it would let the first key
-    /// typed there answer the question.
-    #[test]
-    fn a_half_typed_prefix_does_not_survive_into_a_different_section() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        ui.keys(b"make test\r\x1c", silent(t), t);
-        assert_eq!(ui.keys(b"send it", Phase::Confirming, t), hold(b"send it"));
-    }
-
-    /// And within the same section it does survive: a frame landing between
-    /// the prefix and its letter must not eat the command.
-    #[test]
-    fn a_half_typed_prefix_survives_within_the_same_section() {
-        let t = Instant::now();
-        let mut ui = Ui::new();
-        assert_eq!(ui.keys(&[PREFIX], Phase::Confirming, t), Routed::default());
-        assert_eq!(ui.keys(b"d", Phase::Confirming, t), command(Command::DropHeld));
-    }
-
-    /// The link came back with nothing held: the prefix is gone and the next
-    /// key is ordinary typing on a healthy link.
-    #[test]
-    fn a_half_typed_prefix_does_not_survive_the_link_coming_back() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        ui.keys(&[PREFIX], silent(t), t);
-        assert_eq!(ui.keys(b"d", Phase::Live, t), host(b"d"));
-    }
-
-    #[test]
-    fn confirming_forces_the_popup_visible() {
-        let ui = Ui::new();
-        assert!(!ui.visible(Phase::Live));
-        assert!(ui.visible(Phase::Confirming));
-    }
-
-    #[test]
-    fn a_lingering_popup_is_kept_by_its_own_keys_and_closed_by_typing() {
-        let t = Instant::now();
-        let mut ui = auto_at(t);
-        ui.tick(Phase::Live, ms(t, 100));
-        assert_eq!(ui.keys(b"c", Phase::Live, ms(t, 200)), Routed::default());
+        let mut ui = lingering_at(t);
+        assert_eq!(ui.keys(b"ls", Phase::Live, ms(t, 200)), Routed::default(), "typing reached the host");
         assert_eq!(ui.mode(), Mode::Open { pressed: None });
+        ui.tick(Phase::Live, ms(t, 100) + LINGER);
+        assert_eq!(ui.mode(), Mode::Open { pressed: None }, "a touched popup closed by itself");
 
-        let mut ui = auto_at(t);
-        ui.tick(Phase::Live, ms(t, 100));
-        assert_eq!(ui.keys(b"ls", Phase::Live, ms(t, 200)), host(b"ls"));
+        let mut ui = lingering_at(t);
+        assert_eq!(ui.keys(&[ESC], Phase::Live, ms(t, 200)), Routed::default());
         assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    // ---- an outage closed by hand --------------------------------------
+
+    /// Once closed, what is typed is held exactly as before the popup
+    /// existed -- `q`, `s`, `d`, `Esc` and arrow keys included: none of them
+    /// is a command while the popup is closed.
+    #[test]
+    fn closing_the_outage_popup_holds_what_is_typed_after() {
+        let t = Instant::now();
+        for phase in [silent(t), recovering(t)] {
+            let mut ui = dismissed_at(t);
+            assert_eq!(ui.keys(b"squeue -d", phase, t), hold(b"squeue -d"), "{phase:?}");
+            assert_eq!(ui.keys(&[ESC], phase, t), hold(&[ESC]), "{phase:?}");
+            assert_eq!(ui.keys(b"\x1b[A", phase, t), hold(b"\x1b[A"), "{phase:?}");
+            assert!(!ui.visible(phase), "{phase:?}");
+        }
+    }
+
+    /// Review focus 2. A popup closed during an outage stays closed for the
+    /// rest of that outage, `Recovering` included, and the next outage opens
+    /// it again.
+    #[test]
+    fn a_closed_outage_does_not_reopen_itself_until_a_new_one() {
+        let t = Instant::now();
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.tick(silent(t), ms(t, 2_500)), None);
+        assert_eq!(ui.mode(), Mode::Closed, "the popup re-opened for the outage it was closed in");
+        assert_eq!(ui.tick(recovering(ms(t, 9_000)), ms(t, 9_000)), None);
+        assert_eq!(ui.mode(), Mode::Closed, "Recovering re-opened it");
+
+        assert_eq!(ui.tick(Phase::Live, ms(t, 10_000)), Some(LinkChange::Back { outage: Duration::from_millis(10_000) }));
+        assert_eq!(ui.mode(), Mode::Closed, "a closed popup lingered");
+
+        assert_eq!(ui.tick(silent(ms(t, 10_500)), ms(t, 12_500)), Some(LinkChange::WentSilent));
+        assert_eq!(ui.mode(), Mode::Auto, "the next outage did not open the popup");
+    }
+
+    #[test]
+    fn ctrl_backslash_reopens_a_closed_outage_and_closing_again_keeps_it_closed() {
+        let t = Instant::now();
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.keys(&[PREFIX], silent(t), ms(t, 1_000)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: Some(ms(t, 1_000)) });
+        assert_eq!(ui.keys(b"abc", silent(t), ms(t, 1_200)), Routed::default(), "typing into it was kept");
+
+        assert_eq!(ui.keys(&[PREFIX], silent(t), ms(t, 2_000)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed);
+        ui.tick(silent(t), ms(t, 2_100));
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    /// The literal a double press stands for is typing, and typing during
+    /// an outage is held.
+    #[test]
+    fn a_double_press_during_an_outage_holds_one_literal() {
+        let t = Instant::now();
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.keys(&[PREFIX, PREFIX], silent(t), t), hold(&[PREFIX]));
+        assert_eq!(ui.mode(), Mode::Closed);
+        ui.tick(silent(t), ms(t, 100));
+        assert_eq!(ui.mode(), Mode::Closed, "the double press un-dismissed the outage");
+    }
+
+    /// Review focus 3. Typing held behind a hand-closed popup is asked
+    /// about when the link answers, and the question takes `s` and `d`.
+    #[test]
+    fn held_input_after_a_closed_outage_is_asked_about() {
+        let t = Instant::now();
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.keys(b"make test\r", silent(t), t), hold(b"make test\r"));
+
+        assert!(ui.tick(Phase::Confirming, ms(t, 4_000)).is_some());
+        assert!(ui.visible(Phase::Confirming), "the question did not open the popup");
+        assert_eq!(ui.keys(b"x", Phase::Confirming, ms(t, 4_100)), Routed::default(), "typing into the question was kept");
+        assert_eq!(ui.keys(b"s", Phase::Confirming, ms(t, 4_200)), command(Command::SendHeld));
+
+        ui.tick(Phase::Live, ms(t, 4_300));
+        assert!(!ui.visible(Phase::Live), "the answered question stayed up");
     }
 }
 ```
@@ -2096,11 +2165,11 @@ Expected: FAIL with `not yet implemented`.
 //! whole machine is tested without sleeping, and nothing here holds a timer.
 //! The loop calls [`Ui::tick`] on laps it already takes.
 //!
-//! The rule that decides the keys: **bare letters are popup commands only
-//! while the link is `Live`.** Nothing typed can be lost then, because any
-//! key that is not the popup's own closes it and goes to the host. While
-//! typing is being held -- an outage, or the question afterwards -- every
-//! bare byte is typing, and the popup's commands take the [`PREFIX`].
+//! The rule that decides the keys: **while the popup is shown, every key
+//! is its own.** Nothing typed into it is held or sent, whatever opened it
+//! and whatever the link is doing. While it is closed, `Ctrl-\` opens it and
+//! every other byte goes to the host -- or, during an outage, is held for the
+//! question asked when the link answers again.
 
 // This runs while a client session owns the screen: nothing here may print,
 // or it lands raw on the painted raw-mode terminal.
@@ -2110,13 +2179,13 @@ use std::time::{Duration, Instant};
 
 use crate::linkstate::Phase;
 
-/// `Ctrl-\`. Opens the popup while the link is healthy; while typing is
-/// held it is the prefix for the popup's commands.
+/// `Ctrl-\`. Opens the popup while it is closed, in every phase; closes it
+/// while it is shown.
 pub(crate) const PREFIX: u8 = 0x1c;
 
-/// A read that is exactly this byte is the Esc key. Followed by more bytes
-/// in the same read it begins an escape sequence -- an arrow key, a function
-/// key -- which is typing like any other.
+/// A read that is exactly this byte is the Esc key. Anywhere else in a read
+/// it begins an escape sequence -- an arrow key, a function key -- which
+/// runs to the end of the read.
 pub(crate) const ESC: u8 = 0x1b;
 
 /// How soon a second `Ctrl-\` must follow the one that opened the popup for
@@ -2166,26 +2235,11 @@ pub(crate) enum LinkChange {
     Back { outage: Duration },
 }
 
-/// What is being held, which decides the commands the prefix leads to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Holding {
-    Outage,
-    Confirming,
-}
-
-fn holding(phase: Phase) -> Option<Holding> {
-    match phase {
-        Phase::Silent { .. } | Phase::Recovering { .. } => Some(Holding::Outage),
-        Phase::Confirming => Some(Holding::Confirming),
-        Phase::Live => None,
-    }
-}
-
 pub(crate) struct Ui {
     mode: Mode,
-    /// A `Ctrl-\` typed while holding, whose letter has not arrived yet --
-    /// it may come in the next read -- and what was held when it was typed.
-    prefix: Option<Holding>,
+    /// The popup was closed by hand during the current outage, so it does
+    /// not open itself again until a new outage begins.
+    dismissed: bool,
     /// When the current outage began: the phase's own `Silent { since }`.
     outage_since: Option<Instant>,
     /// How long the last outage lasted, for the lingering popup.
@@ -2196,7 +2250,7 @@ impl Ui {
     pub(crate) fn new() -> Ui {
         Ui {
             mode: Mode::Closed,
-            prefix: None,
+            dismissed: false,
             outage_since: None,
             last_outage: Duration::ZERO,
         }
@@ -2212,24 +2266,31 @@ impl Ui {
         self.mode != Mode::Closed || phase == Phase::Confirming
     }
 
-    /// One lap's phase. Opens the popup when an outage begins, starts the
-    /// linger when the link answers again, and ends it.
+    /// One lap's phase. Opens the popup when an outage begins -- unless it
+    /// was closed by hand during this one -- starts the linger when the link
+    /// answers again, and ends it.
     pub(crate) fn tick(&mut self, phase: Phase, now: Instant) -> Option<LinkChange> {
         if phase.is_outage() {
-            if matches!(self.mode, Mode::Closed | Mode::Lingering { .. }) {
-                self.mode = Mode::Auto;
+            let change = if self.outage_since.is_none() {
+                // `Recovering` is only ever entered from `Silent`, so `now`
+                // is never actually used -- but a lap that somehow saw
+                // `Recovering` first still gets an outage that starts
+                // somewhere.
+                self.outage_since = Some(match phase {
+                    Phase::Silent { since } => since,
+                    _ => now,
+                });
+                self.dismissed = false;
+                Some(LinkChange::WentSilent)
+            } else {
+                None
+            };
+            match self.mode {
+                Mode::Closed if !self.dismissed => self.mode = Mode::Auto,
+                Mode::Lingering { .. } => self.mode = Mode::Auto,
+                _ => {}
             }
-            if self.outage_since.is_some() {
-                return None;
-            }
-            // `Recovering` is only ever entered from `Silent`, so `now` is
-            // never actually used -- but a lap that somehow saw `Recovering`
-            // first still gets an outage that starts somewhere.
-            self.outage_since = Some(match phase {
-                Phase::Silent { since } => since,
-                _ => now,
-            });
-            return Some(LinkChange::WentSilent);
+            return change;
         }
 
         let change = self.outage_since.take().map(|since| {
@@ -2257,85 +2318,86 @@ impl Ui {
     /// the command, if one was typed.
     pub(crate) fn keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
         let mut routed = Routed::default();
-        let held = holding(phase);
-        if self.prefix.is_some() && self.prefix != held {
-            self.prefix = None;
-        }
         let lone_esc = bytes == [ESC];
-        for &b in bytes {
-            let done = match held {
-                Some(h) => self.held_key(b, h, &mut routed),
-                None => self.live_key(b, lone_esc, now, &mut routed),
-            };
-            if done {
+        let mut rest = bytes;
+        while let Some((&b, tail)) = rest.split_first() {
+            rest = tail;
+            if !self.visible(phase) {
+                if b == PREFIX {
+                    self.mode = Mode::Open { pressed: Some(now) };
+                } else {
+                    deliver(b, phase, &mut routed);
+                }
+                continue;
+            }
+            if b == ESC && !lone_esc {
+                // An escape sequence: the rest of the read is one key the
+                // popup has no use for.
+                self.touch();
+                break;
+            }
+            if self.shown_key(b, phase, now, &mut routed) {
                 break;
             }
         }
         routed
     }
 
-    /// A key while typing is held. Returns whether the read is over.
-    fn held_key(&mut self, b: u8, h: Holding, r: &mut Routed) -> bool {
-        // Touched: it will not close on its own once the link is back.
-        if self.mode == Mode::Auto {
-            self.mode = Mode::Open { pressed: None };
+    /// A key while the popup is shown: every key is its own. Returns whether
+    /// the read is over.
+    fn shown_key(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) -> bool {
+        let confirming = phase == Phase::Confirming;
+        let command = match b {
+            b'q' => Some(Command::Quit),
+            b's' if confirming => Some(Command::SendHeld),
+            b'd' if confirming => Some(Command::DropHeld),
+            _ => None,
+        };
+        if command.is_some() {
+            r.command = command;
+            return true;
         }
-        if self.prefix.take().is_some() {
-            let command = match b {
-                b'q' => Some(Command::Quit),
-                b's' if h == Holding::Confirming => Some(Command::SendHeld),
-                b'd' if h == Holding::Confirming => Some(Command::DropHeld),
-                _ => None,
-            };
-            if command.is_some() {
-                r.command = command;
-                return true;
-            }
-            // Not a command here, so the user meant to type both bytes.
-            r.to_hold.extend_from_slice(&[PREFIX, b]);
-            return false;
-        }
-        if b == PREFIX {
-            self.prefix = Some(h);
-        } else {
-            r.to_hold.push(b);
+        match b {
+            // The question about held input has to be answered before the
+            // popup can go.
+            PREFIX | ESC if !confirming => self.close(b, phase, now, r),
+            // `c` and `s` are offered by a later version; they, and every
+            // other key, only count as touching the popup.
+            _ => self.touch(),
         }
         false
     }
 
-    /// A key while the link is healthy. Returns whether the read is over.
-    fn live_key(&mut self, b: u8, lone_esc: bool, now: Instant, r: &mut Routed) -> bool {
-        if self.mode == Mode::Closed {
-            if b == PREFIX {
-                self.mode = Mode::Open { pressed: Some(now) };
-            } else {
-                r.to_host.push(b);
-            }
-            return false;
+    /// Close the popup with `b`, `Esc` or `Ctrl-\`.
+    fn close(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) {
+        if b == PREFIX
+            && let Mode::Open { pressed: Some(at) } = self.mode
+            && now.saturating_duration_since(at) < DOUBLE_PRESS
+        {
+            deliver(PREFIX, phase, r);
         }
-        match b {
-            PREFIX => {
-                if let Mode::Open { pressed: Some(at) } = self.mode
-                    && now.saturating_duration_since(at) < DOUBLE_PRESS
-                {
-                    r.to_host.push(PREFIX);
-                }
-                self.mode = Mode::Closed;
-            }
-            ESC if lone_esc => self.mode = Mode::Closed,
-            b'q' => {
-                r.command = Some(Command::Quit);
-                return true;
-            }
-            // Offered by a later version; pressing one still counts as
-            // touching the popup.
-            b'c' | b's' => self.mode = Mode::Open { pressed: None },
-            _ => {
-                self.mode = Mode::Closed;
-                r.to_host.push(b);
-            }
+        self.mode = Mode::Closed;
+        if phase.is_outage() {
+            self.dismissed = true;
         }
-        false
+    }
+
+    /// A key that does nothing still tells an outage's popup that someone is
+    /// looking at it: it stays until closed.
+    fn touch(&mut self) {
+        if matches!(self.mode, Mode::Auto | Mode::Lingering { .. }) {
+            self.mode = Mode::Open { pressed: None };
+        }
+    }
+}
+
+/// Where a byte typed with the popup closed goes: the host while the link
+/// answers, the held buffer during an outage.
+fn deliver(b: u8, phase: Phase, r: &mut Routed) {
+    if phase.is_outage() {
+        r.to_hold.push(b);
+    } else {
+        r.to_host.push(b);
     }
 }
 ```
@@ -2347,10 +2409,13 @@ Expected: PASS.
 
 - [ ] **Step 6: Injection**
 
-1. In `held_key`, change `b'q' => Some(Command::Quit)` so bare `q` quits: add, before the `if self.prefix.take()…` line, `if b == b'q' { r.command = Some(Command::Quit); return true; }`. `bare_letters_and_esc_are_typing_while_the_link_is_down` must FAIL. Restore.
-2. In `keys`, compute `let lone_esc = bytes.first() == Some(&ESC);`. `a_lone_esc_closes_but_an_escape_sequence_passes_through` must FAIL. Restore.
-3. In `keys`, delete the `if self.prefix.is_some() && self.prefix != held { … }` block. `a_half_typed_prefix_does_not_survive_into_a_different_section` must FAIL. Restore.
-4. In `live_key`, change `< DOUBLE_PRESS` to `<= DOUBLE_PRESS`. `a_second_press_after_the_window_only_closes` must FAIL. Restore.
+1. In `keys`, compute `let lone_esc = bytes.first() == Some(&ESC);`. `a_lone_esc_closes_but_an_escape_sequence_does_nothing` must FAIL (the arrow key closes the popup). Restore.
+2. In `tick`, change `Mode::Closed if !self.dismissed =>` to `Mode::Closed =>`. `a_closed_outage_does_not_reopen_itself_until_a_new_one` must FAIL. Restore.
+3. In `tick`, delete `self.dismissed = false;` from the new-outage branch. `a_closed_outage_does_not_reopen_itself_until_a_new_one` must FAIL at its last assertion (the next outage stays closed). Restore.
+4. In `shown_key`, drop the `if !confirming` guard from the closing arm. `confirming_cannot_be_closed_until_it_is_answered` must FAIL. Restore.
+5. In `close`, replace `deliver(PREFIX, phase, r);` with `r.to_host.push(PREFIX);`. `a_double_press_during_an_outage_holds_one_literal` must FAIL. Restore.
+6. In `close`, change `< DOUBLE_PRESS` to `<= DOUBLE_PRESS`. `a_second_press_after_the_window_only_closes` must FAIL. Restore.
+7. In `keys`, make the closed branch hold every byte whatever the phase (`routed.to_hold.push(b)` in place of `deliver`). `typing_on_a_healthy_link_passes_through_untouched` must FAIL. Restore.
 
 - [ ] **Step 7: Gate and commit**
 
@@ -2360,10 +2425,12 @@ git commit -m "$(cat <<'EOF'
 feat(client): the status popup's states and key routing
 
 Ui decides whether the popup is closed, open, opened by an outage or
-lingering after one, and where each keystroke goes: on a healthy link
-Ctrl-\ opens it, a quick second press sends one literal, Esc closes, q
-quits and any other key closes it and reaches the host; while typing is
-held every bare byte is kept and commands take the Ctrl-\ prefix.
+lingering after one, and where each keystroke goes. While the popup is
+shown every key is its own: Esc or Ctrl-\ closes it (a quick second
+Ctrl-\ also types one literal), q quits, s and d answer the question
+about held input, and nothing else goes anywhere. Closed, Ctrl-\ opens
+it, and other bytes reach the host or, during an outage, are held; an
+outage closed by hand does not reopen the popup until the next one.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -2607,7 +2674,7 @@ mod tests {
         assert!(build(&facts(&q, &a, Phase::Live, t)).standby.is_empty(), "a host with no standby got a block");
     }
 
-    /// Review focus 5: the reason is the far end's own words.
+    /// Review focus 6: the reason is the far end's own words.
     #[test]
     fn a_search_failure_from_the_far_end_is_shown_escaped_and_short() {
         let t = Instant::now();
@@ -2666,6 +2733,9 @@ mod tests {
         );
     }
 
+    /// Every bar carries the dimmed `c config`; every bar but the
+    /// question's carries the dimmed `s sessions`, because there `s` sends.
+    /// The question has no `Esc close`: it closes only when answered.
     #[test]
     fn the_key_bar_offers_what_works_in_each_phase() {
         let t = Instant::now();
@@ -2678,14 +2748,13 @@ mod tests {
                 .collect()
         };
         let own = |s: &str, on: bool| (s.to_string(), on);
-        assert_eq!(
-            bar(Phase::Live),
-            [own("Esc close", true), own("q quit", true), own("c config", false), own("s sessions", false)]
-        );
-        assert_eq!(bar(Phase::Silent { since: t }), [own("Ctrl-\\ q quit", true)]);
+        let shown = [own("Esc close", true), own("q quit", true), own("c config", false), own("s sessions", false)];
+        for phase in [Phase::Live, Phase::Silent { since: t }, Phase::Recovering { attempt: 0, next_try: t }] {
+            assert_eq!(bar(phase), shown, "{phase:?}");
+        }
         assert_eq!(
             bar(Phase::Confirming),
-            [own("Ctrl-\\ s send", true), own("Ctrl-\\ d drop", true), own("Ctrl-\\ q quit", true)]
+            [own("s send", true), own("d drop", true), own("q quit", true), own("c config", false)]
         );
     }
 
@@ -2877,10 +2946,11 @@ fn held(f: &Facts<'_>) -> Vec<String> {
             }
             rows
         }
-        // Someone typing into a dead screen cannot tell "kept" from
-        // "discarded" until the question comes; this is the only place
-        // that can tell them while it still matters. Present tense for the
-        // cap: one they hear about afterwards is one they could not act on.
+        // Someone who closed the popup to type into a dead screen cannot
+        // tell "kept" from "discarded" until the question comes; opening the
+        // popup again shows them here while it still matters. Present tense
+        // for the cap: one they hear about afterwards is one they could not
+        // act on.
         phase if phase.is_outage() && n > 0 => {
             let mut rows = vec![format!("{n} bytes typed since - kept, not sent")];
             if f.held_full {
@@ -3013,12 +3083,14 @@ fn keys(phase: Phase) -> Vec<KeyHint> {
         enabled,
     };
     match phase {
+        // The question closes only when answered. `s` is its answer, so
+        // the dimmed `s sessions` would offer one key for two things.
         Phase::Confirming => vec![
-            hint("Ctrl-\\ s", "send", true),
-            hint("Ctrl-\\ d", "drop", true),
-            hint("Ctrl-\\ q", "quit", true),
+            hint("s", "send", true),
+            hint("d", "drop", true),
+            hint("q", "quit", true),
+            hint("c", "config", false),
         ],
-        phase if phase.is_outage() => vec![hint("Ctrl-\\ q", "quit", true)],
         _ => vec![
             hint("Esc", "close", true),
             hint("q", "quit", true),
@@ -3057,7 +3129,7 @@ Expected: PASS.
 
 1. In `recovering`, show `attempt` instead of `attempt.saturating_add(1)`. `the_recovering_section_reports_quiet_time_attempt_countdown_and_reason` must FAIL. Restore.
 2. In `standby`, replace `summarised(why)` with `why.to_string()`. `a_search_failure_from_the_far_end_is_shown_escaped_and_short` must FAIL. Restore.
-3. In `keys`, add `hint("q", "quit", true)` to the outage bar. `the_key_bar_offers_what_works_in_each_phase` must FAIL. Restore.
+3. In `keys`, add `hint("Esc", "close", true)` to the front of the `Confirming` bar. `the_key_bar_offers_what_works_in_each_phase` must FAIL. Restore.
 4. In `log`, drop `.skip(skip)`. `the_log_shows_the_newest_entries_with_their_age_and_count` must FAIL. Restore.
 
 - [ ] **Step 7: Gate and commit**
@@ -3102,12 +3174,13 @@ EOF
   - `fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>>` (same signature, new body)
   - `#[cfg(test)] fn outage_at(&mut self, now: Instant) -> bool`
   - free fn `fn reading_of(conn: &quinn::Connection) -> crate::quality::Reading`
+  - Test fixtures: `async fn with_popup() -> (HostSession, ClientSession)` (an outage's popup up, `Auto`), `async fn with_confirming_popup(held: &[u8]) -> (HostSession, ClientSession)` (closed with `Esc`, `held` typed blind, the host answering), `const CTRL_BACKSLASH: u8`, `const ESCAPE: u8`.
 - Produces (in `standby.rs`): `pub(crate) fn path(&self) -> Option<&PathDescription>`, `pub(crate) fn rtt(&self) -> Option<Duration>`, `pub(crate) fn probe(&self) -> ProbeState`, `pub(crate) fn searching(&self) -> bool`; `next_search()` loses `#[cfg(test)]`, `last_failure()` loses its `cfg_attr`.
 - Produces (in `linkstate.rs`): `pub fn hold_keys(&mut self, bytes: &[u8])` (no return value); `PREFIX`, `Command` and `prefix_pending` removed.
 
 - [ ] **Step 1: Write the new session tests**
 
-Add to `session.rs`'s test module (near the other popup tests, after `with_confirming_popup` from Step 6):
+Add to `session.rs`'s test module (near the other popup tests, after `with_confirming_popup` and `ESCAPE` from Step 6):
 
 ```rust
     /// The whole point of the key on a healthy link: it opens the popup and
@@ -3128,17 +3201,69 @@ Add to `session.rs`'s test module (near the other popup tests, after `with_confi
         assert!(crate::view::words(&v).contains("Esc close"), "{}", crate::view::words(&v));
     }
 
+    /// On a healthy link the open popup takes every key too: typing into it
+    /// reaches neither the host nor the held buffer, and it stays up.
     #[tokio::test]
-    async fn typing_into_an_open_popup_on_a_healthy_session_closes_it_and_reaches_the_host() {
+    async fn typing_into_an_open_popup_on_a_healthy_session_goes_nowhere() {
         let (_host, mut session) = pair("/bin/sh").await;
         let mut out = Vec::new();
         session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
-        assert!(session.popup_at(Instant::now()).is_some());
+        let before = spoken(&session);
 
-        session.route_keys(b"ls\r", &mut out).unwrap();
+        assert_eq!(session.route_keys(b"ls\r", &mut out).unwrap(), None);
 
-        assert!(spoken(&session).ends_with(b"ls\r"), "{:?}", spoken(&session));
-        assert!(session.popup_at(Instant::now()).is_none(), "the popup swallowed the typing");
+        assert_eq!(spoken(&session), before, "typing went through the popup to the host");
+        assert!(session.link_state.held().is_empty(), "typing into the popup was held");
+        assert!(session.ui.visible(session.link_state.phase_now()), "typing closed the popup");
+    }
+
+    /// Review focus 2, at the session: closing the popup an outage opened
+    /// makes typing blind a choice, and what is typed then is held -- not
+    /// sent at a host that is not answering -- while the popup stays shut
+    /// for the rest of the outage.
+    #[tokio::test]
+    async fn typing_after_closing_the_outage_popup_is_held_and_not_sent() {
+        let (_host, mut session) = with_popup().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(&[ESCAPE], &mut out).unwrap(), None);
+        assert!(!session.ui.visible(session.link_state.phase_now()), "Esc left the popup up");
+        assert_eq!(session.route_keys(b"rm -rf /", &mut out).unwrap(), None);
+
+        assert_eq!(session.link_state.held(), b"rm -rf /", "blind typing was not kept");
+        assert_eq!(spoken(&session), before, "blind typing was sent at a host that is not answering");
+        // Still `Silent` (the rebuild starts at `REBUILD_AFTER`, 20 s), and
+        // still the outage the popup was closed in.
+        let later = Instant::now() + Duration::from_secs(5);
+        assert!(
+            session.popup_at(later).is_none(),
+            "the popup opened itself again for the outage it was closed in"
+        );
+    }
+
+    /// Review focus 3, at the session: typing held behind a popup closed by
+    /// hand is asked about when the host answers, and the question takes a
+    /// bare `s`.
+    #[tokio::test]
+    async fn held_input_after_a_closed_outage_opens_the_question() {
+        let (_host, mut session) = with_popup().await;
+        let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+
+        let now = Instant::now();
+        session.note_heard(now);
+        let v = session
+            .popup_at(now)
+            .expect("the host answered with input held, and nothing was asked");
+        assert!(v.held.first().is_some_and(|l| l.contains("deliver what you typed?")), "{:?}", v.held);
+        assert!(crate::view::words(&v).contains("s send"), "{}", crate::view::words(&v));
+
+        assert_eq!(session.route_keys(b"s", &mut out).unwrap(), None);
+        assert!(spoken(&session).ends_with(b"make test\r"), "{:?}", spoken(&session));
+        assert!(session.link_state.held().is_empty(), "sent and kept");
+        assert!(session.popup_at(Instant::now()).is_none(), "the answered question stayed up");
     }
 
     /// The popup an outage opened stays up for `LINGER` once the link is
@@ -3289,7 +3414,7 @@ Also reword the two docs that still say "the coming status popup" (`StandbyEvent
 
 4. `take_held`: delete the doc sentences about the half-typed prefix and `self.prefix_pending = false;`. `drop_held`: doc becomes "Discard the held input." and delete `self.prefix_pending = false;`.
 5. `Phase::is_outage`'s doc: replace "such as the notice box's rebuild check" with "such as the popup's key routing". `last_heard`'s doc: replace "a caller building the notice for `Recovering`" with "the popup, reporting how long the host has been quiet in `Recovering`,".
-6. Tests: delete `the_prefix_and_a_letter_are_a_command_and_are_not_held`, `every_command_key_is_recognised`, `send_and_drop_are_not_commands_under_the_silent_notice`, `quit_is_offered_in_every_phase`, `a_prefix_split_across_two_reads_still_commands`, `an_unknown_key_after_the_prefix_is_held_with_the_prefix`, `a_half_typed_prefix_does_not_survive_the_notice_it_was_typed_into` and `resolving_the_buffer_drops_a_half_typed_prefix_with_it` — `ui.rs` now has each of them (Task 4). In `keys_typed_offline_are_held_not_delivered`, replace `assert_eq!(s.hold_keys(b"make test"), None);` with `s.hold_keys(b"make test");`.
+6. Tests: delete `the_prefix_and_a_letter_are_a_command_and_are_not_held`, `every_command_key_is_recognised`, `send_and_drop_are_not_commands_under_the_silent_notice`, `quit_is_offered_in_every_phase`, `a_prefix_split_across_two_reads_still_commands`, `an_unknown_key_after_the_prefix_is_held_with_the_prefix`, `a_half_typed_prefix_does_not_survive_the_notice_it_was_typed_into` and `resolving_the_buffer_drops_a_half_typed_prefix_with_it` — the prefix they test no longer exists; the popup's keys are tested in `ui.rs` (Task 4). In `keys_typed_offline_are_held_not_delivered`, replace `assert_eq!(s.hold_keys(b"make test"), None);` with `s.hold_keys(b"make test");`.
 
 - [ ] **Step 5: `session.rs` — the client half**
 
@@ -3342,10 +3467,10 @@ In `new`, initialise `path: None, shown: None, ui: Ui::new(), quality: Quality::
 ```rust
     /// One read from the keyboard, sent wherever it belongs.
     ///
-    /// The popup decides ([`Ui::keys`]): on a healthy link with the popup
-    /// closed every byte goes to the host untouched; while the link is down,
-    /// or the host is answering again with typing held, bytes are held and
-    /// the popup's commands take the `Ctrl-\` prefix.
+    /// The popup decides ([`Ui::keys`]): while it is shown every key is its
+    /// own and nothing is sent or held; while it is closed, `Ctrl-\` opens
+    /// it and every other byte goes to the host untouched -- or, while the
+    /// link is down, is held for the question asked when it answers again.
     ///
     /// `Some(code)` means the user asked to close oxutrm, which is the one
     /// answer that ends the loop. A method rather than the body of the
@@ -3517,7 +3642,7 @@ fn reading_of(conn: &quinn::Connection) -> Reading {
             }
 ```
 
-10. Comment sweep. Run `grep -n -i 'notice\|the box\|box ' src/session.rs src/linkstate.rs src/standby.rs src/rebuild.rs src/connect.rs` and reword every comment or doc that names the notice so it names the popup, keeping each one true. Known sites: `take_frames`' long comment ("the box saying nobody was answering", "the `Silent` box is the only place the rejected count is reported" → "the popup"), `rejected_total`'s doc ("For tests and for the notice." → "For tests and for the popup."), the `rejected_total` field doc, `rebuild_step`'s doc ("with the same `now` the notice was built from" → "the popup was built from"), `swap_in`'s doc ("typed while the notice was up" → "while the popup was holding it"), the `last_failure` field doc ("for the notice" → "for the popup"), the `follow_route` call-site comment and the `rebuild_step` call-site comment ("After the notice, so the box describing the silence…" → "After the popup, so what describes the silence is on the screen…"), the `pacing_interval` deadline comment (drop the sentence about `NOTICE_REFRESH`; keep that the loop wakes at least ten times a second), `Rebuild`'s `Drop` doc in `rebuild.rs` ("the key the notice on screen is offering" → "the key the popup is offering"), and in `rebuild.rs` the `Retry` variant doc ("kept for the notice" → "kept for the popup"). `grep` again afterwards: the only hits left should be inside test names you are about to migrate in Step 6.
+10. Comment sweep. Run `grep -n -i 'notice\|the box\|box ' src/session.rs src/linkstate.rs src/standby.rs src/rebuild.rs src/connect.rs` and reword every comment or doc that names the notice so it names the popup, keeping each one true. Known sites: `take_frames`' long comment ("the box saying nobody was answering", "the `Silent` box is the only place the rejected count is reported" → "the popup"), `rejected_total`'s doc ("For tests and for the notice." → "For tests and for the popup."), the `rejected_total` field doc, `rebuild_step`'s doc ("with the same `now` the notice was built from" → "the popup was built from"), `swap_in`'s doc ("typed while the notice was up" → "typed while the link was down"), the `last_failure` field doc ("for the notice" → "for the popup"), the `follow_route` call-site comment and the `rebuild_step` call-site comment ("After the notice, so the box describing the silence…" → "After the popup, so what describes the silence is on the screen…"), the `pacing_interval` deadline comment (drop the sentence about `NOTICE_REFRESH`; keep that the loop wakes at least ten times a second), `Rebuild`'s `Drop` doc in `rebuild.rs` ("the key the notice on screen is offering" → "the key the popup is offering"), and in `rebuild.rs` the `Retry` variant doc ("kept for the notice" → "kept for the popup"). `grep` again afterwards: the only hits left should be inside test names you are about to migrate in Step 6.
 
 11. `crates/oxutrm-client`: delete `src/notice.rs` (`git rm crates/oxutrm-client/src/notice.rs`); in `lib.rs` remove `pub mod notice;` and `pub use notice::{…};`. In `overlay.rs`'s module doc, replace "a notice, and later a session picker or a config screen" with "the status popup, and later a session picker or a config screen".
 
@@ -3578,6 +3703,9 @@ and fix the comments in those tests that say "`run`'s own loop calls `notice_at`
     /// constant rather than the keystroke.
     const CTRL_BACKSLASH: u8 = 0x1c;
 
+    /// A lone Esc, the popup's close key; the same reasoning.
+    const ESCAPE: u8 = 0x1b;
+
     /// A client with the popup up for a real `Silent` phase, left exactly as
     /// the loop leaves it: the phase decided by `popup_at`, and `shown`
     /// mirroring what the overlay is.
@@ -3598,11 +3726,12 @@ and fix the comments in those tests that say "`run`'s own loop calls `notice_at`
     }
 
     /// A client whose popup asks about `held`, typed blind: the popup went
-    /// up, the user typed into it, and the host started answering again.
-    /// The only phase that offers `Ctrl-\ s` and `Ctrl-\ d`.
+    /// up, the user closed it and typed, and the host started answering
+    /// again. The only phase that offers `s send` and `d drop`.
     async fn with_confirming_popup(held: &[u8]) -> (HostSession, ClientSession) {
         let (host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).expect("close the popup");
         session.route_keys(held, &mut out).expect("hold the typing");
 
         let now = std::time::Instant::now();
@@ -3636,7 +3765,48 @@ and fix the comments in those tests that say "`run`'s own loop calls `notice_at`
 
 `the_notice_names_the_counters_it_can_actually_observe` → `the_popup_says_how_long_the_host_has_been_silent`: same body with `popup_at`, and the assertion `assert!(shown.contains("silent for 6s"), "no silence duration: {shown}");` where `shown = painted_words(&v)`.
 
-`the_silent_notice_says_that_blind_typing_is_being_kept` and `a_full_buffer_is_reported_while_it_is_still_filling`: `notice_at` → `popup_at`; delete the `session.shown = …` lines and the `assert!(session.shown.is_some())` (holding now follows the phase, not what is drawn); `painted_words(&n)` works unchanged on the view.
+`the_silent_notice_says_that_blind_typing_is_being_kept` → `the_reopened_popup_says_that_blind_typing_is_being_kept` (typing into the shown popup is no longer held, so the user closes it, types, and opens it again):
+
+```rust
+    /// Someone who closed the outage popup to type blind cannot tell "kept"
+    /// from "discarded" until the question appears -- and `q`, which the
+    /// popup offers, ends the session before it ever does. Somebody who
+    /// opened it again and quit would leave believing their typing had been
+    /// thrown away, unless it says otherwise.
+    #[tokio::test]
+    async fn the_reopened_popup_says_that_blind_typing_is_being_kept() {
+        let t = std::time::Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.popup_at(t).is_none());
+
+        let bare = session
+            .popup_at(t + Duration::from_secs(3))
+            .expect("no popup after three seconds of silence");
+        assert!(
+            !painted_words(&bare).contains("kept"),
+            "the popup talks about a buffer before anything was typed: {}",
+            painted_words(&bare)
+        );
+
+        let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
+
+        let shown = painted_words(
+            &session
+                .popup_at(t + Duration::from_secs(5))
+                .expect("Ctrl-\\ did not open the popup again"),
+        );
+        assert!(shown.contains("10 bytes"), "the popup does not say how much is being kept: {shown}");
+        assert!(shown.contains("kept"), "someone typing blind is never told their keys are being kept: {shown}");
+        assert_claims_nothing_it_cannot_see(&shown);
+    }
+```
+
+`a_full_buffer_is_reported_while_it_is_still_filling`: `notice_at` → `popup_at`; replace `session.shown = …` and `assert!(session.shown.is_some());` with `assert!(session.popup_at(t + Duration::from_secs(3)).is_some());` followed by `session.route_keys(&[ESCAPE], &mut out).unwrap();` (move `let mut out = Vec::new();` above it); after the `MAX_HELD` bytes, add `session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();` so the popup is open again at `t + 5 s`. `painted_words(&n)` works unchanged on the view.
 
 `the_silence_counters_are_rebuilt_at_most_once_a_second` → replace whole test:
 
@@ -3666,11 +3836,11 @@ and fix the comments in those tests that say "`run`'s own loop calls `notice_at`
     }
 ```
 
-`a_change_of_phase_repaints_at_once_however_recent_the_refresh` → `a_change_of_phase_is_shown_the_lap_it_happens`: `with_popup`, `popup_at(now)`, and assert `v.held.first().is_some_and(|l| l.contains("answering again"))` with the old message.
+`a_change_of_phase_repaints_at_once_however_recent_the_refresh` → `a_change_of_phase_is_shown_the_lap_it_happens`: `with_popup`, then `session.route_keys(&[ESCAPE], &mut out).unwrap();` before the existing `route_keys(b"make test\r", …)` (typing into the shown popup is not held), `popup_at(now)`, and assert `v.held.first().is_some_and(|l| l.contains("answering again"))` with the old message.
 
 `returning_to_live_clears_the_box_at_once` → delete; `returning_to_live_lingers_and_then_closes` (Step 1) replaces it.
 
-`the_confirming_notice_states_only_what_the_client_can_observe` → `the_confirming_popup_states_only_what_the_client_can_observe`: `with_popup`, `popup_at(now)`, body otherwise unchanged.
+`the_confirming_notice_states_only_what_the_client_can_observe` → `the_confirming_popup_states_only_what_the_client_can_observe`: `with_popup`, then `session.route_keys(&[ESCAPE], &mut out).unwrap();` before the existing `route_keys(b"make test\r", …)`, `popup_at(now)`, body otherwise unchanged. Its doc's last paragraph becomes "Reached without sleeping, along the path the loop actually takes: the popup is up, the user closes it and types blind, and then the host answers."
 
 `the_recovering_notice_reports_the_wired_numbers` → `the_recovering_section_reports_the_wired_numbers`: `notice_at` → `popup_at`; `let shown = n.recovering.join(" | ");`; drop `waiting for the network` (that headline is gone; assert `n.marker == Marker::Recovering` instead); keep the three number assertions (`host quiet for 20s`, `reconnect attempt 1`, `next try in 0s`) and their comments; update the doc's first paragraph to say "`view.rs`'s test for the recovering rows calls `build` with numbers already computed; nothing there exercises `popup_at`'s own derivation of them".
 
@@ -3702,7 +3872,7 @@ and fix the comments in those tests that say "`run`'s own loop calls `notice_at`
 
 keeping `assert!(client.shown.is_none(), "the session ended with a popup still up");`. Its doc's last paragraph (about the headline's bytes) is replaced by: "The assertion reads the activity log, which records every outage the popup opens for: painted bytes are a diff, and a diff can split a word wherever a cell happened to be unchanged."
 
-`a_resize_lays_the_notice_out_again_for_the_new_screen` → `a_resize_lays_the_popup_out_again_for_the_new_screen` (Review focus 3), looping over two sizes:
+`a_resize_lays_the_notice_out_again_for_the_new_screen` → `a_resize_lays_the_popup_out_again_for_the_new_screen` (Review focus 4), looping over two sizes:
 
 ```rust
     #[tokio::test]
@@ -3737,7 +3907,66 @@ keeping `assert!(client.shown.is_none(), "the session ended with a popup still u
     }
 ```
 
-The key tests (`typing_into_a_notice_is_held_and_not_sent` → `typing_into_the_popup_during_an_outage_is_held_and_not_sent`, `the_quit_key_ends_the_client_with_a_status_of_zero`, `the_send_key_delivers_what_was_typed_blind`, `the_drop_key_throws_the_blind_typing_away`, `the_silent_notice_does_not_honour_the_keys_it_does_not_offer` → `the_outage_popup_does_not_honour_the_keys_it_does_not_offer`, `the_quit_key_works_under_the_confirming_notice_too` → `…_confirming_popup_too`, `a_frame_between_the_prefix_and_its_letter_does_not_eat_the_command`, `a_scavenged_frame_clears_the_notice` → `a_scavenged_frame_ends_the_silence`) keep their bodies with the fixture renames: their keystrokes are `Ctrl-\`-prefixed, which is still how commands work while typing is held. `a_rejected_frame_is_counted_rather_than_printed`: message "the count did not reach the notice" → "the popup". The route-probe tests that use `with_notice` only need the rename.
+The key tests change with the key model: the popup's commands are bare letters now, and typing is held only once the popup is closed.
+
+- `typing_into_a_notice_is_held_and_not_sent` → delete; `typing_after_closing_the_outage_popup_is_held_and_not_sent` (Step 1) replaces it.
+- `a_frame_between_the_prefix_and_its_letter_does_not_eat_the_command` → delete (no prefix spans two reads any more); in its place:
+
+```rust
+    /// `heard` runs on every frame. One landing while the question is up
+    /// must neither answer it nor take it down: it stays until `s` or `d`.
+    #[tokio::test]
+    async fn a_frame_while_the_question_is_up_does_not_answer_it() {
+        let (mut host, mut session) = with_confirming_popup(b"echo hi\r").await;
+        let mut out = Vec::new();
+
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+
+        assert_eq!(session.link_state.held(), b"echo hi\r", "a frame resolved the held input");
+        assert!(session.popup_at(Instant::now()).is_some(), "a frame took the question down");
+        session.route_keys(b"d", &mut out).expect("the letter lands");
+        assert!(session.link_state.held().is_empty(), "d did not drop the held buffer after a frame");
+    }
+```
+
+- `the_quit_key_ends_the_client_with_a_status_of_zero`: `with_popup`; the keystroke is `b"q"` instead of `&[CTRL_BACKSLASH, b'q']`; the doc's first sentence becomes "`q` is the popup's own key, so it must not reach the shell, …".
+- `the_send_key_delivers_what_was_typed_blind` and `the_drop_key_throws_the_blind_typing_away`: `with_confirming_popup`; the keystrokes are `b"s"` and `b"d"`.
+- `the_quit_key_works_under_the_confirming_notice_too` → `the_quit_key_works_under_the_confirming_popup_too`: `with_confirming_popup`, `b"q"`; doc: "And `q` is the key every popup offers, the question included."
+- `the_silent_notice_does_not_honour_the_keys_it_does_not_offer` → replace whole test:
+
+```rust
+    /// The outage popup offers `Esc` and `q`; `s` and `d` answer only the
+    /// question. Pressed into it, they must neither deliver nor discard what
+    /// was typed blind before it was opened again -- nor be kept as typing.
+    #[tokio::test]
+    async fn the_outage_popup_does_not_honour_the_keys_it_does_not_offer() {
+        let (_host, mut session) = with_popup().await;
+        let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
+        assert!(session.ui.visible(session.link_state.phase_now()), "Ctrl-\\ did not open the popup again");
+        let before = spoken(&session);
+
+        assert_eq!(session.route_keys(b"s", &mut out).unwrap(), None);
+        assert_eq!(
+            spoken(&session),
+            before,
+            "the held input was delivered to a host the popup says is not answering"
+        );
+        assert_eq!(session.route_keys(b"d", &mut out).unwrap(), None);
+        assert_eq!(
+            session.link_state.held(),
+            b"make test\r",
+            "the held input was discarded, or the keys were kept as typing"
+        );
+    }
+```
+
+- `a_scavenged_frame_clears_the_notice` → `a_scavenged_frame_ends_the_silence`: body unchanged with `with_popup`.
+- `a_rejected_frame_is_counted_rather_than_printed`: message "the count did not reach the notice" → "the popup". The route-probe tests that use `with_notice` only need the rename.
 
 - [ ] **Step 7: Run the session, linkstate and standby tests**
 
@@ -3749,7 +3978,8 @@ Expected: PASS (the `#[ignore]`d experiments compile and stay ignored).
 1. In `popup_at`, replace the last line with `(phase != Phase::Live).then(|| self.view(phase, now))` (the old "only while not live" rule). `ctrl_backslash_opens_the_popup_on_a_healthy_session` and `returning_to_live_lingers_and_then_closes` must FAIL. Restore.
 2. In `resize`, delete the `if let Some(v) = self.shown.as_ref() { … }` block. `a_resize_lays_the_popup_out_again_for_the_new_screen` must FAIL. Restore.
 3. In `swap_in_as`, delete `self.quality.new_segment(now);`. `a_swap_starts_a_new_quality_segment` must FAIL. Restore.
-4. In `route_keys`, pass `Phase::Live` instead of `phase` to `self.ui.keys`. `typing_into_the_popup_during_an_outage_is_held_and_not_sent` must FAIL. Restore.
+4. In `route_keys`, pass `Phase::Live` instead of `phase` to `self.ui.keys`. `typing_after_closing_the_outage_popup_is_held_and_not_sent` must FAIL (the typing goes to the host). Restore.
+5. In `route_keys`, drop the `if !routed.to_hold.is_empty() { … }` block. `held_input_after_a_closed_outage_opens_the_question` must FAIL (nothing is asked). Restore.
 
 - [ ] **Step 9: Gate and commit**
 
@@ -3760,9 +3990,10 @@ git commit -m "$(cat <<'EOF'
 feat(client): the status popup replaces the notice
 
 The session builds a PopupView on every lap the popup is open and
-repaints only when it changed. Ctrl-\ opens it on a healthy link, an
-outage opens it by itself, and it lingers three seconds after the link
-comes back. Keys are routed by ui.rs; linkstate only holds bytes now.
+repaints only when it changed. Ctrl-\ opens it, an outage opens it by
+itself, and it lingers three seconds after the link comes back. Keys are
+routed by ui.rs: the shown popup takes every key, and typing is held only
+behind a popup closed during an outage. linkstate only holds bytes now.
 Link quality is sampled once a second on the loop's own laps, and each
 outage's start and end go to the activity log.
 
@@ -3792,7 +4023,7 @@ EOF
   - `fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()>`
   - `fn rebuild_failed(&mut self, why: String, now: Instant)`
   - `announce_standby`, `announce_failover` and `say_mid_session` are deleted.
-  - Test fixtures: `const BIG: TermSize` (80×24), `async fn pair_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession)`, `async fn pair_through_relay_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession, Relay)`, `SharedOut::bytes(&self) -> Vec<u8>`, `fn screen_of(out: &SharedOut, size: TermSize) -> String`, `async fn wait_for_screen(out: &SharedOut, size: TermSize, want: &str, budget: Duration)`, `fn outside_renderer(out: &[u8]) -> Vec<u8>`, `fn last_entry(c: &ClientSession) -> Option<(Kind, String)>`.
+  - Test fixtures: `const BIG: TermSize` (80×24), `async fn pair_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession)`, `async fn pair_through_relay_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession, Relay)`, `SharedOut::bytes(&self) -> Vec<u8>`, `fn screen_of(out: &SharedOut, size: TermSize) -> String`, `async fn wait_for_screen(out: &SharedOut, size: TermSize, want: &str, budget: Duration)`, `async fn wait_off_screen(out: &SharedOut, size: TermSize, gone: &str, budget: Duration)`, `async fn close_the_popup(typing: &mut impl Write, out: &SharedOut, size: TermSize)`, `fn outside_renderer(out: &[u8]) -> Vec<u8>`, `fn last_entry(c: &ClientSession) -> Option<(Kind, String)>`.
 - Produces (`activity.rs`): `LogFile::open_default() -> std::io::Result<LogFile>`.
 - Produces (`standby.rs`): `link: Option<Established>`; `take_for_failover(&mut self, now: Instant) -> Option<Established>`; `not_found(…) -> bool` = "the result was for the search still wanted"; `lost(…) -> bool` = "worth recording"; `probed(&mut self, answered: bool, now: Instant) -> bool` = "it was for the probe in flight"; `told_none` and `dry_spell_news` deleted.
 - Produces (`loopback.rs`): `#[cfg(test)] pub(crate) mod fixtures { pub(crate) fn replay(ansi: &[u8], size: TermSize) -> Vec<String> }`.
@@ -3881,6 +4112,27 @@ Beside `SharedOut`:
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    async fn wait_off_screen(out: &SharedOut, size: TermSize, gone: &str, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while screen_of(out, size).contains(gone) {
+            assert!(
+                Instant::now() < deadline,
+                "{gone:?} never left the screen; it showed:\n{}",
+                screen_of(out, size)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Close the popup the way a user does, before typing to the shell:
+    /// while it is shown it takes every key. The Esc goes alone and the
+    /// next write waits for the popup to be gone, so the client reads it as
+    /// a lone Esc and not as the start of an escape sequence.
+    async fn close_the_popup(typing: &mut impl Write, out: &SharedOut, size: TermSize) {
+        typing.write_all(&[ESCAPE]).expect("type");
+        wait_off_screen(out, size, "q quit", Duration::from_secs(10)).await;
     }
 
     /// What reached the terminal outside the renderer. `Renderer::render`
@@ -4055,11 +4307,11 @@ Replace `a_found_standby_is_added_to_the_path_line`, `no_standby_is_said_on_the_
     async fn sending_or_dropping_held_input_is_recorded() {
         let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
-        session.route_keys(&[CTRL_BACKSLASH, b's'], &mut out).unwrap();
+        session.route_keys(b"s", &mut out).unwrap();
         assert_eq!(last_entry(&session), Some((crate::activity::Kind::Input, "held input sent (10 bytes)".to_string())));
 
         let (_host, mut session) = with_confirming_popup(b"rm -rf /tmp/x\r").await;
-        session.route_keys(&[CTRL_BACKSLASH, b'd'], &mut out).unwrap();
+        session.route_keys(b"d", &mut out).unwrap();
         assert_eq!(last_entry(&session), Some((crate::activity::Kind::Input, "held input dropped (14 bytes)".to_string())));
     }
 
@@ -4141,7 +4393,8 @@ Migrate `a_standby_closed_under_a_running_session_is_announced_and_forgotten` �
         standby_host.sink.connection().close(quinn::VarInt::from_u32(0), SUPERSEDED);
         wait_for_screen(&out, BIG, "lost:", Duration::from_secs(10)).await;
 
-        // `e` closes the popup and goes to the shell with the rest.
+        // The open popup takes every key: close it, then talk to the shell.
+        close_the_popup(&mut typing, &out, BIG).await;
         typing.write_all(b"exit 7\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
@@ -4163,6 +4416,10 @@ Migrate `a_dead_primary_fails_over_onto_an_answering_standby`: use `pair_through
         // standby, `exit 7` would be held for the `Confirming` question and
         // never reach the shell.
         wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(15)).await;
+        // The lingering popup takes every key. Let it close by itself
+        // rather than pressing Esc: an Esc racing the linger's end would
+        // reach the shell, and `ESC e` is a readline command.
+        wait_off_screen(&out, BIG, "LIVE again", Duration::from_secs(10)).await;
 ```
 
 replace the final `out.text().contains("switched to standby")` assertion with
@@ -4551,8 +4808,8 @@ EOF
 - Modify: `src/session.rs` (test module only)
 
 **Interfaces:**
-- Consumes: `pair`, `pair_through_relay_sized`, `BIG`, `keyboard()`, `SharedOut`, `screen_of`, `wait_for_screen`, `outside_renderer` (Task 7), `ClientSession::run_on`, `client.activity`, `client.screen()`, `text()`.
-- Produces: two tests. No production code: if either fails, the defect is in Tasks 4–7, and the fix goes there with a test of its own at that level.
+- Consumes: `pair`, `pair_through_relay_sized`, `BIG`, `keyboard()`, `SharedOut`, `screen_of`, `wait_for_screen`, `wait_off_screen`, `close_the_popup`, `outside_renderer` (Task 7), `ESCAPE`, `CTRL_BACKSLASH` (Task 6), `ClientSession::run_on`, `client.activity`, `client.screen()`, `text()`.
+- Produces: three tests. No production code: if either fails, the defect is in Tasks 4–7, and the fix goes there with a test of its own at that level.
 
 - [ ] **Step 1: Write the tests**
 
@@ -4588,7 +4845,9 @@ EOF
         relay.blackhole(false);
         wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(20)).await;
 
-        // `e` closes the lingering popup and goes to the shell with the rest.
+        // The lingering popup takes every key; it closes by itself after
+        // `LINGER`, and only then does typing reach the shell.
+        wait_off_screen(&out, BIG, "LIVE again", Duration::from_secs(10)).await;
         typing.write_all(b"exit 4\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
             .await
@@ -4605,6 +4864,71 @@ EOF
             .collect();
         assert_eq!(link.first().map(String::as_str), Some("silent"), "{link:?}");
         assert!(link.get(1).is_some_and(|t| t.starts_with("live again via this link, outage ")), "{link:?}");
+        let stray = outside_renderer(&out.bytes());
+        assert!(stray.is_empty(), "written outside the renderer: {:?}", String::from_utf8_lossy(&stray));
+    }
+
+    /// Review focus 2 and 3, end to end: the user closes the outage popup
+    /// and types blind; the popup stays shut for the rest of that outage,
+    /// and when the link answers it opens on the question, whose bare `s`
+    /// delivers the typing to the shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blind_typing_after_closing_the_popup_is_asked_about_and_sent() {
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing.write_all(b"printf 'ready-%s\\n' ok\n").expect("type");
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+
+        relay.blackhole(true);
+        typing.write_all(b"true\n").expect("type");
+        wait_for_screen(&out, BIG, "\u{25cf} SILENT", Duration::from_secs(10)).await;
+
+        close_the_popup(&mut typing, &out, BIG).await;
+        typing.write_all(b"printf 'blind-%s\\n' ok\n").expect("type");
+        // Ten laps at least, all in the outage the popup was closed in:
+        // none of them may open it again.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !screen_of(&out, BIG).contains("SILENT"),
+            "the popup opened itself again for the outage it was closed in:\n{}",
+            screen_of(&out, BIG)
+        );
+        assert!(!screen_of(&out, BIG).contains("blind-ok"), "blind typing reached the shell during the outage");
+
+        relay.blackhole(false);
+        // The question shows the typing as typed (`blind-%s`); `blind-ok`
+        // appears only once the shell has run it.
+        wait_for_screen(&out, BIG, "deliver what you typed?", Duration::from_secs(20)).await;
+        assert!(!screen_of(&out, BIG).contains("blind-ok"), "the typing was delivered before it was asked about");
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, BIG, "blind-ok", Duration::from_secs(10)).await;
+        wait_off_screen(&out, BIG, "deliver what you typed?", Duration::from_secs(10)).await;
+
+        typing.write_all(b"exit 6\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .unwrap_or_else(|_| panic!("the client never finished; the screen was:\n{}", screen_of(&out, BIG)))
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 6);
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 6);
+
+        let input: Vec<String> = client
+            .activity
+            .entries()
+            .filter(|e| e.kind == crate::activity::Kind::Input)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(input, ["held input sent (23 bytes)"]);
         let stray = outside_renderer(&out.bytes());
         assert!(stray.is_empty(), "written outside the renderer: {:?}", String::from_utf8_lossy(&stray));
     }
@@ -4658,15 +4982,16 @@ EOF
 
 - [ ] **Step 2: Run them**
 
-Run: `cargo test --workspace --jobs 4 an_outage_raises_the_popup -- --test-threads 4` and `cargo test --workspace --jobs 4 a_quick_double_ctrl_backslash -- --test-threads 4`.
+Run: `cargo test --workspace --jobs 4 an_outage_raises_the_popup -- --test-threads 4`, `cargo test --workspace --jobs 4 blind_typing_after_closing -- --test-threads 4` and `cargo test --workspace --jobs 4 a_quick_double_ctrl_backslash -- --test-threads 4`.
 Expected: PASS. (They exercise code that already exists; the injections below are what prove they can fail.)
 
 - [ ] **Step 3: Injection**
 
-1. In `Ui::live_key`, delete `r.to_host.push(PREFIX);` from the double-press branch. `a_quick_double_ctrl_backslash_reaches_the_shell_as_one_literal` must FAIL (no `^\` ever reaches the screen). Restore.
-2. In `Ui::live_key`, make the Closed branch push `PREFIX` to the host as well as opening (`r.to_host.push(b)` unconditionally). The double-press test must FAIL with `^\^\`. Restore.
+1. In `Ui::close`, delete the `deliver(PREFIX, phase, r);` call. `a_quick_double_ctrl_backslash_reaches_the_shell_as_one_literal` must FAIL (no `^\` ever reaches the screen). Restore.
+2. In `Ui::keys`, make the closed branch deliver `PREFIX` as well as opening (`deliver(b, phase, &mut routed)` unconditionally). The double-press test must FAIL with `^\^\`. Restore.
 3. In `Ui::tick`, change `Mode::Auto if phase == Phase::Live =>` to set `Mode::Closed` instead of `Lingering`. `an_outage_raises_the_popup_and_its_end_is_reported` must FAIL (no `LIVE again`). Restore.
 4. In `ClientSession::popup_at`, return `None` unconditionally. The outage test must FAIL (no `● SILENT`). Restore.
+5. In `Ui::tick`, change `Mode::Closed if !self.dismissed =>` to `Mode::Closed =>`. `blind_typing_after_closing_the_popup_is_asked_about_and_sent` must FAIL (`SILENT` is back on the screen after the second). Restore.
 
 - [ ] **Step 4: Gate and commit**
 
@@ -4677,7 +5002,9 @@ test(client): the status popup end to end through the real loop
 
 A blackholed link raises the popup on the replayed screen, its return is
 reported as LIVE again, and nothing reaches the terminal outside the
-renderer; a quick double Ctrl-\ arrives at the shell as one literal.
+renderer; typing blind behind a popup closed by hand stays held, the
+popup stays shut for that outage, and the question's s delivers it; a
+quick double Ctrl-\ arrives at the shell as one literal.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -4708,13 +5035,13 @@ Under `## Unreleased` → `### New`, append:
   minimum, average and maximum over the last minute, loss, throughput, an RTT
   sparkline with gaps where the link was down, which link of the session this
   is, the standby and what it is doing, what the rebuild loop is trying and
-  why its last attempt failed, and the last things oxutrm did. While the link
-  is healthy `Esc` or `Ctrl-\` closes it, `q` quits, and any other key closes
-  it and goes to the remote program, so typing never disappears into it. While
-  the link is down everything you type is held, as before — `q`, `Esc` and all
-  — and the popup's commands keep their `Ctrl-\` prefix: `Ctrl-\ q` quits, and
-  once the host answers again `Ctrl-\ s` sends what you typed and `Ctrl-\ d`
-  drops it. `c config` and `s sessions` are shown dimmed; they come later.
+  why its last attempt failed, and the last things oxutrm did. While it is
+  shown it takes every key: `Esc` or `Ctrl-\` closes it, `q` quits, and
+  nothing else you type goes anywhere. You can close it during an outage too;
+  it then stays closed until that outage ends, what you type meanwhile is held
+  as before, and when the host answers again the popup opens to ask about it:
+  `s` sends what you typed, `d` drops it. `c config` and `s sessions` are shown
+  dimmed; they come later.
 
 - **What oxutrm does to keep a session alive is logged.** Outages and their
   end, standby searches, finds and losses, probes and failovers, rebuild
@@ -4739,8 +5066,12 @@ Under `### Changed`, append:
 - **The box that appeared during an outage is the popup now.** What it said —
   how long the host has been silent, what was typed blind, the rebuild attempt
   and its countdown, the question about held input — is a section of the
-  popup, and the keys that answered it are the same.
+  popup. Its keys lose the `Ctrl-\` prefix: `q` quits, `s` and `d` answer the
+  question. Typing into the popup is no longer held; close it with `Esc` to
+  type blind.
 ```
+
+In the same `## Unreleased` section, the entry "A client whose network dies reconnects by itself" ends "`Ctrl-\ q` is how you stop it." — that key is gone: make it "`q` in the status popup is how you stop it."; and its "The box on screen says how long" becomes "The status popup says how long". Older releases' entries that name `Ctrl-\ q`, `s` and `d` stay; they are history.
 
 - [ ] **Step 2: `README.md`**
 
@@ -4761,7 +5092,7 @@ is also appended to `~/.local/state/oxutrm/client.log` (or under
 
 - [ ] **Step 3: Check, gate and commit**
 
-Run `grep -n 'no standby path\|announced once\|box on screen' README.md CHANGES.md` — the only hits left should be the older `CHANGES.md` entries that describe what earlier versions did (those stay; they are history). Run the gate; expected exit 0.
+Run `grep -n 'no standby path\|announced once\|box on screen\|Ctrl-\\ [qsd]' README.md CHANGES.md` — the only hits left should be the older `CHANGES.md` entries that describe what earlier versions did (those stay; they are history). Run the gate; expected exit 0.
 
 ```bash
 git add CHANGES.md README.md
@@ -4784,14 +5115,14 @@ EOF
 | §1.1 linger ~3 s unless a key | 4, 6 |
 | §1.1 quality facts | 3, 5 |
 | §1.1 log in memory and file, 2 MiB | 2, 7 |
-| §1.2 greyed `c config`, `s sessions` | 5 (deviation 9) |
+| §1.2 greyed `c config`, `s sessions` | 5 (in every key bar; deviation 5 for `Confirming`) |
 | §2 units and constraints (no timer, deny, C1, escaping) | 1–5, Global Constraints |
-| §3.1 states | 4 |
-| §3.2 keys | 4 (deviations 1–3) |
+| §3.1 states, dismissed outage, `Confirming` forced open | 4 (transition table), 6, 8 |
+| §3.2 keys: every key to the shown popup, Esc ambiguity, closing during an outage, held input | 4, 5 (key bar), 6 (`route_keys`, held path), 8 (e2e) — decided with the user 2026-10-04 |
 | §4 quality ring, segments, standby block, identity | 3, 5, 6, 7 |
 | §5.1 recording and event table | 2, 6 (`link`), 7 (the rest) |
 | §5.2 retired screen writes | 7 |
-| §5.3 the file | 2 (deviations 4–5), 7 (`connect`) |
+| §5.3 the file, UTC times | 2 (deviation 1), 7 (`connect`) |
 | §6 rendering, repaint on change, resize, notice.rs removed | 1, 5, 6 |
 | §7 testing | each task; 8 for session level |
 | §8 changelog | 9 |
