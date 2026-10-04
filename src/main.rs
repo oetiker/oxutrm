@@ -44,6 +44,10 @@ mod roam;
 mod serve;
 mod session;
 mod standby;
+// Routes the keyboard and drives the popup from Task 6, which removes this
+// attribute.
+#[cfg_attr(not(test), allow(dead_code))]
+mod ui;
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::BorrowedFd;
