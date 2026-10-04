@@ -31,6 +31,7 @@ pub mod guard;
 pub mod overlay;
 pub mod popup;
 pub mod renderer;
+pub mod splash;
 pub mod status;
 
 pub use color::down_convert;
