@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget as _, Wrap};
 
 use crate::overlay::{Overlay, overlay_from_buffer};
+use crate::popup::{summarised, wrapped_row_count};
 
 /// Below this the box is dropped for a single line: a box that does not fit is
 /// worse than a line that does.
@@ -33,15 +34,6 @@ pub struct Notice {
     /// `(keys, what it does)`, rendered as a two-column list.
     pub keys: Vec<(String, String)>,
 }
-
-/// How much of the last failure's reason is shown.
-///
-/// The reason is an error chain built partly from a remote's stderr, so its
-/// length is not ours to choose. The box wraps and is clamped to the screen,
-/// so a long one cannot overflow anything -- but it can fill the screen, and a
-/// box that covers the terminal it is apologising for is not an improvement.
-/// The useful part of an ssh failure is at the front.
-const REASON_SHOWN: usize = 120;
 
 /// The notice shown while the client is rebuilding the link itself.
 ///
@@ -76,67 +68,6 @@ pub fn recovering_notice(
             "closes oxutrm here; it does not touch the host".to_string(),
         )],
     }
-}
-
-/// One line of `reason`, safe to put in a cell and short enough to read.
-///
-/// The first line only: ssh says why it failed first and pads afterwards, so a
-/// multi-line reason's later lines are the least useful part of it. Cut on a
-/// character boundary rather than a byte one -- a reason carries a remote's
-/// stderr, which can be anything at all.
-///
-/// Made legible BEFORE the cut, so the cap bounds what actually reaches the
-/// screen rather than what went into the escaping.
-fn summarised(reason: &str) -> String {
-    let line = legible(reason.lines().next().unwrap_or("").trim());
-    if line.chars().count() <= REASON_SHOWN {
-        return line;
-    }
-    let kept: String = line.chars().take(REASON_SHOWN).collect();
-    format!("{kept}...")
-}
-
-/// `line` with every control scalar shown rather than emitted.
-///
-/// **This string is a remote's stderr**, relayed through ssh and an error
-/// chain and handed to the renderer. Anything in it that a terminal acts on --
-/// C0 (0x00-0x1F and DEL), and C1 (U+0080-U+009F, of which U+009B is CSI and
-/// terminals in UTF-8 mode obey it) -- is untrusted input landing as a control
-/// sequence. What saved this before was incidental: ratatui's
-/// `Buffer::set_stringn` skips zero-width graphemes, so an ESC happened never
-/// to become a cell. That is a property of a third-party crate and not a
-/// decision anybody here made.
-///
-/// # Why a second escaper rather than the one that already exists
-///
-/// `linkstate::render_held` does this same job for held input, and it lives in
-/// the ROOT crate -- which DEPENDS on this one, so it cannot be called from
-/// here, and moving it across is restructuring rather than a fix. The
-/// alternative was to sanitise at the call site in the root crate, before the
-/// reason reaches [`recovering_notice`]. This is the better half of that
-/// trade: it leaves the escaping owned by the function that already owns
-/// "make this reason fit in the box", so no future caller of a public
-/// `recovering_notice` can reintroduce the hole by not knowing about it. The
-/// two escapers deliberately use the same vocabulary -- `^X`, `^?`, `<9B>` --
-/// so a user who has seen one recognises the other. `render_held` is not a
-/// drop-in either way: it takes bytes and applies the held-input cap, and this
-/// takes a `&str` and applies [`REASON_SHOWN`].
-fn legible(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    for ch in line.chars() {
-        match ch {
-            // Every C0 except the ones `lines()` and `trim()` have already
-            // removed, plus DEL.
-            '\u{0}'..='\u{1f}' => {
-                out.push('^');
-                out.push((ch as u8 + b'@') as char);
-            }
-            '\u{7f}' => out.push_str("^?"),
-            '\u{80}'..='\u{9f}' => out.push_str(&format!("<{:02X}>", ch as u32)),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 /// Lay a notice out for this screen, as cells ready to composite.
@@ -181,36 +112,6 @@ pub fn layout_notice(n: &Notice, size: TermSize) -> Overlay {
         .render(inner, &mut buf);
 
     overlay_from_buffer(&buf, (size.rows - rows) / 2, (size.cols - cols) / 2)
-}
-
-/// How many rows `lines` needs when wrapped at `width`, capped at `height`.
-///
-/// `Paragraph::line_count` would answer this directly, but sits behind
-/// ratatui's `unstable-rendered-line-info` feature, and enabling an
-/// unstable feature to size a box is a worse trade than this: render the
-/// same wrap into a scratch buffer and read back the last row it touched.
-/// That is slightly blunt, but by construction it cannot disagree with
-/// ratatui's own wrapping -- it *is* ratatui's own wrapping.
-///
-/// A run of untouched rows at the bottom unambiguously means "wrapping
-/// stopped here": `notice_lines` never puts a blank separator line last, so
-/// any blank row this function could see is sandwiched between two rows
-/// that do have content, and is counted along with them.
-fn wrapped_row_count(lines: &[Line<'static>], width: u16, height: u16) -> u16 {
-    if width == 0 || height == 0 {
-        return 0;
-    }
-
-    let area = Rect::new(0, 0, width, height);
-    let mut buf = Buffer::empty(area);
-    Paragraph::new(lines.to_vec())
-        .wrap(Wrap { trim: false })
-        .render(area, &mut buf);
-
-    (0..height)
-        .rev()
-        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
-        .map_or(0, |y| y + 1)
 }
 
 /// Headline, blank, body, blank, keys -- with the blanks dropped when the part
@@ -266,6 +167,7 @@ fn single_line(n: &Notice, size: TermSize) -> Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::popup::REASON_SHOWN;
 
     /// The words the client actually ships, and deliberately so. This fixture
     /// used to say "close oxutrm here; the shell keeps running" -- the exact

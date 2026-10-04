@@ -32,3 +32,8 @@ ratatui.workspace = true
 # glyph's second column with a SPACE; oxutrm marks it with `Attrs::WIDE_CONT`
 # and no text. Converting between them means measuring the width ourselves.
 unicode-width.workspace = true
+
+[dev-dependencies]
+# Snapshots of the status popup's layout, as `oxutrm-term`'s golden tests do
+# for the emulator: a layout regression shows up as a readable text diff.
+insta.workspace = true

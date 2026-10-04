@@ -1,0 +1,14 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_popup(&view(), TermSize { cols: 40, rows: 12 }))"
+---
+╭ oxutrm · bastion ────────────────╮
+│ ● SILENT                         │
+│ silent for 6s                    │
+│ rtt — · min 30 / avg 35 / max 52 │
+│ ms                               │
+│ standby: searching…              │
+│ rtt ▄▆ █                         │
+│ event-30                         │
+│ q quit  c config                 │
+╰──────────────────────────────────╯
