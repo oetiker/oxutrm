@@ -38,12 +38,12 @@
   ssh, the same handshake a first connect runs. The first attempt goes out
   immediately, because the twenty seconds have already been waited; each
   failure after that backs off, two seconds, then four, then eight, and every
-  eight from then on. It never gives up on its own; `Ctrl-\ q` is how you stop
-  it.
+  eight from then on. It never gives up on its own; `q` in the status popup is
+  how you stop it.
 
   The old link is held throughout, so whichever path comes back first wins: a
   frame arriving on it ends the rebuild, and a rebuild landing first swaps the
-  transport under a session that never noticed. The box on screen says how long
+  transport under a session that never noticed. The status popup says how long
   the host has been quiet, which attempt is next, when it is due, and why the
   last one failed. If the far end answers that the session is gone, that is an
   answer rather than an outage: oxutrm says so and stops. An attempt that gets
@@ -98,6 +98,33 @@
   split-tunnel VPN kept its session when the VPN was dropped, moving to the
   standby without ssh. The stall was not timed.
 
+- **A status popup shows what the connection is doing.** `Ctrl-\` opens it
+  while the link is healthy; pressed twice within half a second it sends one
+  literal `Ctrl-\` to the remote program instead. It also opens by itself two
+  seconds into an outage, and when the link comes back it says how — `● LIVE
+  again via IPv4 punched · outage 4.2 s` — for three seconds before closing,
+  unless you pressed a key in it. It shows the round-trip time now and its
+  minimum, average and maximum over the last minute, loss, throughput, an RTT
+  sparkline with gaps where the link was down, which link of the session this
+  is, the standby and what it is doing, what the rebuild loop is trying and
+  why its last attempt failed, and the last things oxutrm did. While it is
+  shown it takes every key: `Esc` or `Ctrl-\` closes it, `q` quits, and
+  nothing else you type goes anywhere. You can close it during an outage too;
+  it then stays closed until that outage ends, what you type meanwhile is held
+  as before, and when the host answers again the popup opens to ask about it:
+  `s` sends what you typed, `d` drops it. `c config` and `s sessions` are shown
+  dimmed; they come later.
+
+- **What oxutrm does to keep a session alive is logged.** Outages and their
+  end, standby searches, finds and losses, probes and failovers, rebuild
+  attempts and why they failed, held input sent or dropped: each is appended
+  to `$XDG_STATE_HOME/oxutrm/client.log`, or `~/.local/state/oxutrm/client.log`,
+  one line each, with the time in UTC, the ssh target and the start of the
+  session id. Repeats are folded into one line. The file is rotated to
+  `client.log.1` before it passes 1 MiB, so the two never hold more than
+  2 MiB, and two clients sharing it cannot interleave inside a line. If it
+  cannot be written, the popup says so once and the session carries on.
+
 ### Compatibility
 
 - **Both ends have to be upgraded together.** The client now runs
@@ -118,6 +145,19 @@
   an older peer on the other end of the exchange is unaffected and there is no
   `PROTO_VERSION` bump. Three signals, `StandbyRequest`, `Probe` and
   `ProbeAck`, are what the standby link above sends over the wire.
+
+- **Nothing is written over the session any more.** The `standby: …`, `no
+  standby path`, `switched to standby …` and `path migrated …` lines are gone:
+  they were wiped by the repaint that followed them and survived only in the
+  scrollback. Their content is in the popup and the log. The one line still
+  printed is the connect banner, before the session takes over the screen.
+
+- **The box that appeared during an outage is the popup now.** What it said —
+  how long the host has been silent, what was typed blind, the rebuild attempt
+  and its countdown, the question about held input — is a section of the
+  popup. Its keys lose the `Ctrl-\` prefix: `q` quits, `s` and `d` answer the
+  question. Typing into the popup is no longer held; close it with `Esc` to
+  type blind.
 
 ### Fixed
 
