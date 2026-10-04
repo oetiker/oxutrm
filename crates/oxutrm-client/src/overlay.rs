@@ -1,8 +1,8 @@
 //! Layer 1: local UI, converted into cells the renderer can composite.
 //!
 //! The client paints two layers. Layer 0 is the remote framebuffer, which the
-//! host owns. Layer 1 is this: a notice, and later a session picker or a config
-//! screen, drawn locally and never sent anywhere. It is composited into the
+//! host owns. Layer 1 is this: the status popup, and later a session picker or
+//! a config screen, drawn locally and never sent anywhere. It is composited into the
 //! renderer's grid *before* the diff, so drawing it and removing it are both
 //! ordinary diffs.
 //!

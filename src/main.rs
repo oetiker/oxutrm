@@ -21,6 +21,7 @@
 // every one of them must come off. An allow that cannot be removed then is a
 // piece of code with no caller on either side, which is worth knowing.
 mod accept;
+mod activity;
 mod attach_exchange;
 mod candidates;
 mod choose;
@@ -32,11 +33,14 @@ mod link;
 mod linkstate;
 mod listener;
 mod loopback;
+mod quality;
 mod rebuild;
 mod roam;
 mod serve;
 mod session;
 mod standby;
+mod ui;
+mod view;
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::BorrowedFd;

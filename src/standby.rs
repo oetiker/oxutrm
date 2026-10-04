@@ -9,8 +9,9 @@
 //! ends (spec §3.4), which is the price of keeping its path warm.
 
 // This runs while a client session owns the screen: nothing here may print,
-// or it lands raw on the painted raw-mode terminal. A search's
-// failure reason is kept on `last_failure`, not printed.
+// or it lands raw on the painted raw-mode terminal. What happens here is
+// recorded by the session in its activity log, and a search's failure reason
+// is kept on `last_failure` for the popup.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
 use std::net::SocketAddr;
@@ -48,10 +49,9 @@ pub(crate) enum StandbyEvent {
         search: u64,
         e: Box<Established>,
     },
-    /// The search failed. The user is still told only that there is no
-    /// standby (spec §3.7), and the next search asks again anyway -- but the
-    /// reason is kept on [`Standby::last_failure`] for the coming status
-    /// popup, rather than thrown away.
+    /// The search failed, and the next search asks again anyway. The reason
+    /// is recorded in the activity log by the session, and kept on
+    /// [`Standby::last_failure`] for the popup's standby block.
     NotFound {
         search: u64,
         reason: String,
@@ -85,7 +85,8 @@ pub(crate) struct Standby {
     /// loopback, where every candidate is the primary's own path, can admit
     /// them.
     pub(crate) admit_for: fn(SocketAddr) -> Option<RemoteFilter>,
-    link: Option<(Link, PathDescription)>,
+    /// The standby, as its search established it.
+    link: Option<Established>,
     searching: bool,
     /// The number of the search whose result is still wanted. Moved on by
     /// every search started and by every change of primary, so a result
@@ -96,12 +97,8 @@ pub(crate) struct Standby {
     probe: ProbeState,
     probing: bool,
     nonce: u64,
-    /// Whether "no standby path" has been said for the current dry spell, so
-    /// it is said once, not after every failed search.
-    told_none: bool,
-    /// Why the last search failed, for the coming status popup. Cleared the
-    /// moment a search succeeds; never printed (spec §3.7 says only "no
-    /// standby path").
+    /// Why the last search failed, for the popup's standby block. Cleared the
+    /// moment a search succeeds; never printed.
     last_failure: Option<String>,
 }
 
@@ -118,7 +115,6 @@ impl Standby {
             probe: ProbeState::Idle,
             probing: false,
             nonce: 0,
-            told_none: false,
             last_failure: None,
         }
     }
@@ -128,24 +124,38 @@ impl Standby {
         self.link.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn next_search(&self) -> Instant {
         self.next_search
     }
 
-    /// Why the last search failed, kept for the status popup.
-    ///
-    /// Wired by the status popup (sub-project B, Ctrl-\ UI); until then
-    /// nothing outside tests reads it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Why the last search failed, for the popup's standby block.
     pub(crate) fn last_failure(&self) -> Option<&str> {
         self.last_failure.as_deref()
+    }
+
+    /// The standby's path, while there is one.
+    pub(crate) fn path(&self) -> Option<&PathDescription> {
+        self.link.as_ref().map(|e| &e.path)
+    }
+
+    /// quinn's round-trip estimate on the standby's own connection.
+    pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
+        self.link.as_ref().map(|e| e.link.sink.connection().rtt())
+    }
+
+    pub(crate) fn probe(&self) -> ProbeState {
+        self.probe
+    }
+
+    /// Whether a search is running now.
+    pub(crate) fn searching(&self) -> bool {
+        self.searching
     }
 
     /// The standby's connection, for the loop's `closed()` arm and for
     /// probing.
     pub(crate) fn connection(&self) -> Option<quinn::Connection> {
-        self.link.as_ref().map(|(l, _)| l.sink.connection().clone())
+        self.link.as_ref().map(|e| e.link.sink.connection().clone())
     }
 
     /// One decision per lap. `phase` is the lap's own phase;
@@ -208,13 +218,13 @@ impl Standby {
         }
         self.searching = false;
         self.failures = 0;
-        self.told_none = false;
         self.last_failure = None;
-        self.link = Some((e.link, e.path));
+        self.link = Some(e);
         true
     }
 
-    /// A search finished without one. Returns whether to tell the user.
+    /// A search finished without one. Returns whether the result was for the
+    /// search still wanted -- the one worth recording.
     ///
     /// A stale search changes nothing, `reason` included: it most likely
     /// failed because the primary it ran over was closed under it, which says
@@ -226,30 +236,29 @@ impl Standby {
         self.searching = false;
         self.last_failure = Some(reason);
         self.backoff(now);
-        self.dry_spell_news()
+        true
     }
 
-    /// Whatever a probe found. A result for a probe whose outage already
-    /// ended is dropped: `step` reset `probe` to `Idle`, and `Idle` is not
-    /// `Pending`.
-    pub(crate) fn probed(&mut self, answered: bool, now: Instant) {
+    /// Whatever a probe found. Returns whether it was for the probe in
+    /// flight: a result whose outage already ended is dropped, because
+    /// `step` reset `probe` to `Idle`, and `Idle` is not `Pending`.
+    pub(crate) fn probed(&mut self, answered: bool, now: Instant) -> bool {
         self.probing = false;
-        if let ProbeState::Pending { sent } = self.probe {
-            self.probe = if answered {
-                ProbeState::Answered { sent }
-            } else {
-                ProbeState::Failed { at: now }
-            };
-        }
+        let ProbeState::Pending { sent } = self.probe else {
+            return false;
+        };
+        self.probe = if answered {
+            ProbeState::Answered { sent }
+        } else {
+            ProbeState::Failed { at: now }
+        };
+        true
     }
 
-    /// The standby's connection closed on its own. Returns whether to tell
-    /// the user (spec §3.7: the standby is announced when it is lost).
-    ///
-    /// Not when the shell exited or another client took the session over:
-    /// the session is ending, and the primary's close is about to say why.
-    /// Those leave the dry spell unannounced, so a session that does go on
-    /// still hears of it from the next failed search.
+    /// The standby's connection closed on its own. Returns whether that is
+    /// worth recording: not when the shell exited or another client took the
+    /// session over -- the session is ending, and the primary's close is
+    /// about to say why.
     pub(crate) fn lost(&mut self, now: Instant, reason: &quinn::ConnectionError) -> bool {
         self.link = None;
         self.probe = ProbeState::Idle;
@@ -259,7 +268,7 @@ impl Standby {
             quinn::ConnectionError::ApplicationClosed(c)
                 if c.reason.as_ref() == SHELL_EXITED || c.reason.as_ref() == TAKEN_OVER
         );
-        !ending && self.dry_spell_news()
+        !ending
     }
 
     /// The route to the host moved: an interface that was absent may now be
@@ -272,7 +281,7 @@ impl Standby {
     /// Hand the standby over for a failover. After it, a fresh search is due
     /// once the new primary has settled, and a search still running over the
     /// old primary is disowned.
-    pub(crate) fn take_for_failover(&mut self, now: Instant) -> Option<(Link, PathDescription)> {
+    pub(crate) fn take_for_failover(&mut self, now: Instant) -> Option<Established> {
         self.probe = ProbeState::Idle;
         self.failures = 0;
         self.next_search = now + STANDBY_DELAY;
@@ -286,8 +295,8 @@ impl Standby {
     /// hears the host's close, and its socket, tasks and keep-alive timer
     /// would outlive the session's interest in it for good.
     pub(crate) fn forget(&mut self, now: Instant) {
-        if let Some((l, _)) = self.link.take() {
-            close(&l, REBUILT);
+        if let Some(e) = self.link.take() {
+            close(&e.link, REBUILT);
         }
         self.probe = ProbeState::Idle;
         self.next_search = now + STANDBY_DELAY;
@@ -304,11 +313,6 @@ impl Standby {
     fn backoff(&mut self, now: Instant) {
         self.next_search = now + standby_backoff(self.failures);
         self.failures = self.failures.saturating_add(1);
-    }
-
-    /// True the first time in a dry spell, false after.
-    fn dry_spell_news(&mut self) -> bool {
-        !std::mem::replace(&mut self.told_none, true)
     }
 }
 
@@ -420,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_search_is_reported_once_and_backs_off() {
+    fn every_current_failed_search_counts_and_backs_off() {
         let t0 = Instant::now();
         let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
         let first = search_at(&mut s, t0 + STANDBY_DELAY);
@@ -428,22 +432,35 @@ mod tests {
         let t1 = t0 + STANDBY_DELAY;
         assert!(
             s.not_found(first, t1, "no path".to_string()),
-            "the first failure was not reported"
+            "the first failure did not count"
         );
         assert_eq!(s.next_search(), t1 + standby_backoff(0));
         let second = search_at(&mut s, t1 + standby_backoff(0));
 
         let t2 = t1 + standby_backoff(0);
         assert!(
-            !s.not_found(second, t2, "no path".to_string()),
-            "the same dry spell was reported twice"
+            s.not_found(second, t2, "no path".to_string()),
+            "a second current failure did not count"
         );
         assert_eq!(s.next_search(), t2 + standby_backoff(1));
     }
 
-    /// A `NotFound` with a reason is kept for the status popup (not yet
-    /// wired), not told to the user directly (spec §3.7 still says only "no
-    /// standby path").
+    #[tokio::test]
+    async fn the_popup_can_read_what_the_standby_is_doing() {
+        let t0 = Instant::now();
+        let mut fresh = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        assert!(fresh.path().is_none() && fresh.rtt().is_none() && !fresh.searching());
+        search_at(&mut fresh, t0 + STANDBY_DELAY);
+        assert!(fresh.searching());
+
+        let (s, _host) = with_a_standby(t0).await;
+        assert_eq!(s.path().map(|p| p.rtt_ms), Some(38));
+        assert!(s.rtt().is_some());
+        assert_eq!(s.probe(), ProbeState::Idle);
+        assert!(!s.searching());
+    }
+
+    /// A `NotFound` with a reason is kept for the popup's standby block.
     #[test]
     fn a_not_found_with_a_reason_sets_last_failure() {
         let t0 = Instant::now();
@@ -469,7 +486,7 @@ mod tests {
     }
 
     /// A later `Found` is good news, and a stale reason from the dry spell
-    /// before it must not linger in the box.
+    /// before it must not linger in the popup.
     #[tokio::test]
     async fn a_later_found_clears_last_failure() {
         let t0 = Instant::now();
@@ -655,17 +672,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn losing_the_standby_is_reported_once() {
+    async fn losing_the_standby_counts_and_so_does_the_next_failure() {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
         assert!(
             s.lost(t0, &quinn::ConnectionError::TimedOut),
-            "losing the standby went unsaid"
+            "losing the standby went unrecorded"
         );
         let search = search_at(&mut s, t0 + standby_backoff(0));
         assert!(
-            !s.not_found(search, t0 + standby_backoff(0), "no path".to_string()),
-            "the dry spell that losing it began was reported twice"
+            s.not_found(search, t0 + standby_backoff(0), "no path".to_string()),
+            "the failure after the loss did not count"
+        );
+    }
+
+    /// `probed` says whether the result was for the probe in flight, which
+    /// is what the session records.
+    #[tokio::test]
+    async fn a_probe_result_after_its_outage_ended_does_not_count() {
+        let t0 = Instant::now();
+        let (mut s, _host) = with_a_standby(t0).await;
+        assert!(matches!(
+            s.step(silent(t0), t0, false),
+            StandbyAction::Probe { .. }
+        ));
+        s.step(Phase::Live, t0 + Duration::from_millis(100), false);
+        assert!(
+            !s.probed(true, t0 + Duration::from_millis(200)),
+            "a stale answer counted"
+        );
+
+        assert!(matches!(
+            s.step(silent(t0), t0 + Duration::from_secs(1), false),
+            StandbyAction::Probe { .. }
+        ));
+        assert!(
+            s.probed(true, t0 + Duration::from_secs(1)),
+            "a current answer did not count"
         );
     }
 
@@ -695,7 +738,7 @@ mod tests {
 
     /// A search still running when a rebuild lands fails as soon as the old
     /// primary is closed under it. That failure is about a link the session
-    /// no longer has: it must neither say "no standby path" nor push the next
+    /// no longer has: it must neither be recorded nor push the next
     /// search out by a backoff.
     #[test]
     fn a_search_over_a_replaced_primary_changes_nothing() {
@@ -708,7 +751,7 @@ mod tests {
 
         assert!(
             !s.not_found(stale, t1, "this must not be kept".to_string()),
-            "a search over the replaced primary announced a dry spell"
+            "a search over the replaced primary counted as current"
         );
         assert_eq!(
             s.next_search(),
@@ -746,10 +789,10 @@ mod tests {
     }
 
     /// A standby closed because the session is ending -- its shell exited,
-    /// or another client took it over -- is not news: the primary's close is
-    /// about to say why. Nor does it use up the dry spell's one announcement.
+    /// or another client took it over -- is not worth recording: the
+    /// primary's close is about to say why.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_standby_closed_by_the_session_ending_goes_unannounced() {
+    async fn a_standby_closed_by_the_session_ending_goes_unrecorded() {
         for phrase in [TAKEN_OVER, SHELL_EXITED] {
             let t0 = Instant::now();
             let (mut s, _host) = with_a_standby(t0).await;
@@ -757,13 +800,13 @@ mod tests {
 
             assert!(
                 !s.lost(t0, &reason),
-                "announced a standby closed as {:?}",
+                "recorded a standby closed as {:?}",
                 String::from_utf8_lossy(phrase)
             );
             let search = search_at(&mut s, t0 + standby_backoff(0));
             assert!(
                 s.not_found(search, t0 + standby_backoff(0), "no path".to_string()),
-                "the dry spell went unannounced after a close as {:?}",
+                "a current failure after the close went unrecorded (closed as {:?})",
                 String::from_utf8_lossy(phrase)
             );
         }

@@ -237,15 +237,61 @@ impl Loopback {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
+pub(crate) mod fixtures {
     use alacritty_terminal::Term;
     use alacritty_terminal::grid::Dimensions as _;
     use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::term::Config;
     use alacritty_terminal::vte::ansi::Processor;
+    use oxutrm_proto::TermSize;
+
+    /// Replay the bytes the renderer emitted through a real emulator, and read
+    /// back what a terminal would be showing.
+    ///
+    /// This is the end-to-end assertion: not "the client's state matches the
+    /// host's" — which the sync tests already prove — but "the ANSI we
+    /// actually wrote to the terminal paints the screen the host meant".
+    pub(crate) fn replay(ansi: &[u8], size: TermSize) -> Vec<String> {
+        struct Dims(TermSize);
+        impl alacritty_terminal::grid::Dimensions for Dims {
+            fn total_lines(&self) -> usize {
+                self.0.rows as usize
+            }
+            fn screen_lines(&self) -> usize {
+                self.0.rows as usize
+            }
+            fn columns(&self) -> usize {
+                self.0.cols as usize
+            }
+        }
+
+        let dims = Dims(size);
+        let mut term = Term::new(
+            Config::default(),
+            &dims,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, ansi);
+
+        (0..term.screen_lines())
+            .map(|r| {
+                (0..term.columns())
+                    .map(|c| term.grid()[Point::new(Line(r as i32), Column(c))].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use super::fixtures::replay;
 
     fn size() -> TermSize {
         TermSize { cols: 40, rows: 10 }
@@ -313,46 +359,6 @@ mod tests {
             .join("\n")
             .trim_end()
             .to_owned()
-    }
-
-    /// Replay the bytes the renderer emitted through a real emulator, and read
-    /// back what a terminal would be showing.
-    ///
-    /// This is the end-to-end assertion: not "the client's state matches the
-    /// host's" — which the sync tests already prove — but "the ANSI we
-    /// actually wrote to the terminal paints the screen the host meant".
-    fn replay(ansi: &[u8], size: TermSize) -> Vec<String> {
-        struct Dims(TermSize);
-        impl alacritty_terminal::grid::Dimensions for Dims {
-            fn total_lines(&self) -> usize {
-                self.0.rows as usize
-            }
-            fn screen_lines(&self) -> usize {
-                self.0.rows as usize
-            }
-            fn columns(&self) -> usize {
-                self.0.cols as usize
-            }
-        }
-
-        let dims = Dims(size);
-        let mut term = Term::new(
-            Config::default(),
-            &dims,
-            alacritty_terminal::event::VoidListener,
-        );
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, ansi);
-
-        (0..term.screen_lines())
-            .map(|r| {
-                (0..term.columns())
-                    .map(|c| term.grid()[Point::new(Line(r as i32), Column(c))].c)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
-            })
-            .collect()
     }
 
     #[test]

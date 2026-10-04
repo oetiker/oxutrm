@@ -182,7 +182,7 @@ impl Renderer {
 
     /// The screen with layer 1 stamped on top, clipped to the screen.
     ///
-    /// Clipping rather than asserting: a window can shrink between a notice
+    /// Clipping rather than asserting: a window can shrink between a popup
     /// being laid out and being painted, and a resize is not a reason to panic
     /// in the middle of a repaint.
     fn composite<'a>(&self, s: &'a ScreenState) -> std::borrow::Cow<'a, [Cell]> {
@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     /// An overlay wider or taller than the screen must clip, not panic and not
-    /// write past the row. A window can shrink between the notice being built
+    /// write past the row. A window can shrink between the popup being built
     /// and being painted.
     #[test]
     fn an_overlay_larger_than_the_screen_is_clipped() {

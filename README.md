@@ -96,7 +96,7 @@ eight, and every eight for as long as you leave it running. The old link is
 held throughout, so whichever comes back first wins.
 Until the askpass work lands, those attempts run `ssh -o BatchMode=yes`: a key
 that needs a passphrase typed cannot be unlocked from under a session that owns
-the screen, so the attempt fails cleanly and the box on screen says why.
+the screen, so the attempt fails cleanly and the status popup says why.
 
 While a link is up, the client also looks for a **standby**: a second
 connection to the same session over whatever path the kernel would route
@@ -108,20 +108,23 @@ client fails over to it in about three seconds, with no ssh — never because
 the standby is faster, only because the primary has stopped answering, and
 there is no switching back once it has.
 
-Finding, losing or switching to a standby is announced once, written into the
-session and then scrolled past by the next repaint — so it turns up in the
-scrollback rather than staying on screen as a persistent status line:
+`Ctrl-\` opens a status popup on a healthy link, and an outage opens it by
+itself: the round-trip time and its range over the last minute, loss,
+throughput, which link of the session this is, the standby and what it is
+doing, what the rebuild is trying, and the last things oxutrm did. Two quick
+presses send one literal `Ctrl-\` to the remote program. Typing done while it
+was closed during an outage is held, and when the host answers the popup asks
+whether to send it (`s`) or drop it (`d`); keys pressed in the first half
+second after the question appears do nothing. Everything oxutrm does to keep
+the session alive is also appended to `~/.local/state/oxutrm/client.log` (or
+under `$XDG_STATE_HOME`), capped at 2 MiB with one rotation.
 
-    oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452  ·  standby: IPv4 punched, 38 ms
-    oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452  ·  no standby path
-    oxutrm  switched to standby (IPv4 punched)  ·  38 ms
-
-"no standby path" means the session has no fallback, and the next outage waits
-for the twenty-second rebuild above instead. On a machine with only one way
-out the client keeps looking all the same: the wait between searches grows
-from thirty seconds to five minutes, and a route change brings the next one
-forward. Each search is a full attach exchange with the host: that is why the
-session's attach number climbs on such a machine.
+A standby row that says "none" means the session has no fallback, and the next
+outage waits for the twenty-second rebuild above instead. On a machine with
+only one way out the client keeps looking all the same: the wait between
+searches grows from thirty seconds to five minutes, and a route change brings
+the next one forward. Each search is a full attach exchange with the host: that
+is why the session's attach number climbs on such a machine.
 
 `loopback` runs both halves in one process with no network in between: a shell
 on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.

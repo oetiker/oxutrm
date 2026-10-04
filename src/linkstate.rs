@@ -63,12 +63,6 @@ pub fn backoff(attempt: u32) -> Duration {
 /// client, so it has no heartbeat and its idle cost is unchanged.
 pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(5);
 
-/// `Ctrl-\`. A prefix rather than a bare key, and live only while a notice is
-/// showing: while the link is healthy every byte belongs to the host, which is
-/// what keeps oxutrm out of the escape-character collisions Mosh must live
-/// with.
-const PREFIX: u8 = 0x1c;
-
 /// How much blind typing is kept. Beyond this the buffer STOPS ACCEPTING; it
 /// does not drop the oldest bytes, because the oldest are the command and the
 /// newest are the newline, and discarding from the front is exactly how a
@@ -104,7 +98,7 @@ impl Phase {
     /// typed blind. Neither is `Live`. This is the predicate the failover
     /// decision (`failover_due`, below) and the route-follow decision
     /// (`session.rs`'s `follow_route`) share; other code that happens to
-    /// look similar, such as the notice box's rebuild check, may have its
+    /// look similar, such as the popup's key routing, may have its
     /// own reasons to draw the same line and is not implied by this doc.
     pub fn is_outage(&self) -> bool {
         matches!(self, Phase::Silent { .. } | Phase::Recovering { .. })
@@ -171,13 +165,6 @@ pub fn failover_due(phase: Phase, probe: ProbeState, now: Instant) -> bool {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Command {
-    Quit,
-    SendHeld,
-    DropHeld,
-}
-
 /// Where to cut `bytes` for display: at most `HELD_SHOWN` bytes, backed off
 /// so the cut never lands inside a multi-byte UTF-8 sequence. A UTF-8
 /// continuation byte matches `10xxxxxx`; stepping back while the byte right
@@ -193,7 +180,7 @@ fn held_cut(bytes: &[u8]) -> usize {
 
 /// Held input as something safe to put in a box.
 ///
-/// Control bytes become readable rather than being emitted: the notice is
+/// Control bytes become readable rather than being emitted: the popup is
 /// painted through the renderer, and a raw `\r` in a cell would be a control
 /// scalar the receiver's validation rejects. This covers both C0
 /// (0x00-0x1F, plus DEL) and C1 (U+0080-U+009F): U+009B is CSI, and
@@ -253,8 +240,6 @@ pub struct LinkState {
     last_sent: Instant,
     /// Typed while not `Live`, and not delivered to anyone yet.
     held: Vec<u8>,
-    /// The prefix arrived at the end of a read and its letter has not.
-    prefix_pending: bool,
 }
 
 impl LinkState {
@@ -265,7 +250,6 @@ impl LinkState {
             owed_since: None,
             last_sent: now,
             held: Vec::new(),
-            prefix_pending: false,
         }
     }
 
@@ -285,8 +269,8 @@ impl LinkState {
     ///
     /// `Phase::Recovering` does not carry its own `since`, unlike `Silent`:
     /// only a frame arriving leaves `Recovering`, and that same frame is what
-    /// updates this, so a caller building the notice for `Recovering` reads
-    /// the silence's start from here instead.
+    /// updates this, so the popup, reporting how long the host has been
+    /// quiet in `Recovering`, reads the silence's start from here instead.
     pub fn last_heard(&self) -> Instant {
         self.last_heard
     }
@@ -301,27 +285,11 @@ impl LinkState {
         // Coming back with something typed blind is a question, not a
         // resumption. Delivering it silently would replay it against a screen
         // that moved while the user could not watch.
-        let next = if self.held.is_empty() {
+        self.phase = if self.held.is_empty() {
             Phase::Live
         } else {
             Phase::Confirming
         };
-        // A `Ctrl-\` whose letter never came belongs to the box that was up
-        // when it was typed. Carrying it into a DIFFERENT box lets it eat the
-        // first byte typed there -- and if that byte is `s`, the `Confirming`
-        // box answers its own question and delivers typing nobody confirmed.
-        //
-        // "Different" is the operative word: `take_frames` now calls `heard`
-        // on every frame it applies, including frames that land between the
-        // prefix and its letter, which genuinely arrive in two separate
-        // reads. When `next` is the SAME phase as the one already showing --
-        // the box the prefix was typed into is still up -- the reasoning
-        // above does not apply, and clearing the prefix would make the box
-        // eat its own confirmation key instead.
-        if next != self.phase {
-            self.prefix_pending = false;
-        }
-        self.phase = next;
     }
 
     /// We sent something, so a reply is owed from here.
@@ -372,7 +340,7 @@ impl LinkState {
         // quiet session, so `last_heard` is arbitrarily old and the first lap
         // after a keystroke would read as a two-second outage. Worse, the
         // heartbeat owes a reply every `HEARTBEAT_IDLE`, which is longer than
-        // `SILENT_AFTER`, so every idle session would raise the notice every
+        // `SILENT_AFTER`, so every idle session would raise the popup every
         // five seconds for ever.
         match (reply_owed, self.owed_since) {
             (true, None) => self.owed_since = Some(now),
@@ -433,7 +401,7 @@ impl LinkState {
     ///
     /// The counter starts over as well. The failures that ran it up belong to
     /// the link that is gone; counting on across a successful rebuild would
-    /// have the box telling the user about an eleventh attempt over a
+    /// have the popup telling the user about an eleventh attempt over a
     /// connection built by the tenth.
     pub fn rebuilt(&mut self, now: Instant) {
         if let Phase::Recovering { .. } = self.phase {
@@ -464,82 +432,25 @@ impl LinkState {
     }
 
     /// Deliver the held input, emptying the buffer.
-    ///
-    /// A half-typed prefix goes with it: the box it was typed into is gone,
-    /// and a `Ctrl-\` left pending would consume the first byte of whatever
-    /// the user types at the shell next.
     pub fn take_held(&mut self) -> Vec<u8> {
         self.phase = Phase::Live;
-        self.prefix_pending = false;
         std::mem::take(&mut self.held)
     }
 
-    /// Discard the held input, half-typed prefix and all.
+    /// Discard the held input.
     pub fn drop_held(&mut self) {
         self.held.clear();
         self.phase = Phase::Live;
-        self.prefix_pending = false;
     }
 
-    /// Feed keystrokes typed while a notice is showing.
+    /// Keep keystrokes typed while the link is not answering.
     ///
-    /// Returns the command the user asked for, if any; everything else is
-    /// added to the held buffer. The prefix may arrive at the end of one read
-    /// and its letter at the start of the next, which is why the pending flag
-    /// outlives the call: a parser that only looked within one buffer would
-    /// swallow the command and hold two stray bytes.
-    ///
-    /// **Which keys are commands depends on the phase**, because it depends on
-    /// which box the user is reading. The gate lives here rather than in the
-    /// caller so that a letter that is not a command in this phase falls into
-    /// the ordinary "the user meant to type both bytes" arm below -- keeping
-    /// the two bytes, in order, along with whatever else was in the same read.
-    /// A caller that filtered the returned `Command` instead would lose the
-    /// rest of the read, because a command ends the loop.
-    pub fn hold_keys(&mut self, bytes: &[u8]) -> Option<Command> {
-        for &b in bytes.iter() {
-            if self.prefix_pending {
-                self.prefix_pending = false;
-                let command = match b {
-                    // Offered by every notice. Closing oxutrm is always
-                    // available and never touches the host.
-                    b'q' => Some(Command::Quit),
-                    // Offered ONLY by the `Confirming` box, because only that
-                    // box asks the question they answer. Under `Silent` an `s`
-                    // would throw the buffer at a link the user has just been
-                    // told is not answering -- and empty it, so the review
-                    // that is the whole point of holding never happens -- and
-                    // a `d` would discard it with no confirmation at all.
-                    b's' if self.phase == Phase::Confirming => Some(Command::SendHeld),
-                    b'd' if self.phase == Phase::Confirming => Some(Command::DropHeld),
-                    // Not a command here, so the user meant to type both bytes.
-                    _ => {
-                        self.push_held(PREFIX);
-                        self.push_held(b);
-                        None
-                    }
-                };
-                if command.is_some() {
-                    // Anything after a command in the same read belongs to
-                    // whatever the command leads to, not to the old buffer.
-                    return command;
-                }
-                continue;
-            }
-
-            if b == PREFIX {
-                self.prefix_pending = true;
-                continue;
-            }
-            self.push_held(b);
-        }
-        None
-    }
-
-    fn push_held(&mut self, b: u8) {
-        if self.held.len() < MAX_HELD {
-            self.held.push(b);
-        }
+    /// Only the holding: which keystrokes are commands is decided by the
+    /// popup (`ui.rs`) before anything reaches here. Beyond [`MAX_HELD`] the
+    /// buffer stops accepting -- see there for why it never drops the oldest.
+    pub fn hold_keys(&mut self, bytes: &[u8]) {
+        let room = MAX_HELD.saturating_sub(self.held.len());
+        self.held.extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 }
 
@@ -600,7 +511,7 @@ mod tests {
         assert_eq!(
             s.evaluate(t + Duration::from_millis(10_100), true),
             Phase::Live,
-            "the notice painted for a reply owed for 100 ms: the grace period \
+            "the popup opened for a reply owed for 100 ms: the grace period \
              is measuring the calm before the owing instead of the owing"
         );
     }
@@ -734,124 +645,8 @@ mod tests {
     fn keys_typed_offline_are_held_not_delivered() {
         let mut s = LinkState::new(t0());
 
-        assert_eq!(s.hold_keys(b"make test"), None);
+        s.hold_keys(b"make test");
         assert_eq!(s.held(), b"make test");
-    }
-
-    #[test]
-    fn the_prefix_and_a_letter_are_a_command_and_are_not_held() {
-        let mut s = LinkState::new(t0());
-
-        assert_eq!(s.hold_keys(b"ab\x1cq"), Some(Command::Quit));
-        assert_eq!(
-            s.held(),
-            b"ab",
-            "the prefix or the command leaked into the buffer"
-        );
-    }
-
-    #[test]
-    fn every_command_key_is_recognised() {
-        for (byte, want) in [
-            (b'q', Command::Quit),
-            (b's', Command::SendHeld),
-            (b'd', Command::DropHeld),
-        ] {
-            let t = t0();
-            let mut s = LinkState::new(t);
-            // `s` and `d` are offered by the `Confirming` box alone, so that
-            // is the phase they have to be asked in. Something held and the
-            // host answering is exactly what raises it.
-            s.hold_keys(b"x");
-            s.heard(t);
-            assert_eq!(s.phase_now(), Phase::Confirming);
-
-            assert_eq!(
-                s.hold_keys(&[0x1c, byte]),
-                Some(want),
-                "for {}",
-                byte as char
-            );
-        }
-    }
-
-    /// A box the user is reading offers `Ctrl-\ q` and, only when it is
-    /// asking about held input, `s` and `d`. Honouring `s` under `Silent`
-    /// throws the buffer at a link the client has just told the user is not
-    /// answering, and empties it, so the review that is the entire point of
-    /// holding never happens. `d` discards it with no confirmation at all.
-    #[test]
-    fn send_and_drop_are_not_commands_under_the_silent_notice() {
-        for &byte in b"sd" {
-            let t = t0();
-            let mut s = LinkState::new(t);
-            s.hold_keys(b"make test");
-            s.evaluate(t, true);
-            assert!(matches!(
-                s.evaluate(t + Duration::from_secs(3), true),
-                Phase::Silent { .. }
-            ));
-
-            assert_eq!(
-                s.hold_keys(&[0x1c, byte]),
-                None,
-                "`Ctrl-\\ {}` was honoured under a notice that does not offer it",
-                byte as char
-            );
-            assert_eq!(
-                s.held(),
-                [b"make test".as_slice(), &[0x1c, byte]].concat(),
-                "the keystroke was neither a command nor kept"
-            );
-        }
-    }
-
-    /// The one key every box offers. Closing oxutrm is always available, and
-    /// it never touches the host either way.
-    #[test]
-    fn quit_is_offered_in_every_phase() {
-        let t = t0();
-        for phase in ["live", "silent", "confirming"] {
-            let mut s = LinkState::new(t);
-            match phase {
-                "silent" => {
-                    s.evaluate(t, true);
-                    s.evaluate(t + Duration::from_secs(3), true);
-                }
-                "confirming" => {
-                    s.hold_keys(b"x");
-                    s.heard(t);
-                }
-                _ => {}
-            }
-            assert_eq!(
-                s.hold_keys(&[0x1c, b'q']),
-                Some(Command::Quit),
-                "under {phase}"
-            );
-        }
-    }
-
-    /// The prefix can be the last byte of one read and the letter the first of
-    /// the next. A parser that only looked within one buffer would drop the
-    /// command and hold two stray bytes.
-    #[test]
-    fn a_prefix_split_across_two_reads_still_commands() {
-        let mut s = LinkState::new(t0());
-
-        assert_eq!(s.hold_keys(b"x\x1c"), None);
-        assert_eq!(s.hold_keys(b"q"), Some(Command::Quit));
-        assert_eq!(s.held(), b"x");
-    }
-
-    /// An unknown letter after the prefix is ordinary typing, and both bytes
-    /// are kept: the user meant to type them.
-    #[test]
-    fn an_unknown_key_after_the_prefix_is_held_with_the_prefix() {
-        let mut s = LinkState::new(t0());
-
-        assert_eq!(s.hold_keys(b"\x1cz"), None);
-        assert_eq!(s.held(), b"\x1cz");
     }
 
     /// The cap stops accepting rather than dropping the oldest bytes: the
@@ -867,55 +662,6 @@ mod tests {
         assert_eq!(s.held().len(), MAX_HELD);
         assert_eq!(s.held()[0], b'a', "the oldest bytes were dropped");
         assert!(!s.held().contains(&b'z'), "accepted past the cap");
-    }
-
-    /// A `Ctrl-\` whose letter never came belongs to the box that was up when
-    /// it was typed. Left pending, it eats the first byte typed under the NEXT
-    /// box -- and the `Confirming` box's first key is the answer to a question
-    /// about somebody's shell.
-    #[test]
-    fn a_half_typed_prefix_does_not_survive_the_notice_it_was_typed_into() {
-        let t = t0();
-        let mut s = LinkState::new(t);
-        // Typed blind at a silent link, ending on a prefix with no letter.
-        s.hold_keys(b"make test\r\x1c");
-
-        // The host answers, and the box asks whether to deliver that.
-        s.heard(t);
-        assert_eq!(s.phase_now(), Phase::Confirming);
-
-        assert_eq!(
-            s.hold_keys(b"send it"),
-            None,
-            "a prefix left over from the previous box answered the new box's \
-             question, and delivered typing nobody confirmed"
-        );
-        assert!(
-            s.held().ends_with(b"send it"),
-            "the leading byte was eaten by a stale prefix: {:?}",
-            s.held()
-        );
-    }
-
-    /// The same, for the two ways the user ends a box by their own hand. The
-    /// bytes that follow go to the shell, so a stale prefix eats a keystroke
-    /// out of a command line.
-    #[test]
-    fn resolving_the_buffer_drops_a_half_typed_prefix_with_it() {
-        for resolve in [
-            (|s: &mut LinkState| {
-                s.take_held();
-            }) as fn(&mut LinkState),
-            |s: &mut LinkState| s.drop_held(),
-        ] {
-            let mut s = LinkState::new(t0());
-            s.hold_keys(b"x\x1c");
-
-            resolve(&mut s);
-
-            assert_eq!(s.hold_keys(b"day"), None, "a stale prefix commanded");
-            assert_eq!(s.held(), b"day", "the leading byte was eaten");
-        }
     }
 
     #[test]

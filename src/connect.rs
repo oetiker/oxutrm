@@ -14,6 +14,7 @@ use oxutrm_proto::{
 };
 use oxutrm_term::detect_caps;
 
+use crate::activity::{Activity, LogFile};
 use crate::candidates::{inbound_candidates, outbound_candidates};
 use crate::choose::{Decision, decide, pick};
 use crate::ladder::nominate;
@@ -21,6 +22,7 @@ use crate::link::Link;
 use crate::rebuild::Rebuild;
 use crate::session::ClientSession;
 use crate::standby::Standby;
+use crate::view::Identity;
 
 /// `oxutrm <ssh-target>`: L1 to L14.
 ///
@@ -198,7 +200,20 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
     let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
-        .context("preparing the client session")?;
+        .context("preparing the client session")?
+        .with_identity(Identity {
+            target: target.to_owned(),
+            session_id: established.session_id.clone(),
+            attach_id: established.attach_id,
+        })
+        // What oxutrm does to keep the session alive, in the popup and in
+        // client.log. A log file that cannot be opened costs one entry in
+        // the popup's log and nothing else.
+        .with_activity(Activity::with_file(
+            LogFile::open_default(),
+            target,
+            &established.session_id,
+        ));
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     if standby {
@@ -213,9 +228,9 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // RESUMES a session rather than always starting one, so which session it
     // picked is exactly the kind of thing §10.3 forbids doing silently. The
     // line above says which session, and whether it was already running; this
-    // one says how it is reached. After it,
-    // silence -- `announce` prints nothing when called again with the same
-    // path, and only a migration makes it speak.
+    // one says how it is reached. After it, nothing more is printed: the
+    // session owns the screen, and a migration, a failover or a rebuild is
+    // recorded in the activity log, which the popup shows.
     let mut stdout = std::io::stdout();
     session
         .announce(&established.path, &mut stdout)
@@ -231,7 +246,8 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     code
 }
 
-/// The one line a session opens with, before raw mode.
+/// The first of the two lines a session opens with, printed before raw mode.
+/// The connect banner (`status_line`) follows it once the path is known.
 ///
 /// A function rather than a `println!` inline, because `connect` cannot be
 /// reached from a test at all -- it wants a real ssh, a real far end and a

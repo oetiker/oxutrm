@@ -47,20 +47,22 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{
-    Notice, Renderer, layout_notice, recovering_notice, status_line, terminal_size_of,
-};
+use oxutrm_client::{PopupView, Renderer, layout_popup, status_line, terminal_size_of};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
+use crate::activity::{Activity, Kind};
 use crate::link::{Link, SendOutcome};
-use crate::linkstate::{Command, LinkState, Phase};
+use crate::linkstate::{LinkState, Phase};
+use crate::quality::{Quality, Reading};
 use crate::rebuild::{AttemptOutcome, Rebuild};
+use crate::ui::{Command, LinkChange, Mode, Ui};
+use crate::view::{Facts, Identity, StandbyFacts};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -75,20 +77,6 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// reached in practice. It exists so that a reader task which somehow outlives
 /// its connection cannot hold a person's terminal hostage.
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
-
-/// How often the numbers inside a notice already on the screen are allowed to
-/// change.
-///
-/// The counters in the `Silent` box move on nearly every lap: the client keeps
-/// retransmitting during an outage, so `sent_packets` climbs at the pacing
-/// rate, which is as often as 125 times a second. That is both expensive --
-/// each change is two `Paragraph` renders, a clone of the whole cell grid, a
-/// diff and a flush -- and useless, because a number churning that fast cannot
-/// be read, in a box whose entire job is to be read.
-///
-/// It bounds the REFRESH only. A change of phase is what the box exists to
-/// announce and is never held back; see [`ClientSession::notice_at`].
-const NOTICE_REFRESH: Duration = Duration::from_secs(1);
 
 /// How long the host keeps building frames for a client it has not heard from.
 ///
@@ -873,6 +861,18 @@ pub const SUPERSEDED: &[u8] = b"superseded by a newer standby";
 /// legible in a packet trace as [`TAKEN_OVER`] is.
 pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
 
+/// What `conn` reports right now, as plain values for [`Quality`].
+fn reading_of(conn: &quinn::Connection) -> Reading {
+    let stats = conn.stats();
+    Reading {
+        rtt: conn.rtt(),
+        sent: stats.path.sent_packets,
+        lost: stats.path.lost_packets,
+        tx_bytes: stats.udp_tx.bytes,
+        rx_bytes: stats.udp_rx.bytes,
+    }
+}
+
 /// Why the session ended, as an exit status.
 ///
 /// The shell's exit code has no field in the protocol and needs none: the host
@@ -913,26 +913,30 @@ pub struct ClientSession {
     link: Link,
     size: TermSize,
     last_send: Option<Instant>,
-    /// The path last announced, so a change can be spotted and silence can be
-    /// the default.
-    announced: Option<PathDescription>,
+    /// The primary's path: the one `announce` printed, until a migration, a
+    /// failover or a landed rebuild replaces it.
+    path: Option<PathDescription>,
     /// Whether the host is still answering, and what the user is told.
     link_state: LinkState,
-    /// Frames that arrived and could not be applied, for the notice.
+    /// Frames that arrived and could not be applied, for the popup.
     ///
     /// This used to be an `eprintln!`, which was a bug rather than a
     /// diagnostic: the client's stderr IS the terminal it is painting, so the
     /// message desynchronised the renderer's model and nothing repainted it on
     /// a quiet session.
     rejected_total: u64,
-    /// What is currently drawn as layer 1, so an unchanged notice does not
-    /// rebuild an overlay every tick.
-    shown: Option<Notice>,
-    /// The phase [`ClientSession::shown`] was built for, and when.
-    ///
-    /// Both halves are needed: the instant paces the refresh, and the phase is
-    /// what tells a refresh apart from a transition, which is never paced.
-    built: Option<(Phase, Instant)>,
+    /// What is drawn as layer 1, so an unchanged popup is not laid out again
+    /// every lap. Mirrors the overlay exactly: `None` means no overlay.
+    shown: Option<PopupView>,
+    /// The popup's state, and where keystrokes go.
+    ui: Ui,
+    /// A minute of the primary link's measurements, for the popup.
+    quality: Quality,
+    /// What oxutrm did to keep the session alive.
+    activity: Activity,
+    /// Which session this is. `None` where it was not reached over ssh --
+    /// the fixtures in this file's tests.
+    identity: Option<Identity>,
     /// The source address the link was working from, so a moved route can be
     /// spotted. Seeded in [`ClientSession::new`] from the path the connection
     /// came up over. See [`crate::roam`].
@@ -948,9 +952,9 @@ pub struct ClientSession {
     /// fixtures in this file's own tests, which build a link directly rather
     /// than over ssh.
     rebuild: Option<Rebuild>,
-    /// Why the last rebuild attempt failed, for the notice.
+    /// Why the last rebuild attempt failed, for the popup.
     ///
-    /// Spec §5.1: the box says what the last attempt produced, when it
+    /// Spec §5.1: the popup says what the last attempt produced, when it
     /// produced anything. Cleared when the phase leaves `Recovering`, so a
     /// later outage never opens by reporting an older one's reason.
     last_failure: Option<String>,
@@ -1008,11 +1012,14 @@ impl ClientSession {
             link,
             size,
             last_send: None,
-            announced: None,
+            path: None,
             link_state: LinkState::new(Instant::now()),
             rejected_total: 0,
             shown: None,
-            built: None,
+            ui: Ui::new(),
+            quality: Quality::new(Instant::now()),
+            activity: Activity::new(),
+            identity: None,
             route: crate::roam::RouteWatch::new(seed),
             probed_at: None,
             rebuild,
@@ -1028,14 +1035,28 @@ impl ClientSession {
         self
     }
 
+    /// Which session this is, for the popup's title and status rows.
+    pub(crate) fn with_identity(mut self, id: Identity) -> ClientSession {
+        self.identity = Some(id);
+        self
+    }
+
+    /// Keep the activity log in `activity` -- the one with the file, which
+    /// `connect` opens -- instead of the ring-only log `new` starts with.
+    pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
+        self.activity = activity;
+        self
+    }
+
     /// Tell the user what connection they got — once, and then be quiet.
     ///
     /// Spec §10.3: oxutrm never does anything clever silently. On connect this
     /// prints one line. Called again with the same path it prints **nothing**,
     /// which is what makes the silence a property rather than an accident.
-    /// Called again with a different path it announces the migration briefly,
-    /// because walking from Wi-Fi to mobile should be explained rather than
-    /// mysterious.
+    /// Called again with a different path it records the migration in the
+    /// activity log, where the popup shows it: walking from Wi-Fi to mobile
+    /// should be explained rather than mysterious, and the session owns the
+    /// screen by then.
     ///
     /// Rung 4 reads as a warning, and that is not decoration: a session inside
     /// the SSH connection cannot daemonize and cannot be reattached, so
@@ -1043,98 +1064,33 @@ impl ClientSession {
     /// exists to provide while looking like success.
     pub fn announce<W: Write>(&mut self, path: &PathDescription, out: &mut W) -> Result<bool> {
         let same = self
-            .announced
+            .path
             .as_ref()
             .is_some_and(|old| old.rung == path.rung && old.remote == path.remote);
         if same {
             return Ok(false);
         }
 
-        let line = match &self.announced {
-            None => status_line(path),
-            // A migration, not a fresh connect.
-            Some(_) => format!(
-                "oxutrm  path migrated \u{2192} {}  \u{b7}  {} ms",
-                oxutrm_client::rung_label(path),
-                path.rtt_ms
-            ),
-        };
-        writeln!(out, "{line}").context("announcing the path")?;
+        if self.path.is_some() {
+            // A migration, not a fresh connect. The session owns the screen
+            // by now, so it goes to the activity log, not the terminal.
+            self.activity.record(
+                Kind::Link,
+                &format!("path migrated \u{2192} {}", oxutrm_client::rung_label(path)),
+            );
+            self.path = Some(path.clone());
+            return Ok(true);
+        }
+
+        writeln!(out, "{}", status_line(path)).context("announcing the path")?;
         out.flush().context("flushing the terminal")?;
 
         // The line was written outside the renderer's model of the screen, so
         // that model is now wrong by one row. Anything less than a full
         // repaint would leave the terminal and the model disagreeing.
         self.renderer.invalidate();
-        self.announced = Some(path.clone());
+        self.path = Some(path.clone());
         Ok(true)
-    }
-
-    /// Say that a standby exists, or that none could be found or it was lost
-    /// (spec §3.7): the path line, with the standby added to it.
-    ///
-    /// The caller says it once per change; `Standby` keeps track of which
-    /// dry spell has already been reported.
-    fn announce_standby<W: Write>(
-        &mut self,
-        standby: Option<&PathDescription>,
-        out: &mut W,
-    ) -> Result<()> {
-        // The primary's own line, as `announce` printed it. A session that
-        // never announced its path (only the tests' fixtures) says just the
-        // name.
-        let primary = self
-            .announced
-            .as_ref()
-            .map_or_else(|| "oxutrm".to_string(), status_line);
-        let line = match standby {
-            Some(p) => format!(
-                "{primary}  \u{b7}  standby: {}, {} ms",
-                oxutrm_client::rung_label(p),
-                p.rtt_ms
-            ),
-            None => format!("{primary}  \u{b7}  no standby path"),
-        };
-        self.say_mid_session(&line, out)
-            .context("announcing the standby")
-    }
-
-    /// Say that the session now runs over the standby, and remember its path
-    /// as the one announced, so a later `announce` compares against it.
-    fn announce_failover<W: Write>(&mut self, path: &PathDescription, out: &mut W) -> Result<()> {
-        let line = format!(
-            "oxutrm  switched to standby ({})  \u{b7}  {} ms",
-            oxutrm_client::rung_label(path),
-            path.rtt_ms
-        );
-        self.say_mid_session(&line, out)
-            .context("announcing the failover")?;
-        self.announced = Some(path.clone());
-        Ok(())
-    }
-
-    /// One line written over a session in progress, and the screen painted
-    /// straight back.
-    ///
-    /// `\r\n` and not `writeln!`: the terminal is in raw mode, where a bare
-    /// `\n` moves down without returning, so the line after it would start
-    /// mid-row. And the repaint now rather than on the next frame: the line
-    /// was written outside the renderer's model, over whatever a full-screen
-    /// program had painted, and on a quiet session the next frame may be a
-    /// long way off.
-    ///
-    /// Said plainly, because it is easy to assume otherwise: a full repaint
-    /// clears the screen, so the line does not stay on it. It survives only
-    /// where writing it scrolled the terminal, into the scrollback. What this
-    /// guarantees is that the screen is never left corrupted by it.
-    fn say_mid_session<W: Write>(&mut self, line: &str, out: &mut W) -> Result<()> {
-        write!(out, "{line}\r\n").context("writing to the terminal")?;
-        self.renderer.invalidate();
-        self.renderer
-            .render(out, self.screen_rx.state())
-            .context("painting the screen again")?;
-        out.flush().context("flushing the terminal")?;
-        Ok(())
     }
 
     /// One turn: send `input`, apply what arrived, repaint if it changed.
@@ -1208,7 +1164,7 @@ impl ClientSession {
                     // heartbeat, repeating its own state number so there is
                     // nothing to apply -- and on an idle session it is the
                     // only proof of life there will ever be until somebody
-                    // types. Tying this to `Ok(true)` left the box saying
+                    // types. Tying this to `Ok(true)` left the popup saying
                     // nobody was answering up for ever on exactly the session
                     // that had just recovered, with nothing owed any more:
                     // `evaluate` returns early while `Silent` so the counter
@@ -1216,16 +1172,17 @@ impl ClientSession {
                     //
                     // `Err` is deliberately NOT heard. A frame the receiver
                     // could not apply leaves the screen frozen, and the
-                    // `Silent` box is the only place the rejected count is
+                    // popup is the only place the rejected count is
                     // reported -- going back to `Live` there would take the
                     // one explanation away and leave a stale screen with none.
                     //
                     // The loop's `Wake::Frame` arm is not the only path here:
                     // `try_recv` below scavenges frames on pacing, keyboard
                     // and resize laps, and a frame that landed on one of those
-                    // used to repaint the screen underneath a box still saying
-                    // nobody was answering. It also moves `last_heard`, which
-                    // is what the `silent for Ns` counter is built from.
+                    // used to repaint the screen underneath a popup still
+                    // saying nobody was answering. It also moves
+                    // `last_heard`, which is what the `silent for Ns`
+                    // counter is built from.
                     self.note_heard(Instant::now());
                 }
                 // See the host's copy of this arm: a silently swallowed
@@ -1235,7 +1192,7 @@ impl ClientSession {
                     // NOT `eprintln!`: the client's stderr is the terminal it
                     // is painting, so a message here desynchronises the
                     // renderer's model and nothing repaints it on a quiet
-                    // session. The count reaches the user through the notice.
+                    // session. The count reaches the user through the popup.
                     self.rejected_total = self.rejected_total.saturating_add(1);
                 }
             }
@@ -1302,7 +1259,7 @@ impl ClientSession {
         }
     }
 
-    /// For tests and for the notice.
+    /// For tests and for the popup.
     pub fn rejected_total(&self) -> u64 {
         self.rejected_total
     }
@@ -1337,32 +1294,52 @@ impl ClientSession {
 
     /// One read from the keyboard, sent wherever it belongs.
     ///
-    /// While a notice is showing the keyboard belongs to layer 1 -- and only
-    /// then. A healthy session passes every byte to the host untouched.
-    ///
-    /// Which keys are commands is decided in [`LinkState::hold_keys`], from
-    /// the phase, because it is decided by which box the user is reading:
-    /// `Ctrl-\ q` under all of them, `s` and `d` only under `Confirming`.
+    /// The popup decides ([`Ui::keys`]): while it is shown every key is its
+    /// own and nothing is sent or held; while it is closed, `Ctrl-\` opens
+    /// it and every other byte goes to the host untouched -- or, while the
+    /// link is down, is held for the question asked when it answers again.
     ///
     /// `Some(code)` means the user asked to close oxutrm, which is the one
     /// answer that ends the loop. A method rather than the body of the
-    /// `Wake::Keys` arm because holding someone's typing through an outage and
-    /// giving it back afterwards is the whole user-visible payload of this
-    /// phase, and the arm itself cannot be reached from a test without a real
-    /// terminal and a real two-second silence. The arm is left as a single
-    /// call to this, so what is tested is what ships.
+    /// `Wake::Keys` arm because the arm cannot be reached from a test without
+    /// a real terminal; the arm is a single call to this, so what is tested
+    /// is what ships.
     fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>> {
-        if self.shown.is_none() {
-            self.turn(keys, out)?;
-            return Ok(None);
+        self.route_keys_at(keys, Instant::now(), out)
+    }
+
+    /// [`ClientSession::route_keys`] for a read taken at `now`, so a test can
+    /// answer the question after [`crate::ui::ANSWER_GUARD`] without sleeping.
+    fn route_keys_at<W: Write>(
+        &mut self,
+        keys: &[u8],
+        now: Instant,
+        out: &mut W,
+    ) -> Result<Option<i32>> {
+        let phase = self.link_state.phase_now();
+        let routed = self.ui.keys(keys, phase, now);
+        if !routed.to_host.is_empty() {
+            self.turn(&routed.to_host, out)?;
         }
-        match self.link_state.hold_keys(keys) {
+        if !routed.to_hold.is_empty() {
+            self.link_state.hold_keys(&routed.to_hold);
+        }
+        match routed.command {
             Some(Command::Quit) => return Ok(Some(0)),
             Some(Command::SendHeld) => {
                 let held = self.link_state.take_held();
+                self.activity.record(
+                    Kind::Input,
+                    &format!("held input sent ({})", crate::view::byte_count(held.len())),
+                );
                 self.turn(&held, out)?;
             }
-            Some(Command::DropHeld) => self.link_state.drop_held(),
+            Some(Command::DropHeld) => {
+                let n = crate::view::byte_count(self.link_state.held().len());
+                self.link_state.drop_held();
+                self.activity
+                    .record(Kind::Input, &format!("held input dropped ({n})"));
+            }
             None => {}
         }
         Ok(None)
@@ -1388,137 +1365,93 @@ impl ClientSession {
         true
     }
 
-    /// What layer 1 should be showing at `now`, if anything.
+    /// One lap of layer 1: decide the phase, move the popup on, and return
+    /// what it should show at `now` -- `None` while it is closed.
     ///
-    /// The text of a box already on the screen is refreshed at most once per
-    /// [`NOTICE_REFRESH`]; a box that is not there yet, or that belongs to a
-    /// different phase, is built at once. So the numbers settle down to
-    /// something readable while the thing the numbers are ABOUT is still
-    /// reported the instant it changes.
-    fn notice_at(&mut self, now: Instant) -> Option<Notice> {
+    /// Built afresh on every lap it is open and compared by the loop with
+    /// what is on the screen. Every number in it that moves by itself is in
+    /// whole seconds, so an open popup with nothing happening repaints
+    /// rarely and costs one comparison otherwise; a change of phase is
+    /// reported the lap it happens.
+    fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
-
-        // `Silent` and `Recovering` both carry numbers that move on their
-        // own -- `Silent`'s "silent for Ns", and `Recovering`'s "host quiet
-        // for Ns" and "next try in Ns". `Confirming` shows the held buffer,
-        // which changes only when the user types -- and when they do, they
-        // should see it.
-        //
-        // `built_for == phase` and not merely "a box is up": the box already
-        // there has to be THIS phase's, or entering `Silent`/`Recovering`
-        // would itself be delayed by whenever the previous box happened to be
-        // built. For `Recovering` this comparison is exact rather than
-        // approximate: `attempt` and `next_try` only move when
-        // `begin_attempt`/`attempt_failed` run, never on an ordinary
-        // `evaluate` lap, so `built_for == phase` staying true for a whole
-        // second does not paper over a countdown that actually ticked.
-        if matches!(phase, Phase::Silent { .. } | Phase::Recovering { .. })
-            && let Some((built_for, built_at)) = self.built
-            && let Some(shown) = self.shown.as_ref()
-            && built_for == phase
-            && now.duration_since(built_at) < NOTICE_REFRESH
-        {
-            return Some(shown.clone());
+        match self.ui.tick(phase, now) {
+            Some(LinkChange::WentSilent) => self.activity.record(Kind::Link, "silent"),
+            Some(LinkChange::Back { outage }) => {
+                let text = format!(
+                    "live again via {}, outage {:.1} s",
+                    crate::view::path_label(self.path.as_ref()),
+                    outage.as_secs_f64()
+                );
+                self.activity.record(Kind::Link, &text);
+            }
+            None => {}
         }
-        self.built = Some((phase, now));
+        self.ui.visible(phase).then(|| self.view(phase, now))
+    }
 
-        match phase {
-            Phase::Live => None,
-            Phase::Silent { since } => {
-                // Truncated, which reads as "at least this long" — the same
-                // thing every stopwatch and `uptime` says. A rounded counter
-                // would show "6s" from 5.5 s onward, and for a fault the user
-                // may act on, overstating an outage is the worse error.
-                let quiet = now.duration_since(since).as_secs();
-                let stats = self.link.sink.connection().stats();
-                let mut body = vec![format!(
-                    "silent for {quiet}s - sent {} - lost {}",
-                    stats.path.sent_packets, stats.path.lost_packets
-                )];
-                if self.rejected_total() > 0 {
-                    body.push(format!("screen frames rejected: {}", self.rejected_total()));
-                }
-                // Someone typing into a dead screen cannot tell "kept" from
-                // "discarded" until the `Confirming` box appears -- and if
-                // they press `Ctrl-\ q` before it does, they will leave
-                // assuming their typing was thrown away. This is the only
-                // place that can tell them while it still matters.
-                let held = self.link_state.held().len();
-                if held > 0 {
-                    body.push(format!("{held} bytes typed since - kept, not sent"));
-                    // Present tense, and here rather than only in the box that
-                    // comes afterwards: a cap the user is told about after the
-                    // fact is a cap they could not have done anything about.
-                    if self.link_state.held_is_full() {
-                        body.push("The buffer is full; later keys are not being kept.".to_string());
-                    }
-                }
-                Some(Notice {
-                    headline: "no reply from host".to_string(),
-                    body,
-                    keys: vec![(
-                        "Ctrl-\\ q".to_string(),
-                        // What the key DOES, not what the host is doing. The
-                        // silence being reported has a crashed host among its
-                        // plausible causes, so "your shell keeps running on
-                        // the host" -- which this used to say -- was the one
-                        // claim the client is in no position to make. A
-                        // description of the local action stays true either
-                        // way.
-                        "closes oxutrm here; it does not touch the host".to_string(),
-                    )],
-                })
-            }
-            Phase::Recovering { attempt, next_try } => {
-                let quiet = now.duration_since(self.link_state.last_heard());
-                let next_try_in = next_try.saturating_duration_since(now);
-                // The reason the LAST attempt failed, where there has been
-                // one. It is the only thing in the box that says anything
-                // about why this is not working yet -- "Permission denied
-                // (publickey)" under `BatchMode` is a different afternoon from
-                // "Network is unreachable".
-                Some(recovering_notice(
-                    quiet,
-                    attempt,
-                    next_try_in,
-                    self.last_failure.as_deref(),
-                ))
-            }
-            Phase::Confirming => {
-                let held = crate::linkstate::render_held(self.link_state.held());
-                let mut body = vec![
-                    format!(
-                        "You typed {} bytes while offline:",
-                        self.link_state.held().len()
-                    ),
-                    held,
-                ];
-                if self.link_state.held_is_full() {
-                    body.push("The buffer is full; later keys were not kept.".to_string());
-                }
-                Some(Notice {
-                    // What was observed, which is a frame arriving. Nothing
-                    // reconnected: the QUIC connection never dropped, it went
-                    // quiet and came back, and phase 1 has no reconnection
-                    // machinery for a headline to imply. "reconnected" -- which
-                    // this used to say -- named a mechanism oxutrm does not yet
-                    // have.
-                    headline: "the host is answering again - deliver what you typed?".to_string(),
-                    body,
-                    keys: vec![
-                        ("Ctrl-\\ s".to_string(), "send it to the shell".to_string()),
-                        ("Ctrl-\\ d".to_string(), "drop it".to_string()),
-                    ],
-                })
-            }
+    /// What the popup says at `now`.
+    fn view(&self, phase: Phase, now: Instant) -> PopupView {
+        let lingering = match self.ui.mode() {
+            Mode::Lingering { outage, .. } => Some(outage),
+            _ => None,
+        };
+        let standby = self.standby.as_ref().map(|s| StandbyFacts {
+            path: s.path(),
+            rtt: s.rtt(),
+            probe: s.probe(),
+            searching: s.searching(),
+            next_search: s.next_search(),
+            last_failure: s.last_failure(),
+        });
+        crate::view::build(&Facts {
+            identity: self.identity.as_ref(),
+            phase,
+            lingering,
+            last_heard: self.link_state.last_heard(),
+            path: self.path.as_ref(),
+            quality: &self.quality,
+            rejected: self.rejected_total(),
+            standby,
+            rebuild_failure: self.last_failure.as_deref(),
+            held: self.link_state.held(),
+            held_full: self.link_state.held_is_full(),
+            activity: &self.activity,
+            now,
+            wall: SystemTime::now(),
+        })
+    }
+
+    /// One sample of the primary link, if a second has passed since the
+    /// last. Rides on the loop's laps; nothing is armed for it.
+    fn sample_quality(&mut self, now: Instant) {
+        if !self.quality.due(now) {
+            return;
         }
+        let outage = self.link_state.phase_now().is_outage();
+        self.quality
+            .push(now, reading_of(self.link.sink.connection()), outage);
+    }
+
+    /// Whether the popup at `now` is reporting an outage: the question the
+    /// tests that predate the popup asked of the notice, which closed the
+    /// moment the host answered. The popup lingers instead, so "is it up"
+    /// no longer means "is the host silent".
+    #[cfg(test)]
+    fn outage_at(&mut self, now: Instant) -> bool {
+        self.popup_at(now).is_some_and(|v| {
+            matches!(
+                v.marker,
+                oxutrm_client::Marker::Silent | oxutrm_client::Marker::Recovering
+            )
+        })
     }
 
     /// One lap of the rebuild loop.
     ///
     /// Called once per lap of [`ClientSession::run_on`], with the same `now`
-    /// the notice was built from, and a method rather than the body of that
+    /// the popup was built from, and a method rather than the body of that
     /// loop for the reason [`ClientSession::route_keys`] is one: the loop
     /// itself cannot be reached from a test without a real terminal and a real
     /// twenty seconds of silence, and the clock being a parameter is what lets
@@ -1537,7 +1470,7 @@ impl ClientSession {
             return;
         };
 
-        let Phase::Recovering { next_try, .. } = phase else {
+        let Phase::Recovering { attempt, next_try } = phase else {
             // `stood_down` and not a bare `cancel`: the displacing latch
             // belongs to the outage too. Left set, the next `TAKEN_OVER` on
             // this link -- somebody else attaching, an hour later, over a
@@ -1558,6 +1491,169 @@ impl ClientSession {
         }
         rebuild.begin(size, outcomes.clone());
         self.link_state.begin_attempt(now);
+        self.activity.record(
+            Kind::Rebuild,
+            &format!("attempt {} started", attempt.saturating_add(1)),
+        );
+    }
+
+    /// A rebuild attempt failed for a reason worth retrying.
+    fn rebuild_failed(&mut self, why: String, now: Instant) {
+        self.record_attempt_failed(&why);
+        self.link_state.attempt_failed(now);
+        // Kept for the popup's recovering section.
+        self.last_failure = Some(why);
+    }
+
+    /// The log entry for a failed rebuild attempt, retried or not.
+    fn record_attempt_failed(&mut self, why: &str) {
+        if let Phase::Recovering { attempt, .. } = self.link_state.phase_now() {
+            self.activity.record(
+                Kind::Rebuild,
+                &format!("attempt {} failed: {why}", attempt.saturating_add(1)),
+            );
+        }
+    }
+
+    /// A rebuild attempt got an answer that repeating the question will not
+    /// change. The session ends with it, so the log says how: the error is
+    /// what `run_connect` prints once the raw guard is dropped.
+    fn rebuild_refused(&mut self, why: &str) -> anyhow::Error {
+        self.record_attempt_failed(why);
+        anyhow::anyhow!("this session cannot be resumed: {why}")
+    }
+
+    /// A rebuild attempt landed: its link replaces the one that stopped
+    /// answering, and its path and attach are the session's from here.
+    fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        self.swap_in(e.link, now)?;
+        if let Some(id) = self.identity.as_mut() {
+            id.attach_id = e.attach_id;
+        }
+        self.activity.record(
+            Kind::Rebuild,
+            &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
+        );
+        self.path = Some(e.path);
+        Ok(())
+    }
+
+    /// Swap the standby in for a primary that stopped answering (spec §3.5).
+    /// Returns whether there was one to swap in.
+    fn fail_over<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        let Some(e) = self.standby.as_mut().and_then(|s| s.take_for_failover(now)) else {
+            return Ok(false);
+        };
+        self.swap_in_as(e.link, now, SWITCHED)
+            .context("failing over to the standby")?;
+        // Recorded before the first frame goes: the switch has happened, and
+        // a turn that errors must not leave it out of the log.
+        if let Some(id) = self.identity.as_mut() {
+            id.attach_id = e.attach_id;
+        }
+        self.activity.record(
+            Kind::Failover,
+            &format!(
+                "switched to standby ({})",
+                oxutrm_client::rung_label(&e.path)
+            ),
+        );
+        self.path = Some(e.path);
+        // Spec §3.5 step 2: the host adopts the standby on our first frame
+        // on it, so that frame goes now.
+        self.turn(&[], out)?;
+        Ok(true)
+    }
+
+    /// One standby decision (see [`crate::standby::Standby::step`]), with
+    /// what it starts recorded. The loop acts on the returned action.
+    ///
+    /// "probing standby" is recorded for the first probe since the probe
+    /// state was last reset to `Idle` (a rebuild attempt or a forgotten
+    /// answer resets it, so it can recur within one outage): a probe that
+    /// keeps failing is retried every `PROBE_RETRY`, and an entry per retry
+    /// would alternate with its "probe failed" so that nothing folds, and a
+    /// long outage would push everything useful out of the ring. Only a
+    /// probe from `Idle` is a first one; a retry comes from `Failed`.
+    fn standby_step(
+        &mut self,
+        phase: Phase,
+        now: Instant,
+        rebuild_running: bool,
+    ) -> crate::standby::StandbyAction {
+        let Some(s) = self.standby.as_mut() else {
+            return crate::standby::StandbyAction::Nothing;
+        };
+        let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
+        let action = s.step(phase, now, rebuild_running);
+        match action {
+            crate::standby::StandbyAction::Search { .. } => {
+                self.activity.record(Kind::Standby, "search started");
+            }
+            crate::standby::StandbyAction::Probe { .. } if first_probe => {
+                self.activity.record(Kind::Failover, "probing standby");
+            }
+            _ => {}
+        }
+        action
+    }
+
+    /// A standby search or probe reported back. Returns the connection the
+    /// loop should watch for closing, when a search found one that was kept.
+    fn on_standby_event(
+        &mut self,
+        event: crate::standby::StandbyEvent,
+        now: Instant,
+    ) -> Option<quinn::Connection> {
+        let s = self.standby.as_mut()?;
+        match event {
+            crate::standby::StandbyEvent::Found { search, e } => {
+                let path = e.path.clone();
+                if !s.found(search, *e) {
+                    return None;
+                }
+                let watch = s.connection();
+                self.activity.record(
+                    Kind::Standby,
+                    &format!(
+                        "found {}, {} ms",
+                        oxutrm_client::rung_label(&path),
+                        path.rtt_ms
+                    ),
+                );
+                watch
+            }
+            crate::standby::StandbyEvent::NotFound { search, reason } => {
+                let text = format!("not found: {reason}");
+                if s.not_found(search, now, reason) {
+                    self.activity.record(Kind::Standby, &text);
+                }
+                None
+            }
+            crate::standby::StandbyEvent::Probed { answered } => {
+                if s.probed(answered, now) {
+                    self.activity.record(
+                        Kind::Failover,
+                        if answered {
+                            "probe answered"
+                        } else {
+                            "probe failed"
+                        },
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// The standby's connection closed. Whatever the reason, the primary is
+    /// untouched: a standby's close is information, not a reason to end
+    /// anything.
+    fn on_standby_closed(&mut self, reason: &quinn::ConnectionError, now: Instant) {
+        if self.standby.as_mut().is_some_and(|s| s.lost(now, reason)) {
+            self.activity
+                .record(Kind::Standby, &format!("lost: {reason}"));
+        }
     }
 
     /// Put a freshly rebuilt link in place of the one that stopped answering.
@@ -1572,7 +1668,7 @@ impl ClientSession {
     /// **Input the host had not acknowledged is dropped rather than replayed.**
     /// `adopt` resets the host's `written` counter along with its receiver, so
     /// carrying the old pending bytes across would write them to the shell a
-    /// second time. Anything typed while the notice was up is not in here at
+    /// second time. Anything typed while the link was down is not in here at
     /// all: it is held in [`LinkState`] and still needs the user's answer.
     ///
     /// The phase is deliberately NOT left. Landing is not the same as being
@@ -1644,6 +1740,8 @@ impl ClientSession {
         // A full backoff before another attempt, and the old link's failures
         // left behind with it.
         self.link_state.rebuilt(now);
+        // A new connection, whose counters start at zero.
+        self.quality.new_segment(now);
         Ok(())
     }
 
@@ -1656,22 +1754,14 @@ impl ClientSession {
         self.renderer.resize(size);
         self.size = size;
 
-        // Layer 1 was laid out for the screen that just went away. Nothing
-        // else will notice: the loop rebuilds the overlay only when the
-        // notice's CONTENT changes, and a resize does not change a word of it,
-        // so a `Confirming` notice — the one the user sits and reads, because
-        // it is asking them a question — would keep the old geometry until
-        // they pressed a key.
-        //
-        // The same content, laid out again, rather than `self.shown = None`:
-        // `shown` has to keep mirroring what the overlay actually is. Clearing
-        // it would leave the renderer holding a box that `shown` says is not
-        // there, and on any lap where `notice_at` also returns `None` the
-        // loop's `notice != self.shown` test reads `None != None` — false — so
-        // `set_overlay(None)` never runs and the box is stranded on the screen
-        // for the rest of the session.
-        if let Some(n) = self.shown.as_ref() {
-            self.renderer.set_overlay(Some(layout_notice(n, size)));
+        // Layer 1 was laid out for the screen that just went away, and the
+        // loop rebuilds it only when the VIEW changes -- which a resize does
+        // not. The same view, laid out again, rather than `self.shown =
+        // None`: `shown` has to keep mirroring what the overlay is, or a lap
+        // whose view is also `None` would never clear a box stranded on the
+        // screen.
+        if let Some(v) = self.shown.as_ref() {
+            self.renderer.set_overlay(Some(layout_popup(v, size)));
         }
 
         // Carried on the next diff, and worth going immediately: the shell is
@@ -1948,7 +2038,7 @@ impl ClientSession {
                     }
                     match outcome {
                         AttemptOutcome::Landed(established) => {
-                            self.swap_in(established.link, Instant::now())
+                            self.rebuild_landed(*established, Instant::now())
                                 .context("swapping in the rebuilt link")?;
                             // Both of these belong to the link that has just
                             // been replaced: the arm has to watch the new
@@ -1964,54 +2054,26 @@ impl ClientSession {
                             _search_task = None;
                         }
                         // The network, not the far end. The loop keeps its
-                        // cadence and the notice explains the last try.
-                        AttemptOutcome::Retry(why) => {
-                            self.link_state.attempt_failed(Instant::now());
-                            self.last_failure = Some(why);
-                        }
+                        // cadence and the popup explains the last try.
+                        AttemptOutcome::Retry(why) => self.rebuild_failed(why, Instant::now()),
                         // An answer, and repeating the question gets the same
                         // one. `run_connect` prints this after the raw guard
                         // is dropped and exits non-zero.
                         AttemptOutcome::Definite(why) => {
-                            return Err(anyhow::anyhow!("this session cannot be resumed: {why}"));
+                            return Err(self.rebuild_refused(&why));
                         }
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::Found { search, e }) => {
-                    let path = e.path.clone();
-                    if let Some(s) = self.standby.as_mut()
-                        && s.found(search, *e)
-                    {
-                        standby_conn = s.connection();
-                        self.announce_standby(Some(&path), out)?;
+                Wake::Standby(event) => {
+                    if let Some(watch) = self.on_standby_event(event, Instant::now()) {
+                        standby_conn = Some(watch);
                     }
                 }
-                Wake::Standby(crate::standby::StandbyEvent::NotFound { search, reason }) => {
-                    let tell = self
-                        .standby
-                        .as_mut()
-                        .is_some_and(|s| s.not_found(search, Instant::now(), reason));
-                    if tell {
-                        self.announce_standby(None, out)?;
-                    }
-                }
-                Wake::Standby(crate::standby::StandbyEvent::Probed { answered }) => {
-                    if let Some(s) = self.standby.as_mut() {
-                        s.probed(answered, Instant::now());
-                    }
-                }
-                // Whatever the reason, the standby is gone and the primary is
-                // untouched: a standby's close is information, not a reason
-                // to end anything. `lost` decides whether it is news.
+                // Whatever the reason, the standby is gone; `lost` decides
+                // whether it is worth recording.
                 Wake::StandbyClosed(reason) => {
                     standby_conn = None;
-                    let tell = self
-                        .standby
-                        .as_mut()
-                        .is_some_and(|s| s.lost(Instant::now(), &reason));
-                    if tell {
-                        self.announce_standby(None, out)?;
-                    }
+                    self.on_standby_closed(&reason, Instant::now());
                 }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
@@ -2049,17 +2111,18 @@ impl ClientSession {
                 }
             }
 
-            // Layer 1. Rebuilt only when the content actually changed, so a
-            // steady notice costs one comparison per lap rather than a layout.
+            // Layer 1. Laid out again only when the view actually changed, so
+            // an open popup with nothing new costs one comparison per lap.
             let now = Instant::now();
-            let notice = self.notice_at(now);
-            if notice != self.shown {
+            let view = self.popup_at(now);
+            self.sample_quality(now);
+            if view != self.shown {
                 self.renderer
-                    .set_overlay(notice.as_ref().map(|n| layout_notice(n, self.size)));
-                self.shown = notice;
+                    .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
+                self.shown = view;
                 self.renderer
                     .render(out, self.screen_rx.state())
-                    .context("painting the notice")?;
+                    .context("painting the popup")?;
                 out.flush().context("flushing the terminal")?;
             }
 
@@ -2069,8 +2132,8 @@ impl ClientSession {
             // session reaches this line ten times a second and does nothing
             // but one `matches!`.
             //
-            // After the notice, so the box describing the silence is already
-            // on the screen before anything is done about it -- and the user
+            // After the popup, so what describes the silence is already on
+            // the screen before anything is done about it -- and the user
             // is told nothing about the rebind, because a rebind that has not
             // restored contact yet is not something the client can honestly
             // report.
@@ -2088,9 +2151,9 @@ impl ClientSession {
             // does not, and either way the next lap is the same.
             let _ = self.heartbeat(now);
 
-            // After the notice, for the same reason the route probe is: the
-            // box explaining the silence is on the screen before anything is
-            // done about it. After the probe, too -- a rebind is the cheaper
+            // After the popup, for the same reason the route probe is: what
+            // explains the silence is on the screen before anything is done
+            // about it. After the probe, too -- a rebind is the cheaper
             // of the two ways back and costs no ssh at all.
             self.rebuild_step(now, &outcomes_tx);
 
@@ -2100,12 +2163,7 @@ impl ClientSession {
             // the loop acts, so nothing spawned here borrows `self`.
             let rebuild_running = self.rebuild.as_ref().is_some_and(Rebuild::is_running);
             let phase = self.link_state.phase_now();
-            let action = self
-                .standby
-                .as_mut()
-                .map_or(crate::standby::StandbyAction::Nothing, |s| {
-                    s.step(phase, now, rebuild_running)
-                });
+            let action = self.standby_step(phase, now, rebuild_running);
             match action {
                 crate::standby::StandbyAction::Nothing => {}
                 crate::standby::StandbyAction::Search { search } => {
@@ -2159,21 +2217,13 @@ impl ClientSession {
                     }
                 }
                 crate::standby::StandbyAction::FailOver => {
-                    if let Some((link, path)) =
-                        self.standby.as_mut().and_then(|s| s.take_for_failover(now))
-                    {
-                        self.swap_in_as(link, now, SWITCHED)
-                            .context("failing over to the standby")?;
+                    if self.fail_over(now, out)? {
                         conn = self.link.sink.connection().clone();
                         standby_conn = None;
                         // `take_for_failover` disowned any search running
                         // over the old primary; this stops it.
                         _search_task = None;
                         takeover_expected = false;
-                        // Spec §3.5 step 2: the host adopts the standby on
-                        // our first frame on it, so that frame goes now.
-                        self.turn(&[], out)?;
-                        self.announce_failover(&path, out)?;
                     }
                 }
             }
@@ -2202,8 +2252,7 @@ impl ClientSession {
             // `min` is always the pacing interval and both arms were the same
             // expression, below a comment describing a one-second tick that
             // did not exist. Nothing is lost by dropping it: the loop already
-            // wakes at least ten times a second, which is ten times as often
-            // as `NOTICE_REFRESH` lets the counters move.
+            // wakes at least ten times a second.
             deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
         }
     }
@@ -2366,6 +2415,8 @@ mod tests {
     // `use super::*` reaches the session module's own imports, not `crate`'s
     // other modules, so the route pace has to be named explicitly.
     use crate::roam::ROUTE_PROBE_EVERY;
+    use crate::view::words;
+    use oxutrm_client::Marker;
     use oxutrm_host::ssh::SshLauncher;
     use oxutrm_proto::{NatType, Rung};
 
@@ -2469,15 +2520,26 @@ mod tests {
 
     /// `pair`, with a blackholeable relay in the middle.
     async fn pair_through_relay(shell: &str) -> (HostSession, ClientSession, Relay) {
+        pair_through_relay_sized(shell, size()).await
+    }
+
+    /// Big enough for the popup's log to have rows: at the fixtures' 40x10 the
+    /// status block fills the whole box.
+    const BIG: TermSize = TermSize { cols: 80, rows: 24 };
+
+    /// `pair_through_relay` at `size`, with host and client both at `size`
+    /// from the start, so no resize is in flight when a test begins.
+    async fn pair_through_relay_sized(
+        shell: &str,
+        size: TermSize,
+    ) -> (HostSession, ClientSession, Relay) {
         let listening = crate::link::fixtures::listening().await;
         let relay = relay_to(listening.addr).await;
         // The client's peer is the RELAY, which is the whole point.
         let (host_link, client_link) = listening.dial("127.0.0.1:0", relay.addr).await;
 
-        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
-        let client = ClientSession::new(size(), caps(), client_link, None).unwrap();
-
-        let mut host = host;
+        let mut host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let client = ClientSession::new(size, caps(), client_link, None).unwrap();
         host.term.write_input(shell.as_bytes()).unwrap();
         (host, client, relay)
     }
@@ -2491,12 +2553,28 @@ mod tests {
         shell: &str,
         rebuild: Option<Rebuild>,
     ) -> (HostSession, ClientSession) {
+        pair_on_sized(client_bind, shell, rebuild, size()).await
+    }
+
+    /// `pair`, with host and client both at `size` from the start, so no
+    /// resize is in flight when a test begins.
+    async fn pair_sized(shell: &str, size: TermSize) -> (HostSession, ClientSession) {
+        pair_on_sized("127.0.0.1:0", shell, None, size).await
+    }
+
+    /// `pair_on`, at `size`.
+    async fn pair_on_sized(
+        client_bind: &str,
+        shell: &str,
+        rebuild: Option<Rebuild>,
+        size: TermSize,
+    ) -> (HostSession, ClientSession) {
         let listening = crate::link::fixtures::listening().await;
         let addr = listening.addr;
         let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host = HostSession::spawn("/bin/sh", size(), 200, host_link).unwrap();
-        let client = ClientSession::new(size(), caps(), client_link, rebuild).unwrap();
+        let host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let client = ClientSession::new(size, caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
         // the script is fed as input instead, which is also how a real session
@@ -2696,13 +2774,13 @@ mod tests {
                 let _ = host.turn();
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                let _ = client.notice_at(Instant::now());
+                let _ = client.outage_at(Instant::now());
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let before = client.link.sink.connection().stats().path.sent_packets;
             // The session must be HEALTHY before the outage, or the rung
             // measures a session that was never up.
-            let healthy_first = client.notice_at(Instant::now()).is_none();
+            let healthy_first = !client.outage_at(Instant::now());
 
             relay.blackhole(true);
             let dark = tokio::time::Instant::now() + Duration::from_secs(secs);
@@ -2710,18 +2788,18 @@ mod tests {
                 let _ = host.turn();
                 // `run_on` beats every lap; without this the client is never
                 // OWED an answer, never goes `Silent`, and the recovery check
-                // below passes against a notice that never appeared. That is
+                // below passes against a popup that never appeared. That is
                 // exactly the "guard that cannot fail" this project keeps
                 // producing, and it produced one here.
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                let _ = client.notice_at(Instant::now());
+                let _ = client.outage_at(Instant::now());
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let during = client.link.sink.connection().stats().path.sent_packets;
             // The discriminating observable: was the box actually UP when the
             // path came back? If not, this rung measured nothing.
-            let went_silent = client.notice_at(Instant::now()).is_some();
+            let went_silent = client.outage_at(Instant::now());
 
             // The path is perfect again from this instant.
             relay.blackhole(false);
@@ -2732,7 +2810,7 @@ mod tests {
                 let _ = host.turn();
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                if client.notice_at(Instant::now()).is_none() {
+                if !client.outage_at(Instant::now()) {
                     recovered = Some(restored.elapsed());
                     break;
                 }
@@ -2752,7 +2830,7 @@ mod tests {
             assert!(
                 healthy_first && went_silent,
                 "rung {secs}s measured nothing: healthy_first={healthy_first} \
-                 went_silent={went_silent} -- the notice must be UP when the path \
+                 went_silent={went_silent} -- the popup must be UP when the path \
                  returns or the recovery check cannot fail"
             );
         }
@@ -2780,10 +2858,10 @@ mod tests {
                 let _ = host.turn();
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                let _ = client.notice_at(Instant::now());
+                let _ = client.outage_at(Instant::now());
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let healthy_first = client.notice_at(Instant::now()).is_none();
+            let healthy_first = !client.outage_at(Instant::now());
 
             relay.blackhole(true);
             let dark = tokio::time::Instant::now() + Duration::from_secs(secs);
@@ -2791,10 +2869,10 @@ mod tests {
                 let _ = host.turn();
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                let _ = client.notice_at(Instant::now());
+                let _ = client.outage_at(Instant::now());
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let went_silent = client.notice_at(Instant::now()).is_some();
+            let went_silent = client.outage_at(Instant::now());
 
             relay.blackhole(false);
             // THE INTERVENTION: a fresh socket, exactly as `follow_route`
@@ -2811,7 +2889,7 @@ mod tests {
                 let _ = host.turn();
                 let _ = client.heartbeat(Instant::now());
                 let _ = client.turn(&[], &mut out);
-                if client.notice_at(Instant::now()).is_none() {
+                if !client.outage_at(Instant::now()) {
                     recovered = Some(restored.elapsed());
                     break;
                 }
@@ -3610,28 +3688,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_path_change_announces_itself() {
-        let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-
-        client
-            .announce(
-                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
-                &mut out,
-            )
-            .expect("first");
-        out.clear();
-
-        // Walking from Wi-Fi to mobile should be explained, not mysterious.
-        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
-        assert!(client.announce(&better, &mut out).expect("second"));
-        let line = String::from_utf8(out).unwrap();
-        assert!(line.contains("migrated"), "got {line:?}");
-        assert!(line.contains("IPv6 direct"), "got {line:?}");
-        assert!(line.contains("11 ms"), "got {line:?}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn rung_four_reads_as_a_warning() {
         // A session inside the SSH connection cannot daemonize and cannot be
         // reattached. Degrading to it silently would remove both properties
@@ -4312,7 +4368,7 @@ mod tests {
     /// Frames the receiver cannot apply used to go to stderr, which IS the
     /// terminal being painted: the message desynchronised the renderer's model
     /// and nothing repainted it on a quiet session. They are diagnostics about
-    /// the link, so they belong in the link's own notice.
+    /// the link, so they belong in the popup.
     #[tokio::test]
     async fn a_rejected_frame_is_counted_rather_than_printed() {
         let (_host, mut session) = pair("/bin/sh").await;
@@ -4331,12 +4387,12 @@ mod tests {
         assert_eq!(
             session.rejected_total(),
             1,
-            "the count did not reach the notice"
+            "the count did not reach the popup"
         );
     }
 
     #[tokio::test]
-    async fn silence_raises_a_notice_and_a_frame_clears_it() {
+    async fn silence_raises_the_popup_and_a_frame_ends_the_outage() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
 
@@ -4348,66 +4404,72 @@ mod tests {
         // handshake shorter.
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t + Duration::from_secs(1)).is_none());
+        assert!(session.popup_at(t + Duration::from_secs(1)).is_none());
 
-        let notice = session.notice_at(t + Duration::from_secs(3));
-        assert!(notice.is_some(), "no notice after three seconds of silence");
-        assert!(notice.unwrap().headline.contains("no reply"));
+        let v = session
+            .popup_at(t + Duration::from_secs(3))
+            .expect("no popup after three seconds of silence");
+        assert_eq!(v.marker, Marker::Silent);
 
         session.note_heard(t + Duration::from_secs(4));
-        assert!(session.notice_at(t + Duration::from_secs(4)).is_none());
+        assert!(!session.outage_at(t + Duration::from_secs(4)));
     }
 
     #[tokio::test]
-    async fn the_notice_names_the_counters_it_can_actually_observe() {
+    async fn the_popup_says_how_long_the_host_has_been_silent() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
         // The clock's origin, pinned to the test's: see the test above.
         session.note_heard(t);
         session.note_sent(t);
         // And the lap the owing begins on, which the grace period runs from.
-        assert!(session.notice_at(t).is_none());
+        assert!(session.popup_at(t).is_none());
 
-        let n = session.notice_at(t + Duration::from_secs(6)).unwrap();
-        let shown = painted_words(&n);
+        let v = session.popup_at(t + Duration::from_secs(6)).unwrap();
+        let shown = words(&v);
 
-        assert!(shown.contains("6s"), "no silence duration: {shown}");
+        assert!(
+            shown.contains("silent for 6s"),
+            "no silence duration: {shown}"
+        );
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
-    /// A user typing into a dead screen cannot tell "kept" from "discarded"
-    /// until the `Confirming` box appears -- and `Ctrl-\ q`, which the silence
-    /// box does offer, ends the session before it ever does. Somebody who quit
-    /// there would leave believing their typing had been thrown away.
+    /// Someone who closed the outage popup to type blind cannot tell "kept"
+    /// from "discarded" until the question appears -- and `q`, which the
+    /// popup offers, ends the session before it ever does. Somebody who
+    /// opened it again and quit would leave believing their typing had been
+    /// thrown away, unless it says otherwise.
     #[tokio::test]
-    async fn the_silent_notice_says_that_blind_typing_is_being_kept() {
+    async fn the_reopened_popup_says_that_blind_typing_is_being_kept() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t).is_none());
+        assert!(session.popup_at(t).is_none());
 
         let bare = session
-            .notice_at(t + Duration::from_secs(3))
-            .expect("no notice after three seconds of silence");
-        session.shown = Some(bare.clone());
+            .popup_at(t + Duration::from_secs(3))
+            .expect("no popup after three seconds of silence");
         assert!(
-            !painted_words(&bare).contains("kept"),
-            "the box talks about a buffer before anything was typed: {}",
-            painted_words(&bare)
+            !words(&bare).contains("kept"),
+            "the popup talks about a buffer before anything was typed: {}",
+            words(&bare)
         );
 
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
         session.route_keys(b"make test\r", &mut out).unwrap();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
 
-        let shown = painted_words(
+        let shown = words(
             &session
-                .notice_at(t + Duration::from_secs(5))
-                .expect("the notice vanished"),
+                .popup_at(t + Duration::from_secs(5))
+                .expect("Ctrl-\\ did not open the popup again"),
         );
         assert!(
             shown.contains("10 bytes"),
-            "the box does not say how much is being kept: {shown}"
+            "the popup does not say how much is being kept: {shown}"
         );
         assert!(
             shown.contains("kept"),
@@ -4425,117 +4487,121 @@ mod tests {
         let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t).is_none());
-        session.shown = session.notice_at(t + Duration::from_secs(3));
-        assert!(session.shown.is_some());
-
+        assert!(session.popup_at(t).is_none());
+        assert!(session.popup_at(t + Duration::from_secs(3)).is_some());
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
+
         session
             .route_keys(&vec![b'x'; crate::linkstate::MAX_HELD], &mut out)
             .unwrap();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
 
-        let shown = painted_words(
+        let shown = words(
             &session
-                .notice_at(t + Duration::from_secs(5))
-                .expect("the notice vanished"),
+                .popup_at(t + Duration::from_secs(5))
+                .expect("Ctrl-\\ did not open the popup again"),
         );
         assert!(
             shown.contains("full"),
-            "the buffer stopped accepting keystrokes and the box did not say \
-             so: {shown}"
+            "the buffer stopped accepting keystrokes and the popup did not \
+             say so: {shown}"
         );
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
-    /// During an outage the client keeps retransmitting, so `sent_packets`
-    /// climbs at the pacing rate -- as often as 125 times a second. Rebuilding
-    /// the box on each change costs two `Paragraph` renders, a clone of the
-    /// whole cell grid, a diff and a flush every time, and puts a number in
-    /// front of the user that churns far too fast to read, inside a box whose
-    /// entire job is to be read.
+    /// Every number in the popup that moves by itself is in whole seconds,
+    /// so the view changes only when a shown whole-second value (or another
+    /// shown fact) changes, and the loop's comparison spares every other
+    /// repaint. Ages and countdowns can turn over on different sub-second
+    /// phases; here they are pinned to one, so the view holds for a second.
+    /// A view carrying quinn's raw packet counters would change on every lap
+    /// of an outage -- up to 125 times a second -- in a box whose whole job
+    /// is to be read.
     #[tokio::test]
-    async fn the_silence_counters_are_rebuilt_at_most_once_a_second() {
+    async fn an_open_popup_is_the_same_view_for_a_second_at_a_time() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t).is_none());
+        // The link's age ("up Ns") counts from when the session was built,
+        // which is a handshake after `t`; pinned onto `t` like `last_heard`,
+        // so the whole view turns over on the same second boundary.
+        session.quality = Quality::new(t);
+        assert!(session.popup_at(t).is_none());
 
         let first = session
-            .notice_at(t + Duration::from_secs(3))
-            .expect("no notice after three seconds of silence");
-        session.shown = Some(first.clone());
+            .popup_at(t + Duration::from_secs(3))
+            .expect("no popup after three seconds of silence");
 
-        // Something the box reports moves. In a live outage this is the
-        // retransmit counters; here it is a number a test can set.
-        session.rejected_total = 1;
+        // Something real moves between the two laps, as it does in an
+        // outage: the client sends, and quinn's counters climb.
+        let sent = |s: &ClientSession| s.link.sink.connection().stats().path.sent_packets;
+        let before = sent(&session);
+        let mut out = Vec::new();
+        session.turn(b"x", &mut out).expect("a turn that sends");
+        // Bounded well inside a second: the log's ages are read off the wall
+        // clock, and a wait that crossed a real second could move one and
+        // fail the comparison below for a reason it is not about.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while sent(&session) == before {
+            assert!(
+                Instant::now() < deadline,
+                "nothing was sent between the laps"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         assert_eq!(
-            session.notice_at(t + Duration::from_millis(3_400)),
+            session.popup_at(t + Duration::from_millis(3_900)),
             Some(first.clone()),
-            "the box was rebuilt 400 ms after the last one"
+            "the view changed within the same second"
         );
         let later = session
-            .notice_at(t + Duration::from_millis(4_100))
-            .expect("the notice vanished instead of refreshing");
-        assert_ne!(later, first, "the counters never refreshed at all");
-        assert!(
-            painted_words(&later).contains("rejected: 1"),
-            "{}",
-            painted_words(&later)
-        );
+            .popup_at(t + Duration::from_secs(4))
+            .expect("the popup vanished");
+        assert_ne!(later, first, "the silence counter never moved");
+        assert!(words(&later).contains("silent for 4s"), "{}", words(&later));
     }
 
-    /// Only the refresh is paced. A change of phase is the thing the box
-    /// exists to announce, and waiting up to a second to announce it would
-    /// leave the user typing into a screen whose box is a second out of date.
+    /// A change of phase is the thing the popup exists to report, and
+    /// waiting to report it would leave the user looking at a popup that is
+    /// out of date.
     #[tokio::test]
-    async fn a_change_of_phase_repaints_at_once_however_recent_the_refresh() {
-        let (_host, mut session) = with_notice().await;
+    async fn a_change_of_phase_is_shown_the_lap_it_happens() {
+        let (_host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
         session.route_keys(b"make test\r", &mut out).unwrap();
 
-        // A hundred milliseconds after the silence box was last built, the
-        // host answers.
+        // Moments after the outage's popup was last built, the host answers.
         let now = std::time::Instant::now();
         session.note_heard(now);
-        let n = session
-            .notice_at(now)
+        let v = session
+            .popup_at(now)
             .expect("the question about the held input never appeared");
 
         assert!(
-            n.headline.contains("answering again"),
-            "the box still reports the outage the host has already ended: {}",
-            n.headline
+            v.held
+                .first()
+                .is_some_and(|l| l.contains("answering again")),
+            "the popup still reports the outage the host has already ended: {:?}",
+            v.held
         );
     }
 
-    /// And the transition out of a notice altogether is just as immediate:
-    /// a healthy session must not keep a stale box for up to a second.
-    #[tokio::test]
-    async fn returning_to_live_clears_the_box_at_once() {
-        let (_host, mut session) = with_notice().await;
-
-        let now = std::time::Instant::now();
-        session.note_heard(now);
-
-        assert_eq!(
-            session.notice_at(now),
-            None,
-            "a box outlived the silence it was reporting"
-        );
-    }
-
-    /// The other notice, and the one that went unguarded: the check above
-    /// reads only the `Silent` box, which is how "reconnected" survived in a
-    /// phase where nothing reconnects.
+    /// The other popup, and the one that went unguarded: the check above
+    /// reads only the `Silent` popup, which is how "reconnected" survived in
+    /// a phase where nothing reconnects.
     ///
-    /// Reached without sleeping, along the path the loop actually takes: a
-    /// notice is up, something is typed into it, and then the host answers.
+    /// Reached without sleeping, along the path the loop actually takes: the
+    /// popup is up, the user closes it and types blind, and then the host
+    /// answers.
     #[tokio::test]
-    async fn the_confirming_notice_states_only_what_the_client_can_observe() {
-        let (_host, mut session) = with_notice().await;
+    async fn the_confirming_popup_states_only_what_the_client_can_observe() {
+        let (_host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
         session.route_keys(b"make test\r", &mut out).unwrap();
 
         // A frame arrives. That the host is answering again is the whole of
@@ -4545,38 +4611,38 @@ mod tests {
         let now = std::time::Instant::now();
         session.note_heard(now);
 
-        let n = session
-            .notice_at(now)
+        let v = session
+            .popup_at(now)
             .expect("the host answered with input held, and nothing was asked");
-        let shown = painted_words(&n);
+        let shown = words(&v);
 
         assert!(
             shown.contains("10 bytes"),
-            "this is not the notice that asks about the held input: {shown}"
+            "this is not the popup that asks about the held input: {shown}"
         );
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
-    /// The only path by which a user ever sees `Phase::Recovering`. The
-    /// `notice.rs` test for `recovering_notice` calls it directly with
-    /// numbers already computed; nothing there exercises `notice_at`'s own
-    /// derivation of them -- `now.duration_since(self.link_state.last_heard())`
+    /// The only path by which a user ever sees `Phase::Recovering`.
+    /// `view.rs`'s test for the recovering rows calls `build` with numbers
+    /// already computed; nothing there exercises `popup_at`'s own derivation
+    /// of them -- `now.duration_since(self.link_state.last_heard())`
     /// for the quiet count, `next_try.saturating_duration_since(now)` for the
     /// countdown -- so this drives the real wiring through `evaluate`
     /// instead.
     ///
     /// Not run through `assert_claims_nothing_it_cannot_see`: that guard
-    /// forbids "reconnect"/"retry" because phase 1 has no reconnection
-    /// mechanism to promise. `Recovering` is exactly the mechanism phase 2
-    /// adds, so the word belongs here and the guard does not apply.
+    /// forbids "reconnect"/"retry" because nothing reconnects while `Silent`.
+    /// `Recovering` is exactly the mechanism phase 2 adds, so the word
+    /// belongs here and the guard does not apply.
     #[tokio::test]
-    async fn the_recovering_notice_reports_the_wired_numbers() {
+    async fn the_recovering_section_reports_the_wired_numbers() {
         let t = std::time::Instant::now();
         let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t).is_none());
-        let _ = session.notice_at(t + Duration::from_secs(3));
+        assert!(session.popup_at(t).is_none());
+        let _ = session.popup_at(t + Duration::from_secs(3));
         assert!(
             matches!(session.link_state.phase_now(), Phase::Silent { .. }),
             "fixture did not reach Silent: {:?}",
@@ -4584,16 +4650,16 @@ mod tests {
         );
 
         let n = session
-            .notice_at(t + crate::linkstate::REBUILD_AFTER)
-            .expect("no notice while Recovering");
+            .popup_at(t + crate::linkstate::REBUILD_AFTER)
+            .expect("no popup while Recovering");
         assert!(
             matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
             "fixture did not reach Recovering: {:?}",
             session.link_state.phase_now()
         );
 
-        let shown = painted_words(&n);
-        assert!(shown.contains("waiting for the network"), "{shown}");
+        assert_eq!(n.marker, Marker::Recovering);
+        let shown = n.recovering.join(" | ");
         // `last_heard` is `t`; this call lands exactly `REBUILD_AFTER` later,
         // so a quiet count read from anywhere other than `last_heard` (say,
         // `owed_since`, which this session never set to `t`) would not say
@@ -4695,7 +4761,7 @@ mod tests {
 
     /// Drive a fresh session into `Recovering` on a clock of our own.
     ///
-    /// The same build-up `the_recovering_notice_reports_the_wired_numbers`
+    /// The same build-up `the_recovering_section_reports_the_wired_numbers`
     /// uses, and it has to be a build-up: `evaluate` escalates one stage per
     /// call, so a single jump to `REBUILD_AFTER` reaches `Silent` and stops
     /// there. Returns the instant the phase was entered at.
@@ -4703,10 +4769,10 @@ mod tests {
         let t = Instant::now();
         session.note_heard(t);
         session.note_sent(t);
-        assert!(session.notice_at(t).is_none());
-        let _ = session.notice_at(t + Duration::from_secs(3));
+        assert!(!session.outage_at(t));
+        let _ = session.outage_at(t + Duration::from_secs(3));
         let entered = t + crate::linkstate::REBUILD_AFTER;
-        let _ = session.notice_at(entered);
+        let _ = session.outage_at(entered);
         assert!(
             matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
             "the fixture did not reach Recovering: {:?}",
@@ -4865,7 +4931,7 @@ mod tests {
             Phase::Recovering { attempt, next_try } => {
                 assert_eq!(
                     attempt, 0,
-                    "the notice will keep counting attempts up over a link \
+                    "the popup will keep counting attempts up over a link \
                      that has already been rebuilt"
                 );
                 assert_eq!(next_try, landed + crate::linkstate::backoff(0));
@@ -5223,30 +5289,37 @@ mod tests {
     }
 
     /// A completed client-side standby, as a search hands it to the session.
+    /// Also the shape a rebuild's `Established` has. The attach id is not
+    /// the fixtures' zero, so a test can see it carried over.
     fn standby_established(link: Link) -> crate::connect::Established {
         crate::connect::Established {
             link,
             path: path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown),
             session_id: String::new(),
-            attach_id: 0,
+            attach_id: 2,
             host_features: vec![],
         }
     }
 
-    /// A client-side standby holding `link`, as the search it started found
-    /// it. Created a settling delay ago, so its first search is due now.
-    fn standby_holding(link: Link) -> crate::standby::Standby {
-        let now = Instant::now();
-        let mut standby = crate::standby::Standby::new(
+    /// A standby, with the search it started at `now`. Created a settling
+    /// delay before `now`, so that search is due at once.
+    fn standby_searching(now: Instant) -> (crate::standby::Standby, u64) {
+        let mut s = crate::standby::Standby::new(
             crate::attach_exchange::fixtures::stun_free(),
             now.checked_sub(crate::linkstate::STANDBY_DELAY)
                 .expect("a clock this young"),
         );
-        let crate::standby::StandbyAction::Search { search } =
-            standby.step(Phase::Live, now, false)
+        let crate::standby::StandbyAction::Search { search } = s.step(Phase::Live, now, false)
         else {
             panic!("the fixture's standby started no search");
         };
+        (s, search)
+    }
+
+    /// A client-side standby holding `link`, as the search it started found
+    /// it.
+    fn standby_holding(link: Link) -> crate::standby::Standby {
+        let (mut standby, search) = standby_searching(Instant::now());
         assert!(
             standby.found(search, standby_established(link)),
             "the fixture's search was stale"
@@ -5260,9 +5333,94 @@ mod tests {
     struct SharedOut(Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl SharedOut {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
         }
+    }
+
+    /// What a terminal of `size` fed everything the client wrote would be
+    /// showing. Painted bytes are a diff, and a diff can split a word
+    /// wherever a cell happened to be unchanged, so tests read the screen
+    /// and not the bytes.
+    fn screen_of(out: &SharedOut, size: TermSize) -> String {
+        crate::loopback::fixtures::replay(&out.bytes(), size).join("\n")
+    }
+
+    async fn wait_for_screen(out: &SharedOut, size: TermSize, want: &str, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while !screen_of(out, size).contains(want) {
+            assert!(
+                Instant::now() < deadline,
+                "{want:?} never reached the screen; it showed:\n{}",
+                screen_of(out, size)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_off_screen(out: &SharedOut, size: TermSize, gone: &str, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while screen_of(out, size).contains(gone) {
+            assert!(
+                Instant::now() < deadline,
+                "{gone:?} never left the screen; it showed:\n{}",
+                screen_of(out, size)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Close the popup the way a user does, before typing to the shell:
+    /// while it is shown it takes every key. The Esc goes alone and the
+    /// next write waits for the popup to be gone, so the client reads it as
+    /// a lone Esc and not as the start of an escape sequence.
+    async fn close_the_popup(typing: &mut impl Write, out: &SharedOut, size: TermSize) {
+        typing.write_all(&[ESCAPE]).expect("type");
+        wait_off_screen(out, size, "q quit", Duration::from_secs(10)).await;
+    }
+
+    /// What reached the terminal outside the renderer. `Renderer::render`
+    /// wraps every non-empty write in synchronized output
+    /// (`ESC[?2026h` ... `ESC[?2026l`), so anything between those blocks
+    /// was written by something else.
+    fn outside_renderer(out: &[u8]) -> Vec<u8> {
+        const BEGIN: &[u8] = b"\x1b[?2026h";
+        const END: &[u8] = b"\x1b[?2026l";
+        let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+        let mut rest = out;
+        let mut stray = Vec::new();
+        while !rest.is_empty() {
+            let Some(begin) = find(rest, BEGIN) else {
+                stray.extend_from_slice(rest);
+                break;
+            };
+            stray.extend_from_slice(&rest[..begin]);
+            let inside = &rest[begin + BEGIN.len()..];
+            let Some(end) = find(inside, END) else {
+                stray.extend_from_slice(&rest[begin..]);
+                break;
+            };
+            rest = &inside[end + END.len()..];
+        }
+        stray
+    }
+
+    /// The helper has to be able to see a stray, or every assertion made
+    /// with it is a guard that cannot fail.
+    #[test]
+    fn outside_renderer_finds_what_is_written_between_the_renderers_blocks() {
+        assert_eq!(
+            outside_renderer(b"x\x1b[?2026hA\x1b[?2026ly\r\n"),
+            b"xy\r\n"
+        );
+        assert!(outside_renderer(b"\x1b[?2026hA\x1b[?2026l\x1b[?2026hB\x1b[?2026l").is_empty());
+    }
+
+    fn last_entry(c: &ClientSession) -> Option<(Kind, String)> {
+        c.activity
+            .entries()
+            .next_back()
+            .map(|e| (e.kind, e.text.clone()))
     }
 
     impl Write for SharedOut {
@@ -5275,64 +5433,160 @@ mod tests {
         }
     }
 
-    /// Spec §3.7: the path line gains the standby. Written mid-session, so it
-    /// ends in `\r\n` (raw mode has no output processing) and the screen is
-    /// painted again straight after it.
+    /// Spec §5.2: what used to be a line written over the session is an
+    /// entry in the activity log. The handler has no terminal to write to.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_found_standby_is_added_to_the_path_line() {
+    async fn a_found_standby_is_recorded() {
         let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-        client
-            .announce(
-                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
-                &mut out,
-            )
-            .expect("announce");
-        let before = String::from_utf8(out.clone()).unwrap();
-        assert!(!before.contains("standby"), "got {before:?}");
-        out.clear();
+        let now = Instant::now();
+        let (standby, search) = standby_searching(now);
+        client.standby = Some(standby);
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
 
-        let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
-        client
-            .announce_standby(Some(&standby), &mut out)
-            .expect("announce the standby");
+        let watch = client.on_standby_event(
+            crate::standby::StandbyEvent::Found {
+                search,
+                e: Box::new(standby_established(standby_client)),
+            },
+            now,
+        );
 
-        let line = "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  standby: IPv4 punched, 38 ms\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
         assert!(
-            out.len() > line.len(),
-            "nothing was painted over the line: the screen is left scrolled by it"
+            watch.is_some(),
+            "the loop was not handed the standby to watch"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "found IPv4 punched, 38 ms".to_string()))
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn no_standby_is_said_on_the_path_line() {
+    async fn a_failed_search_is_recorded_with_its_reason_and_a_stale_one_is_not() {
         let (_host, mut client) = pair("sleep 30\n").await;
-        let mut out = Vec::new();
-        client
-            .announce(
-                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
-                &mut out,
-            )
-            .expect("announce");
-        out.clear();
+        let now = Instant::now();
+        let (standby, search) = standby_searching(now);
+        client.standby = Some(standby);
 
-        client
-            .announce_standby(None, &mut out)
-            .expect("announce no standby");
+        client.on_standby_event(
+            crate::standby::StandbyEvent::NotFound {
+                search: search + 7,
+                reason: "stale".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "a stale search's failure was recorded"
+        );
 
-        let line =
-            "oxutrm  IPv6 direct  \u{b7}  11 ms  \u{b7}  mtu 1452  \u{b7}  no standby path\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
-        assert!(out.len() > line.len(), "nothing was painted over the line");
+        client.on_standby_event(
+            crate::standby::StandbyEvent::NotFound {
+                search,
+                reason: "no path".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "not found: no path".to_string()))
+        );
     }
 
-    /// The failover says where it went, and the path it went to is then the
-    /// announced one: announcing it again is silence, not a "migrated" line.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failover_announces_the_standby_it_switched_to() {
+    async fn a_lost_standby_is_recorded() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
+
+        client.on_standby_closed(&quinn::ConnectionError::TimedOut, Instant::now());
+
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "lost: timed out".to_string()))
+        );
+        assert!(!client.standby.as_ref().is_some_and(|s| s.has_link()));
+    }
+
+    /// A search the loop starts is recorded as it starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_search_started_is_recorded() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let now = Instant::now();
+        client.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            now.checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        ));
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the fixture recorded something"
+        );
+
+        let action = client.standby_step(Phase::Live, now, false);
+
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Search { .. }),
+            "no search started: {action:?}"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Standby, "search started".to_string()))
+        );
+    }
+
+    /// A probe failing every `PROBE_RETRY` through a long outage is one
+    /// "probing standby" and one folded failure, not two alternating
+    /// entries every five seconds that push everything useful out of the
+    /// ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_outage_records_its_probing_once_and_folds_its_failures() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+
+        for at in [t0, t0 + crate::linkstate::PROBE_RETRY] {
+            let action = client.standby_step(silent, at, false);
+            assert!(
+                matches!(action, crate::standby::StandbyAction::Probe { .. }),
+                "no probe at {:?}: {action:?}",
+                at - t0
+            );
+            client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: false }, at);
+        }
+
+        let log: Vec<(Kind, String, u32)> = client
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.text.clone(), e.repeats))
+            .collect();
+        assert_eq!(
+            log,
+            vec![
+                (Kind::Failover, "probing standby".to_string(), 0),
+                (Kind::Failover, "probe failed".to_string(), 1),
+            ]
+        );
+    }
+
+    /// The failover is recorded, writes nothing to the terminal but the
+    /// renderer's output, and the path it went to becomes the session's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_is_recorded_and_the_path_follows_it() {
         let (_host, mut client) = pair("sleep 30\n").await;
         let mut out = Vec::new();
         client
@@ -5342,22 +5596,310 @@ mod tests {
             )
             .expect("announce");
         out.clear();
+        client.identity = Some(Identity {
+            target: "bastion".into(),
+            session_id: "f0".repeat(16),
+            attach_id: 5,
+        });
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+
+        assert!(
+            client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+
+        assert_eq!(
+            last_entry(&client),
+            Some((
+                Kind::Failover,
+                "switched to standby (IPv4 punched)".to_string()
+            ))
+        );
+        assert!(
+            outside_renderer(&out).is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&outside_renderer(&out))
+        );
+        assert_eq!(
+            client.identity.as_ref().map(|i| i.attach_id),
+            Some(2),
+            "the attach id stayed the old link's"
+        );
         let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
-
-        client
-            .announce_failover(&standby, &mut out)
-            .expect("announce the failover");
-
-        let line = "oxutrm  switched to standby (IPv4 punched)  \u{b7}  38 ms\r\n";
-        let got = String::from_utf8_lossy(&out);
-        assert!(got.starts_with(line), "got {got:?}");
-        assert!(out.len() > line.len(), "nothing was painted over the line");
-        out.clear();
         assert!(
             !client.announce(&standby, &mut out).expect("announce"),
-            "the failover did not record the path it switched to: {:?}",
+            "the failover did not record the path it switched to"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_with_no_standby_does_nothing() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        assert!(
+            !client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+        assert_eq!(client.activity.entries().len(), 0);
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// The migration branch of `announce` used to print; the session owns the
+    /// screen by then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_migration_is_recorded_not_printed() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let mut out = Vec::new();
+        client
+            .announce(
+                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
+                &mut out,
+            )
+            .expect("first");
+        assert!(!out.is_empty(), "the connect line was not printed");
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "the connect line was recorded"
+        );
+        out.clear();
+
+        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        assert!(client.announce(&better, &mut out).expect("second"));
+
+        assert!(
+            out.is_empty(),
+            "the migration was written over the session: {:?}",
             String::from_utf8_lossy(&out)
         );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Link, "path migrated \u{2192} IPv6 direct".to_string()))
+        );
+    }
+
+    /// Spec §5.2, synchronously: once the session owns the screen, the
+    /// events that used to write a line over it -- held input sent, a path
+    /// migration, a failover -- reach the terminal only as the renderer's
+    /// output. The connect banner, written before, is the one thing outside
+    /// it, and finding exactly the banner shows the check can see a stray.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_the_banner_only_the_renderer_writes_to_the_terminal() {
+        let (_host, mut client) = with_confirming_popup(b"make test\r").await;
+        let mut out = Vec::new();
+        let first = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        client.announce(&first, &mut out).expect("the banner");
+        let banner = format!("{}\n", status_line(&first));
+        assert_eq!(String::from_utf8_lossy(&outside_renderer(&out)), banner);
+
+        assert_eq!(answer(&mut client, b"s", &mut out), None);
+        let migrated = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
+        assert!(client.announce(&migrated, &mut out).expect("a migration"));
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        assert!(
+            client
+                .fail_over(Instant::now(), &mut out)
+                .expect("failing over")
+        );
+
+        let texts: Vec<String> = client.activity.entries().map(|e| e.text.clone()).collect();
+        for event in ["held input sent", "path migrated", "switched to standby"] {
+            assert!(
+                texts.iter().any(|t| t.starts_with(event)),
+                "{event:?} never happened, so it proves nothing: {texts:?}"
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&outside_renderer(&out)),
+            banner,
+            "written outside the renderer after the banner"
+        );
+    }
+
+    #[tokio::test]
+    async fn sending_or_dropping_held_input_is_recorded() {
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
+        let mut out = Vec::new();
+        assert!(
+            !session.activity.entries().any(|e| e.kind == Kind::Input),
+            "the fixture recorded input"
+        );
+        answer(&mut session, b"s", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input sent (10 bytes)".to_string()))
+        );
+
+        let (_host, mut session) = with_confirming_popup(b"rm -rf /tmp/x\r").await;
+        answer(&mut session, b"d", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input dropped (14 bytes)".to_string()))
+        );
+
+        // Final review, Minor 6: one byte is "1 byte" in the log too.
+        let (_host, mut session) = with_confirming_popup(b"y").await;
+        answer(&mut session, b"s", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input sent (1 byte)".to_string()))
+        );
+        let (_host, mut session) = with_confirming_popup(b"n").await;
+        answer(&mut session, b"d", &mut out);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Input, "held input dropped (1 byte)".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_attempt_and_its_failure_are_recorded() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            !session.activity.entries().any(|e| e.kind == Kind::Rebuild),
+            "the fixture recorded a rebuild"
+        );
+
+        session.rebuild_step(entered, &tx);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Rebuild, "attempt 1 started".to_string()))
+        );
+
+        session.rebuild_failed(
+            "ssh exited with status 255".to_string(),
+            entered + Duration::from_secs(1),
+        );
+        assert_eq!(
+            last_entry(&session),
+            Some((
+                Kind::Rebuild,
+                "attempt 1 failed: ssh exited with status 255".to_string()
+            ))
+        );
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Recovering { attempt: 1, .. }
+        ));
+        assert_eq!(
+            session.last_failure.as_deref(),
+            Some("ssh exited with status 255")
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// The attempt that ends the session is the last line of the file, so
+    /// it must say how it ended (spec §5.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_definite_rebuild_failure_is_recorded_before_the_session_ends() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert_eq!(
+            last_entry(&session),
+            Some((Kind::Rebuild, "attempt 1 started".to_string()))
+        );
+
+        let err = session.rebuild_refused("the host no longer knows this session");
+
+        assert_eq!(
+            last_entry(&session),
+            Some((
+                Kind::Rebuild,
+                "attempt 1 failed: the host no longer knows this session".to_string()
+            ))
+        );
+        assert_eq!(
+            err.to_string(),
+            "this session cannot be resumed: the host no longer knows this session"
+        );
+        assert_eq!(
+            session.last_failure, None,
+            "a definite answer is not a retry"
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// A probe's answer is recorded; a stale one (the probe it answers is no
+    /// longer pending) is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_answer_is_recorded_and_a_stale_one_is_not() {
+        let (_host, mut client) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        let t0 = Instant::now();
+        let silent = Phase::Silent { since: t0 };
+
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            client.activity.entries().len(),
+            0,
+            "a probe nobody sent was recorded"
+        );
+
+        let action = client.standby_step(silent, t0, false);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "no probe started: {action:?}"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Failover, "probing standby".to_string()))
+        );
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Failover, "probe answered".to_string()))
+        );
+        let before = client.activity.entries().len();
+        client.on_standby_event(crate::standby::StandbyEvent::Probed { answered: true }, t0);
+        assert_eq!(
+            client.activity.entries().len(),
+            before,
+            "a stale answer was recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_landed_rebuild_is_recorded_and_its_path_and_attach_become_the_sessions() {
+        let (_host, mut client) = pair("").await;
+        client.identity = Some(Identity {
+            target: "bastion".into(),
+            session_id: "f0".repeat(16),
+            attach_id: 5,
+        });
+        assert!(client.path.is_none(), "the fixture already had a path");
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+
+        client
+            .rebuild_landed(standby_established(rebuilt), Instant::now())
+            .expect("landing");
+
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Rebuild, "landed via IPv4 punched".to_string()))
+        );
+        assert_eq!(client.path.as_ref().map(|p| p.rtt_ms), Some(38));
+        assert_eq!(client.identity.as_ref().map(|i| i.attach_id), Some(2));
     }
 
     /// Ruling B1. A failover is not a rebuild landing: an ssh attempt that
@@ -5431,11 +5973,12 @@ mod tests {
     }
 
     /// The loop watches the standby's connection: when it closes, the
-    /// standby is forgotten and its loss is said once (spec §3.7). The close
-    /// is the host's `SUPERSEDED`, a reason that ends nothing.
+    /// standby is forgotten and its loss is recorded (spec §5.1), which the
+    /// popup's log shows. The close is the host's `SUPERSEDED`, a reason that
+    /// ends nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_standby_closed_under_a_running_session_is_announced_and_forgotten() {
-        let (mut host, mut client) = pair("").await;
+    async fn a_standby_closed_under_a_running_session_is_recorded_and_forgotten() {
+        let (mut host, mut client) = pair_sized("", BIG).await;
         let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         client.standby = Some(standby_holding(standby_client));
 
@@ -5451,22 +5994,18 @@ mod tests {
             }
         });
 
-        // A round trip through the shell: the loop is running, laps and all,
-        // and has said nothing about the standby it holds.
+        // A round trip through the shell: the loop is running, laps and all.
         typing
             .write_all(b"printf 'ready-%s\\n' ok\n")
             .expect("type");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !out.text().contains("ready-ok") {
-            assert!(
-                Instant::now() < deadline,
-                "the shell never answered; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+
+        // Losing a standby is not an outage, so nothing opens the popup by
+        // itself: open it by hand, as a curious user would.
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
         assert!(
-            !out.text().contains("no standby path"),
+            !screen_of(&out, BIG).contains("lost:"),
             "the standby was reported lost before anything closed it"
         );
 
@@ -5474,16 +6013,10 @@ mod tests {
             .sink
             .connection()
             .close(quinn::VarInt::from_u32(0), SUPERSEDED);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !out.text().contains("no standby path") {
-            assert!(
-                Instant::now() < deadline,
-                "losing the standby went unsaid; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_screen(&out, BIG, "lost:", Duration::from_secs(10)).await;
 
+        // The open popup takes every key: close it, then talk to the shell.
+        close_the_popup(&mut typing, &out, BIG).await;
         typing.write_all(b"exit 7\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
@@ -5493,6 +6026,12 @@ mod tests {
         assert!(
             !client.standby.as_ref().is_some_and(|s| s.has_link()),
             "the closed standby is still held"
+        );
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
     }
@@ -5504,9 +6043,14 @@ mod tests {
     /// The exit status is the evidence: `exit 7` is typed while the primary
     /// is blackholed, so only the standby can carry it to the shell and the
     /// status back. The final link's identity says which one did.
+    ///
+    /// The popup opens for the outage and shows the failover in its log;
+    /// the test reads that off the replayed screen, then waits for the popup
+    /// to say the link is back and to close by itself, and only then types
+    /// `exit 7`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dead_primary_fails_over_onto_an_answering_standby() {
-        let (mut host, mut client, relay) = pair_through_relay("").await;
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         // The probe is answered by the standby's own control server. Its door
@@ -5539,12 +6083,25 @@ mod tests {
         // Sent while the phase is still `Live`, so a reply is owed and the
         // silence is noticed. The bytes themselves are lost with the swap.
         typing.write_all(b"true\n").expect("type");
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        wait_for_screen(&out, BIG, "switched to standby", Duration::from_secs(15)).await;
+        // And answering on it. Typed before the first frame arrives on
+        // it, `exit 7` would be held for the `Confirming` question and never
+        // reach the shell.
+        wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(15)).await;
+        // The lingering popup takes every key. Let it close by itself
+        // rather than pressing Esc: an Esc racing the linger's end would
+        // reach the shell, and `ESC e` is a readline command.
+        wait_off_screen(&out, BIG, "LIVE again", Duration::from_secs(10)).await;
         typing.write_all(b"exit 7\n").expect("type");
 
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
-            .unwrap_or_else(|_| panic!("the client never finished; it painted:\n{}", out.text()))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; it showed:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
             .expect("client task");
         assert_eq!(
             code.expect("the client loop failed"),
@@ -5556,21 +6113,22 @@ mod tests {
             standby_id,
             "the session did not end on the standby"
         );
+        let stray = outside_renderer(&out.bytes());
         assert!(
-            out.text().contains("switched to standby"),
-            "the failover was not announced: {}",
-            out.text()
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
     }
 
     /// The search, end to end through the doors `serve` opens: the request
     /// goes out on the FIRST link's control stream, runs the real exchange
-    /// through the listener, is parked by the host, and is announced by the
-    /// client.
+    /// through the listener, is parked by the host, and is recorded by the
+    /// client, whose popup shows it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_standby_is_found_over_the_first_links_control_stream() {
-        let (mut host, mut client) = pair("").await;
+        let (mut host, mut client) = pair_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let dir = tempfile::tempdir().expect("a scratch directory");
         let listener =
@@ -5612,21 +6170,19 @@ mod tests {
             }
         });
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !out.text().contains("standby: ") {
-            assert!(
-                Instant::now() < deadline,
-                "no standby was announced; the client painted:\n{}",
-                out.text()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // A found standby is not an outage, so nothing opens the popup by
+        // itself: open it by hand and watch its log.
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
+        wait_for_screen(&out, BIG, "found ", Duration::from_secs(20)).await;
         assert_eq!(
             meta.lock().await.attach_id,
             1,
             "the host did not run an exchange for the standby"
         );
 
+        // The open popup takes every key: close it, then talk to the shell.
+        close_the_popup(&mut typing, &out, BIG).await;
         typing.write_all(b"exit 7\n").expect("type");
         let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
             .await
@@ -5638,57 +6194,41 @@ mod tests {
             primary_id,
             "finding a standby moved the session off the primary"
         );
+        assert!(
+            client
+                .activity
+                .entries()
+                .any(|e| e.kind == Kind::Standby && e.text.starts_with("found ")),
+            "the standby was shown but not recorded"
+        );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
         crate::listener::close_the_door(door_task).await;
     }
 
-    /// Every word a notice puts on the screen: headline, body and key list.
-    /// A guard that reads only the body is how a claim came to sit in a key
-    /// list unnoticed, and reading only the `Silent` notice is how another
-    /// came to sit in a headline.
-    fn painted_words(n: &Notice) -> String {
-        std::iter::once(n.headline.clone())
-            .chain(n.body.iter().cloned())
-            .chain(n.keys.iter().flat_map(|(k, d)| [k.clone(), d.clone()]))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// What phase 1 forbids layer 1 to say, wherever in the box it says it.
+    /// What the popup may not say while `Silent` or `Confirming`, wherever
+    /// in it it says it.
     ///
-    /// Nothing reconnects yet, so the notice may not name a mechanism oxutrm
-    /// does not have. And from here a dead network and a crashed host are
-    /// indistinguishable, so it may not vouch for the far end at all -- not
-    /// even hedged. The hedge belongs in the exit message, which is read once
-    /// the session has ended and can point at `oxutrm host --list`; the box
-    /// has room to say what a key DOES, and that stays true either way.
+    /// Nothing is reconnecting in those phases -- the rebuild loop starts
+    /// only in `Recovering` -- so they may not name it. And from here a dead
+    /// network and a crashed host are indistinguishable, so the popup may not
+    /// vouch for the far end at all, not even hedged. What a key DOES stays
+    /// true either way. The list is `view.rs`'s, shared.
     fn assert_claims_nothing_it_cannot_see(shown: &str) {
-        let lower = shown.to_lowercase();
-        assert!(
-            !lower.contains("safe"),
-            "claimed the session is safe, which the client cannot know: {shown}"
-        );
-        assert!(
-            !lower.contains("retry") && !lower.contains("reconnect"),
-            "phase 1 promised a reconnection that does not exist: {shown}"
-        );
-        for claim in ["keeps running", "still running", "is running"] {
-            assert!(
-                !lower.contains(claim),
-                "asserted the shell's state, which the client cannot see: {shown}"
-            );
-        }
+        crate::view::assert_claims_nothing_it_cannot_see(shown);
     }
 
-    /// Ctrl-\, the prefix layer 1 listens for. `linkstate`'s own copy is
-    /// private to that module, and a test that reached for it would be
-    /// asserting the constant rather than the keystroke.
+    /// Ctrl-\, the key layer 1 listens for. `ui`'s own copy is the code
+    /// under test, and a test that reached for it would be asserting the
+    /// constant rather than the keystroke.
     const CTRL_BACKSLASH: u8 = 0x1c;
 
-    /// A client with a real `Silent` notice showing, left exactly as the loop
-    /// leaves it: the phase decided by `notice_at`, and `shown` mirroring what
-    /// the overlay is.
-    async fn with_notice() -> (HostSession, ClientSession) {
+    /// A lone Esc, the popup's close key; the same reasoning.
+    const ESCAPE: u8 = 0x1b;
+
+    /// A client with the popup up for a real `Silent` phase, left exactly as
+    /// the loop leaves it: the phase decided by `popup_at`, and `shown`
+    /// mirroring what the overlay is.
+    async fn with_popup() -> (HostSession, ClientSession) {
         let t = std::time::Instant::now();
         let (host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
@@ -5697,27 +6237,39 @@ mod tests {
         // period is measured from when the reply started being owed, so a
         // fixture that jumped straight to three seconds would be asking about
         // an owing three seconds long that had only just started.
-        assert!(session.notice_at(t).is_none());
-        let notice = session.notice_at(t + Duration::from_secs(3));
-        assert!(notice.is_some(), "the fixture raised no notice");
-        session.shown = notice;
+        assert!(session.popup_at(t).is_none());
+        let view = session.popup_at(t + Duration::from_secs(3));
+        assert!(view.is_some(), "the fixture raised no popup");
+        session.shown = view;
         (host, session)
     }
 
-    /// A client sitting in the `Confirming` box with `held` typed blind: a
-    /// notice went up, the user typed into it, and the host started answering
-    /// again. The only phase that offers `Ctrl-\ s` and `Ctrl-\ d`.
-    async fn with_confirming_notice(held: &[u8]) -> (HostSession, ClientSession) {
-        let (host, mut session) = with_notice().await;
+    /// A client whose popup asks about `held`, typed blind: the popup went
+    /// up, the user closed it and typed, and the host started answering
+    /// again. The only phase that offers `s send` and `d drop`.
+    async fn with_confirming_popup(held: &[u8]) -> (HostSession, ClientSession) {
+        let (host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session
+            .route_keys(&[ESCAPE], &mut out)
+            .expect("close the popup");
         session.route_keys(held, &mut out).expect("hold the typing");
 
         let now = std::time::Instant::now();
         session.note_heard(now);
-        let notice = session.notice_at(now);
-        assert!(notice.is_some(), "the fixture asked the user nothing");
-        session.shown = notice;
+        let view = session.popup_at(now);
+        assert!(view.is_some(), "the fixture asked the user nothing");
+        session.shown = view;
         (host, session)
+    }
+
+    /// Press `keys` once the question has been up for `ANSWER_GUARD`: the
+    /// read is stamped that far past now, which is past when any lap or
+    /// read before this one first saw `Confirming`.
+    fn answer(session: &mut ClientSession, keys: &[u8], out: &mut Vec<u8>) -> Option<i32> {
+        session
+            .route_keys_at(keys, Instant::now() + crate::ui::ANSWER_GUARD, out)
+            .expect("the answer lands")
     }
 
     /// Wait until a frame is sitting in the client's source, without applying
@@ -5734,10 +6286,10 @@ mod tests {
 
     /// A frame that arrives on a pacing lap rather than through the frame arm
     /// still counts as hearing from the host. Without this the picture comes
-    /// back to life underneath a box saying nobody is answering.
+    /// back to life underneath a popup saying nobody is answering.
     #[tokio::test]
-    async fn a_scavenged_frame_clears_the_notice() {
-        let (mut host, mut session) = with_notice().await;
+    async fn a_scavenged_frame_ends_the_silence() {
+        let (mut host, mut session) = with_popup().await;
         let mut out = Vec::new();
 
         // The host answers. The frame lands in the channel, but nothing wakes
@@ -5754,46 +6306,54 @@ mod tests {
     }
 
     /// The counter is built from `last_heard`, so a scavenged frame must move
-    /// it or the box overstates the outage for as long as the box is up.
+    /// it or the popup overstates the outage for as long as it is up.
     #[tokio::test]
-    async fn a_scavenged_frame_takes_the_notice_down() {
-        let (mut host, mut session) = with_notice().await;
+    async fn a_scavenged_frame_ends_the_outage_the_popup_reports() {
+        let (mut host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        assert!(
+            session.outage_at(Instant::now()),
+            "the fixture's popup reports no outage"
+        );
 
         host.turn().expect("the host takes a turn");
         wait_for_frame(&mut session).await;
         session.turn(&[], &mut out).expect("a pacing lap");
 
-        assert!(
-            session.notice_at(Instant::now()).is_none(),
-            "the notice survived a frame that was applied"
+        let v = session
+            .popup_at(Instant::now())
+            .expect("the popup closed instead of lingering");
+        assert_eq!(
+            v.marker,
+            Marker::LiveAgain,
+            "a frame was applied and the popup still reports silence"
         );
     }
 
-    /// `heard` clears a half-typed prefix, and this task makes `heard` run far
-    /// more often. A `Ctrl-\` and its letter genuinely arrive in two reads;
-    /// a frame landing between them must not eat the command.
+    /// `heard` runs on every frame. One landing while the question is up
+    /// must neither answer it nor take it down: it stays until `s` or `d`.
     #[tokio::test]
-    async fn a_frame_between_the_prefix_and_its_letter_does_not_eat_the_command() {
-        let (mut host, mut session) = with_confirming_notice(b"echo hi\r").await;
+    async fn a_frame_while_the_question_is_up_does_not_answer_it() {
+        let (mut host, mut session) = with_confirming_popup(b"echo hi\r").await;
         let mut out = Vec::new();
 
-        // The prefix arrives at the end of one read...
-        session
-            .route_keys(&[CTRL_BACKSLASH], &mut out)
-            .expect("the prefix is held");
-        // ...a frame is applied between the two reads...
         host.turn().expect("the host takes a turn");
         wait_for_frame(&mut session).await;
         session.turn(&[], &mut out).expect("a pacing lap");
-        // ...and the letter arrives in the next.
-        session
-            .route_keys(b"d", &mut out)
-            .expect("the letter lands");
 
+        assert_eq!(
+            session.link_state.held(),
+            b"echo hi\r",
+            "a frame resolved the held input"
+        );
+        assert!(
+            session.popup_at(Instant::now()).is_some(),
+            "a frame took the question down"
+        );
+        answer(&mut session, b"d", &mut out);
         assert!(
             session.link_state.held().is_empty(),
-            "Ctrl-\\ d did not drop the held buffer: the frame ate the prefix"
+            "d did not drop the held buffer after a frame"
         );
     }
 
@@ -5824,40 +6384,16 @@ mod tests {
         );
     }
 
-    /// The payload of the phase: what is typed at a dead link is kept rather
-    /// than thrown at a host that cannot hear it.
-    #[tokio::test]
-    async fn typing_into_a_notice_is_held_and_not_sent() {
-        let (_host, mut session) = with_notice().await;
-        let before = spoken(&session);
-        let mut out = Vec::new();
-
-        assert_eq!(session.route_keys(b"rm -rf /", &mut out).unwrap(), None);
-
-        assert_eq!(
-            session.link_state.held(),
-            b"rm -rf /",
-            "blind typing was not kept"
-        );
-        assert_eq!(
-            spoken(&session),
-            before,
-            "blind typing was sent at a host that is not answering"
-        );
-    }
-
-    /// `Ctrl-\ q` is the notice's own key, so it must not reach the shell as
-    /// two stray bytes, and it must end the client with a status of its own
+    /// `q` is the popup's own key, so it must not reach the shell, and it
+    /// must end the client with a status of its own
     /// rather than one invented for a shell that never exited.
     #[tokio::test]
     async fn the_quit_key_ends_the_client_with_a_status_of_zero() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_popup().await;
         let before = spoken(&session);
         let mut out = Vec::new();
 
-        let answer = session
-            .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
-            .unwrap();
+        let answer = session.route_keys(b"q", &mut out).unwrap();
 
         assert_eq!(answer, Some(0), "the quit key did not end the client");
         assert_eq!(spoken(&session), before, "the command reached the shell");
@@ -5867,14 +6403,12 @@ mod tests {
     /// order, once the user has looked at the screen and said so.
     #[tokio::test]
     async fn the_send_key_delivers_what_was_typed_blind() {
-        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
 
-        let answer = session
-            .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
-            .unwrap();
+        let answered = answer(&mut session, b"s", &mut out);
 
-        assert_eq!(answer, None, "sending the held input ended the session");
+        assert_eq!(answered, None, "sending the held input ended the session");
         assert!(
             spoken(&session).ends_with(b"make test\r"),
             "the held input was not delivered: {:?}",
@@ -5890,73 +6424,298 @@ mod tests {
     /// would deliver the discarded keys at the next `s`.
     #[tokio::test]
     async fn the_drop_key_throws_the_blind_typing_away() {
-        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
         let before = spoken(&session);
 
-        let answer = session
-            .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
-            .unwrap();
+        let answered = answer(&mut session, b"d", &mut out);
 
-        assert_eq!(answer, None, "dropping the held input ended the session");
+        assert_eq!(answered, None, "dropping the held input ended the session");
         assert!(session.link_state.held().is_empty(), "the drop kept it");
         assert_eq!(spoken(&session), before, "the drop sent it instead");
     }
 
-    /// The `Silent` box lists exactly one key, and the two it does not list
-    /// must not work.
-    ///
-    /// `Ctrl-\ s` there would throw the held bytes at a link the client has
-    /// just told the user is not answering -- and empty the buffer, so the
-    /// `Confirming` review that is the entire point of holding never happens.
-    /// `Ctrl-\ d` would discard someone's typing with no confirmation at all.
-    /// Both are kept as typing instead, which is what the user meant by
-    /// pressing keys into a box that does not offer them.
+    /// The outage popup offers `Esc` and `q`; `s` and `d` answer only the
+    /// question. Pressed into it, they must neither deliver nor discard what
+    /// was typed blind before it was opened again -- nor be kept as typing.
     #[tokio::test]
-    async fn the_silent_notice_does_not_honour_the_keys_it_does_not_offer() {
-        let (_host, mut session) = with_notice().await;
+    async fn the_outage_popup_does_not_honour_the_keys_it_does_not_offer() {
+        let (_host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
         session.route_keys(b"make test\r", &mut out).unwrap();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
+        assert!(
+            session.ui.visible(session.link_state.phase_now()),
+            "Ctrl-\\ did not open the popup again"
+        );
         let before = spoken(&session);
 
+        assert_eq!(session.route_keys(b"s", &mut out).unwrap(), None);
         assert_eq!(
-            session
-                .route_keys(&[CTRL_BACKSLASH, b's'], &mut out)
-                .unwrap(),
+            spoken(&session),
+            before,
+            "the held input was delivered to a host the popup says is not answering"
+        );
+        assert_eq!(session.route_keys(b"d", &mut out).unwrap(), None);
+        assert_eq!(
+            session.link_state.held(),
+            b"make test\r",
+            "the held input was discarded, or the keys were kept as typing"
+        );
+    }
+
+    /// And `q` is the key every popup offers, the question included.
+    #[tokio::test]
+    async fn the_quit_key_works_under_the_confirming_popup_too() {
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
+        let mut out = Vec::new();
+
+        assert_eq!(answer(&mut session, b"q", &mut out), Some(0));
+    }
+
+    /// Final review, Important 1, at the session: a key that was in flight
+    /// when the question appeared answers nothing -- the held input is
+    /// neither sent nor dropped and the client does not quit -- and the
+    /// same keys answer once the question has been up `ANSWER_GUARD`.
+    #[tokio::test]
+    async fn keys_in_flight_when_the_question_appears_do_not_answer_it() {
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        for key in [&b"s"[..], b"d", b"q"] {
+            assert_eq!(
+                session.route_keys(key, &mut out).unwrap(),
+                None,
+                "{key:?} quit"
+            );
+        }
+        assert_eq!(spoken(&session), before, "an in-flight key sent the input");
+        assert_eq!(
+            session.link_state.held(),
+            b"make test\r",
+            "an in-flight key dropped the input, or was held with it"
+        );
+        assert!(
+            session.ui.visible(session.link_state.phase_now()),
+            "an in-flight key took the question down"
+        );
+
+        assert_eq!(answer(&mut session, b"s", &mut out), None);
+        assert!(
+            spoken(&session).ends_with(b"make test\r"),
+            "{:?}",
+            spoken(&session)
+        );
+    }
+
+    /// The whole point of the key on a healthy link: it opens the popup and
+    /// is not sent.
+    #[tokio::test]
+    async fn ctrl_backslash_opens_the_popup_on_a_healthy_session() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let now = Instant::now();
+        assert!(
+            session.popup_at(now).is_none(),
+            "the popup was up before the key"
+        );
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        assert_eq!(
+            session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap(),
             None
+        );
+
+        assert_eq!(spoken(&session), before, "the key reached the host");
+        let v = session.popup_at(now).expect("the key opened nothing");
+        assert_eq!(v.marker, Marker::Live);
+        assert!(words(&v).contains("Esc close"), "{}", words(&v));
+    }
+
+    /// On a healthy link the open popup takes every key too: typing into it
+    /// reaches neither the host nor the held buffer, and it stays up.
+    #[tokio::test]
+    async fn typing_into_an_open_popup_on_a_healthy_session_goes_nowhere() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        session.route_keys(&[CTRL_BACKSLASH], &mut out).unwrap();
+        let before = spoken(&session);
+
+        assert_eq!(session.route_keys(b"ls\r", &mut out).unwrap(), None);
+
+        assert_eq!(
+            spoken(&session),
+            before,
+            "typing went through the popup to the host"
+        );
+        assert!(
+            session.link_state.held().is_empty(),
+            "typing into the popup was held"
+        );
+        assert!(
+            session.ui.visible(session.link_state.phase_now()),
+            "typing closed the popup"
+        );
+    }
+
+    /// Review focus 2, at the session: closing the popup an outage opened
+    /// makes typing blind a choice, and what is typed then is held -- not
+    /// sent at a host that is not answering -- while the popup stays shut
+    /// for the rest of the outage.
+    #[tokio::test]
+    async fn typing_after_closing_the_outage_popup_is_held_and_not_sent() {
+        let (_host, mut session) = with_popup().await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        assert_eq!(session.route_keys(&[ESCAPE], &mut out).unwrap(), None);
+        assert!(
+            !session.ui.visible(session.link_state.phase_now()),
+            "Esc left the popup up"
+        );
+        assert_eq!(session.route_keys(b"rm -rf /", &mut out).unwrap(), None);
+
+        assert_eq!(
+            session.link_state.held(),
+            b"rm -rf /",
+            "blind typing was not kept"
         );
         assert_eq!(
             spoken(&session),
             before,
-            "the held input was delivered to a host the box says is not answering"
+            "blind typing was sent at a host that is not answering"
         );
-
-        assert_eq!(
-            session
-                .route_keys(&[CTRL_BACKSLASH, b'd'], &mut out)
-                .unwrap(),
-            None
-        );
+        // Still `Silent` (the rebuild starts at `REBUILD_AFTER`, 20 s), and
+        // still the outage the popup was closed in.
+        let later = Instant::now() + Duration::from_secs(5);
         assert!(
-            session.link_state.held().starts_with(b"make test\r"),
-            "someone's blind typing was discarded by a key the box never \
-             offered: {:?}",
-            session.link_state.held()
+            session.popup_at(later).is_none(),
+            "the popup opened itself again for the outage it was closed in"
         );
     }
 
-    /// And `Ctrl-\ q` is the key every box does offer, in every phase.
+    /// Review focus 3, at the session: typing held behind a popup closed by
+    /// hand is asked about when the host answers, and the question takes a
+    /// bare `s`.
     #[tokio::test]
-    async fn the_quit_key_works_under_the_confirming_notice_too() {
-        let (_host, mut session) = with_confirming_notice(b"make test\r").await;
+    async fn held_input_after_a_closed_outage_opens_the_question() {
+        let (_host, mut session) = with_popup().await;
         let mut out = Vec::new();
+        session.route_keys(&[ESCAPE], &mut out).unwrap();
+        session.route_keys(b"make test\r", &mut out).unwrap();
+        assert!(
+            session.popup_at(Instant::now()).is_none(),
+            "the fixture's popup did not stay closed"
+        );
+
+        let now = Instant::now();
+        session.note_heard(now);
+        let v = session
+            .popup_at(now)
+            .expect("the host answered with input held, and nothing was asked");
+        assert!(
+            v.held
+                .first()
+                .is_some_and(|l| l.contains("deliver what you typed?")),
+            "{:?}",
+            v.held
+        );
+        assert!(words(&v).contains("s send"), "{}", words(&v));
+
+        let before = spoken(&session);
+        assert!(
+            !before.ends_with(b"make test\r"),
+            "sent before it was asked about"
+        );
+        assert_eq!(answer(&mut session, b"s", &mut out), None);
+        assert!(
+            spoken(&session).ends_with(b"make test\r"),
+            "{:?}",
+            spoken(&session)
+        );
+        assert!(session.link_state.held().is_empty(), "sent and kept");
+        assert!(
+            session.popup_at(Instant::now()).is_none(),
+            "the answered question stayed up"
+        );
+    }
+
+    /// The popup an outage opened stays up for `LINGER` once the link is
+    /// back, saying so, and then closes by itself.
+    #[tokio::test]
+    async fn returning_to_live_lingers_and_then_closes() {
+        let (_host, mut session) = with_popup().await;
+        // The host keeps answering throughout: a `note_heard` before each
+        // lap is a frame arriving. Without it the fixture's unacknowledged
+        // input would make the link `Silent` again two seconds in, which is
+        // inside `LINGER`.
+        let now = Instant::now();
+        session.note_heard(now);
+        let v = session.popup_at(now).expect("the popup closed at once");
+        assert_eq!(v.marker, Marker::LiveAgain);
+
+        let almost = now + crate::ui::LINGER - Duration::from_millis(1);
+        session.note_heard(almost);
+        assert!(session.popup_at(almost).is_some(), "closed before LINGER");
+
+        let then = now + crate::ui::LINGER;
+        session.note_heard(then);
+        assert_eq!(session.popup_at(then), None, "it never closed");
+    }
+
+    #[tokio::test]
+    async fn an_outage_and_its_end_are_recorded() {
+        let t = Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.popup_at(t).is_none());
+        assert_eq!(
+            session.activity.entries().len(),
+            0,
+            "something was recorded before the outage"
+        );
+
+        session.popup_at(t + Duration::from_secs(3));
+        session.note_heard(t + Duration::from_millis(4_500));
+        session.popup_at(t + Duration::from_millis(4_500));
+
+        let texts: Vec<String> = session.activity.entries().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, ["silent", "live again via this link, outage 4.5 s"]);
+    }
+
+    /// Two laps within a second take one sample: `Quality::push` does not
+    /// pace itself, so the pacing is the session's.
+    #[tokio::test]
+    async fn quality_is_sampled_once_a_second_and_marks_outage_seconds() {
+        let t = Instant::now();
+        let (_host, mut session) = with_popup().await;
+        assert!(session.quality.sparkline().is_empty());
+
+        session.sample_quality(t);
+        session.sample_quality(t + Duration::from_millis(500));
+        session.sample_quality(t + Duration::from_secs(1));
 
         assert_eq!(
-            session
-                .route_keys(&[CTRL_BACKSLASH, b'q'], &mut out)
-                .unwrap(),
-            Some(0),
+            session.quality.sparkline(),
+            vec![None, None],
+            "with_popup is Silent: both are outage seconds"
         );
+    }
+
+    #[tokio::test]
+    async fn a_swap_starts_a_new_quality_segment() {
+        let (_host, mut client) = pair("").await;
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        assert_eq!(client.quality.segment(), 1);
+
+        client
+            .swap_in(rebuilt, Instant::now())
+            .expect("swapping in");
+
+        assert_eq!(client.quality.segment(), 2);
     }
 
     /// Without a heartbeat an idle session cannot tell an outage from calm,
@@ -5996,7 +6755,7 @@ mod tests {
         assert!(!session.heartbeat(t + Duration::from_secs(6)));
     }
 
-    /// The caller's half of `notice_at`'s question: have we said something the
+    /// The caller's half of `popup_at`'s question: have we said something the
     /// host has not acknowledged? Reading it lets a test wait for a REAL ack
     /// rather than assume one, which is the difference between exercising the
     /// clock and exercising a fixture.
@@ -6019,7 +6778,7 @@ mod tests {
     /// Two full cycles, with the host really answering in between, and the
     /// clock supplied rather than slept through.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_heartbeating_session_that_is_answered_never_raises_a_notice() {
+    async fn a_heartbeating_session_that_is_answered_never_reports_an_outage() {
         let (mut host, mut client) = pair("/bin/sh").await;
         let mut out = Vec::new();
 
@@ -6047,10 +6806,9 @@ mod tests {
                 client.heartbeat(now),
                 "cycle {cycle}: no heartbeat was due after five quiet seconds"
             );
-            assert_eq!(
-                client.notice_at(now),
-                None,
-                "cycle {cycle}: a notice was raised on the very lap the heartbeat \
+            assert!(
+                !client.outage_at(now),
+                "cycle {cycle}: a popup was raised on the very lap the heartbeat \
                  went out, for a reply owed for zero milliseconds. Every idle \
                  session would flash this every {} seconds",
                 crate::linkstate::HEARTBEAT_IDLE.as_secs()
@@ -6070,16 +6828,15 @@ mod tests {
             );
             now += Duration::from_millis(120);
             client.note_heard(now);
-            assert_eq!(
-                client.notice_at(now),
-                None,
-                "cycle {cycle}: a notice survived the host answering"
+            assert!(
+                !client.outage_at(now),
+                "cycle {cycle}: a popup survived the host answering"
             );
         }
     }
 
     /// A healthy session, through the REAL loop, for longer than the
-    /// heartbeat: no notice may ever be painted.
+    /// heartbeat: the popup may never open.
     ///
     /// Both idle-CPU guards run for two seconds, which is below
     /// `HEARTBEAT_IDLE`, so what the heartbeat does *inside* the loop was
@@ -6087,11 +6844,11 @@ mod tests {
     /// property that a working session shows nothing at all. That is how C1
     /// shipped: every one of its parts passed its own review.
     ///
-    /// The assertion reads the bytes that went to the terminal, because that
-    /// is what the user sees. The headline is one uniformly styled span, so if
-    /// it is ever painted its bytes appear in `out` contiguously.
+    /// The assertion reads the activity log, which records every outage the
+    /// popup opens for: painted bytes are a diff, and a diff can split a word
+    /// wherever a cell happened to be unchanged.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_healthy_session_paints_no_notice_across_several_heartbeats() {
+    async fn a_healthy_session_raises_no_popup_across_several_heartbeats() {
         let (mut host, mut client) = pair("").await;
         let (keys, mut typing) = keyboard();
         let host_loop = tokio::spawn(async move { host.run().await });
@@ -6109,66 +6866,72 @@ mod tests {
         let _ = host_loop.await;
 
         assert_eq!(code, 0);
-        let painted = String::from_utf8_lossy(&out);
         assert!(
-            !painted.contains("reply from host"),
-            "a healthy session told the user the host had stopped answering"
+            !client.activity.entries().any(|e| e.text == "silent"),
+            "a healthy session went silent"
         );
         assert!(
             client.shown.is_none(),
-            "the session ended with a notice still up"
+            "the session ended with a popup still up"
         );
     }
 
-    /// The loop rebuilds layer 1 only when the notice's CONTENT changes, and a
-    /// resize changes not one word of it. So the resize itself has to lay the
-    /// box out again, or a `Confirming` notice — the one the user sits and
-    /// reads, because it is asking them a question — keeps the geometry of a
-    /// screen that is gone until they press a key.
+    /// The loop rebuilds layer 1 only when the VIEW changes, and a resize
+    /// changes not one word of it. So the resize itself has to lay the popup
+    /// out again, or a `Confirming` popup -- the one the user sits and reads,
+    /// because it is asking them a question -- keeps the geometry of a
+    /// screen that is gone until they press a key. Twice: once to a box
+    /// that still fits, and once below `MIN_BOX`, where the popup is a
+    /// single line.
     #[tokio::test]
-    async fn a_resize_lays_the_notice_out_again_for_the_new_screen() {
-        let t = std::time::Instant::now();
-        let (_host, mut session) = pair("/bin/sh").await;
-        session.note_heard(t);
-        session.note_sent(t);
+    async fn a_resize_lays_the_popup_out_again_for_the_new_screen() {
+        for small in [
+            TermSize { cols: 24, rows: 8 },
+            TermSize { cols: 19, rows: 5 },
+        ] {
+            let t = std::time::Instant::now();
+            let (_host, mut session) = pair("/bin/sh").await;
+            session.note_heard(t);
+            session.note_sent(t);
 
-        // Raise a notice and paint it, exactly as `run_on` does -- including
-        // the earlier lap on which the reply started being owed.
-        assert!(session.notice_at(t).is_none());
-        let notice = session.notice_at(t + Duration::from_secs(3)).unwrap();
-        session
-            .renderer
-            .set_overlay(Some(layout_notice(&notice, session.size)));
-        session.shown = Some(notice.clone());
-        let mut painted = Vec::new();
-        session
-            .renderer
-            .render(&mut painted, session.screen_rx.state())
-            .unwrap();
+            // Raise the popup and paint it, exactly as `run_on` does --
+            // including the earlier lap on which the reply started being owed.
+            assert!(session.popup_at(t).is_none());
+            let view = session.popup_at(t + Duration::from_secs(3)).unwrap();
+            session
+                .renderer
+                .set_overlay(Some(layout_popup(&view, session.size)));
+            session.shown = Some(view.clone());
+            let mut painted = Vec::new();
+            session
+                .renderer
+                .render(&mut painted, session.screen_rx.state())
+                .unwrap();
 
-        let small = TermSize { cols: 24, rows: 8 };
-        session.resize(small);
-        let mut after = Vec::new();
-        session
-            .renderer
-            .render(&mut after, session.screen_rx.state())
-            .unwrap();
+            session.resize(small);
+            let mut after = Vec::new();
+            session
+                .renderer
+                .render(&mut after, session.screen_rx.state())
+                .unwrap();
 
-        // What a renderer that never saw the old screen paints, for the same
-        // content and the same state. Equality is the assertion: the box is
-        // where the NEW screen puts it, and not where the old one did.
-        let mut fresh = Renderer::new(small, caps());
-        fresh.set_overlay(Some(layout_notice(&notice, small)));
-        let mut expected = Vec::new();
-        fresh
-            .render(&mut expected, session.screen_rx.state())
-            .unwrap();
+            // What a renderer that never saw the old screen paints, for the
+            // same view and the same state. Equality is the assertion: the
+            // popup is where the NEW screen puts it, and not where the old
+            // one did.
+            let mut fresh = Renderer::new(small, caps());
+            fresh.set_overlay(Some(layout_popup(&view, small)));
+            let mut expected = Vec::new();
+            fresh
+                .render(&mut expected, session.screen_rx.state())
+                .unwrap();
 
-        assert_eq!(
-            String::from_utf8_lossy(&after),
-            String::from_utf8_lossy(&expected),
-            "the notice kept the geometry of the screen that went away"
-        );
+            assert_eq!(
+                String::from_utf8_lossy(&after),
+                String::from_utf8_lossy(&expected),
+                "the popup kept the geometry of the screen that went away ({small:?})"
+            );
+        }
     }
 
     /// The rule from spec 4.2, and the one that costs something to get wrong:
@@ -6202,7 +6965,7 @@ mod tests {
     /// a bind/connect pair on every lap is up to 125 a second.
     #[tokio::test]
     async fn probing_is_paced_while_silent() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_popup().await;
         let t = Instant::now();
 
         session.follow_route(t);
@@ -6236,7 +6999,7 @@ mod tests {
     /// probing at all, which would make it a guard that cannot fail.
     #[tokio::test]
     async fn a_probe_that_finds_the_route_unchanged_does_not_rebind() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_popup().await;
         let t = Instant::now();
         let before = session.link.socket.local_addr().expect("a bound socket");
 
@@ -6270,7 +7033,7 @@ mod tests {
     /// the difference.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_moved_route_swaps_the_socket_and_the_session_survives_it() {
-        let (mut host, mut session) = with_notice().await;
+        let (mut host, mut session) = with_popup().await;
         let before = session.link.socket.local_addr().expect("a bound socket");
 
         // A baseline the loopback probe cannot agree with.
@@ -6332,7 +7095,7 @@ mod tests {
     /// of those two constants, which live in different modules, to move first.
     #[tokio::test]
     async fn a_healthy_lap_leaves_no_probe_pace_behind_it() {
-        let (_host, mut session) = with_notice().await;
+        let (_host, mut session) = with_popup().await;
         let t = Instant::now();
 
         session.follow_route(t);
@@ -6421,9 +7184,9 @@ mod tests {
     /// The direct, mutation-sensitive guard on the config itself is
     /// `the_transport_imposes_no_idle_timeout` in
     /// `crates/oxutrm-net/src/quic.rs`. What THIS test's timing does prove,
-    /// and what failed before `notice_at` was moved inside the loop below: a
-    /// silence long enough to have been fatal raises the notice and the
-    /// notice comes down again on its own once the host answers.
+    /// and what failed before `notice_at` (now `popup_at`) was moved inside
+    /// the loop below: a silence long enough to have been fatal raises the
+    /// outage popup and the outage ends on its own once the host answers.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "real 35s wall-clock outage; run explicitly, see doc comment"]
     async fn a_session_outlives_a_silence_that_used_to_kill_it() {
@@ -6445,29 +7208,29 @@ mod tests {
             client
                 .turn(&[], &mut out)
                 .expect("the session survives the lap");
-            // `run`'s own loop calls `notice_at` once per lap (see the
+            // `run`'s own loop calls `popup_at` once per lap (see the
             // `Wake::Due` arm above) -- that is what advances `LinkState`'s
             // grace-period clock. `evaluate` is edge-triggered on being
             // asked, not on wall-clock time passing underneath it, so a loop
             // that never asks would still see `Live` on its first question
             // 35s in and this composed test would prove nothing.
-            let _ = client.notice_at(Instant::now());
+            let _ = client.outage_at(Instant::now());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         assert!(
-            client.notice_at(Instant::now()).is_some(),
-            "no notice after {outage:?} of silence"
+            client.outage_at(Instant::now()),
+            "no popup after {outage:?} of silence"
         );
         // Sanity, not the regression guard -- see the doc comment above for
         // why this cannot be made to fail by restoring the old timeout here.
         assert!(
             client.link.sink.connection().close_reason().is_none(),
-            "the connection died under the notice: {:?}",
+            "the connection died under the popup: {:?}",
             client.link.sink.connection().close_reason()
         );
 
-        // The host comes back. The notice must come down on its own -- through
+        // The host comes back. The popup must come down on its own -- through
         // the scavenging path Task 1 fixed, since nothing here wakes a frame arm.
         host.turn().expect("the host answers at last");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6476,8 +7239,8 @@ mod tests {
             .expect("a lap that scavenges the frame");
 
         assert!(
-            client.notice_at(Instant::now()).is_none(),
-            "the host answered and the notice stayed up"
+            !client.outage_at(Instant::now()),
+            "the host answered and the popup stayed up"
         );
     }
 
@@ -6485,12 +7248,12 @@ mod tests {
     /// the real-clock half of the composed-test story on every default
     /// `cargo test`, not only when someone remembers `--ignored`.
     ///
-    /// Every other notice test in this file injects instants and holds the
+    /// Every other popup test in this file injects instants and holds the
     /// clock still. This one and the 35s test above are the only two that
     /// let `LinkState::evaluate`'s edge-triggered `owed_since` and the
     /// scavenging clear path run against a real clock. This one starts from
     /// a genuinely SYNCED session (the host acks the client's first input
-    /// before the silence begins), so the notice's later rise is driven by
+    /// before the silence begins), so the popup's later rise is driven by
     /// `heartbeat_due` firing at `HEARTBEAT_IDLE` and then `SILENT_AFTER`
     /// more before that owing is old enough to report -- roughly 7s in the
     /// worst case -- rather than by the from-construction seq mismatch every
@@ -6500,7 +7263,7 @@ mod tests {
     /// `heartbeat_due` at all). 9s of real polling budgets both real timers
     /// with margin for a loaded runner.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_short_silence_raises_and_clears_the_notice_on_a_real_clock() {
+    async fn a_short_silence_raises_and_ends_the_outage_on_a_real_clock() {
         let (mut host, mut client) = pair("/bin/sh").await;
         let mut out = Vec::new();
 
@@ -6508,7 +7271,7 @@ mod tests {
         // client speaks once, the host applies it and answers, and the
         // client applies that answer -- so `input_tx.current().seq() ==
         // screen_rx.peer_ack()` and nothing is owed, exactly as a healthy
-        // attach looks. Without this the notice would rise from the same
+        // attach looks. Without this the popup would rise from the same
         // from-construction mismatch the 35s test above already covers, and
         // this test would prove nothing extra about `HEARTBEAT_IDLE`.
         client.turn(&[], &mut out).expect("the client's first lap");
@@ -6523,7 +7286,7 @@ mod tests {
             .turn_with(&[], Some(reply), &mut out)
             .expect("the client applies the host's first ack");
         assert!(
-            client.notice_at(Instant::now()).is_none(),
+            !client.outage_at(Instant::now()),
             "not synced before the silence began; this test would prove \
              nothing about HEARTBEAT_IDLE"
         );
@@ -6534,7 +7297,7 @@ mod tests {
 
         // HEARTBEAT_IDLE (5s) until the client's own heartbeat makes a reply
         // owed, plus SILENT_AFTER (2s) more before that owing is old enough
-        // to raise the notice -- 9s of real polling budgets both with
+        // to raise the popup -- 9s of real polling budgets both with
         // margin.
         let outage = Duration::from_secs(9);
         let deadline = tokio::time::Instant::now() + outage;
@@ -6547,19 +7310,19 @@ mod tests {
             // owed reply this time, since (unlike the 35s test) this one
             // starts synced.
             let _ = client.heartbeat(Instant::now());
-            let _ = client.notice_at(Instant::now());
+            let _ = client.outage_at(Instant::now());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         assert!(
-            client.notice_at(Instant::now()).is_some(),
-            "no notice after {outage:?}, well past HEARTBEAT_IDLE + SILENT_AFTER"
+            client.outage_at(Instant::now()),
+            "no popup after {outage:?}, well past HEARTBEAT_IDLE + SILENT_AFTER"
         );
 
-        // The host answers again; the notice must clear through the same
+        // The host answers again; the popup must clear through the same
         // scavenging path Task 1 fixed.
         //
-        // BOTH sides turn, and the wait is for the notice to go rather than
+        // BOTH sides turn, and the wait is for the popup to go rather than
         // for a fixed sleep to elapse. One `host.turn()` after a 200 ms sleep
         // failed intermittently, and not for the reason a sleep usually fails:
         // nine seconds of laps against a host that never turned fill
@@ -6569,14 +7332,14 @@ mod tests {
         // reply owed included -- was dropped before the host could see it. The
         // single turn then drained sixty-odd frames from seconds ago, had
         // nothing newer to acknowledge, and correctly sent nothing at all: the
-        // notice stayed up because the round trip really was incomplete. That
+        // popup stayed up because the round trip really was incomplete. That
         // is the fixture, not the behaviour -- a real host turns every lap and
         // never lets a backlog build -- so the wait drives both ends until the
         // client's current sequence number reaches the host.
         //
         // `applied` is carried into the message because it separates the two
         // failures worth telling apart: nothing ever arrived (the fixture
-        // wedged again), or a frame landed and the notice stayed up anyway --
+        // wedged again), or a frame landed and the popup stayed up anyway --
         // the defect this test exists for. Diagnosing the CI failure took one
         // run of this message and no reproduction.
         let mut applied = 0;
@@ -6587,15 +7350,15 @@ mod tests {
                 .turn(&[], &mut out)
                 .expect("a lap that scavenges the frame")
                 .applied;
-            if client.notice_at(Instant::now()).is_none() {
+            if !client.outage_at(Instant::now()) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         assert!(
-            client.notice_at(Instant::now()).is_none(),
-            "the host answered and the notice stayed up through 20s of \
+            !client.outage_at(Instant::now()),
+            "the host answered and the popup stayed up through 20s of \
              scavenging laps, {applied} frames applied"
         );
     }
@@ -6620,7 +7383,7 @@ mod tests {
     /// this and almost always on CI: it passes only when the shell's echo is
     /// still in flight and the answer happens to carry a diff.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_answer_that_applies_nothing_still_clears_the_notice() {
+    async fn an_answer_that_applies_nothing_still_ends_the_outage() {
         // No script: the shell's own prompt is then the last thing that
         // changes the screen, and the session settles for good.
         let (mut host, mut client) = pair("").await;
@@ -6699,14 +7462,11 @@ mod tests {
         // started.
         let sent_at = t + crate::linkstate::HEARTBEAT_IDLE;
         assert!(
-            client.notice_at(sent_at).is_none(),
-            "the notice went up the instant the heartbeat did, before the grace period"
+            !client.outage_at(sent_at),
+            "the popup went up the instant the heartbeat did, before the grace period"
         );
         let raised = sent_at + crate::linkstate::SILENT_AFTER;
-        assert!(
-            client.notice_at(raised).is_some(),
-            "the fixture raised no notice"
-        );
+        assert!(client.outage_at(raised), "the fixture raised no popup");
 
         let mut applied = 0;
         let mut answers = 0;
@@ -6719,16 +7479,269 @@ mod tests {
                 .turn(&[], &mut out)
                 .expect("a lap that scavenges the answer")
                 .applied;
-            if client.notice_at(raised).is_none() {
+            if !client.outage_at(raised) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         assert!(
-            client.notice_at(raised).is_none(),
-            "the host sent {answers} answers and the notice stayed up; \
+            !client.outage_at(raised),
+            "the host sent {answers} answers and the popup stayed up; \
              {applied} of them applied"
         );
+    }
+
+    /// Spec §7, end to end: the link goes dark under a running session, the
+    /// popup opens by itself and says so on the screen, and when the link
+    /// comes back it says that too -- with nothing written to the terminal
+    /// outside the renderer at any point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_outage_raises_the_popup_and_its_end_is_reported() {
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+        assert!(
+            !screen_of(&out, BIG).contains("SILENT"),
+            "the popup was up before the outage"
+        );
+
+        relay.blackhole(true);
+        // Sent while the phase is still `Live`, so a reply is owed and the
+        // silence is noticed.
+        typing.write_all(b"true\n").expect("type");
+        wait_for_screen(&out, BIG, "\u{25cf} SILENT", Duration::from_secs(10)).await;
+
+        relay.blackhole(false);
+        wait_for_screen(&out, BIG, "LIVE again", Duration::from_secs(20)).await;
+
+        // The lingering popup takes every key; it closes by itself after
+        // `LINGER`, and only then does typing reach the shell.
+        wait_off_screen(&out, BIG, "LIVE again", Duration::from_secs(10)).await;
+        typing.write_all(b"exit 4\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; the screen was:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 4);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 4);
+
+        let link: Vec<String> = client
+            .activity
+            .entries()
+            .filter(|e| e.kind == crate::activity::Kind::Link)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(link.first().map(String::as_str), Some("silent"), "{link:?}");
+        assert!(
+            link.get(1)
+                .is_some_and(|t| t.starts_with("live again via this link, outage ")),
+            "{link:?}"
+        );
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
+        );
+    }
+
+    /// Review focus 2 and 3, end to end: the user closes the outage popup
+    /// and types blind; the popup stays shut for the rest of that outage,
+    /// and when the link answers it opens on the question, whose bare `s`
+    /// delivers the typing to the shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blind_typing_after_closing_the_popup_is_asked_about_and_sent() {
+        let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing
+            .write_all(b"printf 'ready-%s\\n' ok\n")
+            .expect("type");
+        wait_for_screen(&out, BIG, "ready-ok", Duration::from_secs(10)).await;
+
+        relay.blackhole(true);
+        typing.write_all(b"true\n").expect("type");
+        wait_for_screen(&out, BIG, "\u{25cf} SILENT", Duration::from_secs(10)).await;
+
+        close_the_popup(&mut typing, &out, BIG).await;
+        typing
+            .write_all(b"printf 'blind-%s\\n' ok\n")
+            .expect("type");
+        // Ten laps at least, all in the outage the popup was closed in:
+        // none of them may open it again.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !screen_of(&out, BIG).contains("SILENT"),
+            "the popup opened itself again for the outage it was closed in:\n{}",
+            screen_of(&out, BIG)
+        );
+        assert!(
+            !screen_of(&out, BIG).contains("blind-ok"),
+            "blind typing reached the shell during the outage"
+        );
+
+        relay.blackhole(false);
+        // The question shows the typing as typed (`blind-%s`); `blind-ok`
+        // appears only once the shell has run it.
+        wait_for_screen(
+            &out,
+            BIG,
+            "deliver what you typed?",
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            !screen_of(&out, BIG).contains("blind-ok"),
+            "the typing was delivered before it was asked about"
+        );
+        // The guard runs from the lap that first saw the question, which was
+        // before it was painted, so waiting it out from here is a lower
+        // bound, not a race. Nothing on the screen marks its end.
+        tokio::time::sleep(crate::ui::ANSWER_GUARD).await;
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, BIG, "blind-ok", Duration::from_secs(10)).await;
+        wait_off_screen(
+            &out,
+            BIG,
+            "deliver what you typed?",
+            Duration::from_secs(10),
+        )
+        .await;
+
+        typing.write_all(b"exit 6\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the client never finished; the screen was:\n{}",
+                    screen_of(&out, BIG)
+                )
+            })
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 6);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 6);
+
+        // Activity folds identical entries, so a second send would show as
+        // `repeats == 1`, not as a second entry.
+        let input: Vec<(String, u32)> = client
+            .activity
+            .entries()
+            .filter(|e| e.kind == crate::activity::Kind::Input)
+            .map(|e| (e.text.clone(), e.repeats))
+            .collect();
+        assert_eq!(input, [("held input sent (23 bytes)".to_string(), 0)]);
+        // The shell ran the held line exactly once: counted on the final
+        // screen, after everything that could have run it a second time.
+        let final_screen = text(client.screen());
+        assert_eq!(
+            final_screen.matches("blind-ok").count(),
+            1,
+            "the held line did not run exactly once:\n{final_screen}"
+        );
+        let stray = outside_renderer(&out.bytes());
+        assert!(
+            stray.is_empty(),
+            "written outside the renderer: {:?}",
+            String::from_utf8_lossy(&stray)
+        );
+    }
+
+    /// A quick double `Ctrl-\` is one literal `Ctrl-\` for the remote
+    /// program, through the real keyboard path. `stty -isig -echo` makes the
+    /// shell's `cat -v` print exactly what arrives, once: two literals would
+    /// read `^\^\`, none would read nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quick_double_ctrl_backslash_reaches_the_shell_as_one_literal() {
+        let (mut host, mut client) = pair("").await;
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let client_loop = tokio::spawn({
+            let mut out = out.clone();
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        // `ready-ok` is printed after `stty` has run, so once it is on the
+        // screen nothing typed afterwards can be eaten as a signal.
+        typing
+            .write_all(b"stty -isig -echo; printf 'ready-%s\\n' ok; cat -v\n")
+            .expect("type");
+        wait_for_screen(&out, size(), "ready-ok", Duration::from_secs(10)).await;
+        assert!(
+            !screen_of(&out, size()).contains("^\\"),
+            "a literal arrived before it was typed"
+        );
+
+        // One read: both presses carry the same timestamp, well inside the
+        // window.
+        typing
+            .write_all(&[CTRL_BACKSLASH, CTRL_BACKSLASH, b'\n'])
+            .expect("type");
+        wait_for_screen(&out, size(), "^\\", Duration::from_secs(10)).await;
+
+        // EOF ends `cat`; `-isig` leaves VEOF working.
+        typing.write_all(b"\x04exit 5\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 5);
+        let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
+            .await
+            .expect("the host never finished")
+            .expect("host task")
+            .expect("host loop");
+        assert_eq!(host_code, 5);
+
+        let screen = text(client.screen());
+        assert!(screen.lines().any(|l| l.trim_end() == "^\\"), "{screen}");
+        assert!(!screen.contains("^\\^\\"), "two literals arrived: {screen}");
+        assert_eq!(
+            screen.matches("^\\").count(),
+            1,
+            "not exactly one literal on the final screen: {screen}"
+        );
+        assert!(client.shown.is_none(), "the double press left the popup up");
     }
 }
