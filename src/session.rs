@@ -762,7 +762,7 @@ enum Wake {
     Winch,
     /// The pacing deadline came round.
     Due,
-    /// Time for the splash's next frame.
+    /// Time for the splash's next frame, or for the end of its hold.
     SplashFrame,
     /// A rebuild attempt finished, one way or another.
     Rebuilt(AttemptOutcome),
@@ -822,16 +822,31 @@ async fn keys_readable<K: AsRawFd>(
     }
 }
 
-/// The next tick of the splash's frame timer, or never once the splash is
-/// down and the timer gone. A function for the reason [`keys_readable`] is
-/// one: the arm borrows exactly the local.
-async fn splash_tick(frames: &mut Option<tokio::time::Interval>) {
-    match frames {
-        Some(i) => {
-            i.tick().await;
-        }
+/// The splash's next wake at `at`, or never once there is none -- the
+/// splash is down, or its settled logo is waiting for the host's first
+/// screen, whose arrival wakes the loop anyway. A function for the reason
+/// [`keys_readable`] is one: the arm reads exactly the local.
+async fn splash_due(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
     }
+}
+
+/// The pacing deadline after a lap at `now`, given the one it woke under.
+///
+/// A lap the splash's timer woke ran no turn, so it leaves the deadline
+/// where it was: frames are 40 ms apart and the pacing interval is up to
+/// 100 ms, so a splash tick that pushed it out would land before it every
+/// time, and nothing would be offered, acked or prodded for as long as the
+/// splash runs. Every other lap asks again one interval from now.
+fn next_pacing_deadline(
+    splash_lap: bool,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> tokio::time::Instant {
+    if splash_lap { deadline } else { now + interval }
 }
 
 /// The one application close on a session connection that means "the shell
@@ -985,8 +1000,13 @@ pub struct ClientSession {
     /// The startup splash, while it shows. Armed only by
     /// [`ClientSession::with_splash`], which only a fresh connect calls, and
     /// never armed again once it ends: a recovery inside the loop is the same
-    /// session, so it cannot bring it back.
+    /// session, so it cannot bring it back -- and one that lands while it is
+    /// still up ends it (`swap_in_as`).
     splash: Option<Splash>,
+    /// The splash came down and the screen has not been painted since.
+    /// Whatever took it down without painting -- a resize, a recovery --
+    /// leaves this for the next lap of layer 1.
+    unpainted_splash_end: bool,
 }
 
 /// The startup splash while it shows; the picture is
@@ -1118,6 +1138,7 @@ impl ClientSession {
             // Read once: a laptop that changes zone shows the old one's HH:MM until reattach.
             zone: jiff::tz::TimeZone::system(),
             splash: None,
+            unpainted_splash_end: false,
         })
     }
 
@@ -1155,7 +1176,17 @@ impl ClientSession {
         }
         self.renderer
             .set_overlay(self.shown.as_ref().map(|v| layout_popup(v, self.size)));
+        self.unpainted_splash_end = true;
         true
+    }
+
+    /// Paint the screen as it now stands, for `why`.
+    fn paint<W: Write>(&mut self, out: &mut W, why: &'static str) -> Result<()> {
+        self.unpainted_splash_end = false;
+        self.renderer
+            .render(out, self.screen_rx.state())
+            .context(why)?;
+        out.flush().context("flushing the terminal")
     }
 
     /// One lap of the splash at `now`, while it is up: paint the frame `now`
@@ -1172,10 +1203,7 @@ impl ClientSession {
         let elapsed = now.saturating_duration_since(*s.started.get_or_insert(now));
         if settled(elapsed) && first_screen {
             self.end_splash();
-            self.renderer
-                .render(out, self.screen_rx.state())
-                .context("painting the screen after the splash")?;
-            out.flush().context("flushing the terminal")?;
+            self.paint(out, "painting the screen after the splash")?;
             return Ok(false);
         }
         let frame = frame_of(elapsed);
@@ -1189,6 +1217,25 @@ impl ClientSession {
             out.flush().context("flushing the terminal")?;
         }
         Ok(true)
+    }
+
+    /// When the loop should next wake for the splash, after a lap at
+    /// `now`: the next frame boundary of the splash's own clock while the
+    /// interference runs, then the end of the hold, then never -- a settled
+    /// logo still waiting for the host's first screen changes only when
+    /// that screen arrives, which wakes the loop by itself. `None` too
+    /// before the first lap has started the clock, and once it is down.
+    fn splash_wake(&self, now: Instant) -> Option<Instant> {
+        use oxutrm_client::splash::{FRAME, FRAMES, HOLD, frame_of};
+        let s = self.splash.as_ref()?;
+        let started = s.started?;
+        let frame = frame_of(now.saturating_duration_since(started));
+        if frame < FRAMES {
+            Some(started + FRAME * (frame + 1))
+        } else {
+            let end = started + FRAME * FRAMES + HOLD;
+            (end > now).then_some(end)
+        }
     }
 
     /// Search for, and fail over onto, a standby (spec §3). Only for a host
@@ -1386,6 +1433,12 @@ impl ClientSession {
     /// `recv` yields `None`. The timeout is belt and braces on the one path
     /// where the user's own terminal is what is being held up.
     async fn drain<W: Write>(&mut self, out: &mut W) -> Result<Turn> {
+        // A session that ends under the splash -- a shell that prints and
+        // exits at once -- would otherwise leave the logo as the last
+        // picture, hiding exactly what the remote said before it went.
+        if self.end_splash() {
+            self.paint(out, "painting the screen the session ended on")?;
+        }
         let mut turn = Turn::default();
         let drained = tokio::time::timeout(FINAL_DRAIN, async {
             while let Some(frame) = self.link.source.recv().await {
@@ -1486,10 +1539,7 @@ impl ClientSession {
         // without it: the splash never costs a keystroke. Repainted here and
         // not on the next lap, so the key's echo lands on the real screen.
         if self.end_splash() {
-            self.renderer
-                .render(out, self.screen_rx.state())
-                .context("painting the screen after the splash")?;
-            out.flush().context("flushing the terminal")?;
+            self.paint(out, "painting the screen after the splash")?;
         }
         let phase = self.link_state.phase_now();
         let routed = self.ui.keys(keys, phase, now);
@@ -1586,14 +1636,11 @@ impl ClientSession {
         if !ended && self.splash_lap(now, out)? {
             return Ok(());
         }
-        if view != self.shown || ended {
+        if view != self.shown || ended || self.unpainted_splash_end {
             self.renderer
                 .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
             self.shown = view;
-            self.renderer
-                .render(out, self.screen_rx.state())
-                .context("painting the popup")?;
-            out.flush().context("flushing the terminal")?;
+            self.paint(out, "painting the popup")?;
         }
         Ok(())
     }
@@ -1927,6 +1974,10 @@ impl ClientSession {
         now: Instant,
         reason: &'static [u8],
     ) -> Result<()> {
+        // A recovery never shows the splash, and never leaves one running:
+        // it is a fresh connect's alone. (An outage ends it long before
+        // anything is swapped in; this is for the case where it did not.)
+        self.end_splash();
         // Closed first, and with a reason, for the same reason `adopt` closes
         // the displaced one with `TAKEN_OVER`: a connection that is merely
         // dropped is indistinguishable from one that went quiet.
@@ -1983,16 +2034,18 @@ impl ClientSession {
             self.renderer.set_overlay(Some(layout_popup(v, size)));
         }
         // The splash is laid out for a screen too, so the frame that was
-        // showing is drawn again at the new size -- now, because the turn
-        // that follows a resize paints -- or the splash ends if it no longer
-        // fits.
+        // showing is laid out again at the new size, or the splash ends if
+        // it no longer fits. Neither is painted here, nor by the turn that
+        // follows a resize, which paints only a frame from the host: the
+        // lap of layer 1 after it does, `painted` forgotten or the end
+        // noted, so neither waits for the host's resized screen.
         if let Some(s) = self.splash.as_mut() {
             if !oxutrm_client::splash::fits(size) {
                 self.end_splash();
             } else {
                 // Frame 0 is what `with_splash` put up before any lap.
                 let frame = s.painted.map_or(0, |(frame, _)| frame);
-                s.painted = s.painted.map(|(frame, _)| (frame, size));
+                s.painted = None;
                 let at = oxutrm_client::splash::FRAME * frame;
                 self.renderer
                     .set_overlay(Some(oxutrm_client::splash::splash(at, size, s.seed)));
@@ -2172,14 +2225,15 @@ impl ClientSession {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
 
-        // The splash's frame timer: the one timer that exists only while
-        // something is animating, and gone with the splash. A local, polled
-        // through `splash_tick`, for the reason `outcomes` is one (C1).
-        let mut splash_frames = self.splash.is_some().then(|| {
-            let mut i = tokio::time::interval(oxutrm_client::splash::FRAME);
-            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            i
-        });
+        // The splash's next wake: the one timer that exists only while
+        // something is animating, and gone with the splash. Taken from the
+        // splash's own clock after every lap (`splash_wake`), so it falls on
+        // its frame boundaries and, once the interference has settled, wakes
+        // once more for the end of the hold. `None` until the first lap has
+        // started that clock -- the pacing deadline below is now, so that
+        // lap is at once. A local, polled through `splash_due`, for the
+        // reason `outcomes` is one (C1).
+        let mut splash_at: Option<tokio::time::Instant> = None;
 
         let mut buf = [0u8; 8192];
         // Now, so the first lap sends immediately: an attach owes the host a
@@ -2215,7 +2269,7 @@ impl ClientSession {
                 Some(frame) = self.link.source.recv() => Wake::Frame(frame),
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
-                () = splash_tick(&mut splash_frames) => Wake::SplashFrame,
+                () = splash_due(splash_at) => Wake::SplashFrame,
                 Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 // Quiet until the standby goes away; a closed connection is
@@ -2227,6 +2281,7 @@ impl ClientSession {
 
             // Every borrow of `self` starts HERE, after the select expression
             // has ended and dropped the futures above.
+            let splash_lap = matches!(wake, Wake::SplashFrame);
             match wake {
                 Wake::Nothing => continue,
                 // End of file on the keyboard. The session lives on: output
@@ -2362,9 +2417,7 @@ impl ClientSession {
             self.layer_one(now, out)?;
             // The splash's timer goes with it: once it is down, no timer is
             // left that the session did not have before.
-            if self.splash.is_none() {
-                splash_frames = None;
-            }
+            splash_at = self.splash_wake(now).map(tokio::time::Instant::from_std);
 
             // Follow the route if it moved. Inside the loop rather than on a
             // timer of its own: `follow_route` is gated on `Silent` or
@@ -2485,7 +2538,9 @@ impl ClientSession {
             // there is — typing and resizing both clear `last_send` and send
             // inside the very `turn` above.
             //
-            // The pacing interval, unconditionally. There used to be a second
+            // The pacing interval, whatever woke the lap -- bar the splash's
+            // timer, which leaves the deadline alone (`next_pacing_deadline`).
+            // There used to be a second
             // arm here for "the tick that refreshes the counters", taking
             // `Duration::from_secs(1).min(pacing_interval)` whenever a notice
             // was up. `pacing_interval` is `clamp(rtt/2, 8ms, 100ms)`, so that
@@ -2493,7 +2548,12 @@ impl ClientSession {
             // expression, below a comment describing a one-second tick that
             // did not exist. Nothing is lost by dropping it: the loop already
             // wakes at least ten times a second.
-            deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
+            deadline = next_pacing_deadline(
+                splash_lap,
+                deadline,
+                tokio::time::Instant::now(),
+                self.link.sink.pacing_interval(),
+            );
         }
     }
 
@@ -8527,32 +8587,102 @@ mod tests {
         );
     }
 
-    /// A one-shot owned by the fresh connect: a failover later in the
-    /// session -- the recovery a running loop goes through -- does not
-    /// bring it back.
+    /// Only a fresh connect shows it, never a recovery: a failover that
+    /// lands while it is still up ends it, and the next lap of layer 1
+    /// takes it off the screen. No key first -- the splash is up, mid
+    /// interference, when the failover happens, so a recovery that left it
+    /// running would fail here.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_splash_does_not_come_back_after_a_failover() {
+    async fn a_failover_under_the_splash_ends_it() {
         let t = Instant::now();
         let mut out = Vec::new();
         let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
-        session.route_keys_at(b"x", t, &mut out).unwrap();
-        assert!(session.splash.is_none());
+        let mid = t + Duration::from_millis(100);
+        session.layer_one(mid, &mut out).unwrap();
+        assert!(session.splash.is_some(), "the fixture's splash is down");
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
 
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         session.standby = Some(standby_holding(standby_client));
-        assert!(session.fail_over(t, &mut out).expect("failing over"));
-        let mark = out.len();
+        assert!(session.fail_over(mid, &mut out).expect("failing over"));
         session
-            .layer_one(t + Duration::from_millis(100), &mut out)
+            .layer_one(mid + Duration::from_millis(40), &mut out)
             .unwrap();
 
+        assert!(session.splash.is_none(), "the failover left the splash up");
         assert!(
-            session.splash.is_none(),
-            "the failover armed the splash again"
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the failover"
+        );
+    }
+
+    /// The same for the other recovery, a rebuild landing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_landing_under_the_splash_ends_it() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        let mid = t + Duration::from_millis(100);
+        session.layer_one(mid, &mut out).unwrap();
+        assert!(session.splash.is_some(), "the fixture's splash is down");
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        session
+            .rebuild_landed(standby_established(rebuilt), mid)
+            .expect("landing");
+        session
+            .layer_one(mid + Duration::from_millis(40), &mut out)
+            .unwrap();
+
+        assert!(session.splash.is_none(), "the rebuild left the splash up");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the rebuild"
+        );
+    }
+
+    /// A session that ends while the splash is up -- a `nologin` account,
+    /// a `.bashrc` that exits -- shows the remote's last words, not the
+    /// logo. Through the real loop: the shell prints and exits at once,
+    /// long before the hold is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_ends_under_the_splash_leaves_its_last_screen() {
+        // `by%s` so the echoed command line does not itself contain `bye`.
+        let (mut host, session) = pair_sized("printf 'by%s\\n' e; exit 3\n", BIG).await;
+        let mut client = session.with_splash(7);
+        let (keys, _typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let out = SharedOut::default();
+        let mut painted = out.clone();
+        let start = Instant::now();
+
+        let code = tokio::time::timeout(Duration::from_secs(20), client.run_on(keys, &mut painted))
+            .await
+            .expect("the client never finished");
+        let _ = host_loop.await;
+
+        assert_eq!(code.expect("the client loop failed"), 3);
+        assert!(
+            start.elapsed()
+                < oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES
+                    + oxutrm_client::splash::HOLD,
+            "the session outlived the splash, so this saw nothing"
         );
         assert!(
-            !splash_on_screen(&out[mark..], BIG) && !splash_on_screen(&out, BIG),
-            "the splash was painted again after the failover"
+            String::from_utf8_lossy(&out.bytes())
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+            "the splash was never painted"
+        );
+        let screen = screen_of(&out, BIG);
+        assert!(
+            screen.contains("bye"),
+            "the shell's last output is not on the screen:\n{screen}"
+        );
+        assert!(
+            !splash_on_screen(&out.bytes(), BIG),
+            "the session ended with the splash on the screen:\n{screen}"
         );
     }
 
@@ -8595,7 +8725,8 @@ mod tests {
     /// deadline wakes the loop every `rtt / 2` clamped to 8..100 ms, and on
     /// loopback that is every 8 ms. The timer is for a real link, where the
     /// loop wakes ten times a second and the interference would run at a
-    /// third of its rate; `splash_tick` is tested on its own below.
+    /// third of its rate; `splash_due` and `splash_wake` are tested on
+    /// their own below.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_loop_shows_the_splash_and_takes_it_down_by_itself() {
         let (mut host, session) = pair_sized("", BIG).await;
@@ -8629,7 +8760,10 @@ mod tests {
     }
 
     /// A resize under the splash lays it out for the new screen, or ends it
-    /// once the screen is too small for it.
+    /// once the screen is too small for it -- painted in the same lap, as
+    /// the `Winch` arm runs it (`resize`, a turn, then layer 1), without
+    /// waiting for the host's resized screen. The settled logo, so a new
+    /// frame of the animation cannot be what repaints.
     #[tokio::test]
     async fn a_resize_lays_the_splash_out_again_or_ends_it() {
         let t = Instant::now();
@@ -8645,20 +8779,18 @@ mod tests {
             rows: 30,
         };
         session.resize(wider);
+        session.turn(&[], &mut out).unwrap();
+        session
+            .layer_one(t + settled + Duration::from_millis(1), &mut out)
+            .unwrap();
         assert!(
             session.splash.is_some(),
             "a resize that fits ended the splash"
         );
-        // What the turn after a resize paints, from scratch. The remote
-        // screen is still BIG's until the host redraws, so the splash is
-        // clipped to it; the art sits where the NEW screen centres it.
-        let mut fresh = Vec::new();
-        session.renderer.invalidate();
-        session
-            .renderer
-            .render(&mut fresh, session.screen_rx.state())
-            .unwrap();
-        let painted: Vec<String> = crate::loopback::fixtures::replay(&fresh, BIG)
+        // The remote screen is still BIG's until the host redraws, so the
+        // splash is clipped to it; the art sits where the NEW screen
+        // centres it.
+        let painted: Vec<String> = crate::loopback::fixtures::replay(&out, BIG)
             .iter()
             .map(|l| l.trim_end().to_owned())
             .collect();
@@ -8690,29 +8822,91 @@ mod tests {
 
         let small = TermSize { cols: 33, rows: 30 };
         session.resize(small);
+        session.turn(&[], &mut out).unwrap();
+        session
+            .layer_one(t + settled + Duration::from_millis(2), &mut out)
+            .unwrap();
         assert!(
             session.splash.is_none(),
             "the splash outlived a screen too small for it"
         );
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash ended and is still on the screen"
+        );
     }
 
-    /// The splash's timer arm: a tick about every frame while it is armed,
-    /// and never once it is gone -- a retired timer that still fired would
-    /// be a timer left running for the rest of the session.
+    /// The splash's timer arm: it fires at the instant it is given, and
+    /// never without one -- a retired timer that still fired would be a
+    /// timer left running for the rest of the session.
     #[tokio::test]
-    async fn the_splash_tick_fires_while_armed_and_never_once_gone() {
-        let mut armed = Some(tokio::time::interval(oxutrm_client::splash::FRAME));
-        for _ in 0..3 {
-            tokio::time::timeout(Duration::from_millis(500), splash_tick(&mut armed))
-                .await
-                .expect("an armed timer did not tick");
-        }
-        let mut gone = None;
+    async fn the_splash_wake_fires_when_set_and_never_once_gone() {
+        let at = tokio::time::Instant::now() + Duration::from_millis(30);
+        tokio::time::timeout(Duration::from_millis(500), splash_due(Some(at)))
+            .await
+            .expect("a set wake did not fire");
+        assert!(tokio::time::Instant::now() >= at, "it fired early");
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), splash_tick(&mut gone))
+            tokio::time::timeout(Duration::from_millis(200), splash_due(None))
                 .await
                 .is_err(),
-            "a retired timer ticked"
+            "a retired wake fired"
+        );
+    }
+
+    /// When the loop next wakes for the splash: on each frame boundary of
+    /// its own clock while the interference runs -- so no frame repeats or
+    /// is skipped -- then once at the end of the hold, and not at all while
+    /// the settled logo waits for the host's first screen (that screen's
+    /// arrival is the wake). Walked the way the loop walks it, each lap at
+    /// the instant the last one asked for.
+    #[tokio::test]
+    async fn the_splash_wakes_once_per_frame_then_once_for_the_hold() {
+        use oxutrm_client::splash::{FRAME, FRAMES, HOLD, frame_of};
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        let mut now = t;
+        let mut wakes = Vec::new();
+        while let Some(next) = session.splash_wake(now) {
+            assert!(next > now, "a wake at or before the lap that asked for it");
+            wakes.push(next - t);
+            now = next;
+            // The host is answering: an outage would end the splash.
+            session.note_heard(now);
+            session.layer_one(now, &mut out).unwrap();
+        }
+        let mut want: Vec<Duration> = (1..=FRAMES).map(|f| FRAME * f).collect();
+        want.push(FRAME * FRAMES + HOLD);
+        assert_eq!(wakes, want);
+        for (f, w) in (1..=FRAMES).zip(&wakes) {
+            assert_eq!(frame_of(*w), f, "a wake off its frame's boundary");
+        }
+        // No first screen yet: the logo waits, and nothing ticks.
+        assert!(session.splash.is_some(), "the logo did not wait");
+        assert_eq!(session.splash_wake(now + Duration::from_secs(1)), None);
+    }
+
+    /// A lap the splash's timer woke runs no turn, so it must not push the
+    /// pacing deadline out: on a link whose pacing interval is longer than
+    /// a frame, every tick would land before the deadline and move it
+    /// again, and the outbound side would stall for the whole splash.
+    #[test]
+    fn a_splash_lap_leaves_the_pacing_deadline_where_it_was() {
+        let t = tokio::time::Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut deadline = t + interval;
+        for ms in [40, 80] {
+            deadline =
+                next_pacing_deadline(true, deadline, t + Duration::from_millis(ms), interval);
+        }
+        assert_eq!(deadline, t + interval, "a splash lap moved the deadline");
+        // Any other lap asks again one interval from now, as before.
+        let now = t + Duration::from_millis(100);
+        assert_eq!(
+            next_pacing_deadline(false, deadline, now, interval),
+            now + interval
         );
     }
 }

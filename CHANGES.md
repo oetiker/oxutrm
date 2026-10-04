@@ -122,11 +122,13 @@
   TV — about 0.8 s of snow, torn rows and flicker across the whole screen,
   settling into the logo with the name under it, held for 1.5 s — and then
   your remote screen. Any key ends it at once and still goes to the remote
-  program, so it never costs waiting; an outage starting meanwhile replaces it
-  with the status popup, and a host slow to send its first screen keeps the
-  logo up rather than a blank terminal. It is drawn in your terminal's own
-  text colour, only on a fresh connect (never after a rebuild or a failover),
-  and not at all on a screen smaller than 34x20.
+  program, so it never costs waiting. If the host's first screen is a moment
+  late, the logo stays until it arrives; a host that does not answer at all
+  brings up the status popup in its place, as any outage starting meanwhile
+  does. A session that ends while it shows ends on the remote's last screen,
+  not on the logo. It is drawn in your terminal's own text colour, only on a
+  fresh connect (never after a rebuild or a failover), and not at all on a
+  screen smaller than 34x20.
 
 - **What oxutrm does to keep a session alive is logged.** Outages and their
   end, standby searches, finds and losses, probes and failovers, rebuild
