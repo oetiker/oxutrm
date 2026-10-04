@@ -101,13 +101,13 @@
 - **A status popup shows what the connection is doing.** `Ctrl-\` opens it in
   every phase while it is closed; pressed twice within half a second it sends
   one literal `Ctrl-\` to the remote program instead. It also opens by itself
-  two seconds into an outage, and when the link comes back it says how —
-  `● LIVE again via IPv4 punched · outage 4.2 s` — for three seconds before
+  two seconds into an outage, and when the link comes back it says so —
+  `● LIVE again   outage 4.2 s · IPv4 punched · …` — for three seconds before
   closing, unless you pressed a key in it. It shows the round-trip time now
-  and its minimum, average and maximum over the last minute, loss, throughput,
-  an RTT sparkline with gaps where the link was down, which link of the
-  session this is, the standby and what it is doing, what the rebuild loop is
-  trying and why its last attempt failed, and the last things oxutrm did.
+  and its range over the last minute beside an RTT sparkline with gaps where
+  the link was down, loss, throughput, which link of the session this is, the
+  standby, during an outage what the standby probe and the ssh rebuild are
+  each doing and how long for, and the last things oxutrm did.
   While it is shown it takes every key: `Esc` or `Ctrl-\` closes it, `q`
   quits, and nothing else you type goes anywhere. You can close it during an
   outage too; it then stays closed until that outage ends, what you type
@@ -155,6 +155,22 @@
   session opens with are still printed, before it takes over the screen: which
   session this is and how it was reached (new or resumed), then the path
   banner.
+
+- **The status popup is sorted into sections.** A hand test found it too much
+  text and too little structure: an eight-second failover filled six lines of
+  its log. The session id is in the title now, the first line says how the
+  link is reached and how long it has been up, the RTT and its sparkline share
+  a row, and the standby and the log each have a section under a rule drawn
+  into the border. During an outage a block right under the first line has
+  one row for the standby probe and one for the ssh rebuild, each with its own
+  state and clock (`ssh rebuild   attempt 1 · running 14 s`). The log shows
+  one line per outage once it is over — `22:59  outage 8.1 s → switched to
+  standby (IPv4 punched)` — in local time, with identical lines folded into
+  `×N` and a long line wrapping under its own text. Every step of the outage
+  is still in `client.log`, unchanged and in UTC, followed by that summary
+  line. A failed standby search shows only the first part of its reason; the
+  file has all of it. The attach id, the average RTT and the cumulative
+  sent/lost counts are no longer shown.
 
 - **The box that appeared during an outage is the popup now.** What it said —
   how long the host has been silent, what was typed blind, the rebuild attempt
