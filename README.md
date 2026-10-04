@@ -117,8 +117,8 @@ does to keep the session alive is also appended to
 `~/.local/state/oxutrm/client.log` (or under `$XDG_STATE_HOME`), capped at
 2 MiB with one rotation.
 
-A standby row that says "none" means the session has no fallback, and the next outage waits
-for the twenty-second rebuild above instead. On a machine with only one way
+A standby row that says "none" means the session has no fallback, and the next
+outage waits for the twenty-second rebuild above instead. On a machine with only one way
 out the client keeps looking all the same: the wait between searches grows
 from thirty seconds to five minutes, and a route change brings the next one
 forward. Each search is a full attach exchange with the host: that is why the

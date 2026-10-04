@@ -99,8 +99,8 @@
   standby without ssh. The stall was not timed.
 
 - **A status popup shows what the connection is doing.** `Ctrl-\` opens it
-  while the link is healthy; pressed twice within half a second it sends one
-  literal `Ctrl-\` to the remote program instead. It also opens by itself two
+  in every phase while it is closed; pressed twice within half a second it
+  sends one literal `Ctrl-\` to the remote program instead. It also opens by itself two
   seconds into an outage, and when the link comes back it says how — `● LIVE
   again via IPv4 punched · outage 4.2 s` — for three seconds before closing,
   unless you pressed a key in it. It shows the round-trip time now and its
@@ -149,8 +149,10 @@
 - **Nothing is written over the session any more.** The `standby: …`, `no
   standby path`, `switched to standby …` and `path migrated …` lines are gone:
   they were wiped by the repaint that followed them and survived only in the
-  scrollback. Their content is in the popup and the log. The one line still
-  printed is the connect banner, before the session takes over the screen.
+  scrollback. Their content is in the popup and the log. The two lines a
+  session opens with are still printed, before it takes over the screen: which
+  session this is and how it was reached (new or resumed), then the path
+  banner.
 
 - **The box that appeared during an outage is the popup now.** What it said —
   how long the host has been silent, what was typed blind, the rebuild attempt
