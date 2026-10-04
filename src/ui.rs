@@ -32,6 +32,13 @@ pub(crate) const ESC: u8 = 0x1b;
 /// two reads' timestamps; nothing is armed.
 pub(crate) const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 
+/// How long the question about held input must have been on the screen
+/// before `s`, `d` or `q` answer it. Typing that was already in flight when
+/// the link came back would otherwise send, drop or quit unseen. Measured
+/// from the first lap or read that saw `Confirming` to the read's own
+/// timestamp; nothing is armed.
+pub(crate) const ANSWER_GUARD: Duration = Duration::from_millis(500);
+
 /// How long the popup stays up showing the outcome after the link it opened
 /// for comes back.
 pub(crate) const LINGER: Duration = Duration::from_secs(3);
@@ -86,6 +93,9 @@ pub(crate) struct Ui {
     outage_since: Option<Instant>,
     /// How long the last outage lasted, for the lingering popup.
     last_outage: Duration,
+    /// When the current `Confirming` question was first seen, by a lap or a
+    /// read, for [`ANSWER_GUARD`]. `None` outside `Confirming`.
+    asked_at: Option<Instant>,
 }
 
 impl Ui {
@@ -95,6 +105,7 @@ impl Ui {
             dismissed: false,
             outage_since: None,
             last_outage: Duration::ZERO,
+            asked_at: None,
         }
     }
 
@@ -112,6 +123,7 @@ impl Ui {
     /// was closed by hand during this one -- starts the linger when the link
     /// answers again, and ends it.
     pub(crate) fn tick(&mut self, phase: Phase, now: Instant) -> Option<LinkChange> {
+        self.note_question(phase, now);
         if phase.is_outage() {
             let change = if self.outage_since.is_none() {
                 // `Recovering` is only ever entered from `Silent`, so `now`
@@ -159,6 +171,7 @@ impl Ui {
     /// One read from the keyboard: what goes to the host, what is held, and
     /// the command, if one was typed.
     pub(crate) fn keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
+        self.note_question(phase, now);
         let mut routed = Routed::default();
         let lone_esc = bytes == [ESC];
         let mut rest = bytes;
@@ -185,11 +198,32 @@ impl Ui {
         routed
     }
 
+    /// Start the answer guard the first time `Confirming` is seen, and
+    /// forget it once the phase is anything else, so the next question is
+    /// guarded from its own beginning.
+    fn note_question(&mut self, phase: Phase, now: Instant) {
+        if phase == Phase::Confirming {
+            self.asked_at.get_or_insert(now);
+        } else {
+            self.asked_at = None;
+        }
+    }
+
+    /// Whether the question has been up long enough to be answered by a
+    /// read at `now`.
+    fn answerable(&self, now: Instant) -> bool {
+        self.asked_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= ANSWER_GUARD)
+    }
+
     /// A key while the popup is shown: every key is its own. Returns whether
     /// the read is over.
     fn shown_key(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) -> bool {
         let confirming = phase == Phase::Confirming;
+        // Just after the question appears, its keys are anybody's typing
+        // still in flight: they do nothing, like every other key.
         let command = match b {
+            _ if confirming && !self.answerable(now) => None,
             b'q' => Some(Command::Quit),
             b's' if confirming => Some(Command::SendHeld),
             b'd' if confirming => Some(Command::DropHeld),
@@ -465,7 +499,7 @@ mod tests {
             command(Command::Quit)
         );
         assert_eq!(
-            Ui::new().keys(b"q", Phase::Confirming, t),
+            confirming_at(t).keys(b"q", Phase::Confirming, t + ANSWER_GUARD),
             command(Command::Quit)
         );
     }
@@ -492,7 +526,10 @@ mod tests {
     fn send_and_drop_are_commands_only_under_confirming() {
         let t = Instant::now();
         for (key, want) in [(b's', Command::SendHeld), (b'd', Command::DropHeld)] {
-            assert_eq!(Ui::new().keys(&[key], Phase::Confirming, t), command(want));
+            assert_eq!(
+                confirming_at(t).keys(&[key], Phase::Confirming, t + ANSWER_GUARD),
+                command(want)
+            );
             assert_eq!(
                 auto_at(t).keys(&[key], silent(t), t),
                 Routed::default(),
@@ -530,6 +567,121 @@ mod tests {
             Routed::default()
         );
         assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) });
+    }
+
+    // ---- the question's answer guard ------------------------------------
+
+    /// The question about held input, first on the screen at `t` (the lap
+    /// that saw `Confirming`).
+    fn confirming_at(t: Instant) -> Ui {
+        let mut ui = Ui::new();
+        ui.tick(Phase::Confirming, t);
+        assert!(ui.visible(Phase::Confirming));
+        ui
+    }
+
+    /// Final review, Important 1. Typing that was already in flight when
+    /// the link came back must not answer a question nobody has read yet:
+    /// within `ANSWER_GUARD` of the question appearing, `s`, `d` and `q`
+    /// are keys like any other -- consumed, and nothing else happens.
+    #[test]
+    fn s_d_and_q_do_nothing_just_after_the_question_appears() {
+        let t = Instant::now();
+        for key in *b"sdq" {
+            let mut ui = confirming_at(t);
+            assert_eq!(
+                ui.keys(&[key], Phase::Confirming, ms(t, 100)),
+                Routed::default(),
+                "{} answered a question shown 100 ms ago",
+                key as char
+            );
+            assert!(ui.visible(Phase::Confirming), "{}", key as char);
+            assert_eq!(
+                ui.keys(&[key], Phase::Confirming, ms(t, 499)),
+                Routed::default(),
+                "{} answered inside the guard",
+                key as char
+            );
+        }
+    }
+
+    /// From `ANSWER_GUARD` on, they answer as before. A before-assertion for
+    /// the test above: the same `Ui`, the same key, only the time differs.
+    #[test]
+    fn s_d_and_q_answer_once_the_question_has_been_up_long_enough() {
+        let t = Instant::now();
+        for (key, want) in [
+            (b's', Command::SendHeld),
+            (b'd', Command::DropHeld),
+            (b'q', Command::Quit),
+        ] {
+            let mut ui = confirming_at(t);
+            assert_eq!(
+                ui.keys(&[key], Phase::Confirming, ms(t, 100)),
+                Routed::default()
+            );
+            assert_eq!(
+                ui.keys(&[key], Phase::Confirming, ms(t, 600)),
+                command(want),
+                "{}",
+                key as char
+            );
+            let mut ui = confirming_at(t);
+            assert_eq!(
+                ui.keys(&[key], Phase::Confirming, t + ANSWER_GUARD),
+                command(want),
+                "{} at exactly the guard",
+                key as char
+            );
+        }
+    }
+
+    /// `keys` can see `Confirming` before any lap has: the guard then
+    /// starts at that read.
+    #[test]
+    fn the_guard_starts_at_the_first_read_that_sees_the_question() {
+        let t = Instant::now();
+        let mut ui = Ui::new();
+        assert_eq!(ui.keys(b"s", Phase::Confirming, t), Routed::default());
+        // A later lap does not move the start.
+        ui.tick(Phase::Confirming, ms(t, 300));
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, ms(t, 500)),
+            command(Command::SendHeld)
+        );
+    }
+
+    /// A new question is a new question: leaving `Confirming` clears the
+    /// start, and the next episode is guarded from its own beginning.
+    #[test]
+    fn the_guard_restarts_for_a_new_question() {
+        let t = Instant::now();
+        let mut ui = confirming_at(t);
+        assert_eq!(
+            ui.keys(b"x", Phase::Confirming, ms(t, 1_000)),
+            Routed::default()
+        );
+        ui.tick(silent(ms(t, 1_100)), ms(t, 3_100));
+        let again = ms(t, 5_000);
+        ui.tick(Phase::Confirming, again);
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, again + Duration::from_millis(100)),
+            Routed::default(),
+            "the second question inherited the first one's guard"
+        );
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, again + ANSWER_GUARD),
+            command(Command::SendHeld)
+        );
+
+        // The same through `keys` alone: a read under `Silent` clears it.
+        let mut ui = confirming_at(t);
+        ui.keys(b"", silent(ms(t, 1_100)), ms(t, 3_100));
+        assert_eq!(
+            ui.keys(b"d", Phase::Confirming, ms(t, 5_000)),
+            Routed::default(),
+            "a read outside Confirming left the old start in place"
+        );
     }
 
     // ---- outages -------------------------------------------------------
@@ -768,11 +920,11 @@ mod tests {
             "typing into the question was kept"
         );
         assert_eq!(
-            ui.keys(b"s", Phase::Confirming, ms(t, 4_200)),
+            ui.keys(b"s", Phase::Confirming, ms(t, 4_500)),
             command(Command::SendHeld)
         );
 
-        ui.tick(Phase::Live, ms(t, 4_300));
+        ui.tick(Phase::Live, ms(t, 4_600));
         assert!(!ui.visible(Phase::Live), "the answered question stayed up");
     }
 }

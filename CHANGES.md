@@ -98,22 +98,24 @@
   split-tunnel VPN kept its session when the VPN was dropped, moving to the
   standby without ssh. The stall was not timed.
 
-- **A status popup shows what the connection is doing.** `Ctrl-\` opens it
-  in every phase while it is closed; pressed twice within half a second it
-  sends one literal `Ctrl-\` to the remote program instead. It also opens by itself two
-  seconds into an outage, and when the link comes back it says how — `● LIVE
-  again via IPv4 punched · outage 4.2 s` — for three seconds before closing,
-  unless you pressed a key in it. It shows the round-trip time now and its
-  minimum, average and maximum over the last minute, loss, throughput, an RTT
-  sparkline with gaps where the link was down, which link of the session this
-  is, the standby and what it is doing, what the rebuild loop is trying and
-  why its last attempt failed, and the last things oxutrm did. While it is
-  shown it takes every key: `Esc` or `Ctrl-\` closes it, `q` quits, and
-  nothing else you type goes anywhere. You can close it during an outage too;
-  it then stays closed until that outage ends, what you type meanwhile is held
-  as before, and when the host answers again the popup opens to ask about it:
-  `s` sends what you typed, `d` drops it. `c config` and `s sessions` are shown
-  dimmed; they come later.
+- **A status popup shows what the connection is doing.** `Ctrl-\` opens it in
+  every phase while it is closed; pressed twice within half a second it sends
+  one literal `Ctrl-\` to the remote program instead. It also opens by itself
+  two seconds into an outage, and when the link comes back it says how —
+  `● LIVE again via IPv4 punched · outage 4.2 s` — for three seconds before
+  closing, unless you pressed a key in it. It shows the round-trip time now
+  and its minimum, average and maximum over the last minute, loss, throughput,
+  an RTT sparkline with gaps where the link was down, which link of the
+  session this is, the standby and what it is doing, what the rebuild loop is
+  trying and why its last attempt failed, and the last things oxutrm did.
+  While it is shown it takes every key: `Esc` or `Ctrl-\` closes it, `q`
+  quits, and nothing else you type goes anywhere. You can close it during an
+  outage too; it then stays closed until that outage ends, what you type
+  meanwhile is held as before, and when the host answers again the popup opens
+  to ask about it: `s` sends what you typed, `d` drops it; keys pressed in the
+  first half second after the question appears do nothing, so typing still in
+  flight cannot answer it. `c config` and `s sessions` are shown dimmed; they
+  come later.
 
 - **What oxutrm does to keep a session alive is logged.** Outages and their
   end, standby searches, finds and losses, probes and failovers, rebuild

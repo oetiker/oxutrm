@@ -1305,8 +1305,19 @@ impl ClientSession {
     /// a real terminal; the arm is a single call to this, so what is tested
     /// is what ships.
     fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>> {
+        self.route_keys_at(keys, Instant::now(), out)
+    }
+
+    /// [`ClientSession::route_keys`] for a read taken at `now`, so a test can
+    /// answer the question after [`crate::ui::ANSWER_GUARD`] without sleeping.
+    fn route_keys_at<W: Write>(
+        &mut self,
+        keys: &[u8],
+        now: Instant,
+        out: &mut W,
+    ) -> Result<Option<i32>> {
         let phase = self.link_state.phase_now();
-        let routed = self.ui.keys(keys, phase, Instant::now());
+        let routed = self.ui.keys(keys, phase, now);
         if !routed.to_host.is_empty() {
             self.turn(&routed.to_host, out)?;
         }
@@ -5681,9 +5692,7 @@ mod tests {
         let banner = format!("{}\n", status_line(&first));
         assert_eq!(String::from_utf8_lossy(&outside_renderer(&out)), banner);
 
-        client
-            .route_keys(b"s", &mut out)
-            .expect("sending the held input");
+        assert_eq!(answer(&mut client, b"s", &mut out), None);
         let migrated = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
         assert!(client.announce(&migrated, &mut out).expect("a migration"));
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
@@ -5716,14 +5725,14 @@ mod tests {
             !session.activity.entries().any(|e| e.kind == Kind::Input),
             "the fixture recorded input"
         );
-        session.route_keys(b"s", &mut out).unwrap();
+        answer(&mut session, b"s", &mut out);
         assert_eq!(
             last_entry(&session),
             Some((Kind::Input, "held input sent (10 bytes)".to_string()))
         );
 
         let (_host, mut session) = with_confirming_popup(b"rm -rf /tmp/x\r").await;
-        session.route_keys(b"d", &mut out).unwrap();
+        answer(&mut session, b"d", &mut out);
         assert_eq!(
             last_entry(&session),
             Some((Kind::Input, "held input dropped (14 bytes)".to_string()))
@@ -6237,6 +6246,15 @@ mod tests {
         (host, session)
     }
 
+    /// Press `keys` once the question has been up for `ANSWER_GUARD`: the
+    /// read is stamped that far past now, which is past when any lap or
+    /// read before this one first saw `Confirming`.
+    fn answer(session: &mut ClientSession, keys: &[u8], out: &mut Vec<u8>) -> Option<i32> {
+        session
+            .route_keys_at(keys, Instant::now() + crate::ui::ANSWER_GUARD, out)
+            .expect("the answer lands")
+    }
+
     /// Wait until a frame is sitting in the client's source, without applying
     /// it. `try_recv` in the code under test is what must pick it up.
     ///
@@ -6315,9 +6333,7 @@ mod tests {
             session.popup_at(Instant::now()).is_some(),
             "a frame took the question down"
         );
-        session
-            .route_keys(b"d", &mut out)
-            .expect("the letter lands");
+        answer(&mut session, b"d", &mut out);
         assert!(
             session.link_state.held().is_empty(),
             "d did not drop the held buffer after a frame"
@@ -6373,9 +6389,9 @@ mod tests {
         let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
 
-        let answer = session.route_keys(b"s", &mut out).unwrap();
+        let answered = answer(&mut session, b"s", &mut out);
 
-        assert_eq!(answer, None, "sending the held input ended the session");
+        assert_eq!(answered, None, "sending the held input ended the session");
         assert!(
             spoken(&session).ends_with(b"make test\r"),
             "the held input was not delivered: {:?}",
@@ -6395,9 +6411,9 @@ mod tests {
         let mut out = Vec::new();
         let before = spoken(&session);
 
-        let answer = session.route_keys(b"d", &mut out).unwrap();
+        let answered = answer(&mut session, b"d", &mut out);
 
-        assert_eq!(answer, None, "dropping the held input ended the session");
+        assert_eq!(answered, None, "dropping the held input ended the session");
         assert!(session.link_state.held().is_empty(), "the drop kept it");
         assert_eq!(spoken(&session), before, "the drop sent it instead");
     }
@@ -6438,7 +6454,43 @@ mod tests {
         let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
 
-        assert_eq!(session.route_keys(b"q", &mut out).unwrap(), Some(0));
+        assert_eq!(answer(&mut session, b"q", &mut out), Some(0));
+    }
+
+    /// Final review, Important 1, at the session: a key that was in flight
+    /// when the question appeared answers nothing -- the held input is
+    /// neither sent nor dropped and the client does not quit -- and the
+    /// same keys answer once the question has been up `ANSWER_GUARD`.
+    #[tokio::test]
+    async fn keys_in_flight_when_the_question_appears_do_not_answer_it() {
+        let (_host, mut session) = with_confirming_popup(b"make test\r").await;
+        let before = spoken(&session);
+        let mut out = Vec::new();
+
+        for key in [&b"s"[..], b"d", b"q"] {
+            assert_eq!(
+                session.route_keys(key, &mut out).unwrap(),
+                None,
+                "{key:?} quit"
+            );
+        }
+        assert_eq!(spoken(&session), before, "an in-flight key sent the input");
+        assert_eq!(
+            session.link_state.held(),
+            b"make test\r",
+            "an in-flight key dropped the input, or was held with it"
+        );
+        assert!(
+            session.ui.visible(session.link_state.phase_now()),
+            "an in-flight key took the question down"
+        );
+
+        assert_eq!(answer(&mut session, b"s", &mut out), None);
+        assert!(
+            spoken(&session).ends_with(b"make test\r"),
+            "{:?}",
+            spoken(&session)
+        );
     }
 
     /// The whole point of the key on a healthy link: it opens the popup and
@@ -6560,7 +6612,7 @@ mod tests {
             !before.ends_with(b"make test\r"),
             "sent before it was asked about"
         );
-        assert_eq!(session.route_keys(b"s", &mut out).unwrap(), None);
+        assert_eq!(answer(&mut session, b"s", &mut out), None);
         assert!(
             spoken(&session).ends_with(b"make test\r"),
             "{:?}",
@@ -7558,6 +7610,10 @@ mod tests {
             !screen_of(&out, BIG).contains("blind-ok"),
             "the typing was delivered before it was asked about"
         );
+        // The guard runs from the lap that first saw the question, which was
+        // before it was painted, so waiting it out from here is a lower
+        // bound, not a race. Nothing on the screen marks its end.
+        tokio::time::sleep(crate::ui::ANSWER_GUARD).await;
         typing.write_all(b"s").expect("type");
         wait_for_screen(&out, BIG, "blind-ok", Duration::from_secs(10)).await;
         wait_off_screen(
