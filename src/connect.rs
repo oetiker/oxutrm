@@ -246,7 +246,8 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     code
 }
 
-/// The one line a session opens with, before raw mode.
+/// The first of the two lines a session opens with, printed before raw mode.
+/// The connect banner (`status_line`) follows it once the path is known.
 ///
 /// A function rather than a `println!` inline, because `connect` cannot be
 /// reached from a test at all -- it wants a real ssh, a real far end and a

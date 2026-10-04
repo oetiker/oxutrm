@@ -4,7 +4,9 @@
 //! word of the popup is tested without a network or a terminal. Every number
 //! in it that moves by itself is in whole seconds, which is what lets the
 //! loop compare a freshly built view with the one on the screen and repaint
-//! at most once a second while nothing else changes.
+//! only when a shown whole-second value, or another shown fact, changes.
+//! Ages and countdowns can turn over on different sub-second phases, so
+//! that is not a promise of one repaint a second.
 
 // This runs while a client session owns the screen: nothing here may print,
 // or it lands raw on the painted raw-mode terminal.
@@ -473,8 +475,9 @@ mod tests {
         }
     }
 
-    /// The loop repaints when the view differs, so a view that changes
-    /// faster than once a second repaints faster than once a second.
+    /// The loop repaints when the view differs, so a view built from
+    /// numbers finer than whole seconds would repaint on every lap. Within
+    /// one whole second of every shown age and countdown, it is the same.
     #[test]
     fn a_view_is_the_same_for_a_second_at_a_time() {
         let t = Instant::now();

@@ -4511,10 +4511,13 @@ mod tests {
     }
 
     /// Every number in the popup that moves by itself is in whole seconds,
-    /// so an open popup is the same view for a second at a time and the
-    /// loop's comparison spares the repaint. A view carrying quinn's raw
-    /// packet counters would change on every lap of an outage -- up to 125
-    /// times a second -- in a box whose whole job is to be read.
+    /// so the view changes only when a shown whole-second value (or another
+    /// shown fact) changes, and the loop's comparison spares every other
+    /// repaint. Ages and countdowns can turn over on different sub-second
+    /// phases; here they are pinned to one, so the view holds for a second.
+    /// A view carrying quinn's raw packet counters would change on every lap
+    /// of an outage -- up to 125 times a second -- in a box whose whole job
+    /// is to be read.
     #[tokio::test]
     async fn an_open_popup_is_the_same_view_for_a_second_at_a_time() {
         let t = std::time::Instant::now();

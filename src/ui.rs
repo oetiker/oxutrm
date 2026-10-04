@@ -68,8 +68,8 @@ pub(crate) enum Command {
     DropHeld,
 }
 
-/// Where one read's bytes go. A command ends the read: anything after it
-/// belongs to whatever the command leads to, not to the buffer before it.
+/// Where one read's bytes go. A command ends the read: bytes after it in the
+/// same read are dropped -- neither sent, held nor seen by the popup.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Routed {
     pub(crate) to_host: Vec<u8>,
