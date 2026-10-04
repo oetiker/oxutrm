@@ -119,6 +119,16 @@ pub(crate) fn byte_count(n: usize) -> String {
     }
 }
 
+/// The front of a reason, up to its first `: `, made legible and short.
+///
+/// A standby search's reason is a chain -- "no rung of the ladder reached
+/// the host: no usable path to the host. Every rung, in order: ..." -- whose
+/// first link says what happened and whose rest is for the file, where the
+/// whole of it still goes.
+pub(crate) fn first_clause(reason: &str) -> String {
+    summarised(reason.split(": ").next().unwrap_or(reason))
+}
+
 /// A duration in its largest whole unit: `12s`, `4m`, `3h`.
 pub(crate) fn age(d: Duration) -> String {
     let s = d.as_secs();
@@ -299,8 +309,10 @@ fn standby(s: &StandbyFacts<'_>, now: Instant) -> Vec<String> {
 }
 
 fn log(a: &Activity, wall: SystemTime) -> Vec<String> {
-    let skip = a.entries().len().saturating_sub(MAX_LOG_LINES);
-    a.entries()
+    let shown: Vec<_> = a.entries().filter(|e| !e.detail).collect();
+    let skip = shown.len().saturating_sub(MAX_LOG_LINES);
+    shown
+        .into_iter()
         .skip(skip)
         .map(|e| {
             let age = age(wall.duration_since(e.at).unwrap_or_default());
@@ -309,7 +321,7 @@ fn log(a: &Activity, wall: SystemTime) -> Vec<String> {
             } else {
                 String::new()
             };
-            format!("{age:>4} {} {}{count}", e.kind.name(), e.text)
+            format!("{age:>4} {}{count}", e.shown)
         })
         .collect()
 }
@@ -981,11 +993,42 @@ mod tests {
             ..facts(&q, &a, Phase::Live, t)
         });
         assert_eq!(v.log.len(), MAX_LOG_LINES);
-        assert_eq!(v.log.first().map(String::as_str), Some(" 21s link e-08"));
+        assert_eq!(v.log.first().map(String::as_str), Some(" 21s e-08"));
         assert_eq!(
             v.log.last().map(String::as_str),
-            Some("  0s link e-29 (\u{d7}2)")
+            Some("  0s e-29 (\u{d7}2)")
         );
+    }
+
+    /// The steps of an outage are in the file; the popup shows the line
+    /// that sums the outage up, in its own wording.
+    #[test]
+    fn the_log_leaves_details_out_and_uses_the_popups_wording() {
+        let t = Instant::now();
+        let q = Quality::new(t);
+        let mut a = Activity::new();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        a.record_entry(Kind::Link, "silent", None, true, base);
+        a.record_entry(Kind::Outage, "3.0 s", Some("outage 3.0 s"), false, base);
+        let v = build(&Facts {
+            wall: base,
+            ..facts(&q, &a, Phase::Live, t)
+        });
+        assert_eq!(v.log, ["  0s outage 3.0 s"]);
+    }
+
+    #[test]
+    fn a_first_clause_stops_at_the_first_colon_and_is_legible() {
+        assert_eq!(
+            first_clause(
+                "no rung of the ladder reached the host: no usable path to the host. \
+                 Every rung, in order:"
+            ),
+            "no rung of the ladder reached the host"
+        );
+        assert_eq!(first_clause("no colon here"), "no colon here");
+        assert_eq!(first_clause("\u{1b}[2Jgone: rest"), "^[[2Jgone");
+        assert_eq!(first_clause("a\nb: c"), "a", "a second line was kept");
     }
 
     #[test]
