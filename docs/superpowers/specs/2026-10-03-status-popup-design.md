@@ -91,14 +91,18 @@ Closed ──outage──▶ Auto ──link Live──▶ Lingering ──3 s�
                     └──any key──▶ Open ◀─┘ (any key)
 ```
 
-- `Closed`: every byte goes to the host, as today.
+- `Closed`: every byte goes to the host while the link is `Live`; during an
+  outage it is held (§3.2). A popup closed by hand during an outage is
+  `Closed` with the outage marked dismissed, so it does not re-open itself
+  until a new outage begins.
 - `Open`: opened by hand. Stays until closed.
 - `Auto`: opened because the phase became an outage (`Phase::is_outage`, i.e.
   after `SILENT_AFTER`, 2 s). An `Open` popup stays `Open` when an outage
   starts — nothing jumps.
 - `Lingering`: the link is `Live` again after an `Auto` popup. Shows
   "● LIVE again via <path> · outage <N.N> s" and closes `LINGER` (3 s) after
-  it entered this state. Any key turns it into `Open`.
+  it entered this state. Any key other than a closing or quitting key turns it
+  (or an `Auto` popup) into `Open`, which stays.
 - `Confirming` is not a popup state: while the link phase is `Confirming`
   (held input waiting), the popup is forced open with the held section (§6)
   and cannot close until the user sends or drops the input. Then the normal
@@ -111,22 +115,28 @@ Closed ──outage──▶ Auto ──link Live──▶ Lingering ──3 s�
   (500 ms) of the one that opened the popup closes it and sends one literal
   `0x1c` to the host. The time is taken from the key reads' timestamps; no
   timer is armed. A Ctrl-\ after that window just closes the popup.
-- **While open:** `Esc` or Ctrl-\ closes; `q` quits the client (as today's
-  Ctrl-\ q); `c` and `s` are shown greyed out and do nothing in B; under
-  `Confirming`, `s` sends and `d` drops the held input (as today's Ctrl-\ s /
-  Ctrl-\ d).
-- **Any other key:**
-  - link `Live`: closes the popup and the key goes to the host — typing never
-    disappears into a popup by accident;
-  - link in an outage: the key is held exactly as today (`hold_keys`,
-    `MAX_HELD`), and shown in the held section.
+- **While the popup is shown, every key belongs to it** (user decision
+  2026-10-04), whatever opened it and whatever the link is doing. Nothing
+  typed into the popup is held or sent to the host.
+  - `Esc` or Ctrl-\ closes it (outside the double-press window);
+  - `q` quits the client;
+  - `c` and `s` are shown greyed out and do nothing in B;
+  - under `Confirming`, `s` sends and `d` drops the held input;
+  - any other key does nothing.
+- **Closing during an outage** is allowed. The popup then stays closed until
+  that outage ends (it does not re-open itself for the same outage), and what
+  the user types meanwhile is held exactly as today (`hold_keys`,
+  `MAX_HELD`). Blind typing is thus a deliberate choice; when the link returns
+  with held input, the popup opens in `Confirming` (§3.1).
+- **Closed and the link `Live`:** every byte goes to the host, as today.
 - **Esc ambiguity:** a lone `0x1b` byte in a read is Esc; `0x1b` followed by
   more bytes in the same read is an escape sequence (arrow key etc.) and is
-  treated as "any other key".
+  treated as "any other key" (and so does nothing while the popup is shown).
 
 The existing `PREFIX` handling in `linkstate.rs` (`hold_keys`,
 `prefix_pending`, `Command`) is folded into `ui.rs`; `hold_keys` keeps only
-the holding of bytes.
+the holding of bytes. While the popup is closed, Ctrl-\ opens it in every
+phase, so no other prefix commands remain.
 
 ---
 
@@ -209,7 +219,7 @@ first call), which is written before the session owns the screen.
 - **Where:** `$XDG_STATE_HOME/oxutrm/client.log`, else
   `~/.local/state/oxutrm/client.log`, on Linux and macOS alike. The directory
   is created if missing.
-- **Line:** `<RFC 3339 local time> <target> <session-id prefix> <kind> <text>`;
+- **Line:** `<RFC 3339 UTC time, e.g. 2026-10-04T09:02:44Z> <target> <session-id prefix> <kind> <text>`;
   when a folded run ends (a different entry arrives, or the client exits),
   the run is written as one line with ` (repeated <N>× since <HH:MM>)`.
 - **Writing:** opened once with `O_APPEND`; each line is one `write` call, so
