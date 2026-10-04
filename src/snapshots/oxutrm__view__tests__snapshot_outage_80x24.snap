@@ -1,0 +1,26 @@
+---
+source: src/view.rs
+expression: "screen(&Facts\n{\n    identity: Some(&id), path: Some(&p), last_heard: secs(t, 60), standby:\n    Some(StandbyFacts\n    {\n        probe: ProbeState::Failed { at: secs(t, 92) }, ..standby(Some(&p), t)\n    }), rebuild: Some(rebuild_facts(Some(secs(t, 80)))), held:\n    b\"make test\\r\\n\",\n    ..facts(&q, &a, Phase::Recovering { attempt: 0, next_try: secs(t, 81), },\n    now,)\n})"
+---
+╭ oxutrm · thinlinc · 3ff1218f ────────────────────────────────────────╮
+│ ● RECOVERING   silent 34 s                                           │
+│ standby probe   no answer · next probe in 3 s                        │
+│ ssh rebuild     attempt 1 · running 14 s                             │
+│ 11 bytes typed since - kept, not sent                                │
+│ rtt   —  (70–171)  █▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆ │
+│ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s                                        │
+├ standby ─────────────────────────────────────────────────────────────┤
+│ IPv4 punched · 41 ms                                                 │
+├ recent ──────────────────────────────────────────────────────────────┤
+│ 22:53  outage 96.3 s → switched to standby (IPv4 punched) after 1    │
+│        failed ssh attempt                                            │
+│ 22:59  outage 8.1 s → switched to standby (IPv4 punched)             │
+│ 22:59  standby not found: the host gave up                           │
+│                                                                      │
+│                                                                      │
+│                                                                      │
+│                                                                      │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│ Esc close  q quit  c config  s sessions                              │
+╰──────────────────────────────────────────────────────────────────────╯

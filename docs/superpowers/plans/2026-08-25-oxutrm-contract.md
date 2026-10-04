@@ -72,6 +72,7 @@
 | `libc` | `0.2` | host; client — **only** `sigaction`, to restore the terminal when the client is killed. rustix has no stable binding for installing a handler (`rustix::runtime` is explicitly unstable), and that one gap is why `oxutrm-client` is `deny(unsafe_code)` rather than `forbid`. |
 | `proptest` | `1` | sync (dev) |
 | `insta` | `1` | term (dev, snapshots) |
+| `jiff` | `0.2`, `default-features = false` (features `std`, `tz-system`, `tzdb-zoneinfo`) | root — the status popup's local wall-clock times. std has no time zone and the root crate forbids `unsafe`; client.log stays UTC without it. |
 
 ---
 

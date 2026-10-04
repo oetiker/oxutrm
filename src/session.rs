@@ -47,7 +47,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
@@ -62,7 +62,7 @@ use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
 use crate::rebuild::{AttemptOutcome, Rebuild};
 use crate::ui::{Command, LinkChange, Mode, Ui};
-use crate::view::{Facts, Identity, StandbyFacts};
+use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -964,6 +964,8 @@ pub struct ClientSession {
     /// How the current outage is going, for the one line that sums it up
     /// when it ends.
     outage: OutageNotes,
+    /// The zone the popup's log shows its times in: the system's, read once.
+    zone: jiff::tz::TimeZone,
 }
 
 /// What one outage came to, gathered while it lasts.
@@ -1063,6 +1065,7 @@ impl ClientSession {
             last_failure: None,
             standby: None,
             outage: OutageNotes::default(),
+            zone: jiff::tz::TimeZone::system(),
         })
     }
 
@@ -1073,7 +1076,7 @@ impl ClientSession {
         self
     }
 
-    /// Which session this is, for the popup's title and status rows.
+    /// Which session this is, for the popup's title.
     pub(crate) fn with_identity(mut self, id: Identity) -> ClientSession {
         self.identity = Some(id);
         self
@@ -1219,8 +1222,8 @@ impl ClientSession {
                     // and resize laps, and a frame that landed on one of those
                     // used to repaint the screen underneath a popup still
                     // saying nobody was answering. It also moves
-                    // `last_heard`, which is what the `silent for Ns`
-                    // counter is built from.
+                    // `last_heard`, which is what the header's `silent N s`
+                    // is built from.
                     self.note_heard(Instant::now());
                 }
                 // See the host's copy of this arm: a silently swallowed
@@ -1457,12 +1460,15 @@ impl ClientSession {
             quality: &self.quality,
             rejected: self.rejected_total(),
             standby,
-            rebuild_failure: self.last_failure.as_deref(),
+            rebuild: self.rebuild.as_ref().map(|r| RebuildFacts {
+                running_since: r.running_since(),
+                last_failure: self.last_failure.as_deref(),
+            }),
             held: self.link_state.held(),
             held_full: self.link_state.held_is_full(),
             activity: &self.activity,
             now,
-            wall: SystemTime::now(),
+            zone: &self.zone,
         })
     }
 
@@ -1532,7 +1538,7 @@ impl ClientSession {
         if rebuild.is_running() || now < next_try {
             return;
         }
-        rebuild.begin(size, outcomes.clone());
+        rebuild.begin(size, outcomes.clone(), now);
         self.link_state.begin_attempt(now);
         self.activity.record_detail(
             Kind::Rebuild,
@@ -1545,7 +1551,7 @@ impl ClientSession {
         self.record_attempt_failed(&why);
         self.outage.failed_attempts = self.outage.failed_attempts.saturating_add(1);
         self.link_state.attempt_failed(now);
-        // Kept for the popup's recovering section.
+        // Kept for the reason row under the popup's `ssh rebuild`.
         self.last_failure = Some(why);
     }
 
@@ -1568,12 +1574,9 @@ impl ClientSession {
     }
 
     /// A rebuild attempt landed: its link replaces the one that stopped
-    /// answering, and its path and attach are the session's from here.
+    /// answering, and its path is the session's from here.
     fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
         self.swap_in(e.link, now)?;
-        if let Some(id) = self.identity.as_mut() {
-            id.attach_id = e.attach_id;
-        }
         self.activity.record_detail(
             Kind::Rebuild,
             &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
@@ -1596,9 +1599,6 @@ impl ClientSession {
             .context("failing over to the standby")?;
         // Recorded before the first frame goes: the switch has happened, and
         // a turn that errors must not leave it out of the log.
-        if let Some(id) = self.identity.as_mut() {
-            id.attach_id = e.attach_id;
-        }
         let switched = format!(
             "switched to standby ({})",
             oxutrm_client::rung_label(&e.path)
@@ -2576,7 +2576,7 @@ mod tests {
     }
 
     /// Big enough for the popup's log to have rows: at the fixtures' 40x10 the
-    /// status block fills the whole box.
+    /// rows above it fill the whole box.
     const BIG: TermSize = TermSize { cols: 80, rows: 24 };
 
     /// `pair_through_relay` at `size`, with host and client both at `size`
@@ -4480,10 +4480,7 @@ mod tests {
         let v = session.popup_at(t + Duration::from_secs(6)).unwrap();
         let shown = words(&v);
 
-        assert!(
-            shown.contains("silent for 6s"),
-            "no silence duration: {shown}"
-        );
+        assert!(shown.contains("silent 6 s"), "no silence duration: {shown}");
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
@@ -4592,9 +4589,10 @@ mod tests {
         let before = sent(&session);
         let mut out = Vec::new();
         session.turn(b"x", &mut out).expect("a turn that sends");
-        // Bounded well inside a second: the log's ages are read off the wall
-        // clock, and a wait that crossed a real second could move one and
-        // fail the comparison below for a reason it is not about.
+        // Bounded well inside a second. The view's clocks all run off `t`,
+        // not the wall clock, so the wait cannot move them; the log's times
+        // do read the wall clock, but only to the minute, and nothing here
+        // is logged anyway: `silent` is a detail the popup leaves out.
         let deadline = Instant::now() + Duration::from_millis(500);
         while sent(&session) == before {
             assert!(
@@ -4613,7 +4611,7 @@ mod tests {
             .popup_at(t + Duration::from_secs(4))
             .expect("the popup vanished");
         assert_ne!(later, first, "the silence counter never moved");
-        assert!(words(&later).contains("silent for 4s"), "{}", words(&later));
+        assert!(words(&later).contains("silent 4 s"), "{}", words(&later));
     }
 
     /// A change of phase is the thing the popup exists to report, and
@@ -4676,21 +4674,25 @@ mod tests {
     }
 
     /// The only path by which a user ever sees `Phase::Recovering`.
-    /// `view.rs`'s test for the recovering rows calls `build` with numbers
+    /// `view.rs`'s tests for the attempts block call `build` with numbers
     /// already computed; nothing there exercises `popup_at`'s own derivation
-    /// of them -- `now.duration_since(self.link_state.last_heard())`
-    /// for the quiet count, `next_try.saturating_duration_since(now)` for the
-    /// countdown -- so this drives the real wiring through `evaluate`
-    /// instead.
+    /// of them -- `now.duration_since(self.link_state.last_heard())` for the
+    /// silence, `next_try.saturating_duration_since(now)` for the countdown,
+    /// `Rebuild::running_since` for the attempt's clock -- so this drives the
+    /// real wiring through `evaluate` and `rebuild_step` instead.
     ///
     /// Not run through `assert_claims_nothing_it_cannot_see`: that guard
-    /// forbids "reconnect"/"retry" because nothing reconnects while `Silent`.
-    /// `Recovering` is exactly the mechanism phase 2 adds, so the word
-    /// belongs here and the guard does not apply.
-    #[tokio::test]
-    async fn the_recovering_section_reports_the_wired_numbers() {
+    /// covers `Silent` and `Confirming`, where nothing is being rebuilt.
+    /// `Recovering` is exactly the phase in which an attempt runs, so
+    /// "running" belongs here and the guard does not apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_attempts_block_reports_the_wired_numbers() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
         let t = std::time::Instant::now();
-        let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
         assert!(session.popup_at(t).is_none());
@@ -4701,8 +4703,9 @@ mod tests {
             session.link_state.phase_now()
         );
 
+        let entered = t + crate::linkstate::REBUILD_AFTER;
         let n = session
-            .popup_at(t + crate::linkstate::REBUILD_AFTER)
+            .popup_at(entered)
             .expect("no popup while Recovering");
         assert!(
             matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
@@ -4711,19 +4714,43 @@ mod tests {
         );
 
         assert_eq!(n.marker, Marker::Recovering);
-        let shown = n.recovering.join(" | ");
         // `last_heard` is `t`; this call lands exactly `REBUILD_AFTER` later,
-        // so a quiet count read from anywhere other than `last_heard` (say,
+        // so a silence read from anywhere other than `last_heard` (say,
         // `owed_since`, which this session never set to `t`) would not say
-        // 20s here.
-        assert!(shown.contains("host quiet for 20s"), "{shown}");
-        // Attempt 0 internally (the first attempt), rendered as 1.
-        assert!(shown.contains("reconnect attempt 1"), "{shown}");
+        // 20 s here.
+        assert_eq!(n.header, "silent 20 s");
         // `next_try` was set to exactly `now` on entering `Recovering`, and
         // this call is that same `now` -- so the countdown, read through
         // `saturating_duration_since`, must be zero rather than negative or
-        // panicking.
-        assert!(shown.contains("next try in 0s"), "{shown}");
+        // panicking. Attempt 0 internally, the first to a person.
+        let rebuild_row = |v: &PopupView| {
+            v.attempts
+                .iter()
+                .find(|r| r.label == "ssh rebuild")
+                .map(|r| r.text.clone())
+        };
+        assert_eq!(rebuild_row(&n).as_deref(), Some("attempt 1 in 0 s"));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        let running = session
+            .popup_at(entered + Duration::from_millis(3_400))
+            .expect("the popup closed");
+        assert_eq!(
+            rebuild_row(&running).as_deref(),
+            Some("attempt 1 \u{b7} running 3 s")
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+        let gone = session
+            .popup_at(entered + Duration::from_millis(3_400))
+            .expect("the popup closed");
+        assert!(
+            !rebuild_row(&gone).is_some_and(|t| t.contains("running")),
+            "a cancelled attempt is still running: {:?}",
+            rebuild_row(&gone)
+        );
     }
 
     // ---- the rebuild loop --------------------------------------------------
@@ -5341,8 +5368,7 @@ mod tests {
     }
 
     /// A completed client-side standby, as a search hands it to the session.
-    /// Also the shape a rebuild's `Established` has. The attach id is not
-    /// the fixtures' zero, so a test can see it carried over.
+    /// Also the shape a rebuild's `Established` has.
     fn standby_established(link: Link) -> crate::connect::Established {
         crate::connect::Established {
             link,
@@ -5651,7 +5677,6 @@ mod tests {
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
-            attach_id: 5,
         });
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         client.standby = Some(standby_holding(standby_client));
@@ -5678,11 +5703,6 @@ mod tests {
             outside_renderer(&out).is_empty(),
             "{:?}",
             String::from_utf8_lossy(&outside_renderer(&out))
-        );
-        assert_eq!(
-            client.identity.as_ref().map(|i| i.attach_id),
-            Some(2),
-            "the attach id stayed the old link's"
         );
         let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
         assert!(
@@ -5949,12 +5969,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_landed_rebuild_is_recorded_and_its_path_and_attach_become_the_sessions() {
+    async fn a_landed_rebuild_is_recorded_and_its_path_becomes_the_sessions() {
         let (_host, mut client) = pair("").await;
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
-            attach_id: 5,
         });
         assert!(client.path.is_none(), "the fixture already had a path");
         let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
@@ -5973,7 +5992,6 @@ mod tests {
             "the outage's summary will not say how it ended"
         );
         assert_eq!(client.path.as_ref().map(|p| p.rtt_ms), Some(38));
-        assert_eq!(client.identity.as_ref().map(|i| i.attach_id), Some(2));
     }
 
     /// Ruling B1. A failover is not a rebuild landing: an ssh attempt that

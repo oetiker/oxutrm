@@ -36,7 +36,7 @@ pub mod status;
 pub use color::down_convert;
 pub use guard::{RawGuard, TERMINAL_RESTORE};
 pub use overlay::{Overlay, overlay_from_buffer};
-pub use popup::{KeyHint, Marker, PopupView, layout_popup, legible, summarised};
+pub use popup::{KeyHint, Marker, PopupView, Row, layout_popup, legible, summarised};
 pub use renderer::Renderer;
 pub use status::{rung_label, status_line};
 

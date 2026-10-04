@@ -204,7 +204,6 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
         .with_identity(Identity {
             target: target.to_owned(),
             session_id: established.session_id.clone(),
-            attach_id: established.attach_id,
         })
         // What oxutrm does to keep the session alive, in the popup and in
         // client.log. A log file that cannot be opened costs one entry in

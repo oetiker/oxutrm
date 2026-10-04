@@ -51,7 +51,7 @@ pub(crate) enum StandbyEvent {
     },
     /// The search failed, and the next search asks again anyway. The reason
     /// is recorded in the activity log by the session, and kept on
-    /// [`Standby::last_failure`] for the popup's standby block.
+    /// [`Standby::last_failure`] for the popup's standby section.
     NotFound {
         search: u64,
         reason: String,
@@ -97,7 +97,7 @@ pub(crate) struct Standby {
     probe: ProbeState,
     probing: bool,
     nonce: u64,
-    /// Why the last search failed, for the popup's standby block. Cleared the
+    /// Why the last search failed, for the popup's standby section. Cleared the
     /// moment a search succeeds; never printed.
     last_failure: Option<String>,
 }
@@ -128,7 +128,7 @@ impl Standby {
         self.next_search
     }
 
-    /// Why the last search failed, for the popup's standby block.
+    /// Why the last search failed, for the popup's standby section.
     pub(crate) fn last_failure(&self) -> Option<&str> {
         self.last_failure.as_deref()
     }
@@ -460,7 +460,7 @@ mod tests {
         assert!(!s.searching());
     }
 
-    /// A `NotFound` with a reason is kept for the popup's standby block.
+    /// A `NotFound` with a reason is kept for the popup's standby section.
     #[test]
     fn a_not_found_with_a_reason_sets_last_failure() {
         let t0 = Instant::now();

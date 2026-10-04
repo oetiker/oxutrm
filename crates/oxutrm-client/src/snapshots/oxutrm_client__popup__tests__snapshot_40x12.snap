@@ -2,13 +2,13 @@
 source: crates/oxutrm-client/src/popup.rs
 expression: "text_of(&layout_popup(&view(), TermSize { cols: 40, rows: 12 }))"
 ---
-╭ oxutrm · bastion ────────────────╮
-│ ● SILENT                         │
-│ silent for 6s                    │
-│ rtt — · min 30 / avg 35 / max 52 │
-│ ms                               │
-│ standby: searching…              │
-│ rtt ▄▆ █                         │
-│ event-30                         │
+╭ oxutrm · bastion · f00dcafe ─────╮
+│ ● SILENT   silent 6 s            │
+│ standby probe   probing…         │
+│ ssh rebuild     in 14 s          │
+│ rtt   —  (30–52)  ▄▆ █           │
+│ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s    │
+│                                  │
+├──────────────────────────────────┤
 │ q quit  c config                 │
 ╰──────────────────────────────────╯
