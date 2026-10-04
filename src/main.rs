@@ -21,6 +21,10 @@
 // every one of them must come off. An allow that cannot be removed then is a
 // piece of code with no caller on either side, which is worth knowing.
 mod accept;
+// Fed by the session in Task 6 (link events) and Task 7 (everything else,
+// and the file); Task 7 removes this attribute.
+#[cfg_attr(not(test), allow(dead_code))]
+mod activity;
 mod attach_exchange;
 mod candidates;
 mod choose;
