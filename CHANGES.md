@@ -215,6 +215,12 @@
   set, adds `-o ConnectTimeout=10`. A `ConnectTimeout` set in your ssh
   configuration is left alone.
 
+- **The activity log numbers ssh attempts across the whole outage.** After a
+  switch to the standby, the next ssh attempt was logged as "attempt 1" again,
+  so one outage could log two different attempts both as "attempt 1". The log
+  now counts on. The popup's own attempt counter still starts over with each
+  new link, as does the retry schedule.
+
 - **Programs that ask the terminal a question get an answer.** The host's
   emulator always worked out the reply to a query such as "where is the
   cursor?" (`CSI 6n`) or "what are you?" (device attributes), and then threw
