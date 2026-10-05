@@ -17,8 +17,8 @@
 // through the popup, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
@@ -86,20 +86,38 @@ fn needs_connect_timeout(ssh_g_output: Option<&str>) -> bool {
 
 /// The launcher a rebuild attempt runs ssh through: `launcher` with
 /// [`BATCH_MODE`], and [`CONNECT_TIMEOUT`] where the user's ssh would
-/// otherwise have no bound on its connect.
+/// otherwise have no bound on its connect -- asked of `ssh -G` the first
+/// time, and of `bound` once ssh has answered (see [`ConnectBound`]).
 ///
 /// Asked of the same launcher, so production asks `ssh -G` and a test's fake
 /// ssh is asked the same question, and the argument list the tests see is
 /// the one that ships.
-async fn rebuild_launcher(launcher: &SshLauncher, target: &str) -> SshLauncher {
+async fn rebuild_launcher(
+    launcher: &SshLauncher,
+    target: &str,
+    bound: &ConnectBound,
+) -> SshLauncher {
     let launcher = BATCH_MODE
         .iter()
         .fold(launcher.clone(), |batch, arg| batch.arg(arg));
-    let config = tokio::time::timeout(CONFIG_QUERY_TIMEOUT, launcher.effective_config(target))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    if needs_connect_timeout(config.as_deref()) {
+    let needed = match bound.0.get() {
+        Some(&known) => known,
+        None => {
+            let config =
+                tokio::time::timeout(CONFIG_QUERY_TIMEOUT, launcher.effective_config(target))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let needed = needs_connect_timeout(config.as_deref());
+            if config.is_some() {
+                // One attempt runs at a time, so nobody else can have set
+                // it meanwhile; and if somebody had, theirs is as good.
+                let _ = bound.0.set(needed);
+            }
+            needed
+        }
+    };
+    if needed {
         CONNECT_TIMEOUT
             .iter()
             .fold(launcher, |bounded, arg| bounded.arg(arg))
@@ -261,6 +279,34 @@ impl Commitment {
     }
 }
 
+/// Whether a rebuild's ssh needs [`CONNECT_TIMEOUT`], kept once `ssh -G`
+/// has given a definite answer, and shared by every attempt of one
+/// [`Rebuild`].
+///
+/// Asked once and not per attempt, because the question is not always
+/// cheap. `ssh -G` connects to nothing, but it does evaluate the
+/// configuration, and a `Match exec` or a canonicalised host name can cost
+/// seconds -- on every attempt, during exactly the kind of VPN drop the
+/// timeout is for. The answer cannot change within one session unless
+/// somebody edits their ssh configuration, and a session that outlives such
+/// an edit keeps the old answer, as an ssh already running keeps its options.
+///
+/// Only an answer is kept. A query that failed or ran out of
+/// [`CONFIG_QUERY_TIMEOUT`] is not knowing, and the next attempt asks again
+/// (meanwhile this one adds the timeout, as [`needs_connect_timeout`] does
+/// for `None`).
+#[derive(Clone, Debug, Default)]
+struct ConnectBound(Arc<OnceLock<bool>>);
+
+/// What one attempt shares with the [`Rebuild`] that began it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Ties {
+    /// This attempt's own line. A fresh one per attempt.
+    commitment: Commitment,
+    /// The rebuild's, shared by all its attempts.
+    bound: ConnectBound,
+}
+
 /// One attempt at getting back into `session_id` on `target`.
 ///
 /// `launcher` is the injection point, exactly as it is for
@@ -273,8 +319,10 @@ impl Commitment {
 /// `size` is the client's **current** terminal size, so the host adopts at the
 /// right geometry from the `ClientHello` alone with no resize afterwards.
 ///
-/// `commitment` is claimed immediately before the `Attach` is sent (see
-/// [`Commitment`]); an attempt that finds it already abandoned stops there.
+/// `ties` are what the attempt shares with the [`Rebuild`] that began it:
+/// its commitment, claimed immediately before the `Attach` is sent (see
+/// [`Commitment`]) -- an attempt that finds it already abandoned stops there
+/// -- and what `ssh -G` has already said ([`ConnectBound`]).
 ///
 /// # Why the channel may be dropped when this returns
 ///
@@ -291,7 +339,7 @@ pub(crate) async fn attempt(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
-    commitment: &Commitment,
+    ties: &Ties,
 ) -> AttemptOutcome {
     attempt_within(
         ATTEMPT_DEADLINE,
@@ -300,7 +348,7 @@ pub(crate) async fn attempt(
         session_id,
         size,
         cfg,
-        commitment,
+        ties,
     )
     .await
 }
@@ -323,9 +371,9 @@ async fn attempt_within(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
-    commitment: &Commitment,
+    ties: &Ties,
 ) -> AttemptOutcome {
-    let body = one_attempt(launcher, target, session_id, size, cfg, commitment);
+    let body = one_attempt(launcher, target, session_id, size, cfg, ties);
     match tokio::time::timeout(deadline, body).await {
         Ok(outcome) => outcome,
         Err(_) => AttemptOutcome::Retry(format!(
@@ -344,9 +392,9 @@ async fn one_attempt(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
-    commitment: &Commitment,
+    ties: &Ties,
 ) -> AttemptOutcome {
-    let launcher = rebuild_launcher(launcher, target).await;
+    let launcher = rebuild_launcher(launcher, target, &ties.bound).await;
 
     let mut channel = match SshChannel::open(&launcher, target).await {
         Ok(channel) => channel,
@@ -369,7 +417,7 @@ async fn one_attempt(
     // The task got here before the loop's abort did, so this outcome may well
     // be sent -- the channel is likely empty -- and read. It is read as stale:
     // the abandon ended this attempt's generation (see `Report`).
-    if !commitment.commit() {
+    if !ties.commitment.commit() {
         return AttemptOutcome::Retry("abandoned for the standby".to_owned());
     }
     let choice = Choice::Attach {
@@ -411,6 +459,9 @@ pub(crate) struct Rebuild {
     /// Whether the attempt in flight has sent its `Attach`. A fresh one per
     /// attempt, so an old attempt's line can never be read as the new one's.
     commitment: Commitment,
+    /// What `ssh -G` said, once it has said it: one answer for every attempt
+    /// of this rebuild ([`ConnectBound`]).
+    bound: ConnectBound,
     /// When the attempt in flight began, for the popup's clock on it.
     started: Option<Instant>,
     /// An attempt has begun and no swap has happened since, so a `TAKEN_OVER`
@@ -434,6 +485,7 @@ impl Rebuild {
             in_flight: None,
             generation: 0,
             commitment: Commitment::default(),
+            bound: ConnectBound::default(),
             started: None,
             displacing: false,
         }
@@ -540,11 +592,14 @@ impl Rebuild {
         let target = self.target.clone();
         let session_id = self.session_id.clone();
         let cfg = self.cfg.clone();
-        let commitment = Commitment::default();
-        self.commitment = commitment.clone();
+        let ties = Ties {
+            commitment: Commitment::default(),
+            bound: self.bound.clone(),
+        };
+        self.commitment = ties.commitment.clone();
         self.displacing = true;
         self.in_flight = Some(tokio::spawn(async move {
-            let outcome = attempt(&launcher, &target, &session_id, size, &cfg, &commitment).await;
+            let outcome = attempt(&launcher, &target, &session_id, size, &cfg, &ties).await;
             // A closed receiver means the session this was for has ended.
             // There is nobody to tell, and that is not a failure.
             let _ = outcomes
@@ -824,7 +879,7 @@ mod tests {
             session_id,
             a_size(),
             &test_config(),
-            &Commitment::default(),
+            &Ties::default(),
         )
         .await
     }
@@ -928,7 +983,7 @@ mod tests {
                 "abc123",
                 a_size(),
                 &test_config(),
-                &Commitment::default(),
+                &Ties::default(),
             ),
         )
         .await
@@ -1170,6 +1225,91 @@ mod tests {
             rebuild_arguments("connecttimeout 30").await,
             [&["-o", "BatchMode=yes"][..], &remote[..]].concat(),
             "the user's own ConnectTimeout was overridden"
+        );
+    }
+
+    /// An ssh that counts the `ssh -G` questions it is asked in `asked`, one
+    /// line each, answering them with `config` -- or failing them, for
+    /// `None` -- and otherwise records its arguments in `args`, one per
+    /// line, and fails as an unreachable host does.
+    fn fake_ssh_counting_questions(config: Option<&str>) -> FakeHost {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let asked = dir.path().join("asked");
+        let args = dir.path().join("args");
+        let answer = match config {
+            Some(config) => format!("printf '%s\\n' '{config}'; exit 0"),
+            None => "echo 'ssh: cannot resolve' >&2; exit 255".to_owned(),
+        };
+        let text = format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *' -G '*) echo asked >> '{}'; {answer};; esac\n\
+             printf '%s\\n' \"$@\" > '{}'\n\
+             exit 255\n",
+            asked.display(),
+            args.display()
+        );
+        let script = dir.path().join("fake-ssh");
+        std::fs::write(&script, text).expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        let launcher = SshLauncher::command(&script);
+        FakeHost { dir, launcher }
+    }
+
+    /// Two attempts of one rebuild, run to their end against `fake`: how
+    /// often each was asked `ssh -G`, and whether each carried the
+    /// connect timeout.
+    async fn two_attempts(fake: &FakeHost) -> (usize, [bool; 2]) {
+        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
+            .via(fake.launcher.clone(), test_config());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut bounded = [false; 2];
+        for b in &mut bounded {
+            rebuild.begin(a_size(), tx.clone(), Instant::now());
+            let report = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the attempt never reported")
+                .expect("the attempt's sender went away");
+            assert!(
+                matches!(rebuild.accept(report), Some(AttemptOutcome::Retry(_))),
+                "the fake ssh did not fail as expected"
+            );
+            *b = std::fs::read_to_string(fake.path("args"))
+                .expect("the fake ssh recorded no arguments")
+                .lines()
+                .any(|a| a == "ConnectTimeout=10");
+        }
+        let asked = std::fs::read_to_string(fake.path("asked"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        (asked, bounded)
+    }
+
+    /// `ssh -G` is asked once per rebuild, not once per attempt: a `Match
+    /// exec` or a canonicalised host name can make it cost seconds, on every
+    /// attempt of an outage. A definite answer is kept either way it goes;
+    /// a question that failed is asked again, and in the meantime the
+    /// attempt is bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ssh_is_asked_about_its_connect_timeout_once_per_rebuild() {
+        let none = fake_ssh_counting_questions(Some("connecttimeout none"));
+        assert_eq!(two_attempts(&none).await, (1, [true, true]));
+
+        let own = fake_ssh_counting_questions(Some("connecttimeout 30"));
+        assert_eq!(
+            two_attempts(&own).await,
+            (1, [false, false]),
+            "the user's own ConnectTimeout was overridden, or asked for twice"
+        );
+
+        let failing = fake_ssh_counting_questions(None);
+        assert_eq!(
+            two_attempts(&failing).await,
+            (2, [true, true]),
+            "a question that got no answer was not asked again"
         );
     }
 
