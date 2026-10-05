@@ -27,6 +27,12 @@ pub struct Signals {
     pub child_exit: Option<i32>,
     /// Something changed that a renderer would care about.
     pub wakeup: bool,
+    /// The emulator's answers to the child's questions -- the cursor position
+    /// (`CSI 6n`), device attributes, mode reports -- owed back to the child
+    /// on its input, in order. A terminal that never answers leaves the child
+    /// waiting: atuin, for one, gives up with "the cursor position could not
+    /// be read".
+    pub replies: Vec<String>,
 }
 
 /// The listener handed to `Term::new`.
@@ -68,8 +74,10 @@ impl EventListener for EventSink {
             Event::ClipboardStore(kind, text) => s.clipboard.push((kind, text)),
             Event::ChildExit(status) => s.child_exit = Some(crate::pty::exit_code(status)),
             Event::Wakeup => s.wakeup = true,
-            // The rest are for an interactive front end - mouse shape, colour
-            // queries, PTY write-backs - and oxutrm answers none of them here.
+            Event::PtyWrite(reply) => s.replies.push(reply),
+            // The rest are for an interactive front end -- mouse shape, colour
+            // and text-area-size queries -- and oxutrm answers none of them
+            // here.
             _ => {}
         }
     }

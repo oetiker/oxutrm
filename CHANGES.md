@@ -165,6 +165,14 @@
 
 ### Fixed
 
+- **Programs that ask the terminal a question get an answer.** The host's
+  emulator always worked out the reply to a query such as "where is the
+  cursor?" (`CSI 6n`) or "what are you?" (device attributes), and then threw
+  it away, so the program asking waited for nothing. atuin's arrow-up search
+  gave up every time with "The cursor position could not be read within a
+  normal duration". The replies now go back to the program, from the host,
+  whose screen is the one being asked about.
+
 - **A standby search's diagnostics no longer garble the screen.** Each standby
   search runs the full connection ladder, birthday blast included, so on a
   machine whose blast misses this printed over the painted raw-mode screen on
