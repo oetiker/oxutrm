@@ -184,6 +184,14 @@ impl HostTerm {
         if let Some(code) = signals.child_exit {
             self.exited = Some(code);
         }
+        // Answered here, on the host, because the host's emulator is the one
+        // whose cursor and modes the child is asking about; the client's
+        // terminal only mirrors it. A reply that cannot be written is dropped
+        // like a keystroke to a child that has gone: the child is not waiting
+        // for it any more, and failing the poll would end the session over it.
+        for reply in &signals.replies {
+            let _ = self.pty.write_input(reply.as_bytes());
+        }
 
         // The emulator's own answer to "did anything move". Reset so the next
         // poll reports only what is new.
@@ -823,6 +831,32 @@ mod tests {
     fn the_sequence_number_is_whatever_the_caller_asked_for() {
         let t = sh("exit 0", size());
         assert_eq!(t.snapshot(42).seq, 42);
+    }
+
+    /// An application that asks the terminal something -- here the cursor
+    /// position, as atuin does before it draws -- gets the emulator's answer
+    /// on its own input. Without one it waits, and atuin gives up with "the
+    /// cursor position could not be read".
+    ///
+    /// The script reads the reply itself: `stty` makes the read return what
+    /// arrived within two seconds, so a missing answer shows as `got:` with
+    /// nothing after it rather than hanging the test.
+    #[test]
+    fn a_cursor_position_query_is_answered() {
+        let mut t = sh(
+            "stty -icanon -echo min 0 time 20; \
+             printf '\\033[3;5H\\033[6n'; \
+             r=$(dd bs=1 count=6 2>/dev/null | tr -d '\\033'); \
+             printf '\\033[1;1Hgot:%s' \"$r\"; sleep 5",
+            size(),
+        );
+        assert!(
+            poll_until(&mut t, Duration::from_secs(10), |t| {
+                row_text(&t.snapshot(1), 0).starts_with("got:[3;5R")
+            }),
+            "got {:?}",
+            row_text(&t.snapshot(1), 0)
+        );
     }
 
     #[test]
