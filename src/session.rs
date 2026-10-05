@@ -60,7 +60,7 @@ use crate::activity::{Activity, Kind};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
-use crate::rebuild::{AttemptOutcome, Rebuild};
+use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage, Report};
 use crate::ui::{Command, LinkChange, Mode, Ui};
 use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
 
@@ -764,8 +764,9 @@ enum Wake {
     Due,
     /// Time for the splash's next frame, or for the end of its hold.
     SplashFrame,
-    /// A rebuild attempt finished, one way or another.
-    Rebuilt(AttemptOutcome),
+    /// A rebuild attempt finished, one way or another -- or one the loop
+    /// has since given up had already finished (see `Report`).
+    Rebuilt(Report),
     /// A standby search or probe reported back.
     Standby(crate::standby::StandbyEvent),
     /// The standby's connection closed, with this reason.
@@ -1034,12 +1035,22 @@ struct OutageNotes {
     /// How it ended, when something oxutrm did ended it: `None` is a
     /// primary that came back by itself.
     ended: Option<String>,
+    /// How many ssh attempts have begun during it, which is also the number
+    /// of the latest -- the one the log's "attempt N" entries are about.
+    ///
+    /// Not the phase's own counter, which a failover or a landed rebuild
+    /// starts over: right for the popup's row and the retry schedule, which
+    /// are about the link in place now, but in the log it made two different
+    /// attempts of one outage both "attempt 1".
+    attempts: u32,
     /// How many ssh attempts failed during it.
     failed_attempts: u32,
     /// `failed_attempts` when the standby was switched in, while that
-    /// switch is what ended the outage. An attempt begun before the switch
-    /// may still be running (ruling B1) and fail after it; that failure is
-    /// not one the outage waited through, so the summary counts to here.
+    /// switch is what ended the outage. The switch abandons an attempt still
+    /// in flight, and a failure it may still report is dropped as stale
+    /// (`Rebuild::accept`), so while this is `Some` it equals
+    /// `failed_attempts`; it is kept as the marker that the switch ended the
+    /// outage, which the popup's `switched` row reads.
     /// Cleared again if a rebuild lands or a new attempt has to begin: then
     /// the switch did not end it after all.
     failed_at_switch: Option<u32>,
@@ -1726,14 +1737,14 @@ impl ClientSession {
     /// phase out of `Recovering` by the time this runs, and the attempt in
     /// flight is then not merely redundant -- left running, it could land and
     /// swap the transport under a session that had already come back.
-    fn rebuild_step(&mut self, now: Instant, outcomes: &tokio::sync::mpsc::Sender<AttemptOutcome>) {
+    fn rebuild_step(&mut self, now: Instant, outcomes: &tokio::sync::mpsc::Sender<Report>) {
         let phase = self.link_state.phase_now();
         let size = self.size;
         let Some(rebuild) = self.rebuild.as_mut() else {
             return;
         };
 
-        let Phase::Recovering { attempt, next_try } = phase else {
+        let Phase::Recovering { next_try, .. } = phase else {
             // `stood_down` and not a bare `cancel`: the displacing latch
             // belongs to the outage too. Left set, the next `TAKEN_OVER` on
             // this link -- somebody else attaching, an hour later, over a
@@ -1757,9 +1768,10 @@ impl ClientSession {
         // An attempt after a switch: the standby did not answer either, and
         // the outage goes on.
         self.outage.failed_at_switch = None;
+        self.outage.attempts = self.outage.attempts.saturating_add(1);
         self.activity.record_detail(
             Kind::Rebuild,
-            &format!("attempt {} started", attempt.saturating_add(1)),
+            &format!("attempt {} started", self.outage.attempts),
         );
     }
 
@@ -1774,10 +1786,10 @@ impl ClientSession {
 
     /// The log entry for a failed rebuild attempt, retried or not.
     fn record_attempt_failed(&mut self, why: &str) {
-        if let Phase::Recovering { attempt, .. } = self.link_state.phase_now() {
+        if let Phase::Recovering { .. } = self.link_state.phase_now() {
             self.activity.record_detail(
                 Kind::Rebuild,
-                &format!("attempt {} failed: {why}", attempt.saturating_add(1)),
+                &format!("attempt {} failed: {why}", self.outage.attempts),
             );
         }
     }
@@ -1792,24 +1804,114 @@ impl ClientSession {
 
     /// A rebuild attempt landed: its link replaces the one that stopped
     /// answering, and its path is the session's from here.
+    ///
+    /// Usually inside the outage, which it then ends. It can also land after
+    /// the old link came back by itself (`Rebuild::accept`), and is taken
+    /// then too -- the host adopted it and closed the old link -- but that
+    /// outage is over, and its summary says it came back by itself, which
+    /// was true when it ended. Its notes are left alone, the landing is
+    /// logged as what it is, and `swap_in` leaves a phase that is not
+    /// `Recovering` as it is.
     fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        // Before the swap, which changes nothing about the phase but is
+        // about to change everything else.
+        let ends_the_outage = self.link_state.phase_now().is_outage();
         self.swap_in(e.link, now)?;
-        self.activity.record_detail(
-            Kind::Rebuild,
-            &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
-        );
-        self.outage.ended = Some(format!(
-            "rebuilt over ssh {}",
-            in_parens(&oxutrm_client::rung_label(&e.path))
-        ));
-        self.outage.failed_at_switch = None;
+        let label = oxutrm_client::rung_label(&e.path);
+        if ends_the_outage {
+            self.activity
+                .record_detail(Kind::Rebuild, &format!("landed via {label}"));
+            self.outage.ended = Some(format!("rebuilt over ssh {}", in_parens(&label)));
+            self.outage.failed_at_switch = None;
+        } else {
+            self.activity.record_detail(
+                Kind::Rebuild,
+                &format!("landed via {label} after the old link came back"),
+            );
+        }
         self.path = Some(e.path);
         Ok(())
     }
 
+    /// A rebuild attempt reported back. True when it landed and its link is
+    /// now the session's, which the loop has to follow.
+    ///
+    /// A failure reported by an attempt the loop has given up since --
+    /// abandoned for the standby, or stood down when the old link came back
+    /// -- changes nothing at all (`Rebuild::accept`): not the log, not the
+    /// schedule, and above all not the session's life, which a queued
+    /// `Definite` used to end just after it had been rescued. A LANDING is
+    /// swapped in whichever attempt it came from: the host has already moved
+    /// to that link and closed the one this client is on.
+    fn rebuild_reported(&mut self, report: Report, now: Instant) -> Result<bool> {
+        let Some(outcome) = self.rebuild.as_mut().and_then(|r| r.accept(report)) else {
+            return Ok(false);
+        };
+        match outcome {
+            AttemptOutcome::Landed(established) => {
+                self.rebuild_landed(*established, now)
+                    .context("swapping in the rebuilt link")?;
+                Ok(true)
+            }
+            // The network, not the far end. The loop keeps its cadence and
+            // the popup explains the last try.
+            AttemptOutcome::Retry(why) => {
+                self.rebuild_failed(why, now);
+                Ok(false)
+            }
+            // An answer, and repeating the question gets the same one.
+            // `run_connect` prints this after the raw guard is dropped and
+            // exits non-zero.
+            AttemptOutcome::Definite(why) => Err(self.rebuild_refused(&why)),
+        }
+    }
+
+    /// How far the rebuild attempt in flight has got, for the standby's
+    /// step (see [`RebuildStage`]).
+    fn rebuild_stage(&self) -> RebuildStage {
+        self.rebuild
+            .as_ref()
+            .map_or(RebuildStage::Idle, Rebuild::stage)
+    }
+
     /// Swap the standby in for a primary that stopped answering (spec §3.5).
     /// Returns whether there was one to swap in.
+    ///
+    /// A rebuild attempt still connecting is abandoned first -- the standby
+    /// answered, and ssh has not -- and its ssh killed with it. Before the
+    /// swap, so the attempt cannot send its `Attach` to a host that is about
+    /// to adopt the standby. One that committed after the step decided (the
+    /// two run on different threads) wins instead: nothing is swapped, and
+    /// the next step sees it `Committed` and waits (ruling B1).
+    ///
+    /// The phase needs nothing more: the swap leaves it `Recovering` at
+    /// attempt 0 with a full backoff ([`LinkState::rebuilt`]), the popup's
+    /// rebuild row reads the cancelled attempt as not running, and nothing
+    /// counts it as failed either: an outcome it had already queued (it may
+    /// have failed before its `Attach` and not been read yet) belongs to a
+    /// generation the abandon ended, and `Rebuild::accept` drops it.
     fn fail_over<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        if self
+            .standby
+            .as_ref()
+            .is_none_or(|s| s.connection().is_none())
+        {
+            return Ok(false);
+        }
+        if let Some(rebuild) = self.rebuild.as_mut()
+            && rebuild.is_running()
+        {
+            if !rebuild.abandon() {
+                return Ok(false);
+            }
+            self.activity.record_detail(
+                Kind::Rebuild,
+                &format!(
+                    "attempt {} abandoned: standby answered",
+                    self.outage.attempts
+                ),
+            );
+        }
         let Some(e) = self.standby.as_mut().and_then(|s| s.take_for_failover(now)) else {
             return Ok(false);
         };
@@ -1843,13 +1945,13 @@ impl ClientSession {
         &mut self,
         phase: Phase,
         now: Instant,
-        rebuild_running: bool,
+        rebuild: RebuildStage,
     ) -> crate::standby::StandbyAction {
         let Some(s) = self.standby.as_mut() else {
             return crate::standby::StandbyAction::Nothing;
         };
         let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
-        let action = s.step(phase, now, rebuild_running);
+        let action = s.step(phase, now, rebuild);
         match action {
             crate::standby::StandbyAction::Search { .. } => {
                 self.activity.record_detail(Kind::Standby, "search started");
@@ -1968,9 +2070,10 @@ impl ClientSession {
     ///
     /// The rebuild's displacement latch is NOT cleared here, and that is the
     /// difference that matters (ruling B1). A failover is not our rebuild
-    /// landing: an ssh attempt started before it may still reach the host
-    /// and close this new link as taken over, and that close has to be read
-    /// as our own doing, not as the end of the session. The latch is cleared
+    /// landing: an earlier ssh attempt in this outage may have sent its
+    /// `Attach` before it failed, the host may still adopt it and close this
+    /// new link as taken over, and that close has to be read as our own
+    /// doing, not as the end of the session. The latch is cleared
     /// when frames make the phase `Live` again (`Rebuild::stood_down`), or by
     /// a rebuild that lands.
     pub(crate) fn swap_in_as(
@@ -2195,7 +2298,7 @@ impl ClientSession {
         // the arm below borrows this and not `self` (C1) -- exactly as
         // `HostSession::run_with_attaches` holds its receiver, and for the
         // same reason. Depth one: only one attempt ever runs at a time.
-        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel::<AttemptOutcome>(1);
+        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel::<Report>(1);
         // A `TAKEN_OVER` close that has already been explained: our own
         // rebuild reaching the host. The ARM is disabled rather than the wake
         // being ignored, because a closed connection is permanently ready, so
@@ -2277,7 +2380,7 @@ impl ClientSession {
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
                 () = splash_due(splash_at) => Wake::SplashFrame,
-                Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
+                Some(report) = outcomes.recv() => Wake::Rebuilt(report),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 // Quiet until the standby goes away; a closed connection is
                 // ready for ever, which is why the handler disarms it.
@@ -2341,36 +2444,20 @@ impl ClientSession {
                 // Layer 1 below paints the frame.
                 Wake::SplashFrame => {}
                 // A rebuild attempt finished.
-                Wake::Rebuilt(outcome) => {
-                    if let Some(rebuild) = self.rebuild.as_mut() {
-                        rebuild.finished();
-                    }
-                    match outcome {
-                        AttemptOutcome::Landed(established) => {
-                            self.rebuild_landed(*established, Instant::now())
-                                .context("swapping in the rebuilt link")?;
-                            // Both of these belong to the link that has just
-                            // been replaced: the arm has to watch the new
-                            // connection, and a takeover on the old one can no
-                            // longer arrive because nothing is watching it.
-                            conn = self.link.sink.connection().clone();
-                            takeover_expected = false;
-                            // `swap_in` has forgotten (and closed) the
-                            // standby, which the host dropped as it adopted
-                            // this attach. A search still running over the
-                            // old primary is disowned with it, and stopped.
-                            standby_conn = None;
-                            _search_task = None;
-                        }
-                        // The network, not the far end. The loop keeps its
-                        // cadence and the popup explains the last try.
-                        AttemptOutcome::Retry(why) => self.rebuild_failed(why, Instant::now()),
-                        // An answer, and repeating the question gets the same
-                        // one. `run_connect` prints this after the raw guard
-                        // is dropped and exits non-zero.
-                        AttemptOutcome::Definite(why) => {
-                            return Err(self.rebuild_refused(&why));
-                        }
+                Wake::Rebuilt(report) => {
+                    if self.rebuild_reported(report, Instant::now())? {
+                        // Both of these belong to the link that has just
+                        // been replaced: the arm has to watch the new
+                        // connection, and a takeover on the old one can no
+                        // longer arrive because nothing is watching it.
+                        conn = self.link.sink.connection().clone();
+                        takeover_expected = false;
+                        // `swap_in` has forgotten (and closed) the
+                        // standby, which the host dropped as it adopted
+                        // this attach. A search still running over the
+                        // old primary is disowned with it, and stopped.
+                        standby_conn = None;
+                        _search_task = None;
                     }
                 }
                 Wake::Standby(event) => {
@@ -2458,12 +2545,14 @@ impl ClientSession {
             self.rebuild_step(now, &outcomes_tx);
 
             // The standby (spec §3). After the rebuild step, so an attempt
-            // started on this very lap already counts as running: nothing is
-            // failed over onto while one is (ruling B1). The step decides and
-            // the loop acts, so nothing spawned here borrows `self`.
-            let rebuild_running = self.rebuild.as_ref().is_some_and(Rebuild::is_running);
+            // started on this very lap is already in the picture: nothing is
+            // failed over onto while one that has sent its `Attach` runs
+            // (ruling B1), and one still connecting is abandoned by the
+            // failover (`fail_over`). The step decides and the loop acts, so
+            // nothing spawned here borrows `self`.
+            let stage = self.rebuild_stage();
             let phase = self.link_state.phase_now();
-            let action = self.standby_step(phase, now, rebuild_running);
+            let action = self.standby_step(phase, now, stage);
             match action {
                 crate::standby::StandbyAction::Nothing => {}
                 crate::standby::StandbyAction::Search { search } => {
@@ -5021,6 +5110,14 @@ mod tests {
         }
     }
 
+    /// How a fake ssh answers `ssh -G`, which every rebuild attempt asks
+    /// before it connects (`rebuild::rebuild_launcher`): at once, as an ssh
+    /// with no configuration does. A fake that ran its body for the question
+    /// as well would record the wrong pid, and one that hangs would hang the
+    /// question for its whole bound.
+    const ASKED_SSH_G: &str =
+        "case \" $* \" in *' -G '*) printf '%s\\n' 'connecttimeout none'; exit 0;; esac\n";
+
     /// An `ssh` that records its own pid and then never says anything.
     ///
     /// An attempt against this is permanently in flight, which is what the
@@ -5034,7 +5131,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                "#!/bin/sh\n{ASKED_SSH_G}echo $$ > '{}'\nexec sleep 300\n",
                 pidfile.display()
             ),
         )
@@ -5642,7 +5739,8 @@ mod tests {
             now.checked_sub(crate::linkstate::STANDBY_DELAY)
                 .expect("a clock this young"),
         );
-        let crate::standby::StandbyAction::Search { search } = s.step(Phase::Live, now, false)
+        let crate::standby::StandbyAction::Search { search } =
+            s.step(Phase::Live, now, RebuildStage::Idle)
         else {
             panic!("the fixture's standby started no search");
         };
@@ -5868,7 +5966,7 @@ mod tests {
             "the fixture recorded something"
         );
 
-        let action = client.standby_step(Phase::Live, now, false);
+        let action = client.standby_step(Phase::Live, now, RebuildStage::Idle);
 
         assert!(
             matches!(action, crate::standby::StandbyAction::Search { .. }),
@@ -5897,7 +5995,7 @@ mod tests {
         let silent = Phase::Silent { since: t0 };
 
         for at in [t0, t0 + crate::linkstate::PROBE_RETRY] {
-            let action = client.standby_step(silent, at, false);
+            let action = client.standby_step(silent, at, RebuildStage::Idle);
             assert!(
                 matches!(action, crate::standby::StandbyAction::Probe { .. }),
                 "no probe at {:?}: {action:?}",
@@ -6208,7 +6306,7 @@ mod tests {
             "a probe nobody sent was recorded"
         );
 
-        let action = client.standby_step(silent, t0, false);
+        let action = client.standby_step(silent, t0, RebuildStage::Idle);
         assert!(
             matches!(action, crate::standby::StandbyAction::Probe { .. }),
             "no probe started: {action:?}"
@@ -6234,6 +6332,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_landed_rebuild_is_recorded_and_its_path_becomes_the_sessions() {
         let (_host, mut client) = pair("").await;
+        drive_to_recovering(&mut client);
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
@@ -6295,6 +6394,498 @@ mod tests {
         );
         let reason = closed_as(&displaced).await;
         assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// The 2026-10-04 outage, through the session's own steps: the rebuild's
+    /// ssh is stuck connecting (there, a 75 s TCP connect timeout to a target
+    /// only reachable over the VPN that had dropped), and the standby
+    /// answers. The standby is probed and switched to while the attempt
+    /// runs, and the attempt is abandoned before the switch, its ssh killed.
+    /// What an abandoned attempt may still have queued is the business of
+    /// `a_queued_outcome_of_an_abandoned_attempt_changes_nothing`: this
+    /// one's ssh hangs, so it never has anything to say.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answering_standby_abandons_a_rebuild_still_connecting() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _outcomes) = tokio::sync::mpsc::channel(1);
+
+        session.rebuild_step(entered, &tx);
+        let ssh = wait_for_pid(&pidfile).await;
+        assert_eq!(
+            session.rebuild_stage(),
+            RebuildStage::Connecting,
+            "the fixture's attempt is not the one this test is about"
+        );
+
+        let stage = session.rebuild_stage();
+        let action = session.standby_step(session.link_state.phase_now(), entered, stage);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "the standby was not probed while the rebuild connected: {action:?}"
+        );
+        session.on_standby_event(
+            crate::standby::StandbyEvent::Probed { answered: true },
+            entered,
+        );
+        let due = entered + crate::linkstate::FAILOVER_GRACE;
+        let stage = session.rebuild_stage();
+        let action = session.standby_step(session.link_state.phase_now(), due, stage);
+        assert_eq!(
+            action,
+            crate::standby::StandbyAction::FailOver,
+            "an answered standby waited on an ssh that had not got anywhere"
+        );
+
+        let mut out = Vec::new();
+        assert!(session.fail_over(due, &mut out).expect("failing over"));
+
+        let rebuild = session.rebuild.as_ref().expect("a rebuild");
+        assert!(!rebuild.is_running(), "the abandoned attempt still runs");
+        assert!(
+            rebuild.may_have_displaced_us(),
+            "the latch went with the abandoned attempt, but an earlier one in \
+             this outage may have reached the host"
+        );
+        let texts: Vec<(Kind, String)> = session
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.text.clone()))
+            .collect();
+        let abandoned = texts.iter().position(|e| {
+            *e == (
+                Kind::Rebuild,
+                "attempt 1 abandoned: standby answered".to_string(),
+            )
+        });
+        let switched = texts
+            .iter()
+            .position(|(_, t)| t.starts_with("switched to standby"));
+        assert!(
+            abandoned.is_some() && abandoned < switched,
+            "the abandon is not recorded before the switch: {texts:#?}"
+        );
+        // Coherent for the popup: a fresh schedule, no failure to explain,
+        // and nothing counted against the outage.
+        match session.link_state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(attempt, 0);
+                assert_eq!(next_try, due + crate::linkstate::backoff(0));
+            }
+            other => panic!("the failover left Recovering by itself: {other:?}"),
+        }
+        assert_eq!(session.last_failure, None);
+        assert_eq!(session.outage.failed_attempts, 0);
+
+        assert_gone(ssh, "the abandoned attempt's ssh").await;
+    }
+
+    /// An `ssh` that fails before the far end has offered anything: `body`
+    /// is what it does instead, after answering `ssh -G` as every fake must.
+    fn ssh_failing_at_once(dir: &std::path::Path, body: &str) -> SshLauncher {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = dir.join("failing-ssh");
+        std::fs::write(&script, format!("#!/bin/sh\n{ASKED_SSH_G}{body}"))
+            .expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        SshLauncher::command(&script)
+    }
+
+    /// The two outcomes an attempt can report before it has committed, and
+    /// the fake ssh that produces each: ssh dying is a `Retry`, a far end too
+    /// old for `--connect` a `Definite`. Neither sends an `Attach`, so the
+    /// attempt is still `Connecting` -- and abandonable -- with its outcome
+    /// already queued.
+    const FAILING_BEFORE_THE_LINE: [(&str, &str); 2] = [
+        (
+            "a Retry",
+            "echo 'ssh: connect to host bastion.example.net port 22: \
+             Network is unreachable' >&2\nexit 255\n",
+        ),
+        (
+            "a Definite",
+            "echo 'oxutrm host: unknown option \"--connect\"' >&2\nexit 2\n",
+        ),
+    ];
+
+    /// The report an attempt queued, once it has. Read off the channel the
+    /// way the loop's arm reads it -- the loop just has not got to it yet.
+    async fn queued_report(outcomes: &mut tokio::sync::mpsc::Receiver<Report>) -> Report {
+        tokio::time::timeout(Duration::from_secs(10), outcomes.recv())
+            .await
+            .expect("the attempt never reported")
+            .expect("the attempt's sender went away")
+    }
+
+    /// The rebuild's entries in the activity log, in order.
+    fn rebuild_entries(session: &ClientSession) -> Vec<String> {
+        session
+            .activity
+            .entries()
+            .filter(|e| e.kind == Kind::Rebuild)
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// An attempt that failed before its `Attach`, with its outcome queued
+    /// and not yet read, is abandoned for the standby -- and the outcome then
+    /// arrives at the loop. It belongs to an attempt the loop has given up,
+    /// and changes nothing.
+    ///
+    /// The window is not narrow: the attempt failed, so its commitment never
+    /// left `Connecting` and `abandon` succeeds on a task that has already
+    /// sent. Before outcomes carried their attempt's generation, a queued
+    /// `Definite` ended a session that had just switched to its standby
+    /// ("this session cannot be resumed"), and a queued `Retry` logged
+    /// "attempt N failed" after "abandoned", counted a failure against the
+    /// outage, set the popup's last failure and pushed the schedule back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_outcome_of_an_abandoned_attempt_changes_nothing() {
+        for (what, body) in FAILING_BEFORE_THE_LINE {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+                .via(ssh_failing_at_once(dir.path(), body), stunless());
+            let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+            let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+            session.standby = Some(standby_holding(standby_client));
+            let entered = drive_to_recovering(&mut session);
+            let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+
+            session.rebuild_step(entered, &tx);
+            let report = queued_report(&mut outcomes).await;
+            assert_eq!(
+                session.rebuild_stage(),
+                RebuildStage::Connecting,
+                "{what}: the attempt is not one that can be abandoned with \
+                 its outcome queued, so this tests nothing"
+            );
+
+            let due = entered + crate::linkstate::FAILOVER_GRACE;
+            let mut out = Vec::new();
+            assert!(
+                session.fail_over(due, &mut out).expect("failing over"),
+                "{what}: the fixture did not fail over"
+            );
+            let phase = session.link_state.phase_now();
+            let log = rebuild_entries(&session);
+
+            let read = due + Duration::from_millis(5);
+            let landed = session.rebuild_reported(report, read).unwrap_or_else(|e| {
+                panic!("{what} from the abandoned attempt ended the session: {e:#}")
+            });
+
+            assert!(!landed, "{what}: nothing landed");
+            assert_eq!(
+                session.link_state.phase_now(),
+                phase,
+                "{what}: the abandoned attempt moved the schedule"
+            );
+            assert_eq!(
+                rebuild_entries(&session),
+                log,
+                "{what}: the abandoned attempt was logged as failing after it was abandoned"
+            );
+            assert_eq!(session.outage.failed_attempts, 0, "{what}");
+            assert_eq!(session.last_failure, None, "{what}");
+        }
+    }
+
+    /// The same, for an attempt that the OLD link outran: a frame brought
+    /// the session back while the attempt's failure sat queued, the step
+    /// stood the rebuild down, and then the loop read the outcome. A queued
+    /// `Definite` used to end the session that had just recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_outcome_of_a_stood_down_attempt_changes_nothing() {
+        for (what, body) in FAILING_BEFORE_THE_LINE {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+                .via(ssh_failing_at_once(dir.path(), body), stunless());
+            let (mut host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+            let entered = drive_to_recovering(&mut session);
+            let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+
+            session.rebuild_step(entered, &tx);
+            let report = queued_report(&mut outcomes).await;
+
+            let mut out = Vec::new();
+            host.turn().expect("the host takes a turn");
+            wait_for_frame(&mut session).await;
+            session.turn(&[], &mut out).expect("a pacing lap");
+            assert_eq!(
+                session.link_state.phase_now(),
+                Phase::Live,
+                "{what}: the frame did not revive the link"
+            );
+            session.rebuild_step(Instant::now(), &tx);
+            let log = rebuild_entries(&session);
+
+            let landed = session
+                .rebuild_reported(report, Instant::now())
+                .unwrap_or_else(|e| {
+                    panic!("{what} from a stood-down attempt ended a live session: {e:#}")
+                });
+
+            assert!(!landed, "{what}: nothing landed");
+            assert_eq!(session.link_state.phase_now(), Phase::Live, "{what}");
+            assert_eq!(rebuild_entries(&session), log, "{what}");
+            assert_eq!(session.outage.failed_attempts, 0, "{what}");
+            assert_eq!(session.last_failure, None, "{what}");
+        }
+    }
+
+    /// The race the other way round: the old link answered while the
+    /// attempt's `Attach` was already on its way, the step stood the rebuild
+    /// down, and the host then adopted the attach -- closing the old link as
+    /// taken over -- and the attempt's landing was read after the
+    /// stand-down. A frame on the old link proves only that the host had not
+    /// adopted anything WHEN IT SENT that frame.
+    ///
+    /// The landed link is the only one the host still knows, so it is taken.
+    /// Closing it as given up -- what the client did once it read only the
+    /// attempt in flight -- left the session on the link the host had just
+    /// closed, and it ended as "taken over" a moment after it came back. The
+    /// outage is over already, so the landing changes the link and the path
+    /// and leaves the outage's notes alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_landing_read_after_a_stand_down_is_taken() {
+        let (_, fails) = FAILING_BEFORE_THE_LINE[0];
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(ssh_failing_at_once(dir.path(), fails), stunless());
+        let (mut host, mut session) = pair_on("127.0.0.1:0", "", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        // A real report, for the attempt's real generation; only what it
+        // says is changed, as no fake ssh here can complete an attach.
+        let queued = queued_report(&mut outcomes).await;
+
+        let mut out = Vec::new();
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        session
+            .layer_one(Instant::now(), &mut out)
+            .expect("a layer-one lap");
+        assert_eq!(
+            session.link_state.phase_now(),
+            Phase::Live,
+            "the frame did not revive the link"
+        );
+        session.rebuild_step(Instant::now(), &tx);
+        assert!(
+            !session.rebuild.as_ref().is_some_and(Rebuild::is_running),
+            "the fixture did not stand the rebuild down"
+        );
+
+        // The host adopts the attempt's attach, as `HostSession::adopt` does
+        // for every newer attach: the old link is closed as taken over.
+        let (host_side, landed) = crate::link::fixtures::link_pair().await;
+        let landed_conn = landed.sink.connection().clone();
+        let displaced = session.link.sink.connection().clone();
+        host.adopt(host_side, size()).expect("the host adopts");
+        let reason = closed_as(&displaced).await;
+        assert!(
+            closed_with(&reason, TAKEN_OVER),
+            "the fixture's host did not displace the old link: {reason:?}"
+        );
+        let log = rebuild_entries(&session);
+
+        let report = queued.landed_instead(standby_established(landed));
+        let swapped = session
+            .rebuild_reported(report, Instant::now())
+            .unwrap_or_else(|e| {
+                panic!("a landing read after a stand-down ended the session: {e:#}")
+            });
+
+        assert!(swapped, "the landed link was not taken");
+        assert_eq!(
+            session.link.sink.connection().stable_id(),
+            landed_conn.stable_id(),
+            "the session is not on the link the host adopted"
+        );
+        assert_eq!(session.link_state.phase_now(), Phase::Live);
+        assert_eq!(
+            session.outage.ended, None,
+            "an outage that had already ended was told how it ended a second time"
+        );
+        assert_eq!(session.path.as_ref().map(|p| p.rtt_ms), Some(38));
+        let mut expected = log;
+        expected.push("landed via IPv4 punched after the old link came back".to_owned());
+        assert_eq!(rebuild_entries(&session), expected);
+        assert!(
+            !session
+                .rebuild
+                .as_ref()
+                .is_some_and(Rebuild::may_have_displaced_us),
+            "nothing in flight can displace the landed link"
+        );
+
+        host.term
+            .write_input(b"printf 'after-%s\\r\\n' landing\n")
+            .expect("write");
+        assert!(
+            drive(
+                &mut host,
+                &mut session,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("after-landing")
+            )
+            .await,
+            "nothing crossed the landed link; screen was {:?}",
+            text(session.screen())
+        );
+    }
+
+    /// Ruling B1, the other side of the line: an attempt that has sent its
+    /// `Attach` may be adopted by the host, so a failover decided just before
+    /// it committed is not carried out over it. The standby stays where it
+    /// is and the attempt runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_rebuild_is_not_abandoned_for_the_standby() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let script = dir.path().join("committing-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{ASKED_SSH_G}\
+                 printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+                 read -r choice\n\
+                 exec sleep 300\n"
+            ),
+        )
+        .expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(SshLauncher::command(&script), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _outcomes) = tokio::sync::mpsc::channel(1);
+
+        session.rebuild_step(entered, &tx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.rebuild_stage() != RebuildStage::Committed {
+            assert!(Instant::now() < deadline, "the attempt never committed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut out = Vec::new();
+        assert!(
+            !session.fail_over(entered, &mut out).expect("failing over"),
+            "failed over onto the standby over an attempt the host may adopt"
+        );
+        assert!(
+            session.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the standby was taken even though nothing was swapped in"
+        );
+        assert_eq!(session.rebuild_stage(), RebuildStage::Committed);
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// The log numbers ssh attempts across the whole outage. A failover (or
+    /// a landed rebuild) starts the PHASE's counter over, which is right for
+    /// the popup's row and the retry schedule -- they are about the link in
+    /// place now -- but an outage that switched to its standby and then
+    /// needed ssh again read "attempt 1 failed" twice in the file, about two
+    /// different attempts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attempts_are_numbered_across_the_whole_outage_in_the_log() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _outcomes) = tokio::sync::mpsc::channel(1);
+        let mut out = Vec::new();
+        let rebuild_log = |session: &ClientSession| -> Vec<String> {
+            session
+                .activity
+                .entries()
+                .filter(|e| e.kind == Kind::Rebuild)
+                .map(|e| e.text.clone())
+                .collect()
+        };
+
+        // Attempt 1 fails, as the loop has it: the task reports, and is
+        // done with.
+        session.rebuild_step(entered, &tx);
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+        let failed = entered + Duration::from_secs(1);
+        session.rebuild_failed("ssh exited with status 255".to_string(), failed);
+        // Attempt 2 is abandoned for the standby.
+        let Phase::Recovering { next_try, .. } = session.link_state.phase_now() else {
+            panic!("the failure left Recovering");
+        };
+        session.rebuild_step(next_try, &tx);
+        assert!(session.fail_over(next_try, &mut out).expect("failing over"));
+        // The standby says nothing either, and ssh is tried again.
+        let Phase::Recovering { next_try, .. } = session.link_state.phase_now() else {
+            panic!("the failover left Recovering by itself");
+        };
+        session.rebuild_step(next_try, &tx);
+
+        assert_eq!(
+            rebuild_log(&session),
+            [
+                "attempt 1 started",
+                "attempt 1 failed: ssh exited with status 255",
+                "attempt 2 started",
+                "attempt 2 abandoned: standby answered",
+                "attempt 3 started",
+            ]
+        );
+        // The popup and the schedule still count per phase: the link in
+        // place now is the standby, and this is the first try over it.
+        assert!(
+            matches!(
+                session.link_state.phase_now(),
+                Phase::Recovering { attempt: 0, .. }
+            ),
+            "{:?}",
+            session.link_state.phase_now()
+        );
+        let running = session
+            .popup_at(next_try + Duration::from_secs(1))
+            .expect("the popup closed");
+        let row = running
+            .attempts
+            .iter()
+            .find(|r| r.label == "ssh rebuild")
+            .map(|r| r.text.clone());
+        assert!(
+            row.as_deref().is_some_and(|t| t.starts_with("attempt 1 ")),
+            "the popup's row counts across the outage: {row:?}"
+        );
+
+        session.rebuild_failed("ssh exited".to_string(), next_try + Duration::from_secs(2));
+        assert_eq!(
+            rebuild_log(&session).last().map(String::as_str),
+            Some("attempt 3 failed: ssh exited")
+        );
         if let Some(r) = session.rebuild.as_mut() {
             r.cancel();
         }
@@ -7106,7 +7697,8 @@ mod tests {
         let entered = drive_to_recovering(&mut session);
         let s = |n: u64| entered + Duration::from_secs(n);
 
-        let action = session.standby_step(session.link_state.phase_now(), entered, false);
+        let action =
+            session.standby_step(session.link_state.phase_now(), entered, RebuildStage::Idle);
         assert!(
             matches!(action, crate::standby::StandbyAction::Probe { .. }),
             "no probe: {action:?}"
@@ -7115,6 +7707,10 @@ mod tests {
             crate::standby::StandbyEvent::Probed { answered: true },
             s(0),
         );
+        // The attempt the failures below are about. This fixture has no ssh
+        // to begin one through, so it is counted by hand, as `rebuild_step`
+        // would.
+        session.outage.attempts = 1;
         session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
         let mut out = Vec::new();
         assert!(session.fail_over(s(2), &mut out).expect("failing over"));
@@ -7143,6 +7739,8 @@ mod tests {
         let (_host, mut session) = pair("sleep 30\n").await;
         let entered = drive_to_recovering(&mut session);
         let s = |n: u64| entered + Duration::from_secs(n);
+        // Begun by hand, as in the failover's twin above.
+        session.outage.attempts = 1;
         session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
         let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
         session
@@ -7254,6 +7852,7 @@ mod tests {
         let len = Duration::from_millis(96_340);
         let notes = |ended: Option<&str>, failed_attempts| OutageNotes {
             ended: ended.map(str::to_string),
+            attempts: failed_attempts,
             failed_attempts,
             failed_at_switch: None,
         };
@@ -7320,6 +7919,7 @@ mod tests {
         assert!(session.popup_at(t).is_none());
         session.outage = OutageNotes {
             ended: Some("switched to standby (IPv4 punched)".to_string()),
+            attempts: 3,
             failed_attempts: 2,
             failed_at_switch: Some(1),
         };

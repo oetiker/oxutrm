@@ -155,8 +155,9 @@ pub enum ProbeState {
 /// also mean a rebuild attempt is in flight, and landing that attempt would
 /// have the host adopt it as the primary and close the standby this just
 /// promoted as `TAKEN_OVER` -- so the caller (`Standby::step`) is responsible
-/// for not failing over while a rebuild attempt is running; this function
-/// does not know about rebuilds and does not gate on them.
+/// for not failing over while a rebuild attempt that has sent its `Attach` is
+/// running (`RebuildStage::Committed`); this function does not know about
+/// rebuilds and does not gate on them.
 pub fn failover_due(phase: Phase, probe: ProbeState, now: Instant) -> bool {
     let outage = phase.is_outage();
     match probe {

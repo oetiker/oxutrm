@@ -197,6 +197,39 @@
 
 ### Fixed
 
+- **A standby that answers is used even while ssh is still trying.** Once an
+  ssh rebuild had started, 20 s into an outage, the standby was no longer
+  probed until the attempt ended, for fear that the host would adopt the
+  rebuild and close the standby just switched to. An ssh stuck connecting has
+  sent the host nothing it could adopt, so that fear only applies once the
+  attempt has asked for the session. Until then the standby is now probed as
+  usual, and when it answers the client switches to it and abandons the
+  attempt, killing its ssh. A VPN drop on 2026-10-04 lasted 96 s because of
+  this: the rebuild's ssh waited out a 75 s TCP connect timeout, and the
+  standby answered a second after it gave up.
+
+- **A session no longer ends just after its old link came back.** When an
+  ssh rebuild failed at about the moment the old link came back by itself, its
+  failure was still acted on afterwards: a far end too old for `--connect`
+  ended the session that had just recovered ("this session cannot be
+  resumed"), and an ordinary failure pushed the next retry back. The client now
+  only listens to failures of the attempt it is still waiting for. A rebuild
+  that has already landed is still taken, because the host has moved the
+  session to it.
+
+- **A rebuild's ssh gives up on a dead route after 10 s.** ssh has no
+  connect timeout of its own by default, so a rebuild whose target could not
+  be reached waited for the operating system's, which is 75 s on macOS. A
+  rebuild now asks `ssh -G` what it would do and, where no `ConnectTimeout` is
+  set, adds `-o ConnectTimeout=10`. A `ConnectTimeout` set in your ssh
+  configuration is left alone.
+
+- **The activity log numbers ssh attempts across the whole outage.** After a
+  switch to the standby, the next ssh attempt was logged as "attempt 1" again,
+  so one outage could log two different attempts both as "attempt 1". The log
+  now counts on. The popup's own attempt counter still starts over with each
+  new link, as does the retry schedule.
+
 - **Programs that ask the terminal a question get an answer.** The host's
   emulator always worked out the reply to a query such as "where is the
   cursor?" (`CSI 6n`) or "what are you?" (device attributes), and then threw
