@@ -60,7 +60,7 @@ use crate::activity::{Activity, Kind};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
-use crate::rebuild::{AttemptOutcome, Rebuild};
+use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage};
 use crate::ui::{Command, LinkChange, Mode, Ui};
 use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
 
@@ -1037,9 +1037,10 @@ struct OutageNotes {
     /// How many ssh attempts failed during it.
     failed_attempts: u32,
     /// `failed_attempts` when the standby was switched in, while that
-    /// switch is what ended the outage. An attempt begun before the switch
-    /// may still be running (ruling B1) and fail after it; that failure is
-    /// not one the outage waited through, so the summary counts to here.
+    /// switch is what ended the outage. The switch abandons an attempt still
+    /// in flight, but one that had already failed may have its failure on
+    /// the way, read after the switch; that failure is not one the outage
+    /// waited through, so the summary counts to here.
     /// Cleared again if a rebuild lands or a new attempt has to begin: then
     /// the switch did not end it after all.
     failed_at_switch: Option<u32>,
@@ -1807,9 +1808,52 @@ impl ClientSession {
         Ok(())
     }
 
+    /// How far the rebuild attempt in flight has got, for the standby's
+    /// step (see [`RebuildStage`]).
+    fn rebuild_stage(&self) -> RebuildStage {
+        self.rebuild
+            .as_ref()
+            .map_or(RebuildStage::Idle, Rebuild::stage)
+    }
+
     /// Swap the standby in for a primary that stopped answering (spec §3.5).
     /// Returns whether there was one to swap in.
+    ///
+    /// A rebuild attempt still connecting is abandoned first -- the standby
+    /// answered, and ssh has not -- and its ssh killed with it. Before the
+    /// swap, so the attempt cannot send its `Attach` to a host that is about
+    /// to adopt the standby. One that committed after the step decided (the
+    /// two run on different threads) wins instead: nothing is swapped, and
+    /// the next step sees it `Committed` and waits (ruling B1).
+    ///
+    /// The phase needs nothing more: the swap leaves it `Recovering` at
+    /// attempt 0 with a full backoff ([`LinkState::rebuilt`]), the popup's
+    /// rebuild row reads the cancelled attempt as not running, and an
+    /// abandoned attempt never reports an outcome, so nothing counts it as
+    /// failed either.
     fn fail_over<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        if self
+            .standby
+            .as_ref()
+            .is_none_or(|s| s.connection().is_none())
+        {
+            return Ok(false);
+        }
+        if let Some(rebuild) = self.rebuild.as_mut()
+            && rebuild.is_running()
+        {
+            if !rebuild.abandon() {
+                return Ok(false);
+            }
+            let attempt = match self.link_state.phase_now() {
+                Phase::Recovering { attempt, .. } => attempt.saturating_add(1),
+                _ => 1,
+            };
+            self.activity.record_detail(
+                Kind::Rebuild,
+                &format!("attempt {attempt} abandoned: standby answered"),
+            );
+        }
         let Some(e) = self.standby.as_mut().and_then(|s| s.take_for_failover(now)) else {
             return Ok(false);
         };
@@ -1843,13 +1887,13 @@ impl ClientSession {
         &mut self,
         phase: Phase,
         now: Instant,
-        rebuild_running: bool,
+        rebuild: RebuildStage,
     ) -> crate::standby::StandbyAction {
         let Some(s) = self.standby.as_mut() else {
             return crate::standby::StandbyAction::Nothing;
         };
         let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
-        let action = s.step(phase, now, rebuild_running);
+        let action = s.step(phase, now, rebuild);
         match action {
             crate::standby::StandbyAction::Search { .. } => {
                 self.activity.record_detail(Kind::Standby, "search started");
@@ -1968,9 +2012,10 @@ impl ClientSession {
     ///
     /// The rebuild's displacement latch is NOT cleared here, and that is the
     /// difference that matters (ruling B1). A failover is not our rebuild
-    /// landing: an ssh attempt started before it may still reach the host
-    /// and close this new link as taken over, and that close has to be read
-    /// as our own doing, not as the end of the session. The latch is cleared
+    /// landing: an earlier ssh attempt in this outage may have sent its
+    /// `Attach` before it failed, the host may still adopt it and close this
+    /// new link as taken over, and that close has to be read as our own
+    /// doing, not as the end of the session. The latch is cleared
     /// when frames make the phase `Live` again (`Rebuild::stood_down`), or by
     /// a rebuild that lands.
     pub(crate) fn swap_in_as(
@@ -2458,12 +2503,14 @@ impl ClientSession {
             self.rebuild_step(now, &outcomes_tx);
 
             // The standby (spec §3). After the rebuild step, so an attempt
-            // started on this very lap already counts as running: nothing is
-            // failed over onto while one is (ruling B1). The step decides and
-            // the loop acts, so nothing spawned here borrows `self`.
-            let rebuild_running = self.rebuild.as_ref().is_some_and(Rebuild::is_running);
+            // started on this very lap is already in the picture: nothing is
+            // failed over onto while one that has sent its `Attach` runs
+            // (ruling B1), and one still connecting is abandoned by the
+            // failover (`fail_over`). The step decides and the loop acts, so
+            // nothing spawned here borrows `self`.
+            let stage = self.rebuild_stage();
             let phase = self.link_state.phase_now();
-            let action = self.standby_step(phase, now, rebuild_running);
+            let action = self.standby_step(phase, now, stage);
             match action {
                 crate::standby::StandbyAction::Nothing => {}
                 crate::standby::StandbyAction::Search { search } => {
@@ -5642,7 +5689,8 @@ mod tests {
             now.checked_sub(crate::linkstate::STANDBY_DELAY)
                 .expect("a clock this young"),
         );
-        let crate::standby::StandbyAction::Search { search } = s.step(Phase::Live, now, false)
+        let crate::standby::StandbyAction::Search { search } =
+            s.step(Phase::Live, now, RebuildStage::Idle)
         else {
             panic!("the fixture's standby started no search");
         };
@@ -5868,7 +5916,7 @@ mod tests {
             "the fixture recorded something"
         );
 
-        let action = client.standby_step(Phase::Live, now, false);
+        let action = client.standby_step(Phase::Live, now, RebuildStage::Idle);
 
         assert!(
             matches!(action, crate::standby::StandbyAction::Search { .. }),
@@ -5897,7 +5945,7 @@ mod tests {
         let silent = Phase::Silent { since: t0 };
 
         for at in [t0, t0 + crate::linkstate::PROBE_RETRY] {
-            let action = client.standby_step(silent, at, false);
+            let action = client.standby_step(silent, at, RebuildStage::Idle);
             assert!(
                 matches!(action, crate::standby::StandbyAction::Probe { .. }),
                 "no probe at {:?}: {action:?}",
@@ -6208,7 +6256,7 @@ mod tests {
             "a probe nobody sent was recorded"
         );
 
-        let action = client.standby_step(silent, t0, false);
+        let action = client.standby_step(silent, t0, RebuildStage::Idle);
         assert!(
             matches!(action, crate::standby::StandbyAction::Probe { .. }),
             "no probe started: {action:?}"
@@ -6295,6 +6343,150 @@ mod tests {
         );
         let reason = closed_as(&displaced).await;
         assert!(closed_with(&reason, SWITCHED), "closed as {reason:?}");
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// The 2026-10-04 outage, through the session's own steps: the rebuild's
+    /// ssh is stuck connecting (there, a 75 s TCP connect timeout to a target
+    /// only reachable over the VPN that had dropped), and the standby
+    /// answers. The standby is probed and switched to while the attempt
+    /// runs, and the attempt is abandoned before the switch -- its ssh
+    /// killed, and no outcome from it ever arriving to swap anything later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answering_standby_abandons_a_rebuild_still_connecting() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+
+        session.rebuild_step(entered, &tx);
+        let ssh = wait_for_pid(&pidfile).await;
+        assert_eq!(
+            session.rebuild_stage(),
+            RebuildStage::Connecting,
+            "the fixture's attempt is not the one this test is about"
+        );
+
+        let stage = session.rebuild_stage();
+        let action = session.standby_step(session.link_state.phase_now(), entered, stage);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "the standby was not probed while the rebuild connected: {action:?}"
+        );
+        session.on_standby_event(
+            crate::standby::StandbyEvent::Probed { answered: true },
+            entered,
+        );
+        let due = entered + crate::linkstate::FAILOVER_GRACE;
+        let stage = session.rebuild_stage();
+        let action = session.standby_step(session.link_state.phase_now(), due, stage);
+        assert_eq!(
+            action,
+            crate::standby::StandbyAction::FailOver,
+            "an answered standby waited on an ssh that had not got anywhere"
+        );
+
+        let mut out = Vec::new();
+        assert!(session.fail_over(due, &mut out).expect("failing over"));
+
+        let rebuild = session.rebuild.as_ref().expect("a rebuild");
+        assert!(!rebuild.is_running(), "the abandoned attempt still runs");
+        assert!(
+            rebuild.may_have_displaced_us(),
+            "the latch went with the abandoned attempt, but an earlier one in \
+             this outage may have reached the host"
+        );
+        let texts: Vec<(Kind, String)> = session
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.text.clone()))
+            .collect();
+        let abandoned = texts.iter().position(|e| {
+            *e == (
+                Kind::Rebuild,
+                "attempt 1 abandoned: standby answered".to_string(),
+            )
+        });
+        let switched = texts
+            .iter()
+            .position(|(_, t)| t.starts_with("switched to standby"));
+        assert!(
+            abandoned.is_some() && abandoned < switched,
+            "the abandon is not recorded before the switch: {texts:#?}"
+        );
+        // Coherent for the popup: a fresh schedule, no failure to explain,
+        // and nothing counted against the outage.
+        match session.link_state.phase_now() {
+            Phase::Recovering { attempt, next_try } => {
+                assert_eq!(attempt, 0);
+                assert_eq!(next_try, due + crate::linkstate::backoff(0));
+            }
+            other => panic!("the failover left Recovering by itself: {other:?}"),
+        }
+        assert_eq!(session.last_failure, None);
+        assert_eq!(session.outage.failed_attempts, 0);
+
+        assert_gone(ssh, "the abandoned attempt's ssh").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), outcomes.recv())
+                .await
+                .is_err(),
+            "the abandoned attempt still reported an outcome"
+        );
+    }
+
+    /// Ruling B1, the other side of the line: an attempt that has sent its
+    /// `Attach` may be adopted by the host, so a failover decided just before
+    /// it committed is not carried out over it. The standby stays where it
+    /// is and the attempt runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_rebuild_is_not_abandoned_for_the_standby() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let script = dir.path().join("committing-ssh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"t\":\"Sessions\",\"sessions\":[]}'\n\
+             read -r choice\n\
+             exec sleep 300\n",
+        )
+        .expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(SshLauncher::command(&script), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _outcomes) = tokio::sync::mpsc::channel(1);
+
+        session.rebuild_step(entered, &tx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.rebuild_stage() != RebuildStage::Committed {
+            assert!(Instant::now() < deadline, "the attempt never committed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut out = Vec::new();
+        assert!(
+            !session.fail_over(entered, &mut out).expect("failing over"),
+            "failed over onto the standby over an attempt the host may adopt"
+        );
+        assert!(
+            session.standby.as_ref().is_some_and(|s| s.has_link()),
+            "the standby was taken even though nothing was swapped in"
+        );
+        assert_eq!(session.rebuild_stage(), RebuildStage::Committed);
         if let Some(r) = session.rebuild.as_mut() {
             r.cancel();
         }
@@ -7106,7 +7298,8 @@ mod tests {
         let entered = drive_to_recovering(&mut session);
         let s = |n: u64| entered + Duration::from_secs(n);
 
-        let action = session.standby_step(session.link_state.phase_now(), entered, false);
+        let action =
+            session.standby_step(session.link_state.phase_now(), entered, RebuildStage::Idle);
         assert!(
             matches!(action, crate::standby::StandbyAction::Probe { .. }),
             "no probe: {action:?}"

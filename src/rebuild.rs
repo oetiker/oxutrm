@@ -17,6 +17,8 @@
 // through the popup, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
@@ -94,6 +96,72 @@ impl std::fmt::Debug for AttemptOutcome {
     }
 }
 
+/// How far the attempt in flight has got, as far as the standby cares.
+///
+/// The line that matters is the `Attach`. The host can only adopt a rebuild
+/// -- which is what closes every other link it holds for the session,
+/// standby included, as taken over -- after it has read the `Choose` naming
+/// it. An attempt given up before that line is invisible to the host: there
+/// is no attach for it to adopt, so it cannot close a standby the client has
+/// promoted in the meantime. That was the only reason for ruling B1 (no
+/// failover while a rebuild runs), so B1 now holds only from the line on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebuildStage {
+    /// No attempt is in flight.
+    Idle,
+    /// An attempt is in flight and has not yet sent its `Attach`: ssh is
+    /// still connecting, or the offer has not arrived. Abandoning it is free.
+    Connecting,
+    /// The `Attach` has gone, or is going, to the host. The host may adopt
+    /// this attempt, so nothing may be promoted over it.
+    Committed,
+}
+
+/// The line between [`RebuildStage::Connecting`] and
+/// [`RebuildStage::Committed`] for one attempt, shared between the attempt's
+/// task and the loop that may abandon it.
+///
+/// Three states and a compare-and-swap rather than a flag the task sets,
+/// because the two sides race. The loop decides to fail over on one thread
+/// while the attempt runs on another, and `JoinHandle::abort` only takes
+/// effect at the task's next yield: a task that set a plain flag and wrote
+/// its `Choose` in the same poll would send the `Attach` AFTER the loop had
+/// read "not committed" and promoted the standby -- the exact adoption B1
+/// exists to prevent. With one atomic that each side moves out of
+/// `CONNECTING` only if the other has not, exactly one of them wins: either
+/// the `Attach` goes and the failover is held off, or the failover goes and
+/// the `Attach` never does.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Commitment(Arc<AtomicU8>);
+
+impl Commitment {
+    const CONNECTING: u8 = 0;
+    const COMMITTED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// The attempt's side: claim the right to send the `Attach`. False when
+    /// the loop abandoned the attempt first, and then it must not.
+    fn commit(&self) -> bool {
+        self.claim(Self::COMMITTED)
+    }
+
+    /// The loop's side: give the attempt up before it commits. False when
+    /// it has already committed.
+    fn abandon(&self) -> bool {
+        self.claim(Self::ABANDONED)
+    }
+
+    fn claim(&self, to: u8) -> bool {
+        self.0
+            .compare_exchange(Self::CONNECTING, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn is_committed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::COMMITTED
+    }
+}
+
 /// One attempt at getting back into `session_id` on `target`.
 ///
 /// `launcher` is the injection point, exactly as it is for
@@ -104,6 +172,9 @@ impl std::fmt::Debug for AttemptOutcome {
 ///
 /// `size` is the client's **current** terminal size, so the host adopts at the
 /// right geometry from the `ClientHello` alone with no resize afterwards.
+///
+/// `commitment` is claimed immediately before the `Attach` is sent (see
+/// [`Commitment`]); an attempt that finds it already abandoned stops there.
 ///
 /// # Why the channel may be dropped when this returns
 ///
@@ -120,8 +191,18 @@ pub(crate) async fn attempt(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
+    commitment: &Commitment,
 ) -> AttemptOutcome {
-    attempt_within(ATTEMPT_DEADLINE, launcher, target, session_id, size, cfg).await
+    attempt_within(
+        ATTEMPT_DEADLINE,
+        launcher,
+        target,
+        session_id,
+        size,
+        cfg,
+        commitment,
+    )
+    .await
 }
 
 /// [`attempt`], with its outer bound as a parameter.
@@ -142,8 +223,9 @@ async fn attempt_within(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
+    commitment: &Commitment,
 ) -> AttemptOutcome {
-    let body = one_attempt(launcher, target, session_id, size, cfg);
+    let body = one_attempt(launcher, target, session_id, size, cfg, commitment);
     match tokio::time::timeout(deadline, body).await {
         Ok(outcome) => outcome,
         Err(_) => AttemptOutcome::Retry(format!(
@@ -162,6 +244,7 @@ async fn one_attempt(
     session_id: &str,
     size: TermSize,
     cfg: &NetConfig,
+    commitment: &Commitment,
 ) -> AttemptOutcome {
     let launcher = BATCH_MODE
         .iter()
@@ -182,6 +265,15 @@ async fn one_attempt(
         return classify(target, &e);
     }
 
+    // The line (see `RebuildStage`). Past it the host may adopt this attempt,
+    // so the standby is no longer the loop's to promote; short of it the loop
+    // has already promoted it, and this attempt must leave the host alone.
+    // The outcome is never read: the loop that abandoned the attempt has also
+    // aborted its task, and this is only the case where the task got here
+    // before the abort did.
+    if !commitment.commit() {
+        return AttemptOutcome::Retry("abandoned for the standby".to_owned());
+    }
     let choice = Choice::Attach {
         id: session_id.to_owned(),
     };
@@ -213,6 +305,9 @@ pub(crate) struct Rebuild {
     launcher: SshLauncher,
     cfg: NetConfig,
     in_flight: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the attempt in flight has sent its `Attach`. A fresh one per
+    /// attempt, so an old attempt's line can never be read as the new one's.
+    commitment: Commitment,
     /// When the attempt in flight began, for the popup's clock on it.
     started: Option<Instant>,
     /// An attempt has begun and no swap has happened since, so a `TAKEN_OVER`
@@ -234,6 +329,7 @@ impl Rebuild {
             launcher: SshLauncher::ssh(),
             cfg: NetConfig::default(),
             in_flight: None,
+            commitment: Commitment::default(),
             started: None,
             displacing: false,
         }
@@ -254,6 +350,34 @@ impl Rebuild {
     /// Is an attempt running right now?
     pub(crate) fn is_running(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// How far the attempt in flight has got (see [`RebuildStage`]).
+    pub(crate) fn stage(&self) -> RebuildStage {
+        if self.in_flight.is_none() {
+            RebuildStage::Idle
+        } else if self.commitment.is_committed() {
+            RebuildStage::Committed
+        } else {
+            RebuildStage::Connecting
+        }
+    }
+
+    /// Give up the attempt in flight for a standby that answered, if it has
+    /// not committed. Returns whether it was given up; false when there was
+    /// none or it has already sent its `Attach`, and then nothing changes.
+    ///
+    /// Not [`Rebuild::stood_down`]: the displacing latch stays as it is. An
+    /// EARLIER attempt in this same outage may have committed before it
+    /// failed, and the host may still adopt it and close the standby being
+    /// promoted now as taken over; that close has to go on being read as our
+    /// own doing.
+    pub(crate) fn abandon(&mut self) -> bool {
+        if self.in_flight.is_none() || !self.commitment.abandon() {
+            return false;
+        }
+        self.cancel();
+        true
     }
 
     /// When the attempt now running began; `None` while none is.
@@ -310,9 +434,11 @@ impl Rebuild {
         let target = self.target.clone();
         let session_id = self.session_id.clone();
         let cfg = self.cfg.clone();
+        let commitment = Commitment::default();
+        self.commitment = commitment.clone();
         self.displacing = true;
         self.in_flight = Some(tokio::spawn(async move {
-            let outcome = attempt(&launcher, &target, &session_id, size, &cfg).await;
+            let outcome = attempt(&launcher, &target, &session_id, size, &cfg, &commitment).await;
             // A closed receiver means the session this was for has ended.
             // There is nobody to tell, and that is not a failure.
             let _ = outcomes.send(outcome).await;
@@ -537,6 +663,7 @@ mod tests {
             session_id,
             a_size(),
             &test_config(),
+            &Commitment::default(),
         )
         .await
     }
@@ -640,6 +767,7 @@ mod tests {
                 "abc123",
                 a_size(),
                 &test_config(),
+                &Commitment::default(),
             ),
         )
         .await
@@ -666,6 +794,106 @@ mod tests {
             }
             other => panic!("expected a Retry naming the deadline, got {other:?}"),
         }
+    }
+
+    /// The offer, and then whatever the client answered it with recorded in
+    /// `choice.json` -- after which the far end hangs, as a host still working
+    /// on the attach would. `exec` for the reason
+    /// [`fake_host_that_never_answers`] gives.
+    fn fake_host_that_takes_the_choice_and_hangs() -> FakeHost {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let record = dir.path().join("choice.json");
+        let body = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             read -r choice\n\
+             printf '%s' \"$choice\" > '{}'\n\
+             exec sleep 300\n",
+            record.display()
+        );
+        FakeHost::new(dir, &body)
+    }
+
+    /// A `Rebuild` that runs its attempts against `fake`, with one begun.
+    fn rebuilding_against(fake: &FakeHost) -> Rebuild {
+        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
+            .via(fake.launcher.clone(), test_config());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        rebuild.begin(a_size(), tx, Instant::now());
+        rebuild
+    }
+
+    /// An attempt whose ssh never gets as far as the offer has sent no
+    /// `Attach`, so the host cannot adopt it and the standby may be promoted
+    /// over it: it stays `Connecting` for as long as it hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attempt_that_hangs_before_the_offer_never_commits() {
+        let fake = fake_host_that_never_answers();
+        let mut rebuild = rebuilding_against(&fake);
+        assert_eq!(rebuild.stage(), RebuildStage::Connecting);
+
+        // Long enough for a real subprocess to have started and hung; a
+        // commit that did not wait for the offer would have happened by now.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            rebuild.stage(),
+            RebuildStage::Connecting,
+            "an attempt that never saw an offer counts as having sent an Attach"
+        );
+
+        assert!(
+            rebuild.abandon(),
+            "an uncommitted attempt was not abandoned"
+        );
+        assert_eq!(rebuild.stage(), RebuildStage::Idle);
+        assert!(!rebuild.is_running());
+    }
+
+    /// The line is the `Attach`: once the far end has the choice in hand, the
+    /// attempt is `Committed`, and it can no longer be abandoned for the
+    /// standby -- the host may be adopting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attempt_commits_once_it_sends_its_attach() {
+        let fake = fake_host_that_takes_the_choice_and_hangs();
+        let record = fake.path("choice.json");
+        let mut rebuild = rebuilding_against(&fake);
+
+        // The far end having READ the choice, which is later than the
+        // client claiming the line, so the stage is settled by then.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(&record).is_ok_and(|c| !c.is_empty()) {
+            assert!(Instant::now() < deadline, "the attempt never sent a choice");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rebuild.stage(), RebuildStage::Committed);
+
+        assert!(
+            !rebuild.abandon(),
+            "an attempt the host may adopt was abandoned for the standby"
+        );
+        assert_eq!(
+            rebuild.stage(),
+            RebuildStage::Committed,
+            "a refused abandon changed the attempt anyway"
+        );
+        rebuild.cancel();
+        assert_eq!(rebuild.stage(), RebuildStage::Idle);
+    }
+
+    /// The two sides of the line race, and exactly one wins: an attempt the
+    /// loop abandoned first does not send its `Attach`, and one that
+    /// committed first is not abandoned.
+    #[test]
+    fn a_commitment_goes_to_whichever_side_claims_it_first() {
+        let abandoned = Commitment::default();
+        assert!(abandoned.abandon());
+        assert!(!abandoned.commit(), "an abandoned attempt still committed");
+        assert!(!abandoned.is_committed());
+
+        let committed = Commitment::default();
+        assert!(committed.commit());
+        assert!(!committed.abandon(), "a committed attempt was abandoned");
+        assert!(committed.is_committed());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

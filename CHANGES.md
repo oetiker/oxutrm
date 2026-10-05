@@ -197,6 +197,17 @@
 
 ### Fixed
 
+- **A standby that answers is used even while ssh is still trying.** Once an
+  ssh rebuild had started, 20 s into an outage, the standby was no longer
+  probed until the attempt ended, for fear that the host would adopt the
+  rebuild and close the standby just switched to. An ssh stuck connecting has
+  sent the host nothing it could adopt, so that fear only applies once the
+  attempt has asked for the session. Until then the standby is now probed as
+  usual, and when it answers the client switches to it and abandons the
+  attempt, killing its ssh. A VPN drop on 2026-10-04 lasted 96 s because of
+  this: the rebuild's ssh waited out a 75 s TCP connect timeout, and the
+  standby answered a second after it gave up.
+
 - **Programs that ask the terminal a question get an answer.** The host's
   emulator always worked out the reply to a query such as "where is the
   cursor?" (`CSI 6n`) or "what are you?" (device attributes), and then threw

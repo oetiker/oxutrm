@@ -25,6 +25,7 @@ use crate::link::Link;
 use crate::linkstate::{
     PROBE_RETRY, Phase, ProbeState, STANDBY_DELAY, failover_due, standby_backoff,
 };
+use crate::rebuild::RebuildStage;
 use crate::session::{REBUILT, SHELL_EXITED, TAKEN_OVER};
 
 /// Why the client closed a standby that a search found for a primary which
@@ -158,19 +159,29 @@ impl Standby {
         self.link.as_ref().map(|e| e.link.sink.connection().clone())
     }
 
-    /// One decision per lap. `phase` is the lap's own phase;
-    /// `rebuild_running` is whether an ssh rebuild attempt is in flight.
+    /// One decision per lap. `phase` is the lap's own phase; `rebuild` is how
+    /// far the ssh rebuild attempt in flight has got, if there is one.
     ///
-    /// Nothing is failed over onto while a rebuild runs (ruling B1): the host
-    /// would adopt the attempt as a primary when it lands and close the
-    /// standby this had just promoted as taken over. An answer from before
-    /// the attempt is forgotten too, so the standby is asked again once the
-    /// attempt is over rather than trusted on old news.
+    /// Nothing is failed over onto while a **committed** attempt runs (ruling
+    /// B1): one that has sent its `Attach` may be adopted by the host as the
+    /// primary, which closes the standby this had just promoted as taken
+    /// over. An answer from before that attempt is forgotten too, so the
+    /// standby is asked again once the attempt is over rather than trusted on
+    /// old news.
+    ///
+    /// An attempt that has NOT committed is no reason to wait, and this
+    /// behaves exactly as if there were none: the host has seen nothing of
+    /// it and cannot adopt it, and the loop abandons it when it fails over
+    /// (`Rebuild::abandon`). B1 used to hold for any attempt in flight, and
+    /// on 2026-10-04 that turned a VPN drop into a 96 s outage: the rebuild
+    /// started at 20 s, its ssh sat in a 75 s TCP connect timeout, and the
+    /// standby -- never probed while it did -- answered a second after the
+    /// ssh gave up.
     pub(crate) fn step(
         &mut self,
         phase: Phase,
         now: Instant,
-        rebuild_running: bool,
+        rebuild: RebuildStage,
     ) -> StandbyAction {
         if !phase.is_outage() {
             // The outage (if there was one) is over, and so is its probe.
@@ -187,7 +198,7 @@ impl Standby {
         if self.link.is_none() {
             return StandbyAction::Nothing;
         }
-        if rebuild_running {
+        if rebuild == RebuildStage::Committed {
             self.probe = ProbeState::Idle;
             return StandbyAction::Nothing;
         }
@@ -351,7 +362,7 @@ mod tests {
 
     /// The search `step` starts at `now`, by its number.
     fn search_at(s: &mut Standby, now: Instant) -> u64 {
-        match s.step(Phase::Live, now, false) {
+        match s.step(Phase::Live, now, RebuildStage::Idle) {
             StandbyAction::Search { search } => search,
             other => panic!("no search started: {other:?}"),
         }
@@ -387,7 +398,7 @@ mod tests {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
         assert_eq!(
-            s.step(Phase::Live, t0 + STANDBY_DELAY, false),
+            s.step(Phase::Live, t0 + STANDBY_DELAY, RebuildStage::Idle),
             StandbyAction::Nothing,
             "a session that has a standby searched for another"
         );
@@ -397,7 +408,7 @@ mod tests {
         assert!(!s.has_link());
         assert_eq!(s.next_search(), t0 + standby_backoff(0));
         assert!(matches!(
-            s.step(Phase::Live, t0 + standby_backoff(0), false),
+            s.step(Phase::Live, t0 + standby_backoff(0), RebuildStage::Idle),
             StandbyAction::Search { .. }
         ));
     }
@@ -410,14 +421,14 @@ mod tests {
             s.step(
                 Phase::Live,
                 t0 + STANDBY_DELAY - Duration::from_millis(1),
-                false
+                RebuildStage::Idle
             ),
             StandbyAction::Nothing,
             "searched before the first paint had its moment"
         );
         search_at(&mut s, t0 + STANDBY_DELAY);
         assert_eq!(
-            s.step(Phase::Live, t0 + STANDBY_DELAY * 2, false),
+            s.step(Phase::Live, t0 + STANDBY_DELAY * 2, RebuildStage::Idle),
             StandbyAction::Nothing,
             "a second search started while the first was still running"
         );
@@ -539,7 +550,7 @@ mod tests {
         let search = search_at(&mut s, t1);
         let _ = s.not_found(search, t1, "no path".to_string());
         assert_eq!(
-            s.step(Phase::Live, t1 + Duration::from_secs(1), false),
+            s.step(Phase::Live, t1 + Duration::from_secs(1), RebuildStage::Idle),
             StandbyAction::Nothing,
             "the fixture has no backoff to cut short"
         );
@@ -556,7 +567,7 @@ mod tests {
         let (mut s, _host) = with_a_standby(t0).await;
 
         assert_eq!(
-            s.step(silent(t0), t0, false),
+            s.step(silent(t0), t0, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 1 }
         );
         s.probed(true, t0);
@@ -564,13 +575,13 @@ mod tests {
             s.step(
                 silent(t0),
                 t0 + FAILOVER_GRACE - Duration::from_millis(1),
-                false
+                RebuildStage::Idle
             ),
             StandbyAction::Nothing,
             "failed over inside the grace a blipping primary gets"
         );
         assert_eq!(
-            s.step(silent(t0), t0 + FAILOVER_GRACE, false),
+            s.step(silent(t0), t0 + FAILOVER_GRACE, RebuildStage::Idle),
             StandbyAction::FailOver
         );
     }
@@ -581,13 +592,13 @@ mod tests {
         let (mut s, _host) = with_a_standby(t0).await;
 
         assert_eq!(
-            s.step(silent(t0), t0, false),
+            s.step(silent(t0), t0, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 1 }
         );
         s.probed(false, t0);
 
         let later = t0 + Duration::from_secs(10);
-        let action = s.step(silent(t0), later, false);
+        let action = s.step(silent(t0), later, RebuildStage::Idle);
         assert_ne!(action, StandbyAction::FailOver);
         // Not merely quiet: the failed probe is retried.
         assert_eq!(action, StandbyAction::Probe { nonce: 2 });
@@ -598,7 +609,7 @@ mod tests {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
         assert_eq!(
-            s.step(silent(t0), t0, false),
+            s.step(silent(t0), t0, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 1 }
         );
         s.probed(false, t0);
@@ -606,12 +617,12 @@ mod tests {
             s.step(
                 silent(t0),
                 t0 + PROBE_RETRY - Duration::from_millis(1),
-                false
+                RebuildStage::Idle
             ),
             StandbyAction::Nothing
         );
         assert_eq!(
-            s.step(silent(t0), t0 + PROBE_RETRY, false),
+            s.step(silent(t0), t0 + PROBE_RETRY, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 2 }
         );
     }
@@ -623,27 +634,30 @@ mod tests {
         let (mut s, _host) = with_a_standby(t0).await;
 
         assert_eq!(
-            s.step(silent(t0), t0, false),
+            s.step(silent(t0), t0, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 1 }
         );
         s.probed(true, t0);
         let t1 = t0 + Duration::from_millis(100);
-        assert_eq!(s.step(Phase::Live, t1, false), StandbyAction::Nothing);
+        assert_eq!(
+            s.step(Phase::Live, t1, RebuildStage::Idle),
+            StandbyAction::Nothing
+        );
 
         let t2 = t1 + Duration::from_secs(60);
         assert_eq!(
-            s.step(silent(t2), t2, false),
+            s.step(silent(t2), t2, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 2 },
             "the next outage failed over on the last one's answer"
         );
     }
 
-    /// Ruling B1: an ssh rebuild in flight would be adopted by the host as a
-    /// primary and close the standby this promoted as taken over. So nothing
-    /// is promoted while one runs, and an answer from before it is not
-    /// trusted after it.
+    /// Ruling B1: an ssh rebuild that has sent its `Attach` may be adopted by
+    /// the host as a primary, closing the standby this promoted as taken
+    /// over. So nothing is promoted while one runs, and an answer from before
+    /// it is not trusted after it.
     #[tokio::test]
-    async fn no_failover_while_a_rebuild_attempt_is_running() {
+    async fn no_failover_while_a_committed_rebuild_attempt_is_running() {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
         let recovering = Phase::Recovering {
@@ -652,22 +666,75 @@ mod tests {
         };
 
         assert_eq!(
-            s.step(recovering, t0, false),
+            s.step(recovering, t0, RebuildStage::Idle),
             StandbyAction::Probe { nonce: 1 }
         );
         s.probed(true, t0);
         let due = t0 + FAILOVER_GRACE;
         assert_eq!(
-            s.step(recovering, due, true),
+            s.step(recovering, due, RebuildStage::Committed),
             StandbyAction::Nothing,
-            "failed over while a rebuild attempt was in flight"
+            "failed over while a committed rebuild attempt was in flight"
         );
 
         // The attempt ends without landing. The standby is asked again rather
         // than promoted on an answer that predates the attempt.
         assert_eq!(
-            s.step(recovering, due + Duration::from_secs(30), false),
+            s.step(
+                recovering,
+                due + Duration::from_secs(30),
+                RebuildStage::Idle
+            ),
             StandbyAction::Probe { nonce: 2 }
+        );
+    }
+
+    /// The 2026-10-04 outage. An attempt still connecting has sent the host
+    /// nothing it could adopt, so it is no reason to wait: the standby is
+    /// probed, retried and failed over onto exactly as with no attempt at
+    /// all -- here after two failed probes, as the VPN's route settled.
+    #[tokio::test]
+    async fn an_uncommitted_rebuild_attempt_does_not_hold_off_the_failover() {
+        let t0 = Instant::now();
+        let (mut s, _host) = with_a_standby(t0).await;
+        let recovering = Phase::Recovering {
+            attempt: 0,
+            next_try: t0,
+        };
+        let connecting = RebuildStage::Connecting;
+
+        assert_eq!(
+            s.step(recovering, t0, connecting),
+            StandbyAction::Probe { nonce: 1 },
+            "the standby was not probed while a rebuild was connecting"
+        );
+        s.probed(false, t0);
+        let t1 = t0 + PROBE_RETRY;
+        assert_eq!(
+            s.step(recovering, t1, connecting),
+            StandbyAction::Probe { nonce: 2 },
+            "a failed probe was not retried while a rebuild was connecting"
+        );
+        s.probed(false, t1);
+        let t2 = t1 + PROBE_RETRY;
+        assert_eq!(
+            s.step(recovering, t2, connecting),
+            StandbyAction::Probe { nonce: 3 }
+        );
+        s.probed(true, t2);
+        assert_eq!(
+            s.step(
+                recovering,
+                t2 + FAILOVER_GRACE - Duration::from_millis(1),
+                connecting
+            ),
+            StandbyAction::Nothing,
+            "failed over inside the grace"
+        );
+        assert_eq!(
+            s.step(recovering, t2 + FAILOVER_GRACE, connecting),
+            StandbyAction::FailOver,
+            "an answered standby waited on a rebuild that had not committed"
         );
     }
 
@@ -693,17 +760,21 @@ mod tests {
         let t0 = Instant::now();
         let (mut s, _host) = with_a_standby(t0).await;
         assert!(matches!(
-            s.step(silent(t0), t0, false),
+            s.step(silent(t0), t0, RebuildStage::Idle),
             StandbyAction::Probe { .. }
         ));
-        s.step(Phase::Live, t0 + Duration::from_millis(100), false);
+        s.step(
+            Phase::Live,
+            t0 + Duration::from_millis(100),
+            RebuildStage::Idle,
+        );
         assert!(
             !s.probed(true, t0 + Duration::from_millis(200)),
             "a stale answer counted"
         );
 
         assert!(matches!(
-            s.step(silent(t0), t0 + Duration::from_secs(1), false),
+            s.step(silent(t0), t0 + Duration::from_secs(1), RebuildStage::Idle),
             StandbyAction::Probe { .. }
         ));
         assert!(

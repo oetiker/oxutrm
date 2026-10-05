@@ -246,8 +246,9 @@ fn attempts(f: &Facts<'_>) -> Vec<Row> {
     };
     let label = "ssh rebuild";
     if r.switched {
-        // An attempt begun before the switch may still run (ruling B1),
-        // but the outage no longer waits on it.
+        // The switch abandoned any attempt still connecting, and one that
+        // had committed would have held it off (ruling B1); either way the
+        // outage no longer waits on ssh.
         rows.push(Row::new(label, "not needed \u{b7} switched to standby"));
         return rows;
     }
