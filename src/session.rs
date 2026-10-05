@@ -5068,6 +5068,14 @@ mod tests {
         }
     }
 
+    /// How a fake ssh answers `ssh -G`, which every rebuild attempt asks
+    /// before it connects (`rebuild::rebuild_launcher`): at once, as an ssh
+    /// with no configuration does. A fake that ran its body for the question
+    /// as well would record the wrong pid, and one that hangs would hang the
+    /// question for its whole bound.
+    const ASKED_SSH_G: &str =
+        "case \" $* \" in *' -G '*) printf '%s\\n' 'connecttimeout none'; exit 0;; esac\n";
+
     /// An `ssh` that records its own pid and then never says anything.
     ///
     /// An attempt against this is permanently in flight, which is what the
@@ -5081,7 +5089,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                "#!/bin/sh\n{ASKED_SSH_G}echo $$ > '{}'\nexec sleep 300\n",
                 pidfile.display()
             ),
         )
@@ -6454,10 +6462,12 @@ mod tests {
         let script = dir.path().join("committing-ssh");
         std::fs::write(
             &script,
-            "#!/bin/sh\n\
-             printf '%s\\n' '{\"t\":\"Sessions\",\"sessions\":[]}'\n\
-             read -r choice\n\
-             exec sleep 300\n",
+            format!(
+                "#!/bin/sh\n{ASKED_SSH_G}\
+                 printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+                 read -r choice\n\
+                 exec sleep 300\n"
+            ),
         )
         .expect("writing the fake ssh");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))

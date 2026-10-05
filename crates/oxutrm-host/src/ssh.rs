@@ -101,6 +101,41 @@ impl SshLauncher {
     pub fn program(&self) -> &OsStr {
         &self.program
     }
+
+    /// What `ssh -G <target>` prints: the configuration this launcher's ssh
+    /// would connect to `target` with, every option resolved, one
+    /// `keyword value` per line -- without connecting.
+    ///
+    /// This is how oxutrm reads the user's ssh configuration without
+    /// parsing `~/.ssh/config` itself (see the module docs): ssh does the
+    /// reading, with every `Include`, `Match` and default it knows about,
+    /// and says what it concluded. The same program, arguments and
+    /// environment the launcher would connect with, so the answer is about
+    /// the ssh that will actually run, and a test's fake ssh is asked too.
+    ///
+    /// An error is ssh failing to start or exiting non-zero. Nothing bounds
+    /// the wait here; the caller does, and dropping the future kills the
+    /// child.
+    pub async fn effective_config(&self, target: &str) -> std::io::Result<String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        cmd.arg("-G").arg(target);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let out = cmd.output().await?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "`ssh -G` exited with {}",
+                out.status
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 impl Default for SshLauncher {

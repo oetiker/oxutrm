@@ -36,6 +36,78 @@ use crate::connect::{Established, HostRefused, establish, read_offer};
 /// asks for.
 const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 
+/// A bound on ssh's TCP connect, for a rebuild whose ssh has none of its own.
+///
+/// ssh's default is no timeout at all, which leaves the bound to the
+/// operating system. On macOS that is 75 s. On 2026-10-04 a VPN dropped,
+/// the rebuild started 20 s in, and its target was only reachable over that
+/// VPN: the SYN went nowhere, and ssh sat out the full 75 s while the
+/// standby, which answered a second after ssh gave up, was not asked. The
+/// outage lasted 96 s.
+///
+/// **Ten seconds**, and not the two or three a LAN would allow: a VPN that
+/// comes back takes several seconds to settle its routes, and an attempt
+/// that times out just before the route appears costs a whole backoff. Ten
+/// still turns the 75 s wait into the next attempt.
+///
+/// Added only where the user's ssh has no `ConnectTimeout` of its own (see
+/// [`needs_connect_timeout`]): one somebody set is their call, not ours.
+const CONNECT_TIMEOUT: [&str; 2] = ["-o", "ConnectTimeout=10"];
+
+/// How long `ssh -G` may take to say what ssh would do.
+///
+/// It reads config files and connects to nothing, so it takes milliseconds;
+/// this bound is for the configuration that runs something (a `Match exec`
+/// that hangs). Running out is treated as not knowing, which adds
+/// [`CONNECT_TIMEOUT`].
+const CONFIG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a rebuild's ssh needs [`CONNECT_TIMEOUT`], given what `ssh -G`
+/// printed -- `None` when it failed or ran out of time.
+///
+/// `connecttimeout none` is the default, and the case this is for. A number
+/// is the user's own setting, and wins. Anything else -- no answer, no such
+/// line, a value this does not understand -- is not knowing, and an ssh
+/// that may wait 75 s on a dead route is the thing not to risk.
+fn needs_connect_timeout(ssh_g_output: Option<&str>) -> bool {
+    let Some(output) = ssh_g_output else {
+        return true;
+    };
+    let value = output.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let keyword = words.next()?;
+        keyword
+            .eq_ignore_ascii_case("connecttimeout")
+            .then(|| words.next())
+            .flatten()
+    });
+    !value.is_some_and(|v| v.parse::<u64>().is_ok())
+}
+
+/// The launcher a rebuild attempt runs ssh through: `launcher` with
+/// [`BATCH_MODE`], and [`CONNECT_TIMEOUT`] where the user's ssh would
+/// otherwise have no bound on its connect.
+///
+/// Asked of the same launcher, so production asks `ssh -G` and a test's fake
+/// ssh is asked the same question, and the argument list the tests see is
+/// the one that ships.
+async fn rebuild_launcher(launcher: &SshLauncher, target: &str) -> SshLauncher {
+    let launcher = BATCH_MODE
+        .iter()
+        .fold(launcher.clone(), |batch, arg| batch.arg(arg));
+    let config = tokio::time::timeout(CONFIG_QUERY_TIMEOUT, launcher.effective_config(target))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    if needs_connect_timeout(config.as_deref()) {
+        CONNECT_TIMEOUT
+            .iter()
+            .fold(launcher, |bounded, arg| bounded.arg(arg))
+    } else {
+        launcher
+    }
+}
+
 /// The outer bound on one whole attempt.
 ///
 /// Nothing inside [`attempt`] bounds the wait for a far end that accepts the
@@ -166,9 +238,10 @@ impl Commitment {
 ///
 /// `launcher` is the injection point, exactly as it is for
 /// [`SshChannel::open`]: production passes [`SshLauncher::ssh`] and the tests
-/// point it at a script that speaks the protocol on stdio. [`BATCH_MODE`] is
-/// added here rather than by the caller, so every attempt carries it and the
-/// tests exercise the argument list that ships.
+/// point it at a script that speaks the protocol on stdio. [`BATCH_MODE`] and
+/// [`CONNECT_TIMEOUT`] are added here rather than by the caller (see
+/// [`rebuild_launcher`]), so every attempt carries them and the tests
+/// exercise the argument list that ships.
 ///
 /// `size` is the client's **current** terminal size, so the host adopts at the
 /// right geometry from the `ClientHello` alone with no resize afterwards.
@@ -246,9 +319,7 @@ async fn one_attempt(
     cfg: &NetConfig,
     commitment: &Commitment,
 ) -> AttemptOutcome {
-    let launcher = BATCH_MODE
-        .iter()
-        .fold(launcher.clone(), |batch, arg| batch.arg(arg));
+    let launcher = rebuild_launcher(launcher, target).await;
 
     let mut channel = match SshChannel::open(&launcher, target).await {
         Ok(channel) => channel,
@@ -571,12 +642,32 @@ mod tests {
 
     impl FakeHost {
         /// Write `body` as an executable script in `dir` and point a launcher
-        /// at it.
+        /// at it. Asked `ssh -G`, it says `connecttimeout none`, as an ssh
+        /// with no configuration of its own does.
         fn new(dir: tempfile::TempDir, body: &str) -> FakeHost {
+            FakeHost::configured(dir, "connecttimeout none", body)
+        }
+
+        /// [`FakeHost::new`], answering `ssh -G` with `config` instead.
+        ///
+        /// Every attempt asks `ssh -G` first (see `rebuild_launcher`), and a
+        /// fake that did not answer it would run `body` for the question as
+        /// well: one that hangs would cost every test the whole
+        /// `CONFIG_QUERY_TIMEOUT`, and one that records something would
+        /// record the question too.
+        fn configured(dir: tempfile::TempDir, config: &str, body: &str) -> FakeHost {
             use std::os::unix::fs::PermissionsExt as _;
 
+            let body = body
+                .strip_prefix("#!/bin/sh\n")
+                .expect("a fake host is a /bin/sh script");
+            let text = format!(
+                "#!/bin/sh\n\
+                 case \" $* \" in *' -G '*) printf '%s\\n' '{config}'; exit 0;; esac\n\
+                 {body}"
+            );
             let script = dir.path().join("fake-ssh");
-            std::fs::write(&script, body).expect("writing the fake host script");
+            std::fs::write(&script, text).expect("writing the fake host script");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("making the fake host script executable");
             let launcher = SshLauncher::command(&script);
@@ -878,6 +969,72 @@ mod tests {
         );
         rebuild.cancel();
         assert_eq!(rebuild.stage(), RebuildStage::Idle);
+    }
+
+    /// An ssh that writes the arguments it was started with to `args`, one
+    /// per line, and then fails as an unreachable host does. `-G` is answered
+    /// with `config` first, as [`FakeHost::configured`] does.
+    fn fake_ssh_recording_its_arguments(config: &str) -> FakeHost {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let record = dir.path().join("args");
+        let body = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" > '{}'\n\
+             exit 255\n",
+            record.display()
+        );
+        FakeHost::configured(dir, config, &body)
+    }
+
+    /// The arguments the rebuild's ssh was started with, given what `ssh -G`
+    /// said about its configuration.
+    async fn rebuild_arguments(config: &str) -> Vec<String> {
+        let fake = fake_ssh_recording_its_arguments(config);
+        let _ = run_attempt(&fake, "abc123").await;
+        std::fs::read_to_string(fake.path("args"))
+            .expect("the fake ssh recorded no arguments")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The argument list that ships: batch mode always, and the connect
+    /// timeout where the user's ssh has none -- placed before the target,
+    /// where an ssh option belongs, and dropped where it has one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_bounds_the_connect_only_where_ssh_does_not() {
+        let remote = ["bastion.example.net", "oxutrm", "host", "--connect"];
+        assert_eq!(
+            rebuild_arguments("connecttimeout none").await,
+            [
+                &["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"][..],
+                &remote[..]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            rebuild_arguments("connecttimeout 30").await,
+            [&["-o", "BatchMode=yes"][..], &remote[..]].concat(),
+            "the user's own ConnectTimeout was overridden"
+        );
+    }
+
+    #[test]
+    fn the_connect_timeout_is_added_unless_ssh_has_one() {
+        let config = |timeout: &str| {
+            format!("user tobi\nhostname 10.0.0.7\nconnecttimeout {timeout}\nport 22\n")
+        };
+        assert!(needs_connect_timeout(Some(&config("none"))));
+        assert!(!needs_connect_timeout(Some(&config("30"))));
+        assert!(!needs_connect_timeout(Some("ConnectTimeout 5\n")));
+        // Not knowing is not a reason to wait 75 s.
+        assert!(needs_connect_timeout(None), "ssh -G failed");
+        assert!(needs_connect_timeout(Some("")), "ssh -G said nothing");
+        assert!(needs_connect_timeout(Some("user tobi\nport 22\n")));
+        assert!(needs_connect_timeout(Some("connecttimeout\n")));
+        assert!(needs_connect_timeout(Some(&config("soon"))));
+        // A keyword that merely starts the same is not this one.
+        assert!(needs_connect_timeout(Some("connecttimeoutx 30\n")));
     }
 
     /// The two sides of the line race, and exactly one wins: an attempt the

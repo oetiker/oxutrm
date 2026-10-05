@@ -208,6 +208,13 @@
   this: the rebuild's ssh waited out a 75 s TCP connect timeout, and the
   standby answered a second after it gave up.
 
+- **A rebuild's ssh gives up on a dead route after 10 s.** ssh has no
+  connect timeout of its own by default, so a rebuild whose target could not
+  be reached waited for the operating system's, which is 75 s on macOS. A
+  rebuild now asks `ssh -G` what it would do and, where no `ConnectTimeout` is
+  set, adds `-o ConnectTimeout=10`. A `ConnectTimeout` set in your ssh
+  configuration is left alone.
+
 - **Programs that ask the terminal a question get an answer.** The host's
   emulator always worked out the reply to a query such as "where is the
   cursor?" (`CSI 6n`) or "what are you?" (device attributes), and then threw
