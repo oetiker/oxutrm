@@ -1180,6 +1180,54 @@ mod tests {
         assert!(!rebuild.is_running());
     }
 
+    /// The offer, from a far end that has already stopped reading: its
+    /// stdin is closed before the offer goes out, so the `Choose` cannot be
+    /// written at all, and it then hangs with stdout open. `exec` for the
+    /// reason [`fake_host_that_never_answers`] gives.
+    fn fake_host_that_will_not_read_the_choice() -> FakeHost {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let body = "#!/bin/sh\n\
+                    exec 0<&-\n\
+                    printf '%s\\n' '{\"t\":\"Sessions\",\"sessions\":[]}'\n\
+                    exec sleep 300\n";
+        FakeHost::new(dir, body)
+    }
+
+    /// The line is claimed BEFORE the `Choose` is written, not after. A
+    /// commit after the write would leave a window in which the `Attach` is
+    /// on its way to the host and the loop still reads `Connecting` -- and
+    /// may promote the standby over an attempt the host is about to adopt.
+    ///
+    /// Pinned by a write that fails: the far end closed its stdin before it
+    /// offered anything, so the `Choose` is refused with a broken pipe and
+    /// the attempt ends on the spot. Only an attempt that committed before
+    /// writing has committed by then; one that committed after would have
+    /// returned on the failed write first and never claimed the line at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attempt_commits_before_it_writes_its_attach() {
+        let fake = fake_host_that_will_not_read_the_choice();
+        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
+            .via(fake.launcher.clone(), test_config());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        rebuild.begin(a_size(), tx, Instant::now());
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the attempt hung instead of failing on the write")
+            .expect("the attempt's sender went away");
+        // Read while the report is still unaccepted: the attempt is in
+        // flight as far as the stage is concerned.
+        assert_eq!(
+            rebuild.stage(),
+            RebuildStage::Committed,
+            "the attempt wrote its Choose before it claimed the line"
+        );
+        match rebuild.accept(report) {
+            Some(AttemptOutcome::Retry(why)) if why.to_lowercase().contains("broken pipe") => {}
+            other => panic!("the write was not what ended the attempt: {other:?}"),
+        }
+    }
+
     /// An ssh that writes the arguments it was started with to `args`, one
     /// per line, and then fails as an unreachable host does. `-G` is answered
     /// with `config` first, as [`FakeHost::configured`] does.
