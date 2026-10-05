@@ -218,7 +218,10 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
         // be asking for a passphrase. Here and nowhere else: a rebuild or a
         // failover happens inside the running session and never comes back
         // through this function.
-        .with_splash(splash_seed());
+        .with_splash(
+            splash_seed(),
+            &splash_caption(&chosen, &established.session_id, &established.path),
+        );
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     if standby {
@@ -275,6 +278,26 @@ fn opening_line(chosen: &Choice, session_id: &str) -> String {
         Choice::Attach { .. } => format!("oxutrm: resumed session {session_id}."),
         Choice::New => format!("oxutrm: new session {session_id}."),
     }
+}
+
+/// What the splash says under the name: the opening line's news -- which
+/// session, and whether it was already running -- and how it is reached,
+/// which the opening line cannot say yet. The splash covers the opening line
+/// almost at once, so without this the screen would never say it long enough
+/// to read.
+///
+/// Eight characters of the id, not all of it: the caption has to fit under
+/// a 32-column logo on a small screen, and `--attach` takes as few as four.
+fn splash_caption(chosen: &Choice, session_id: &str, path: &PathDescription) -> String {
+    let id: String = session_id.chars().take(8).collect();
+    let news = match chosen {
+        Choice::Attach { .. } => "resumed session",
+        Choice::New => "new session",
+    };
+    oxutrm_client::legible(&format!(
+        "{news} {id} \u{b7} {}",
+        oxutrm_client::rung_label(path)
+    ))
 }
 
 /// One completed client-side attach, and the two identities the rebuild loop
@@ -814,6 +837,28 @@ mod tests {
     /// somebody typing a bare `oxutrm <target>` expecting a fresh shell got a
     /// resumed one -- half-typed command still at the prompt -- with the
     /// screen repaint, which arrives after raw mode, as the only signal.
+    #[test]
+    fn the_splash_caption_says_which_session_and_how_it_is_reached() {
+        let id = "3ff1218f".to_string() + &"0".repeat(24);
+        let path = PathDescription {
+            rung: oxutrm_proto::Rung::StunPunch,
+            local: "127.0.0.1:1".parse().unwrap(),
+            remote: "203.0.113.7:443".parse().unwrap(),
+            probes_sent: 0,
+            nat_type: NatType::Unknown,
+            rtt_ms: 38,
+            mtu: 1400,
+        };
+        assert_eq!(
+            splash_caption(&Choice::Attach { id: id.clone() }, &id, &path),
+            "resumed session 3ff1218f \u{b7} IPv4 punched"
+        );
+        assert_eq!(
+            splash_caption(&Choice::New, &id, &path),
+            "new session 3ff1218f \u{b7} IPv4 punched"
+        );
+    }
+
     #[test]
     fn the_opening_line_says_whether_the_session_was_already_running() {
         let id = "a".repeat(32);

@@ -1013,6 +1013,8 @@ pub struct ClientSession {
 /// [`oxutrm_client::splash`]'s.
 struct Splash {
     seed: u64,
+    /// Which session this is and how it is reached, under the name.
+    caption: String,
     /// When the first frame was painted: `None` until the loop's first lap,
     /// so the time ssh and the banner took is not counted against it.
     started: Option<Instant>,
@@ -1142,7 +1144,8 @@ impl ClientSession {
         })
     }
 
-    /// Open with the startup splash, drawn from `seed`. For a fresh connect
+    /// Open with the startup splash, drawn from `seed`, with `caption` under
+    /// the name. For a fresh connect
     /// only, and only on a screen it fits ([`oxutrm_client::splash::fits`]);
     /// elsewhere this does nothing.
     ///
@@ -1150,16 +1153,18 @@ impl ClientSession {
     /// painted at all: the host's first screen may be what wakes the loop
     /// first, and it has to land under the splash rather than flash up
     /// ahead of it. Its clock starts on the loop's first lap.
-    pub(crate) fn with_splash(mut self, seed: u64) -> ClientSession {
+    pub(crate) fn with_splash(mut self, seed: u64, caption: &str) -> ClientSession {
         if oxutrm_client::splash::fits(self.size) {
             self.renderer
                 .set_overlay(Some(oxutrm_client::splash::splash(
                     Duration::ZERO,
                     self.size,
                     seed,
+                    caption,
                 )));
             self.splash = Some(Splash {
                 seed,
+                caption: caption.to_owned(),
                 started: None,
                 // Not painted yet: on the renderer is not on the screen.
                 painted: None,
@@ -1210,7 +1215,7 @@ impl ClientSession {
         if s.painted != Some((frame, size)) {
             s.painted = Some((frame, size));
             self.renderer
-                .set_overlay(Some(splash(elapsed, size, s.seed)));
+                .set_overlay(Some(splash(elapsed, size, s.seed, &s.caption)));
             self.renderer
                 .render(out, self.screen_rx.state())
                 .context("painting the splash")?;
@@ -2048,7 +2053,9 @@ impl ClientSession {
                 s.painted = None;
                 let at = oxutrm_client::splash::FRAME * frame;
                 self.renderer
-                    .set_overlay(Some(oxutrm_client::splash::splash(at, size, s.seed)));
+                    .set_overlay(Some(oxutrm_client::splash::splash(
+                        at, size, s.seed, &s.caption,
+                    )));
             }
         }
 
@@ -8397,7 +8404,7 @@ mod tests {
         out: &mut Vec<u8>,
     ) -> (HostSession, ClientSession) {
         let (host, session) = pair_sized("/bin/sh", size).await;
-        let mut session = session.with_splash(7);
+        let mut session = session.with_splash(7, "");
         session.layer_one(t, out).expect("the first lap");
         (host, session)
     }
@@ -8430,7 +8437,7 @@ mod tests {
     #[tokio::test]
     async fn a_screen_painted_before_the_first_lap_is_already_under_the_splash() {
         let (mut host, session) = pair_sized("/bin/sh", BIG).await;
-        let mut session = session.with_splash(7);
+        let mut session = session.with_splash(7, "");
         let mut out = Vec::new();
 
         first_frame(&mut host, &mut session, &mut out).await;
@@ -8568,7 +8575,7 @@ mod tests {
     async fn an_outage_replaces_the_splash_with_the_popup() {
         let t = Instant::now();
         let (_host, session) = pair_sized("/bin/sh", BIG).await;
-        let mut session = session.with_splash(7);
+        let mut session = session.with_splash(7, "");
         let mut out = Vec::new();
         session.note_heard(t);
         session.note_sent(t);
@@ -8650,7 +8657,7 @@ mod tests {
     async fn a_session_that_ends_under_the_splash_leaves_its_last_screen() {
         // `by%s` so the echoed command line does not itself contain `bye`.
         let (mut host, session) = pair_sized("printf 'by%s\\n' e; exit 3\n", BIG).await;
-        let mut client = session.with_splash(7);
+        let mut client = session.with_splash(7, "");
         let (keys, _typing) = keyboard();
         let host_loop = tokio::spawn(async move { host.run().await });
         let out = SharedOut::default();
@@ -8693,7 +8700,7 @@ mod tests {
     async fn the_splash_is_painted_only_through_the_renderer() {
         let t = Instant::now();
         let (mut host, session) = pair_sized("/bin/sh", BIG).await;
-        let mut session = session.with_splash(7);
+        let mut session = session.with_splash(7, "");
         let mut out = Vec::new();
         let path = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
         session.announce(&path, &mut out).expect("the banner");
@@ -8730,7 +8737,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_loop_shows_the_splash_and_takes_it_down_by_itself() {
         let (mut host, session) = pair_sized("", BIG).await;
-        let mut client = session.with_splash(7);
+        let mut client = session.with_splash(7, "");
         let (keys, mut typing) = keyboard();
         let host_loop = tokio::spawn(async move { host.run().await });
         let out = SharedOut::default();
@@ -8795,7 +8802,7 @@ mod tests {
             .map(|l| l.trim_end().to_owned())
             .collect();
         let rows = |size: TermSize| -> Vec<String> {
-            let o = oxutrm_client::splash::splash(settled, size, 7);
+            let o = oxutrm_client::splash::splash(settled, size, 7, "");
             o.cells
                 .chunks(usize::from(o.cols))
                 .take(usize::from(BIG.rows))

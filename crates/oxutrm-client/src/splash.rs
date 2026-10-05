@@ -52,13 +52,17 @@ pub fn settled(elapsed: Duration) -> bool {
 }
 
 /// The splash `elapsed` after it began, covering the whole of a `size`
-/// screen.
+/// screen, with `caption` -- which session this is, and how it is reached --
+/// centred one blank row under the name.
 ///
 /// Opaque: every cell is drawn, blank ones as spaces, so nothing of the
 /// remote screen shows through. No colour is set -- the terminal's own text
 /// colour is used -- and the flicker is the whole picture switching between
-/// bold and dim.
-pub fn splash(elapsed: Duration, size: TermSize, seed: u64) -> Overlay {
+/// bold and dim. The caption is plain text in that same colour, tunes in
+/// with the name, and is left out when the screen has no row to spare for
+/// it; one wider than the screen is cut. It is shown as given, so the caller
+/// makes it legible.
+pub fn splash(elapsed: Duration, size: TermSize, seed: u64, caption: &str) -> Overlay {
     let frame = frame_of(elapsed);
     let t = f64::from(frame) / f64::from(FRAMES);
     // Each frame draws its own noise, independently of the one before, as a
@@ -78,8 +82,19 @@ pub fn splash(elapsed: Duration, size: TermSize, seed: u64) -> Overlay {
 
     let (rows, cols) = (usize::from(size.rows), usize::from(size.cols));
     let art_rows = HEAD.len() + GAP_ROWS + NAME.len();
-    let top = rows.saturating_sub(art_rows) / 2;
+    // The caption's two rows, the blank one and its own, count towards the
+    // centring only when there is room for them and a row either side.
+    let captioned = !caption.is_empty() && rows >= art_rows + CAPTION_ROWS + 2;
+    let block_rows = art_rows + if captioned { CAPTION_ROWS } else { 0 };
+    let top = rows.saturating_sub(block_rows) / 2;
     let left = cols.saturating_sub(ART_COLS) / 2;
+    let caption_row = top + art_rows + 1;
+    let caption: Vec<char> = if captioned && t >= NAME_FROM {
+        caption.chars().take(cols).collect()
+    } else {
+        Vec::new()
+    };
+    let caption_left = cols.saturating_sub(caption.len()) / 2;
 
     let mut cells = Vec::with_capacity(rows * cols);
     for r in 0..rows {
@@ -108,11 +123,25 @@ pub fn splash(elapsed: Duration, size: TermSize, seed: u64) -> Overlay {
                     v ^= rng.snow(p);
                 }
             }
-            cells.push(Cell {
-                text: braille(v),
-                fg: Color::Default,
-                bg: Color::Default,
-                attrs,
+            // The caption is text, not dots: it covers whatever the noise
+            // put under it.
+            let text = (r == caption_row)
+                .then(|| c.checked_sub(caption_left))
+                .flatten()
+                .and_then(|i| caption.get(i));
+            cells.push(match text {
+                Some(ch) => Cell {
+                    text: CellText::new(ch.encode_utf8(&mut [0; 4])),
+                    fg: Color::Default,
+                    bg: Color::Default,
+                    attrs: Attrs::empty(),
+                },
+                None => Cell {
+                    text: braille(v),
+                    fg: Color::Default,
+                    bg: Color::Default,
+                    attrs,
+                },
             });
         }
     }
@@ -183,6 +212,13 @@ impl Rng {
 /// Blank rows between the head and the name.
 const GAP_ROWS: usize = 2;
 
+/// The caption's rows under the name: a blank one, then the caption.
+const CAPTION_ROWS: usize = 2;
+
+/// How far into the tuning-in (0 to 1) the name -- and with it the caption
+/// -- appears.
+const NAME_FROM: f64 = 0.6;
+
 /// The art's width in cells; every line of [`HEAD`] and [`NAME`] is this wide.
 const ART_COLS: usize = 32;
 
@@ -222,7 +258,7 @@ fn art_cell(ir: usize, ic: usize, t: f64) -> u8 {
     } else if let Some(n) = ir.checked_sub(HEAD.len() + GAP_ROWS) {
         // The name tunes in late.
         match NAME.get(n) {
-            Some(line) if t >= 0.6 => line,
+            Some(line) if t >= NAME_FROM => line,
             _ => return 0,
         }
     } else {
@@ -270,13 +306,13 @@ mod tests {
 
     #[test]
     fn snapshot_settled_80x24() {
-        insta::assert_snapshot!(text_of(&splash(at(FRAMES), SCREEN, 7)));
+        insta::assert_snapshot!(text_of(&splash(at(FRAMES), SCREEN, 7, "")));
     }
 
     #[test]
     fn the_splash_covers_the_whole_screen_opaquely() {
         for frame in [0, FRAMES / 2, FRAMES] {
-            let o = splash(at(frame), SCREEN, 7);
+            let o = splash(at(frame), SCREEN, 7, "");
             assert_eq!((o.row, o.col, o.rows, o.cols), (0, 0, 24, 80));
             assert_eq!(o.cells.len(), 80 * 24);
             assert!(
@@ -293,7 +329,7 @@ mod tests {
     #[test]
     fn no_colour_is_set() {
         for frame in [0, FRAMES / 2, FRAMES] {
-            let o = splash(at(frame), SCREEN, 7);
+            let o = splash(at(frame), SCREEN, 7, "");
             assert!(
                 o.cells
                     .iter()
@@ -307,7 +343,7 @@ mod tests {
     /// of the art's, in the middle of the screen.
     #[test]
     fn the_settled_logo_is_the_art_centred_and_bold() {
-        let o = splash(at(FRAMES), SCREEN, 7);
+        let o = splash(at(FRAMES), SCREEN, 7, "");
         let art: u32 = HEAD
             .iter()
             .chain(NAME.iter())
@@ -335,11 +371,11 @@ mod tests {
 
     #[test]
     fn the_same_seed_gives_the_same_frame_and_another_seed_another() {
-        assert_eq!(splash(at(3), SCREEN, 7), splash(at(3), SCREEN, 7));
-        assert_ne!(splash(at(3), SCREEN, 7), splash(at(3), SCREEN, 8));
+        assert_eq!(splash(at(3), SCREEN, 7, ""), splash(at(3), SCREEN, 7, ""));
+        assert_ne!(splash(at(3), SCREEN, 7, ""), splash(at(3), SCREEN, 8, ""));
         assert_ne!(
-            splash(at(3), SCREEN, 7),
-            splash(at(4), SCREEN, 7),
+            splash(at(3), SCREEN, 7, ""),
+            splash(at(4), SCREEN, 7, ""),
             "consecutive frames of the interference are the same picture"
         );
     }
@@ -347,9 +383,9 @@ mod tests {
     /// Snow is densest at the start and gone by the end.
     #[test]
     fn the_interference_dies_down_as_it_tunes_in() {
-        let early = dots(&splash(at(0), SCREEN, 7));
-        let late = dots(&splash(at(FRAMES * 3 / 4), SCREEN, 7));
-        let art = dots(&splash(at(FRAMES), SCREEN, 7));
+        let early = dots(&splash(at(0), SCREEN, 7, ""));
+        let late = dots(&splash(at(FRAMES * 3 / 4), SCREEN, 7, ""));
+        let art = dots(&splash(at(FRAMES), SCREEN, 7, ""));
         assert!(
             early > late && late > art,
             "early {early}, late {late}, settled {art}"
@@ -377,7 +413,7 @@ mod tests {
     fn early_frames_flicker_between_bold_and_dim() {
         let mut seen = Vec::new();
         for seed in 0..20 {
-            let o = splash(at(2), SCREEN, seed);
+            let o = splash(at(2), SCREEN, seed, "");
             let a = o.cells[0].attrs;
             assert!(o.cells.iter().all(|c| c.attrs == a), "a frame mixes styles");
             seen.push(a);
@@ -408,5 +444,74 @@ mod tests {
         assert!(fits(SCREEN));
         assert!(!fits(TermSize { cols: 33, rows: 20 }));
         assert!(!fits(TermSize { cols: 34, rows: 19 }));
+    }
+
+    const CAPTION: &str = "resumed session 3ff1218f \u{b7} IPv4 punched";
+
+    /// The caption sits one blank row under the name, centred on the screen
+    /// on its own width, not on the art's: a caption wider than the art
+    /// still reads as centred.
+    #[test]
+    fn the_caption_is_centred_under_the_name() {
+        let o = splash(at(FRAMES), SCREEN, 7, CAPTION);
+        let text = text_of(&o);
+        let lines: Vec<&str> = text.lines().collect();
+        // 24 rows, 18 of art + a gap + the caption = 20: 2 above.
+        assert!(
+            lines[1].is_empty(),
+            "the row above the art is not blank: {text}"
+        );
+        assert_eq!(
+            lines[2],
+            format!("{}{}", " ".repeat(24), HEAD[0].replace('\u{2800}', " ")).trim_end(),
+            "the block with its caption is not centred vertically: {text}"
+        );
+        // Head 2..=14, the gap, the name 17..=19, a blank row, the caption.
+        assert!(
+            lines[20].is_empty(),
+            "no blank row between name and caption: {text}"
+        );
+        let width = CAPTION.chars().count();
+        assert_eq!(
+            lines[21],
+            format!("{}{CAPTION}", " ".repeat((80 - width) / 2)),
+            "{text}"
+        );
+        let row = &o.cells[21 * 80..22 * 80];
+        let first = (80 - width) / 2;
+        assert!(
+            row[first..first + width].iter().all(|c| c.attrs.is_empty()),
+            "the caption is not plain text"
+        );
+    }
+
+    #[test]
+    fn the_caption_tunes_in_with_the_name() {
+        let early = text_of(&splash(at(FRAMES / 2), SCREEN, 7, CAPTION));
+        assert!(!early.contains("resumed"), "{early}");
+        let late = text_of(&splash(at(FRAMES * 3 / 4), SCREEN, 7, CAPTION));
+        assert!(late.contains(CAPTION), "{late}");
+    }
+
+    /// A caption wider than the screen is cut, never wrapped or spilled.
+    #[test]
+    fn a_caption_wider_than_the_screen_is_cut() {
+        let narrow = TermSize { cols: 34, rows: 22 };
+        let o = splash(at(FRAMES), narrow, 7, CAPTION);
+        assert_eq!(o.cells.len(), 34 * 22);
+        let text = text_of(&o);
+        assert!(
+            text.contains("resumed session 3ff1218f \u{b7} IPv4 pu"),
+            "{text}"
+        );
+    }
+
+    /// At the smallest splash screen there is no row to spare: the logo is
+    /// shown as before and the caption is left out.
+    #[test]
+    fn without_room_for_it_the_caption_is_left_out() {
+        let tight = TermSize { cols: 80, rows: 20 };
+        let with = splash(at(FRAMES), tight, 7, CAPTION);
+        assert_eq!(with, splash(at(FRAMES), tight, 7, ""));
     }
 }

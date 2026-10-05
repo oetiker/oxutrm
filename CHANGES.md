@@ -121,7 +121,9 @@
   mode, a fresh connect shows the ox head tuning in like a badly received
   TV — about 0.8 s of snow, torn rows and flicker across the whole screen,
   settling into the logo with the name under it, held for 1.5 s — and then
-  your remote screen. Any key ends it at once and still goes to the remote
+  your remote screen. Under the name it says which session you landed in and
+  how it is reached (`resumed session 3ff1218f · IPv4 punched`), since the
+  logo covers the line that says so before raw mode. Any key ends it at once and still goes to the remote
   program, so it never costs waiting. If the host's first screen is a moment
   late, the logo stays until it arrives; a host that does not answer at all
   brings up the status popup in its place, as any outage starting meanwhile
