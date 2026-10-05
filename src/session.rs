@@ -47,7 +47,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
@@ -62,7 +62,7 @@ use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
 use crate::rebuild::{AttemptOutcome, Rebuild};
 use crate::ui::{Command, LinkChange, Mode, Ui};
-use crate::view::{Facts, Identity, StandbyFacts};
+use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -762,6 +762,8 @@ enum Wake {
     Winch,
     /// The pacing deadline came round.
     Due,
+    /// Time for the splash's next frame, or for the end of its hold.
+    SplashFrame,
     /// A rebuild attempt finished, one way or another.
     Rebuilt(AttemptOutcome),
     /// A standby search or probe reported back.
@@ -818,6 +820,33 @@ async fn keys_readable<K: AsRawFd>(
         Some(k) => k.readable_mut().await,
         None => std::future::pending().await,
     }
+}
+
+/// The splash's next wake at `at`, or never once there is none -- the
+/// splash is down, or its settled logo is waiting for the host's first
+/// screen, whose arrival wakes the loop anyway. A function for the reason
+/// [`keys_readable`] is one: the arm reads exactly the local.
+async fn splash_due(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The pacing deadline after a lap at `now`, given the one it woke under.
+///
+/// A lap the splash's timer woke ran no turn, so it leaves the deadline
+/// where it was: frames are 40 ms apart and the pacing interval is up to
+/// 100 ms, so a splash tick that pushed it out would land before it every
+/// time, and nothing would be offered, acked or prodded for as long as the
+/// splash runs. Every other lap asks again one interval from now.
+fn next_pacing_deadline(
+    splash_lap: bool,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> tokio::time::Instant {
+    if splash_lap { deadline } else { now + interval }
 }
 
 /// The one application close on a session connection that means "the shell
@@ -926,7 +955,9 @@ pub struct ClientSession {
     /// a quiet session.
     rejected_total: u64,
     /// What is drawn as layer 1, so an unchanged popup is not laid out again
-    /// every lap. Mirrors the overlay exactly: `None` means no overlay.
+    /// every lap. Mirrors the overlay exactly -- `None` means no overlay --
+    /// except while the startup splash is up: then the overlay is the
+    /// splash, and this is what goes back when it ends.
     shown: Option<PopupView>,
     /// The popup's state, and where keystrokes go.
     ui: Ui,
@@ -961,6 +992,86 @@ pub struct ClientSession {
     /// The standby link, and the search for one (spec §3). `None` for a
     /// host that did not offer one; see [`ClientSession::with_standby`].
     standby: Option<crate::standby::Standby>,
+    /// How the current outage is going, for the one line that sums it up
+    /// when it ends.
+    outage: OutageNotes,
+    /// The zone the popup's log shows its times in: the system's, read once.
+    zone: jiff::tz::TimeZone,
+    /// The startup splash, while it shows. Armed only by
+    /// [`ClientSession::with_splash`], which only a fresh connect calls, and
+    /// never armed again once it ends: a recovery inside the loop is the same
+    /// session, so it cannot bring it back -- and one that lands while it is
+    /// still up ends it (`swap_in_as`).
+    splash: Option<Splash>,
+    /// The splash came down and the screen has not been painted since.
+    /// Whatever took it down without painting -- a resize, a recovery --
+    /// leaves this for the next lap of layer 1.
+    unpainted_splash_end: bool,
+}
+
+/// The startup splash while it shows; the picture is
+/// [`oxutrm_client::splash`]'s.
+struct Splash {
+    seed: u64,
+    /// Which session this is and how it is reached, under the name.
+    caption: String,
+    /// When the first frame was painted: `None` until the loop's first lap,
+    /// so the time ssh and the banner took is not counted against it.
+    started: Option<Instant>,
+    /// The frame and screen size last handed to the renderer, so a lap that
+    /// would paint the same picture paints nothing.
+    painted: Option<(u32, TermSize)>,
+}
+
+/// What one outage came to, gathered while it lasts.
+///
+/// The activity log writes every step of an outage -- the probes, the
+/// failover, each ssh attempt -- to the file, and the popup shows none of
+/// them: it shows one line per outage instead, written when it ends from
+/// what is gathered here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OutageNotes {
+    /// How it ended, when something oxutrm did ended it: `None` is a
+    /// primary that came back by itself.
+    ended: Option<String>,
+    /// How many ssh attempts failed during it.
+    failed_attempts: u32,
+    /// `failed_attempts` when the standby was switched in, while that
+    /// switch is what ended the outage. An attempt begun before the switch
+    /// may still be running (ruling B1) and fail after it; that failure is
+    /// not one the outage waited through, so the summary counts to here.
+    /// Cleared again if a rebuild lands or a new attempt has to begin: then
+    /// the switch did not end it after all.
+    failed_at_switch: Option<u32>,
+}
+
+/// `label` in parentheses, for a summary: a path label that has a
+/// parenthesis of its own (`IPv4 punched (birthday, 412 probes)`) has it
+/// turned into a comma, so the summary does not nest them.
+fn in_parens(label: &str) -> String {
+    match label.strip_suffix(')').and_then(|l| l.split_once(" (")) {
+        Some((head, tail)) => format!("({head}, {tail})"),
+        None => format!("({label})"),
+    }
+}
+
+impl OutageNotes {
+    /// The summary entry for an outage of `length` that ended as these
+    /// notes say: the file's text (after its `outage` kind) and the popup's.
+    fn summary(&self, length: Duration) -> (String, String) {
+        let mut text = format!(
+            "{:.1} s \u{2192} {}",
+            length.as_secs_f64(),
+            self.ended.as_deref().unwrap_or("came back by itself")
+        );
+        match self.failed_at_switch.unwrap_or(self.failed_attempts) {
+            0 => {}
+            1 => text.push_str(" after 1 failed ssh attempt"),
+            n => text.push_str(&format!(" after {n} failed ssh attempts")),
+        }
+        let shown = format!("outage {text}");
+        (text, shown)
+    }
 }
 
 impl ClientSession {
@@ -1025,7 +1136,111 @@ impl ClientSession {
             rebuild,
             last_failure: None,
             standby: None,
+            outage: OutageNotes::default(),
+            // Read once: a laptop that changes zone shows the old one's HH:MM until reattach.
+            zone: jiff::tz::TimeZone::system(),
+            splash: None,
+            unpainted_splash_end: false,
         })
+    }
+
+    /// Open with the startup splash, drawn from `seed`, with `caption` under
+    /// the name. For a fresh connect
+    /// only, and only on a screen it fits ([`oxutrm_client::splash::fits`]);
+    /// elsewhere this does nothing.
+    ///
+    /// The first frame goes on the renderer here, before anything is
+    /// painted at all: the host's first screen may be what wakes the loop
+    /// first, and it has to land under the splash rather than flash up
+    /// ahead of it. Its clock starts on the loop's first lap.
+    pub(crate) fn with_splash(mut self, seed: u64, caption: &str) -> ClientSession {
+        if oxutrm_client::splash::fits(self.size) {
+            self.renderer
+                .set_overlay(Some(oxutrm_client::splash::splash(
+                    Duration::ZERO,
+                    self.size,
+                    seed,
+                    caption,
+                )));
+            self.splash = Some(Splash {
+                seed,
+                caption: caption.to_owned(),
+                started: None,
+                // Not painted yet: on the renderer is not on the screen.
+                painted: None,
+            });
+        }
+        self
+    }
+
+    /// Take the splash down, if it is up, putting back whatever layer 1
+    /// should show instead. Reports whether it was up: the caller repaints.
+    fn end_splash(&mut self) -> bool {
+        if self.splash.take().is_none() {
+            return false;
+        }
+        self.renderer
+            .set_overlay(self.shown.as_ref().map(|v| layout_popup(v, self.size)));
+        self.unpainted_splash_end = true;
+        true
+    }
+
+    /// Paint the screen as it now stands, for `why`.
+    fn paint<W: Write>(&mut self, out: &mut W, why: &'static str) -> Result<()> {
+        self.unpainted_splash_end = false;
+        self.renderer
+            .render(out, self.screen_rx.state())
+            .context(why)?;
+        out.flush().context("flushing the terminal")
+    }
+
+    /// One lap of the splash at `now`, while it is up: paint the frame `now`
+    /// falls on if it is not already painted, or end it once it has been
+    /// held long enough and the host's first screen is there to show
+    /// instead. Reports whether it is still up.
+    fn splash_lap<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
+        use oxutrm_client::splash::{frame_of, settled, splash};
+        let first_screen = self.screen_rx.applied_kinds() != (0, 0);
+        let size = self.size;
+        let Some(s) = self.splash.as_mut() else {
+            return Ok(false);
+        };
+        let elapsed = now.saturating_duration_since(*s.started.get_or_insert(now));
+        if settled(elapsed) && first_screen {
+            self.end_splash();
+            self.paint(out, "painting the screen after the splash")?;
+            return Ok(false);
+        }
+        let frame = frame_of(elapsed);
+        if s.painted != Some((frame, size)) {
+            s.painted = Some((frame, size));
+            self.renderer
+                .set_overlay(Some(splash(elapsed, size, s.seed, &s.caption)));
+            self.renderer
+                .render(out, self.screen_rx.state())
+                .context("painting the splash")?;
+            out.flush().context("flushing the terminal")?;
+        }
+        Ok(true)
+    }
+
+    /// When the loop should next wake for the splash, after a lap at
+    /// `now`: the next frame boundary of the splash's own clock while the
+    /// interference runs, then the end of the hold, then never -- a settled
+    /// logo still waiting for the host's first screen changes only when
+    /// that screen arrives, which wakes the loop by itself. `None` too
+    /// before the first lap has started the clock, and once it is down.
+    fn splash_wake(&self, now: Instant) -> Option<Instant> {
+        use oxutrm_client::splash::{FRAME, FRAMES, HOLD, frame_of};
+        let s = self.splash.as_ref()?;
+        let started = s.started?;
+        let frame = frame_of(now.saturating_duration_since(started));
+        if frame < FRAMES {
+            Some(started + FRAME * (frame + 1))
+        } else {
+            let end = started + FRAME * FRAMES + HOLD;
+            (end > now).then_some(end)
+        }
     }
 
     /// Search for, and fail over onto, a standby (spec §3). Only for a host
@@ -1035,7 +1250,7 @@ impl ClientSession {
         self
     }
 
-    /// Which session this is, for the popup's title and status rows.
+    /// Which session this is, for the popup's title.
     pub(crate) fn with_identity(mut self, id: Identity) -> ClientSession {
         self.identity = Some(id);
         self
@@ -1181,8 +1396,8 @@ impl ClientSession {
                     // and resize laps, and a frame that landed on one of those
                     // used to repaint the screen underneath a popup still
                     // saying nobody was answering. It also moves
-                    // `last_heard`, which is what the `silent for Ns`
-                    // counter is built from.
+                    // `last_heard`, which is what the header's `silent N s`
+                    // is built from.
                     self.note_heard(Instant::now());
                 }
                 // See the host's copy of this arm: a silently swallowed
@@ -1223,6 +1438,12 @@ impl ClientSession {
     /// `recv` yields `None`. The timeout is belt and braces on the one path
     /// where the user's own terminal is what is being held up.
     async fn drain<W: Write>(&mut self, out: &mut W) -> Result<Turn> {
+        // A session that ends under the splash -- a shell that prints and
+        // exits at once -- would otherwise leave the logo as the last
+        // picture, hiding exactly what the remote said before it went.
+        if self.end_splash() {
+            self.paint(out, "painting the screen the session ended on")?;
+        }
         let mut turn = Turn::default();
         let drained = tokio::time::timeout(FINAL_DRAIN, async {
             while let Some(frame) = self.link.source.recv().await {
@@ -1294,6 +1515,9 @@ impl ClientSession {
 
     /// One read from the keyboard, sent wherever it belongs.
     ///
+    /// Any key first takes the startup splash down, and is then routed as
+    /// if it had never been up.
+    ///
     /// The popup decides ([`Ui::keys`]): while it is shown every key is its
     /// own and nothing is sent or held; while it is closed, `Ctrl-\` opens
     /// it and every other byte goes to the host untouched -- or, while the
@@ -1316,6 +1540,12 @@ impl ClientSession {
         now: Instant,
         out: &mut W,
     ) -> Result<Option<i32>> {
+        // Any key ends the splash, and then goes wherever it would have gone
+        // without it: the splash never costs a keystroke. Repainted here and
+        // not on the next lap, so the key's echo lands on the real screen.
+        if self.end_splash() {
+            self.paint(out, "painting the screen after the splash")?;
+        }
         let phase = self.link_state.phase_now();
         let routed = self.ui.keys(keys, phase, now);
         if !routed.to_host.is_empty() {
@@ -1377,18 +1607,47 @@ impl ClientSession {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
         match self.ui.tick(phase, now) {
-            Some(LinkChange::WentSilent) => self.activity.record(Kind::Link, "silent"),
+            Some(LinkChange::WentSilent) => {
+                self.outage = OutageNotes::default();
+                self.activity.record_detail(Kind::Link, "silent");
+            }
             Some(LinkChange::Back { outage }) => {
                 let text = format!(
                     "live again via {}, outage {:.1} s",
                     crate::view::path_label(self.path.as_ref()),
                     outage.as_secs_f64()
                 );
-                self.activity.record(Kind::Link, &text);
+                self.activity.record_detail(Kind::Link, &text);
+                let (text, shown) = std::mem::take(&mut self.outage).summary(outage);
+                self.activity.record_shown(Kind::Outage, &text, &shown);
             }
             None => {}
         }
         self.ui.visible(phase).then(|| self.view(phase, now))
+    }
+
+    /// Layer 1 for one lap at `now`: the popup, or the splash while it is
+    /// up. A method rather than the body of the loop so a test drives
+    /// exactly what ships.
+    ///
+    /// The popup is laid out again only when the view actually changed, so
+    /// an open popup with nothing new costs one comparison per lap. An
+    /// outage that opens it while the splash is up ends the splash: what is
+    /// wrong with the link matters more than the logo.
+    fn layer_one<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<()> {
+        let view = self.popup_at(now);
+        self.sample_quality(now);
+        let ended = view.is_some() && self.end_splash();
+        if !ended && self.splash_lap(now, out)? {
+            return Ok(());
+        }
+        if view != self.shown || ended || self.unpainted_splash_end {
+            self.renderer
+                .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
+            self.shown = view;
+            self.paint(out, "painting the popup")?;
+        }
+        Ok(())
     }
 
     /// What the popup says at `now`.
@@ -1403,7 +1662,7 @@ impl ClientSession {
             probe: s.probe(),
             searching: s.searching(),
             next_search: s.next_search(),
-            last_failure: s.last_failure(),
+            last_search_failed: s.last_failure().is_some(),
         });
         crate::view::build(&Facts {
             identity: self.identity.as_ref(),
@@ -1414,12 +1673,16 @@ impl ClientSession {
             quality: &self.quality,
             rejected: self.rejected_total(),
             standby,
-            rebuild_failure: self.last_failure.as_deref(),
+            rebuild: self.rebuild.as_ref().map(|r| RebuildFacts {
+                running_since: r.running_since(),
+                last_failure: self.last_failure.as_deref(),
+                switched: self.outage.failed_at_switch.is_some(),
+            }),
             held: self.link_state.held(),
             held_full: self.link_state.held_is_full(),
             activity: &self.activity,
             now,
-            wall: SystemTime::now(),
+            zone: &self.zone,
         })
     }
 
@@ -1489,9 +1752,12 @@ impl ClientSession {
         if rebuild.is_running() || now < next_try {
             return;
         }
-        rebuild.begin(size, outcomes.clone());
+        rebuild.begin(size, outcomes.clone(), now);
         self.link_state.begin_attempt(now);
-        self.activity.record(
+        // An attempt after a switch: the standby did not answer either, and
+        // the outage goes on.
+        self.outage.failed_at_switch = None;
+        self.activity.record_detail(
             Kind::Rebuild,
             &format!("attempt {} started", attempt.saturating_add(1)),
         );
@@ -1500,15 +1766,16 @@ impl ClientSession {
     /// A rebuild attempt failed for a reason worth retrying.
     fn rebuild_failed(&mut self, why: String, now: Instant) {
         self.record_attempt_failed(&why);
+        self.outage.failed_attempts = self.outage.failed_attempts.saturating_add(1);
         self.link_state.attempt_failed(now);
-        // Kept for the popup's recovering section.
+        // Kept for the reason row under the popup's `ssh rebuild`.
         self.last_failure = Some(why);
     }
 
     /// The log entry for a failed rebuild attempt, retried or not.
     fn record_attempt_failed(&mut self, why: &str) {
         if let Phase::Recovering { attempt, .. } = self.link_state.phase_now() {
-            self.activity.record(
+            self.activity.record_detail(
                 Kind::Rebuild,
                 &format!("attempt {} failed: {why}", attempt.saturating_add(1)),
             );
@@ -1524,16 +1791,18 @@ impl ClientSession {
     }
 
     /// A rebuild attempt landed: its link replaces the one that stopped
-    /// answering, and its path and attach are the session's from here.
+    /// answering, and its path is the session's from here.
     fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
         self.swap_in(e.link, now)?;
-        if let Some(id) = self.identity.as_mut() {
-            id.attach_id = e.attach_id;
-        }
-        self.activity.record(
+        self.activity.record_detail(
             Kind::Rebuild,
             &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
         );
+        self.outage.ended = Some(format!(
+            "rebuilt over ssh {}",
+            in_parens(&oxutrm_client::rung_label(&e.path))
+        ));
+        self.outage.failed_at_switch = None;
         self.path = Some(e.path);
         Ok(())
     }
@@ -1548,16 +1817,11 @@ impl ClientSession {
             .context("failing over to the standby")?;
         // Recorded before the first frame goes: the switch has happened, and
         // a turn that errors must not leave it out of the log.
-        if let Some(id) = self.identity.as_mut() {
-            id.attach_id = e.attach_id;
-        }
-        self.activity.record(
-            Kind::Failover,
-            &format!(
-                "switched to standby ({})",
-                oxutrm_client::rung_label(&e.path)
-            ),
-        );
+        let label = oxutrm_client::rung_label(&e.path);
+        self.activity
+            .record_detail(Kind::Failover, &format!("switched to standby ({label})"));
+        self.outage.ended = Some(format!("switched to standby {}", in_parens(&label)));
+        self.outage.failed_at_switch = Some(self.outage.failed_attempts);
         self.path = Some(e.path);
         // Spec §3.5 step 2: the host adopts the standby on our first frame
         // on it, so that frame goes now.
@@ -1588,10 +1852,11 @@ impl ClientSession {
         let action = s.step(phase, now, rebuild_running);
         match action {
             crate::standby::StandbyAction::Search { .. } => {
-                self.activity.record(Kind::Standby, "search started");
+                self.activity.record_detail(Kind::Standby, "search started");
             }
             crate::standby::StandbyAction::Probe { .. } if first_probe => {
-                self.activity.record(Kind::Failover, "probing standby");
+                self.activity
+                    .record_detail(Kind::Failover, "probing standby");
             }
             _ => {}
         }
@@ -1613,26 +1878,28 @@ impl ClientSession {
                     return None;
                 }
                 let watch = s.connection();
-                self.activity.record(
-                    Kind::Standby,
-                    &format!(
-                        "found {}, {} ms",
-                        oxutrm_client::rung_label(&path),
-                        path.rtt_ms
-                    ),
+                let text = format!(
+                    "found {}, {} ms",
+                    oxutrm_client::rung_label(&path),
+                    path.rtt_ms
                 );
+                self.activity
+                    .record_shown(Kind::Standby, &text, &format!("standby {text}"));
                 watch
             }
             crate::standby::StandbyEvent::NotFound { search, reason } => {
+                // The file keeps the whole reason; the popup says what it
+                // means to the user, not which rungs of the ladder failed.
                 let text = format!("not found: {reason}");
                 if s.not_found(search, now, reason) {
-                    self.activity.record(Kind::Standby, &text);
+                    self.activity
+                        .record_shown(Kind::Standby, &text, crate::view::NO_SECOND_PATH);
                 }
                 None
             }
             crate::standby::StandbyEvent::Probed { answered } => {
                 if s.probed(answered, now) {
-                    self.activity.record(
+                    self.activity.record_detail(
                         Kind::Failover,
                         if answered {
                             "probe answered"
@@ -1651,8 +1918,12 @@ impl ClientSession {
     /// anything.
     fn on_standby_closed(&mut self, reason: &quinn::ConnectionError, now: Instant) {
         if self.standby.as_mut().is_some_and(|s| s.lost(now, reason)) {
-            self.activity
-                .record(Kind::Standby, &format!("lost: {reason}"));
+            let reason = reason.to_string();
+            self.activity.record_shown(
+                Kind::Standby,
+                &format!("lost: {reason}"),
+                &format!("standby lost: {}", crate::view::first_clause(&reason)),
+            );
         }
     }
 
@@ -1708,6 +1979,10 @@ impl ClientSession {
         now: Instant,
         reason: &'static [u8],
     ) -> Result<()> {
+        // A recovery never shows the splash, and never leaves one running:
+        // it is a fresh connect's alone. (An outage ends it long before
+        // anything is swapped in; this is for the case where it did not.)
+        self.end_splash();
         // Closed first, and with a reason, for the same reason `adopt` closes
         // the displaced one with `TAKEN_OVER`: a connection that is merely
         // dropped is indistinguishable from one that went quiet.
@@ -1762,6 +2037,26 @@ impl ClientSession {
         // screen.
         if let Some(v) = self.shown.as_ref() {
             self.renderer.set_overlay(Some(layout_popup(v, size)));
+        }
+        // The splash is laid out for a screen too, so the frame that was
+        // showing is laid out again at the new size, or the splash ends if
+        // it no longer fits. Neither is painted here, nor by the turn that
+        // follows a resize, which paints only a frame from the host: the
+        // lap of layer 1 after it does, `painted` forgotten or the end
+        // noted, so neither waits for the host's resized screen.
+        if let Some(s) = self.splash.as_mut() {
+            if !oxutrm_client::splash::fits(size) {
+                self.end_splash();
+            } else {
+                // Frame 0 is what `with_splash` put up before any lap.
+                let frame = s.painted.map_or(0, |(frame, _)| frame);
+                s.painted = None;
+                let at = oxutrm_client::splash::FRAME * frame;
+                self.renderer
+                    .set_overlay(Some(oxutrm_client::splash::splash(
+                        at, size, s.seed, &s.caption,
+                    )));
+            }
         }
 
         // Carried on the next diff, and worth going immediately: the shell is
@@ -1937,6 +2232,16 @@ impl ClientSession {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
 
+        // The splash's next wake: the one timer that exists only while
+        // something is animating, and gone with the splash. Taken from the
+        // splash's own clock after every lap (`splash_wake`), so it falls on
+        // its frame boundaries and, once the interference has settled, wakes
+        // once more for the end of the hold. `None` until the first lap has
+        // started that clock -- the pacing deadline below is now, so that
+        // lap is at once. A local, polled through `splash_due`, for the
+        // reason `outcomes` is one (C1).
+        let mut splash_at: Option<tokio::time::Instant> = None;
+
         let mut buf = [0u8; 8192];
         // Now, so the first lap sends immediately: an attach owes the host a
         // frame before anything has happened, because that frame is what
@@ -1971,6 +2276,7 @@ impl ClientSession {
                 Some(frame) = self.link.source.recv() => Wake::Frame(frame),
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
+                () = splash_due(splash_at) => Wake::SplashFrame,
                 Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 // Quiet until the standby goes away; a closed connection is
@@ -1982,6 +2288,7 @@ impl ClientSession {
 
             // Every borrow of `self` starts HERE, after the select expression
             // has ended and dropped the futures above.
+            let splash_lap = matches!(wake, Wake::SplashFrame);
             match wake {
                 Wake::Nothing => continue,
                 // End of file on the keyboard. The session lives on: output
@@ -2031,6 +2338,8 @@ impl ClientSession {
                 Wake::Due => {
                     self.turn(&[], out)?;
                 }
+                // Layer 1 below paints the frame.
+                Wake::SplashFrame => {}
                 // A rebuild attempt finished.
                 Wake::Rebuilt(outcome) => {
                     if let Some(rebuild) = self.rebuild.as_mut() {
@@ -2111,20 +2420,11 @@ impl ClientSession {
                 }
             }
 
-            // Layer 1. Laid out again only when the view actually changed, so
-            // an open popup with nothing new costs one comparison per lap.
             let now = Instant::now();
-            let view = self.popup_at(now);
-            self.sample_quality(now);
-            if view != self.shown {
-                self.renderer
-                    .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
-                self.shown = view;
-                self.renderer
-                    .render(out, self.screen_rx.state())
-                    .context("painting the popup")?;
-                out.flush().context("flushing the terminal")?;
-            }
+            self.layer_one(now, out)?;
+            // The splash's timer goes with it: once it is down, no timer is
+            // left that the session did not have before.
+            splash_at = self.splash_wake(now).map(tokio::time::Instant::from_std);
 
             // Follow the route if it moved. Inside the loop rather than on a
             // timer of its own: `follow_route` is gated on `Silent` or
@@ -2245,7 +2545,9 @@ impl ClientSession {
             // there is — typing and resizing both clear `last_send` and send
             // inside the very `turn` above.
             //
-            // The pacing interval, unconditionally. There used to be a second
+            // The pacing interval, whatever woke the lap -- bar the splash's
+            // timer, which leaves the deadline alone (`next_pacing_deadline`).
+            // There used to be a second
             // arm here for "the tick that refreshes the counters", taking
             // `Duration::from_secs(1).min(pacing_interval)` whenever a notice
             // was up. `pacing_interval` is `clamp(rtt/2, 8ms, 100ms)`, so that
@@ -2253,7 +2555,12 @@ impl ClientSession {
             // expression, below a comment describing a one-second tick that
             // did not exist. Nothing is lost by dropping it: the loop already
             // wakes at least ten times a second.
-            deadline = tokio::time::Instant::now() + self.link.sink.pacing_interval();
+            deadline = next_pacing_deadline(
+                splash_lap,
+                deadline,
+                tokio::time::Instant::now(),
+                self.link.sink.pacing_interval(),
+            );
         }
     }
 
@@ -2524,7 +2831,7 @@ mod tests {
     }
 
     /// Big enough for the popup's log to have rows: at the fixtures' 40x10 the
-    /// status block fills the whole box.
+    /// rows above it fill the whole box.
     const BIG: TermSize = TermSize { cols: 80, rows: 24 };
 
     /// `pair_through_relay` at `size`, with host and client both at `size`
@@ -4428,10 +4735,7 @@ mod tests {
         let v = session.popup_at(t + Duration::from_secs(6)).unwrap();
         let shown = words(&v);
 
-        assert!(
-            shown.contains("silent for 6s"),
-            "no silence duration: {shown}"
-        );
+        assert!(shown.contains("silent 6 s"), "no silence duration: {shown}");
         assert_claims_nothing_it_cannot_see(&shown);
     }
 
@@ -4540,9 +4844,10 @@ mod tests {
         let before = sent(&session);
         let mut out = Vec::new();
         session.turn(b"x", &mut out).expect("a turn that sends");
-        // Bounded well inside a second: the log's ages are read off the wall
-        // clock, and a wait that crossed a real second could move one and
-        // fail the comparison below for a reason it is not about.
+        // Bounded well inside a second. The view's clocks all run off `t`,
+        // not the wall clock, so the wait cannot move them; the log's times
+        // do read the wall clock, but only to the minute, and nothing here
+        // is logged anyway: `silent` is a detail the popup leaves out.
         let deadline = Instant::now() + Duration::from_millis(500);
         while sent(&session) == before {
             assert!(
@@ -4561,7 +4866,7 @@ mod tests {
             .popup_at(t + Duration::from_secs(4))
             .expect("the popup vanished");
         assert_ne!(later, first, "the silence counter never moved");
-        assert!(words(&later).contains("silent for 4s"), "{}", words(&later));
+        assert!(words(&later).contains("silent 4 s"), "{}", words(&later));
     }
 
     /// A change of phase is the thing the popup exists to report, and
@@ -4624,21 +4929,25 @@ mod tests {
     }
 
     /// The only path by which a user ever sees `Phase::Recovering`.
-    /// `view.rs`'s test for the recovering rows calls `build` with numbers
+    /// `view.rs`'s tests for the attempts block call `build` with numbers
     /// already computed; nothing there exercises `popup_at`'s own derivation
-    /// of them -- `now.duration_since(self.link_state.last_heard())`
-    /// for the quiet count, `next_try.saturating_duration_since(now)` for the
-    /// countdown -- so this drives the real wiring through `evaluate`
-    /// instead.
+    /// of them -- `now.duration_since(self.link_state.last_heard())` for the
+    /// silence, `next_try.saturating_duration_since(now)` for the countdown,
+    /// `Rebuild::running_since` for the attempt's clock -- so this drives the
+    /// real wiring through `evaluate` and `rebuild_step` instead.
     ///
     /// Not run through `assert_claims_nothing_it_cannot_see`: that guard
-    /// forbids "reconnect"/"retry" because nothing reconnects while `Silent`.
-    /// `Recovering` is exactly the mechanism phase 2 adds, so the word
-    /// belongs here and the guard does not apply.
-    #[tokio::test]
-    async fn the_recovering_section_reports_the_wired_numbers() {
+    /// covers `Silent` and `Confirming`, where nothing is being rebuilt.
+    /// `Recovering` is exactly the phase in which an attempt runs, so
+    /// "running" belongs here and the guard does not apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_attempts_block_reports_the_wired_numbers() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
         let t = std::time::Instant::now();
-        let (_host, mut session) = pair("/bin/sh").await;
         session.note_heard(t);
         session.note_sent(t);
         assert!(session.popup_at(t).is_none());
@@ -4649,8 +4958,9 @@ mod tests {
             session.link_state.phase_now()
         );
 
+        let entered = t + crate::linkstate::REBUILD_AFTER;
         let n = session
-            .popup_at(t + crate::linkstate::REBUILD_AFTER)
+            .popup_at(entered)
             .expect("no popup while Recovering");
         assert!(
             matches!(session.link_state.phase_now(), Phase::Recovering { .. }),
@@ -4659,19 +4969,43 @@ mod tests {
         );
 
         assert_eq!(n.marker, Marker::Recovering);
-        let shown = n.recovering.join(" | ");
         // `last_heard` is `t`; this call lands exactly `REBUILD_AFTER` later,
-        // so a quiet count read from anywhere other than `last_heard` (say,
+        // so a silence read from anywhere other than `last_heard` (say,
         // `owed_since`, which this session never set to `t`) would not say
-        // 20s here.
-        assert!(shown.contains("host quiet for 20s"), "{shown}");
-        // Attempt 0 internally (the first attempt), rendered as 1.
-        assert!(shown.contains("reconnect attempt 1"), "{shown}");
+        // 20 s here.
+        assert_eq!(n.header, "silent 20 s");
         // `next_try` was set to exactly `now` on entering `Recovering`, and
         // this call is that same `now` -- so the countdown, read through
         // `saturating_duration_since`, must be zero rather than negative or
-        // panicking.
-        assert!(shown.contains("next try in 0s"), "{shown}");
+        // panicking. Attempt 0 internally, the first to a person.
+        let rebuild_row = |v: &PopupView| {
+            v.attempts
+                .iter()
+                .find(|r| r.label == "ssh rebuild")
+                .map(|r| r.text.clone())
+        };
+        assert_eq!(rebuild_row(&n).as_deref(), Some("attempt 1 in 0 s"));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        let running = session
+            .popup_at(entered + Duration::from_millis(3_400))
+            .expect("the popup closed");
+        assert_eq!(
+            rebuild_row(&running).as_deref(),
+            Some("attempt 1 \u{b7} running 3 s")
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+        let gone = session
+            .popup_at(entered + Duration::from_millis(3_400))
+            .expect("the popup closed");
+        assert!(
+            !rebuild_row(&gone).is_some_and(|t| t.contains("running")),
+            "a cancelled attempt is still running: {:?}",
+            rebuild_row(&gone)
+        );
     }
 
     // ---- the rebuild loop --------------------------------------------------
@@ -5289,8 +5623,7 @@ mod tests {
     }
 
     /// A completed client-side standby, as a search hands it to the session.
-    /// Also the shape a rebuild's `Established` has. The attach id is not
-    /// the fixtures' zero, so a test can see it carried over.
+    /// Also the shape a rebuild's `Established` has.
     fn standby_established(link: Link) -> crate::connect::Established {
         crate::connect::Established {
             link,
@@ -5545,6 +5878,10 @@ mod tests {
             last_entry(&client),
             Some((Kind::Standby, "search started".to_string()))
         );
+        assert!(
+            client.activity.entries().all(|e| e.detail),
+            "a search starting shows in the popup's log"
+        );
     }
 
     /// A probe failing every `PROBE_RETRY` through a long outage is one
@@ -5581,6 +5918,10 @@ mod tests {
                 (Kind::Failover, "probe failed".to_string(), 1),
             ]
         );
+        assert!(
+            client.activity.entries().all(|e| e.detail),
+            "a probe's step shows in the popup's log"
+        );
     }
 
     /// The failover is recorded, writes nothing to the terminal but the
@@ -5599,7 +5940,6 @@ mod tests {
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
-            attach_id: 5,
         });
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         client.standby = Some(standby_holding(standby_client));
@@ -5617,15 +5957,15 @@ mod tests {
                 "switched to standby (IPv4 punched)".to_string()
             ))
         );
+        assert_eq!(
+            client.outage.ended.as_deref(),
+            Some("switched to standby (IPv4 punched)"),
+            "the outage's summary will not say how it ended"
+        );
         assert!(
             outside_renderer(&out).is_empty(),
             "{:?}",
             String::from_utf8_lossy(&outside_renderer(&out))
-        );
-        assert_eq!(
-            client.identity.as_ref().map(|i| i.attach_id),
-            Some(2),
-            "the attach id stayed the old link's"
         );
         let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
         assert!(
@@ -5795,6 +6135,18 @@ mod tests {
             session.last_failure.as_deref(),
             Some("ssh exited with status 255")
         );
+        assert_eq!(
+            session.outage.failed_attempts, 1,
+            "the outage's summary will not count the failed attempt"
+        );
+        assert!(
+            session
+                .activity
+                .entries()
+                .filter(|e| e.kind == Kind::Rebuild)
+                .all(|e| e.detail),
+            "an attempt's step shows in the popup's log"
+        );
         if let Some(r) = session.rebuild.as_mut() {
             r.cancel();
         }
@@ -5880,12 +6232,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_landed_rebuild_is_recorded_and_its_path_and_attach_become_the_sessions() {
+    async fn a_landed_rebuild_is_recorded_and_its_path_becomes_the_sessions() {
         let (_host, mut client) = pair("").await;
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
-            attach_id: 5,
         });
         assert!(client.path.is_none(), "the fixture already had a path");
         let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
@@ -5898,8 +6249,12 @@ mod tests {
             last_entry(&client),
             Some((Kind::Rebuild, "landed via IPv4 punched".to_string()))
         );
+        assert_eq!(
+            client.outage.ended.as_deref(),
+            Some("rebuilt over ssh (IPv4 punched)"),
+            "the outage's summary will not say how it ended"
+        );
         assert_eq!(client.path.as_ref().map(|p| p.rtt_ms), Some(38));
-        assert_eq!(client.identity.as_ref().map(|i| i.attach_id), Some(2));
     }
 
     /// Ruling B1. A failover is not a rebuild landing: an ssh attempt that
@@ -6682,8 +7037,294 @@ mod tests {
         session.note_heard(t + Duration::from_millis(4_500));
         session.popup_at(t + Duration::from_millis(4_500));
 
-        let texts: Vec<String> = session.activity.entries().map(|e| e.text.clone()).collect();
-        assert_eq!(texts, ["silent", "live again via this link, outage 4.5 s"]);
+        let got: Vec<(Kind, String, bool)> = session
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.shown.clone(), e.detail))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Kind::Link, "silent".to_string(), true),
+                (
+                    Kind::Link,
+                    "live again via this link, outage 4.5 s".to_string(),
+                    true
+                ),
+                (
+                    Kind::Outage,
+                    "outage 4.5 s \u{2192} came back by itself".to_string(),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            session.activity.entries().last().map(|e| e.text.clone()),
+            Some("4.5 s \u{2192} came back by itself".to_string()),
+            "the file line repeats its kind"
+        );
+    }
+
+    /// The popup's log of one outage, from its silence to its end: each
+    /// entry's kind, popup wording and detail flag.
+    fn shown_log(session: &ClientSession) -> Vec<(Kind, String, bool)> {
+        session
+            .activity
+            .entries()
+            .map(|e| (e.kind, e.shown.clone(), e.detail))
+            .collect()
+    }
+
+    /// Every entry but the last is a detail with the words `steps` gives,
+    /// and the last is the shown `outage` line `summary`.
+    fn assert_one_line_per_outage(session: &ClientSession, steps: &[&str], summary: &str) {
+        let log = shown_log(session);
+        let (last, before) = log.split_last().expect("nothing was recorded");
+        assert_eq!(
+            last,
+            &(Kind::Outage, summary.to_string(), false),
+            "{log:#?}"
+        );
+        let words: Vec<&str> = before.iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(words, steps, "{log:#?}");
+        assert!(
+            before.iter().all(|e| e.2),
+            "a step of the outage shows in the popup: {log:#?}"
+        );
+    }
+
+    /// Review I2, failover. Driven from the silence through the probe, a
+    /// failed attempt and the switch to the frame on the standby: what the
+    /// outage noted reaches its summary, and every step is a detail. The
+    /// attempt that was running fails after the switch (review M2) and is
+    /// not counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_ended_by_a_failover_is_one_line_and_its_steps_are_details() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+
+        let action = session.standby_step(session.link_state.phase_now(), entered, false);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Probe { .. }),
+            "no probe: {action:?}"
+        );
+        session.on_standby_event(
+            crate::standby::StandbyEvent::Probed { answered: true },
+            s(0),
+        );
+        session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
+        let mut out = Vec::new();
+        assert!(session.fail_over(s(2), &mut out).expect("failing over"));
+        session.rebuild_failed("ssh exited".to_string(), s(3));
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        assert_one_line_per_outage(
+            &session,
+            &[
+                "silent",
+                "probing standby",
+                "probe answered",
+                "attempt 1 failed: ssh exited with status 255",
+                "switched to standby (IPv4 punched)",
+                "attempt 1 failed: ssh exited",
+                "live again via IPv4 punched, outage 24.0 s",
+            ],
+            "outage 24.0 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt",
+        );
+    }
+
+    /// Review I2, rebuild. The same, ended by an ssh attempt that landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_ended_by_a_rebuild_is_one_line_and_its_steps_are_details() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        session.rebuild_failed("ssh exited with status 255".to_string(), s(1));
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        session
+            .rebuild_landed(standby_established(rebuilt), s(2))
+            .expect("landing");
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        assert_one_line_per_outage(
+            &session,
+            &[
+                "silent",
+                "attempt 1 failed: ssh exited with status 255",
+                "landed via IPv4 punched",
+                "live again via IPv4 punched, outage 24.0 s",
+            ],
+            "outage 24.0 s \u{2192} rebuilt over ssh (IPv4 punched) after 1 failed ssh attempt",
+        );
+    }
+
+    /// Review I2, by itself. The primary answers again after two attempts
+    /// failed: the summary still counts them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_that_ended_by_itself_still_counts_its_failed_attempts() {
+        let (_host, mut session) = pair("sleep 30\n").await;
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        session.rebuild_failed("ssh exited".to_string(), s(1));
+        session.rebuild_failed("ssh exited".to_string(), s(2));
+        session.note_heard(s(4));
+        session.popup_at(s(4));
+
+        let log = shown_log(&session);
+        assert_eq!(
+            log.last(),
+            Some(&(
+                Kind::Outage,
+                "outage 24.0 s \u{2192} came back by itself after 2 failed ssh attempts"
+                    .to_string(),
+                false
+            )),
+            "{log:#?}"
+        );
+        assert!(log[..log.len() - 1].iter().all(|e| e.2), "{log:#?}");
+    }
+
+    /// Review M2. A switch that did not end the outage -- the standby never
+    /// answered and a new attempt had to begin -- counts the failures after
+    /// it after all, and the rebuild row shows the new attempt again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_attempt_after_a_switch_undoes_the_switch_in_the_notes() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let pidfile = dir.path().join("ssh.pid");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(hanging_ssh(dir.path(), &pidfile), stunless());
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        let entered = drive_to_recovering(&mut session);
+        let s = |n: u64| entered + Duration::from_secs(n);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(s(0), &tx);
+        let mut out = Vec::new();
+        assert!(session.fail_over(s(1), &mut out).expect("failing over"));
+        let row = |session: &ClientSession, at| {
+            session
+                .view(session.link_state.phase_now(), at)
+                .attempts
+                .into_iter()
+                .find(|r| r.label == "ssh rebuild")
+                .map(|r| r.text)
+        };
+        assert_eq!(
+            row(&session, s(1)).as_deref(),
+            Some("not needed \u{b7} switched to standby"),
+            "the attempt begun before the switch shows as current"
+        );
+
+        // The old attempt fails after the switch; no frame comes on the
+        // standby, and the next attempt begins.
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+        session.rebuild_failed("ssh exited".to_string(), s(2));
+        assert_eq!(session.outage.failed_at_switch, Some(0));
+        let next = match session.link_state.phase_now() {
+            Phase::Recovering { next_try, .. } => next_try,
+            other => panic!("not recovering: {other:?}"),
+        };
+        session.rebuild_step(next, &tx);
+        assert_eq!(session.outage.failed_at_switch, None);
+        assert!(
+            row(&session, next).is_some_and(|t| t.contains("running")),
+            "{:?}",
+            row(&session, next)
+        );
+        assert_eq!(
+            session.outage.summary(Duration::from_secs(30)).1,
+            "outage 30.0 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+        );
+        if let Some(r) = session.rebuild.as_mut() {
+            r.cancel();
+        }
+    }
+
+    /// How an outage ended, in the words of the one line that sums it up.
+    #[test]
+    fn an_outage_summary_says_how_it_ended_and_what_failed_first() {
+        let len = Duration::from_millis(96_340);
+        let notes = |ended: Option<&str>, failed_attempts| OutageNotes {
+            ended: ended.map(str::to_string),
+            failed_attempts,
+            failed_at_switch: None,
+        };
+        assert_eq!(
+            notes(None, 0).summary(len).1,
+            "outage 96.3 s \u{2192} came back by itself"
+        );
+        assert_eq!(
+            notes(Some("switched to standby (IPv4 punched)"), 1).summary(len),
+            (
+                "96.3 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+                    .to_string(),
+                "outage 96.3 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            notes(Some("rebuilt over ssh (IPv6 direct)"), 3)
+                .summary(len)
+                .1,
+            "outage 96.3 s \u{2192} rebuilt over ssh (IPv6 direct) after 3 failed ssh attempts"
+        );
+        // Review M2: a failure after the switch that ended it is not one the
+        // outage waited through.
+        assert_eq!(
+            OutageNotes {
+                failed_at_switch: Some(1),
+                ..notes(Some("switched to standby (IPv4 punched)"), 2)
+            }
+            .summary(len)
+            .1,
+            "outage 96.3 s \u{2192} switched to standby (IPv4 punched) after 1 failed ssh attempt"
+        );
+    }
+
+    /// Review M6: a path label with a parenthesis of its own is not nested
+    /// in the summary's.
+    #[test]
+    fn a_summary_does_not_nest_parentheses() {
+        assert_eq!(in_parens("IPv4 punched"), "(IPv4 punched)");
+        assert_eq!(
+            in_parens("IPv4 punched (birthday, 412 probes)"),
+            "(IPv4 punched, birthday, 412 probes)"
+        );
+        assert_eq!(
+            in_parens("IPv6 punched (port mapped)"),
+            "(IPv6 punched, port mapped)"
+        );
+        let birthday = path_of(Rung::Birthday, 38, 1400, 412, NatType::Unknown);
+        assert_eq!(
+            in_parens(&oxutrm_client::rung_label(&birthday)),
+            "(IPv4 punched, birthday, 412 probes)"
+        );
+    }
+
+    /// A new outage starts its notes over: the last one's ending is not
+    /// this one's.
+    #[tokio::test]
+    async fn a_new_outage_forgets_how_the_last_one_ended() {
+        let t = Instant::now();
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.popup_at(t).is_none());
+        session.outage = OutageNotes {
+            ended: Some("switched to standby (IPv4 punched)".to_string()),
+            failed_attempts: 2,
+            failed_at_switch: Some(1),
+        };
+        session.popup_at(t + Duration::from_secs(3));
+        assert_eq!(session.outage, OutageNotes::default());
     }
 
     /// Two laps within a second take one sample: `Quality::push` does not
@@ -7743,5 +8384,536 @@ mod tests {
             "not exactly one literal on the final screen: {screen}"
         );
         assert!(client.shown.is_none(), "the double press left the popup up");
+    }
+
+    // ---- the startup splash ------------------------------------------------
+
+    /// Whether a terminal fed `out` shows any braille dot: the splash's art
+    /// and snow are braille, and nothing the fixtures' shell prints is.
+    fn splash_on_screen(out: &[u8], size: TermSize) -> bool {
+        crate::loopback::fixtures::replay(out, size)
+            .iter()
+            .any(|l| l.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)))
+    }
+
+    /// A session at `size` with the splash armed, the way `connect` builds
+    /// one, and the first frame of it painted at `t`.
+    async fn with_splash_at(
+        size: TermSize,
+        t: Instant,
+        out: &mut Vec<u8>,
+    ) -> (HostSession, ClientSession) {
+        let (host, session) = pair_sized("/bin/sh", size).await;
+        let mut session = session.with_splash(7, "");
+        session.layer_one(t, out).expect("the first lap");
+        (host, session)
+    }
+
+    /// Let the host's first screen reach the client and be applied.
+    async fn first_frame(host: &mut HostSession, session: &mut ClientSession, out: &mut Vec<u8>) {
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(session).await;
+        session.turn(&[], out).expect("a pacing lap");
+        assert!(
+            session.screen_rx.applied_kinds() != (0, 0),
+            "the fixture applied no frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_splash_is_the_first_thing_painted() {
+        let mut out = Vec::new();
+        let (_host, session) = with_splash_at(BIG, Instant::now(), &mut out).await;
+        assert!(session.splash.is_some());
+        assert!(
+            splash_on_screen(&out, BIG),
+            "the first lap painted no splash"
+        );
+    }
+
+    /// The host's first screen can be what wakes the loop first, before
+    /// any lap of layer 1 has run. It must land under the splash, not flash
+    /// up on its own ahead of it.
+    #[tokio::test]
+    async fn a_screen_painted_before_the_first_lap_is_already_under_the_splash() {
+        let (mut host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7, "");
+        let mut out = Vec::new();
+
+        first_frame(&mut host, &mut session, &mut out).await;
+
+        assert!(!out.is_empty(), "the frame painted nothing");
+        assert!(
+            splash_on_screen(&out, BIG),
+            "the remote screen was painted before the splash"
+        );
+    }
+
+    /// Any key ends it at once, and the key is not swallowed: it goes on to
+    /// the shell exactly as it would have without the splash. Synchronous:
+    /// the splash has to be gone by the time the key is routed, not on some
+    /// later lap.
+    #[tokio::test]
+    async fn a_key_ends_the_splash_and_reaches_the_shell() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        assert_eq!(session.route_keys_at(b"x", t, &mut out).unwrap(), None);
+
+        assert!(session.splash.is_none(), "the key left the splash up");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the key"
+        );
+        assert!(
+            spoken(&session).ends_with(b"x"),
+            "the key that ended the splash never reached the shell: {:?}",
+            spoken(&session)
+        );
+        // And no later lap brings it back.
+        session
+            .layer_one(t + Duration::from_millis(100), &mut out)
+            .unwrap();
+        assert!(!splash_on_screen(&out, BIG), "the splash came back");
+    }
+
+    /// Ctrl-\ under the splash does what it always does -- opens the popup,
+    /// which takes over the screen -- rather than being eaten by it.
+    #[tokio::test]
+    async fn ctrl_backslash_under_the_splash_opens_the_popup() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        session
+            .route_keys_at(&[CTRL_BACKSLASH], t, &mut out)
+            .unwrap();
+        session.layer_one(t, &mut out).unwrap();
+
+        assert!(session.splash.is_none());
+        assert!(session.shown.is_some(), "Ctrl-\\ opened no popup");
+        let screen = crate::loopback::fixtures::replay(&out, BIG).join("\n");
+        assert!(screen.contains("q quit"), "no popup on screen:\n{screen}");
+    }
+
+    #[tokio::test]
+    async fn the_splash_is_skipped_below_34x20() {
+        for (size, shown) in [
+            (TermSize { cols: 34, rows: 20 }, true),
+            (TermSize { cols: 33, rows: 20 }, false),
+            (TermSize { cols: 34, rows: 19 }, false),
+        ] {
+            let mut out = Vec::new();
+            let (_host, session) = with_splash_at(size, Instant::now(), &mut out).await;
+            assert_eq!(session.splash.is_some(), shown, "at {size:?}");
+            assert_eq!(splash_on_screen(&out, size), shown, "at {size:?}");
+        }
+    }
+
+    /// The interference settles and the logo is held; then the remote
+    /// screen. Not a moment before, even with the host's screen in hand.
+    #[tokio::test]
+    async fn the_splash_ends_after_the_hold_once_the_host_has_painted() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (mut host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        first_frame(&mut host, &mut session, &mut out).await;
+        let end = oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES
+            + oxutrm_client::splash::HOLD;
+
+        session
+            .layer_one(t + end - Duration::from_millis(1), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_some(),
+            "the splash ended before its hold did"
+        );
+        assert!(splash_on_screen(&out, BIG));
+
+        session.layer_one(t + end, &mut out).unwrap();
+        assert!(session.splash.is_none(), "the splash outlived its hold");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash ended and is still on the screen"
+        );
+    }
+
+    /// A host slow to send its first screen leaves the clean logo up rather
+    /// than a blank terminal.
+    #[tokio::test]
+    async fn the_logo_stays_until_the_hosts_first_screen_arrives() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (mut host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        // The host is answering -- an outage would replace the splash with
+        // the popup, which is another test -- but no screen has come yet.
+        let late = t + Duration::from_millis(2_400);
+        session.note_heard(late);
+        session.layer_one(late, &mut out).unwrap();
+        assert!(
+            session.splash.is_some(),
+            "the splash ended with nothing to show beneath it"
+        );
+        assert!(splash_on_screen(&out, BIG));
+
+        first_frame(&mut host, &mut session, &mut out).await;
+        session
+            .layer_one(t + Duration::from_millis(2_450), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_none(),
+            "the host's screen arrived and the logo stayed"
+        );
+        assert!(!splash_on_screen(&out, BIG));
+    }
+
+    /// An outage starting under the splash: the popup replaces it.
+    #[tokio::test]
+    async fn an_outage_replaces_the_splash_with_the_popup() {
+        let t = Instant::now();
+        let (_host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7, "");
+        let mut out = Vec::new();
+        session.note_heard(t);
+        session.note_sent(t);
+        session.layer_one(t, &mut out).unwrap();
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        session
+            .layer_one(t + Duration::from_secs(3), &mut out)
+            .unwrap();
+
+        assert!(session.splash.is_none(), "the splash survived the outage");
+        assert!(session.shown.is_some(), "the outage raised no popup");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen around the popup"
+        );
+    }
+
+    /// Only a fresh connect shows it, never a recovery: a failover that
+    /// lands while it is still up ends it, and the next lap of layer 1
+    /// takes it off the screen. No key first -- the splash is up, mid
+    /// interference, when the failover happens, so a recovery that left it
+    /// running would fail here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_under_the_splash_ends_it() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        let mid = t + Duration::from_millis(100);
+        session.layer_one(mid, &mut out).unwrap();
+        assert!(session.splash.is_some(), "the fixture's splash is down");
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        session.standby = Some(standby_holding(standby_client));
+        assert!(session.fail_over(mid, &mut out).expect("failing over"));
+        session
+            .layer_one(mid + Duration::from_millis(40), &mut out)
+            .unwrap();
+
+        assert!(session.splash.is_none(), "the failover left the splash up");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the failover"
+        );
+    }
+
+    /// The same for the other recovery, a rebuild landing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_landing_under_the_splash_ends_it() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+        let mid = t + Duration::from_millis(100);
+        session.layer_one(mid, &mut out).unwrap();
+        assert!(session.splash.is_some(), "the fixture's splash is down");
+        assert!(splash_on_screen(&out, BIG), "the fixture shows no splash");
+
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        session
+            .rebuild_landed(standby_established(rebuilt), mid)
+            .expect("landing");
+        session
+            .layer_one(mid + Duration::from_millis(40), &mut out)
+            .unwrap();
+
+        assert!(session.splash.is_none(), "the rebuild left the splash up");
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash is still on the screen after the rebuild"
+        );
+    }
+
+    /// A session that ends while the splash is up -- a `nologin` account,
+    /// a `.bashrc` that exits -- shows the remote's last words, not the
+    /// logo. Through the real loop: the shell prints and exits at once,
+    /// long before the hold is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_ends_under_the_splash_leaves_its_last_screen() {
+        // `by%s` so the echoed command line does not itself contain `bye`.
+        let (mut host, session) = pair_sized("printf 'by%s\\n' e; exit 3\n", BIG).await;
+        let mut client = session.with_splash(7, "");
+        let (keys, _typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let out = SharedOut::default();
+        let mut painted = out.clone();
+        let start = Instant::now();
+
+        let code = tokio::time::timeout(Duration::from_secs(20), client.run_on(keys, &mut painted))
+            .await
+            .expect("the client never finished");
+        let _ = host_loop.await;
+
+        assert_eq!(code.expect("the client loop failed"), 3);
+        assert!(
+            start.elapsed()
+                < oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES
+                    + oxutrm_client::splash::HOLD,
+            "the session outlived the splash, so this saw nothing"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.bytes())
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+            "the splash was never painted"
+        );
+        let screen = screen_of(&out, BIG);
+        assert!(
+            screen.contains("bye"),
+            "the shell's last output is not on the screen:\n{screen}"
+        );
+        assert!(
+            !splash_on_screen(&out.bytes(), BIG),
+            "the session ended with the splash on the screen:\n{screen}"
+        );
+    }
+
+    /// The splash's own guard of the project rule: it is painted by the
+    /// renderer and nothing else. The banner is the one thing outside it,
+    /// and finding exactly the banner shows the check can see a stray.
+    #[tokio::test]
+    async fn the_splash_is_painted_only_through_the_renderer() {
+        let t = Instant::now();
+        let (mut host, session) = pair_sized("/bin/sh", BIG).await;
+        let mut session = session.with_splash(7, "");
+        let mut out = Vec::new();
+        let path = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        session.announce(&path, &mut out).expect("the banner");
+
+        for ms in [0, 40, 80, 400, 900] {
+            session
+                .layer_one(t + Duration::from_millis(ms), &mut out)
+                .unwrap();
+        }
+        first_frame(&mut host, &mut session, &mut out).await;
+        assert!(
+            splash_on_screen(&out, BIG),
+            "no splash was painted to check"
+        );
+        session.route_keys_at(b"x", t, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&outside_renderer(&out)),
+            format!("{}\n", status_line(&path)),
+            "the splash wrote outside the renderer"
+        );
+    }
+
+    /// The whole thing through the real loop, nobody typing: it shows, and
+    /// it goes by itself once the hold is over.
+    ///
+    /// **What this does NOT guard, stated because it was checked:** the
+    /// frame timer. With it removed this still passes, because the pacing
+    /// deadline wakes the loop every `rtt / 2` clamped to 8..100 ms, and on
+    /// loopback that is every 8 ms. The timer is for a real link, where the
+    /// loop wakes ten times a second and the interference would run at a
+    /// third of its rate; `splash_due` and `splash_wake` are tested on
+    /// their own below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_loop_shows_the_splash_and_takes_it_down_by_itself() {
+        let (mut host, session) = pair_sized("", BIG).await;
+        let mut client = session.with_splash(7, "");
+        let (keys, mut typing) = keyboard();
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let out = SharedOut::default();
+        let mut painted = out.clone();
+        let client_loop = tokio::spawn(async move { client.run_on(keys, &mut painted).await });
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        while !splash_on_screen(&out.bytes(), BIG) {
+            assert!(Instant::now() < deadline, "the loop painted no splash");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The hold ends 2.3 s after the first frame; a second to spare.
+        let deadline = start + Duration::from_millis(3_500);
+        while splash_on_screen(&out.bytes(), BIG) {
+            assert!(Instant::now() < deadline, "the splash never went by itself");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        typing.write_all(b"exit 3\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(20), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 3);
+        let _ = host_loop.await;
+    }
+
+    /// A resize under the splash lays it out for the new screen, or ends it
+    /// once the screen is too small for it -- painted in the same lap, as
+    /// the `Winch` arm runs it (`resize`, a turn, then layer 1), without
+    /// waiting for the host's resized screen. The settled logo, so a new
+    /// frame of the animation cannot be what repaints.
+    #[tokio::test]
+    async fn a_resize_lays_the_splash_out_again_or_ends_it() {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        // The settled logo: no noise, so the layout is all there is to see.
+        let settled = oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES;
+        session.layer_one(t + settled, &mut out).unwrap();
+
+        let wider = TermSize {
+            cols: 100,
+            rows: 30,
+        };
+        session.resize(wider);
+        session.turn(&[], &mut out).unwrap();
+        session
+            .layer_one(t + settled + Duration::from_millis(1), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_some(),
+            "a resize that fits ended the splash"
+        );
+        // The remote screen is still BIG's until the host redraws, so the
+        // splash is clipped to it; the art sits where the NEW screen
+        // centres it.
+        let painted: Vec<String> = crate::loopback::fixtures::replay(&out, BIG)
+            .iter()
+            .map(|l| l.trim_end().to_owned())
+            .collect();
+        let rows = |size: TermSize| -> Vec<String> {
+            let o = oxutrm_client::splash::splash(settled, size, 7, "");
+            o.cells
+                .chunks(usize::from(o.cols))
+                .take(usize::from(BIG.rows))
+                .map(|r| {
+                    r.iter()
+                        .take(usize::from(BIG.cols))
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_ne!(
+            rows(wider),
+            rows(BIG),
+            "the two layouts cannot be told apart"
+        );
+        assert_eq!(
+            painted,
+            rows(wider),
+            "the splash kept the old screen's layout"
+        );
+
+        let small = TermSize { cols: 33, rows: 30 };
+        session.resize(small);
+        session.turn(&[], &mut out).unwrap();
+        session
+            .layer_one(t + settled + Duration::from_millis(2), &mut out)
+            .unwrap();
+        assert!(
+            session.splash.is_none(),
+            "the splash outlived a screen too small for it"
+        );
+        assert!(
+            !splash_on_screen(&out, BIG),
+            "the splash ended and is still on the screen"
+        );
+    }
+
+    /// The splash's timer arm: it fires at the instant it is given, and
+    /// never without one -- a retired timer that still fired would be a
+    /// timer left running for the rest of the session.
+    #[tokio::test]
+    async fn the_splash_wake_fires_when_set_and_never_once_gone() {
+        let at = tokio::time::Instant::now() + Duration::from_millis(30);
+        tokio::time::timeout(Duration::from_millis(500), splash_due(Some(at)))
+            .await
+            .expect("a set wake did not fire");
+        assert!(tokio::time::Instant::now() >= at, "it fired early");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), splash_due(None))
+                .await
+                .is_err(),
+            "a retired wake fired"
+        );
+    }
+
+    /// When the loop next wakes for the splash: on each frame boundary of
+    /// its own clock while the interference runs -- so no frame repeats or
+    /// is skipped -- then once at the end of the hold, and not at all while
+    /// the settled logo waits for the host's first screen (that screen's
+    /// arrival is the wake). Walked the way the loop walks it, each lap at
+    /// the instant the last one asked for.
+    #[tokio::test]
+    async fn the_splash_wakes_once_per_frame_then_once_for_the_hold() {
+        use oxutrm_client::splash::{FRAME, FRAMES, HOLD, frame_of};
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let (_host, mut session) = with_splash_at(BIG, t, &mut out).await;
+
+        let mut now = t;
+        let mut wakes = Vec::new();
+        while let Some(next) = session.splash_wake(now) {
+            assert!(next > now, "a wake at or before the lap that asked for it");
+            wakes.push(next - t);
+            now = next;
+            // The host is answering: an outage would end the splash.
+            session.note_heard(now);
+            session.layer_one(now, &mut out).unwrap();
+        }
+        let mut want: Vec<Duration> = (1..=FRAMES).map(|f| FRAME * f).collect();
+        want.push(FRAME * FRAMES + HOLD);
+        assert_eq!(wakes, want);
+        for (f, w) in (1..=FRAMES).zip(&wakes) {
+            assert_eq!(frame_of(*w), f, "a wake off its frame's boundary");
+        }
+        // No first screen yet: the logo waits, and nothing ticks.
+        assert!(session.splash.is_some(), "the logo did not wait");
+        assert_eq!(session.splash_wake(now + Duration::from_secs(1)), None);
+    }
+
+    /// A lap the splash's timer woke runs no turn, so it must not push the
+    /// pacing deadline out: on a link whose pacing interval is longer than
+    /// a frame, every tick would land before the deadline and move it
+    /// again, and the outbound side would stall for the whole splash.
+    #[test]
+    fn a_splash_lap_leaves_the_pacing_deadline_where_it_was() {
+        let t = tokio::time::Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut deadline = t + interval;
+        for ms in [40, 80] {
+            deadline =
+                next_pacing_deadline(true, deadline, t + Duration::from_millis(ms), interval);
+        }
+        assert_eq!(deadline, t + interval, "a splash lap moved the deadline");
+        // Any other lap asks again one interval from now, as before.
+        let now = t + Duration::from_millis(100);
+        assert_eq!(
+            next_pacing_deadline(false, deadline, now, interval),
+            now + interval
+        );
     }
 }

@@ -1,9 +1,9 @@
 //! The activity log: what oxutrm did to keep the session alive.
 //!
-//! Kept twice: a ring of the last [`RING`] entries for the status popup, and
-//! a size-capped file for afterwards. The network crates never log -- they
-//! return reasons -- and the session records them here. [`Activity::record`]
-//! is the only way in.
+//! Kept twice: a ring of the last [`RING`] entries for the status popup
+//! (details give way first when it is full), and a size-capped file for
+//! afterwards. The network crates never log -- they return reasons -- and
+//! the session records them here. [`Activity::record`] is the only way in.
 //!
 //! Times in the file are UTC. The root crate forbids `unsafe`, std has no
 //! time zone, and UTC is unambiguous on any machine that reads the file.
@@ -35,6 +35,9 @@ pub(crate) enum Kind {
     Rebuild,
     Input,
     Log,
+    /// One line for a whole outage, once it is over: how long it was and
+    /// how it ended.
+    Outage,
 }
 
 impl Kind {
@@ -46,6 +49,7 @@ impl Kind {
             Kind::Rebuild => "rebuild",
             Kind::Input => "input",
             Kind::Log => "log",
+            Kind::Outage => "outage",
         }
     }
 }
@@ -59,6 +63,12 @@ pub(crate) struct Entry {
     pub(crate) kind: Kind,
     /// Legible already: escaped and cut to one line when it was recorded.
     pub(crate) text: String,
+    /// What the popup shows for it: `text` unless it was recorded with a
+    /// shorter wording. Legible already, like `text`.
+    pub(crate) shown: String,
+    /// A step of something summed up by a later entry, such as the probes
+    /// and attempts of an outage: in the file, not in the popup.
+    pub(crate) detail: bool,
     /// How many times it happened again after the first.
     pub(crate) repeats: u32,
 }
@@ -110,12 +120,40 @@ impl Activity {
         self.record_at(kind, text, SystemTime::now());
     }
 
+    /// [`Activity::record`], for a step the popup leaves out: the file
+    /// gets the same line as any other entry.
+    pub(crate) fn record_detail(&mut self, kind: Kind, text: &str) {
+        self.record_entry(kind, text, None, true, SystemTime::now());
+    }
+
+    /// [`Activity::record`], with `shown` as the popup's wording and `text`
+    /// as the file's.
+    pub(crate) fn record_shown(&mut self, kind: Kind, text: &str, shown: &str) {
+        self.record_entry(kind, text, Some(shown), false, SystemTime::now());
+    }
+
     /// [`Activity::record`], at a given time.
     pub(crate) fn record_at(&mut self, kind: Kind, text: &str, at: SystemTime) {
+        self.record_entry(kind, text, None, false, at);
+    }
+
+    /// The one way in. Both texts are escaped and cut to one line here, so
+    /// neither the popup nor the file can be handed a control sequence.
+    pub(crate) fn record_entry(
+        &mut self,
+        kind: Kind,
+        text: &str,
+        shown: Option<&str>,
+        detail: bool,
+        at: SystemTime,
+    ) {
         let text = oxutrm_client::summarised(text);
+        let shown = shown.map_or_else(|| text.clone(), oxutrm_client::summarised);
         if let Some(last) = self.ring.back_mut()
             && last.kind == kind
             && last.text == text
+            && last.shown == shown
+            && last.detail == detail
         {
             last.repeats = last.repeats.saturating_add(1);
             last.at = at;
@@ -128,6 +166,8 @@ impl Activity {
             since: at,
             kind,
             text,
+            shown,
+            detail,
             repeats: 0,
         });
         self.write(&line);
@@ -138,10 +178,18 @@ impl Activity {
         self.ring.iter()
     }
 
+    /// The ring is full at [`RING`]: the oldest detail gives way first, so
+    /// the steps of a long outage -- never shown -- cannot push out what
+    /// the popup lists. The newest entry is never the one to go, because
+    /// a repeat folds into it. With no other detail, the oldest goes.
     fn push(&mut self, e: Entry) {
         self.ring.push_back(e);
         while self.ring.len() > RING {
-            self.ring.pop_front();
+            let older = self.ring.len() - 1;
+            match self.ring.iter().take(older).position(|e| e.detail) {
+                Some(i) => self.ring.remove(i),
+                None => self.ring.pop_front(),
+            };
         }
     }
 
@@ -190,11 +238,14 @@ impl Activity {
     /// The file is gone for the rest of the session: said once, in the ring.
     fn file_off(&mut self, e: &std::io::Error) {
         let at = SystemTime::now();
+        let text = oxutrm_client::summarised(&format!("log file off: {e}"));
         self.push(Entry {
             at,
             since: at,
             kind: Kind::Log,
-            text: oxutrm_client::summarised(&format!("log file off: {e}")),
+            shown: text.clone(),
+            text,
+            detail: false,
             repeats: 0,
         });
     }
@@ -365,13 +416,16 @@ mod tests {
             Kind::Rebuild,
             Kind::Input,
             Kind::Log,
+            Kind::Outage,
         ]
         .into_iter()
         .map(Kind::name)
         .collect();
         assert_eq!(
             names,
-            ["link", "standby", "failover", "rebuild", "input", "log"]
+            [
+                "link", "standby", "failover", "rebuild", "input", "log", "outage"
+            ]
         );
     }
 
@@ -421,6 +475,65 @@ mod tests {
         assert_eq!(a.entries().next_back().unwrap().text, "e-249");
     }
 
+    /// Review M1. A long outage records a step every few seconds and the
+    /// popup shows none of them: in a full ring the oldest detail gives way
+    /// first, so twenty minutes of attempts do not push out the outages
+    /// and searches the popup lists. Order is kept.
+    #[test]
+    fn a_full_ring_lets_a_detail_go_before_a_shown_entry() {
+        let mut a = Activity::new();
+        for i in 0..50 {
+            a.record_at(Kind::Standby, &format!("shown-{i:02}"), at(T + i));
+        }
+        for i in 0..300 {
+            a.record_entry(
+                Kind::Rebuild,
+                &format!("attempt {i:03} started"),
+                None,
+                true,
+                at(T + 100 + i),
+            );
+        }
+        assert_eq!(a.entries().len(), RING);
+        let shown: Vec<String> = a
+            .entries()
+            .filter(|e| !e.detail)
+            .map(|e| e.text.clone())
+            .collect();
+        let want: Vec<String> = (0..50).map(|i| format!("shown-{i:02}")).collect();
+        assert_eq!(shown, want, "a shown entry gave way to a detail");
+        let details: Vec<String> = a
+            .entries()
+            .filter(|e| e.detail)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(
+            details.first().map(String::as_str),
+            Some("attempt 150 started")
+        );
+        assert_eq!(
+            details.last().map(String::as_str),
+            Some("attempt 299 started")
+        );
+        // Oldest first still: every shown entry here is older than every
+        // detail, and stays in front of them.
+        assert!(a.entries().take(50).all(|e| !e.detail), "{:?}", texts(&a));
+
+        // With no detail left to let go, the oldest shown entry goes.
+        let mut b = Activity::new();
+        b.record_entry(Kind::Link, "a detail", None, true, at(T));
+        for i in 0..RING as u64 {
+            b.record_at(Kind::Standby, &format!("s-{i:03}"), at(T + 1 + i));
+        }
+        assert!(
+            b.entries().all(|e| !e.detail),
+            "the detail outlived a shown entry"
+        );
+        b.record_at(Kind::Standby, "newest", at(T + 1_000));
+        assert_eq!(b.entries().len(), RING);
+        assert_eq!(b.entries().next().unwrap().text, "s-001");
+    }
+
     /// A reason is a remote's stderr. Escaped and cut to its first line when
     /// recorded, so neither the popup nor the file can be handed a control
     /// sequence.
@@ -439,6 +552,73 @@ mod tests {
             "{text:?}"
         );
         assert!(!text.contains("second line"), "{text:?}");
+    }
+
+    /// The popup's wording is the popup's: escaped like the file's text,
+    /// and not what goes into the file.
+    #[test]
+    fn a_shown_text_is_for_the_popup_and_the_file_keeps_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, path) = opened(dir.path(), LOG_CAP);
+        a.record_entry(
+            Kind::Standby,
+            "not found: far: away",
+            Some("standby not found: \u{1b}[2Jfar"),
+            false,
+            at(T),
+        );
+        let e = a.entries().next().unwrap();
+        assert_eq!(e.text, "not found: far: away");
+        assert_eq!(e.shown, "standby not found: ^[[2Jfar");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "2026-09-21T14:13:20Z bastion f00dcafe standby not found: far: away\n"
+        );
+
+        a.record_at(Kind::Link, "silent", at(T + 1));
+        let plain = a.entries().next_back().unwrap();
+        assert_eq!(plain.shown, plain.text, "no wording given, and it differs");
+    }
+
+    /// A detail is left out of the popup, not out of the file: its line is
+    /// the one any other entry would have written.
+    #[test]
+    fn a_detail_is_written_to_the_file_like_any_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, path) = opened(dir.path(), LOG_CAP);
+        a.record_entry(Kind::Failover, "probing standby", None, true, at(T));
+        a.record_entry(Kind::Failover, "probe failed", None, false, at(T + 1));
+        let flags: Vec<bool> = a.entries().map(|e| e.detail).collect();
+        assert_eq!(flags, [true, false]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "2026-09-21T14:13:20Z bastion f00dcafe failover probing standby\n\
+             2026-09-21T14:13:21Z bastion f00dcafe failover probe failed\n"
+        );
+    }
+
+    /// The same words, once as a detail and once not, or with different
+    /// wordings for the popup, are two entries: folding them would show one
+    /// that the popup was meant to leave out, or the wrong wording.
+    #[test]
+    fn a_detail_and_a_shown_entry_do_not_fold_together() {
+        let mut a = Activity::new();
+        a.record_entry(Kind::Link, "x", None, true, at(T));
+        a.record_entry(Kind::Link, "x", None, false, at(T));
+        a.record_entry(Kind::Link, "x", Some("y"), false, at(T));
+        a.record_entry(Kind::Link, "x", Some("y"), false, at(T));
+        let got: Vec<(bool, String, u32)> = a
+            .entries()
+            .map(|e| (e.detail, e.shown.clone(), e.repeats))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (true, "x".to_string(), 0),
+                (false, "x".to_string(), 0),
+                (false, "y".to_string(), 1),
+            ]
+        );
     }
 
     #[test]

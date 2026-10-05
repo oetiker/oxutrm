@@ -46,7 +46,6 @@ struct Sample {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RttStats {
     pub(crate) min: Duration,
-    pub(crate) avg: Duration,
     pub(crate) max: Duration,
 }
 
@@ -55,9 +54,6 @@ pub(crate) struct Loss {
     /// Sent and lost across the window, on the current link.
     pub(crate) window_sent: u64,
     pub(crate) window_lost: u64,
-    /// Sent and lost over the current link's whole life.
-    pub(crate) total_sent: u64,
-    pub(crate) total_lost: u64,
 }
 
 impl Loss {
@@ -146,8 +142,7 @@ impl Quality {
             .collect();
         let min = *rtts.iter().min()?;
         let max = *rtts.iter().max()?;
-        let avg = rtts.iter().sum::<Duration>() / rtts.len() as u32;
-        Some(RttStats { min, avg, max })
+        Some(RttStats { min, max })
     }
 
     pub(crate) fn loss(&self) -> Option<Loss> {
@@ -156,8 +151,6 @@ impl Quality {
         Some(Loss {
             window_sent: last.reading.sent.saturating_sub(first.reading.sent),
             window_lost: last.reading.lost.saturating_sub(first.reading.lost),
-            total_sent: last.reading.sent,
-            total_lost: last.reading.lost,
         })
     }
 
@@ -248,7 +241,6 @@ mod tests {
             Duration::from_millis(50),
             "an outage second's RTT counted"
         );
-        assert_eq!(s.avg, Duration::from_millis(40));
         assert_eq!(q.rtt_now(), Some(Duration::from_millis(50)));
     }
 
@@ -266,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn loss_is_measured_across_the_window_and_counted_for_the_link() {
+    fn loss_is_measured_across_the_window() {
         let t = Instant::now();
         let mut q = Quality::new(t);
         q.push(t, r(30, 1_000, 10, 0, 0), false);
@@ -274,7 +266,6 @@ mod tests {
         q.push(secs(t, 2), r(30, 1_200, 14, 0, 0), false);
         let l = q.loss().unwrap();
         assert_eq!((l.window_sent, l.window_lost), (200, 4));
-        assert_eq!((l.total_sent, l.total_lost), (1_200, 14));
         assert_eq!(l.percent(), Some(2.0));
     }
 
@@ -299,7 +290,7 @@ mod tests {
         q.push(secs(t, 2), r(20, 10, 0, 1_000, 2_000), false);
         q.push(secs(t, 3), r(20, 20, 1, 2_000, 4_000), false);
         let l = q.loss().unwrap();
-        assert_eq!((l.window_sent, l.window_lost, l.total_sent), (10, 1, 20));
+        assert_eq!((l.window_sent, l.window_lost), (10, 1));
         assert_eq!(
             q.throughput(),
             Some(Throughput {

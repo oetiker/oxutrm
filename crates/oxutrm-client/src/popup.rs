@@ -36,8 +36,23 @@ pub const MAX_BOX: TermSize = TermSize { cols: 72, rows: 24 };
 /// box. The useful part of an ssh failure is at the front.
 pub const REASON_SHOWN: usize = 120;
 
-/// The label in front of the RTT sparkline.
-const SPARK_LABEL: &str = "rtt ";
+/// The cells between the marker and the rest of the header line.
+const HEADER_GAP: &str = "   ";
+
+/// The cells between the rtt text and its sparkline.
+const SPARK_GAP: u16 = 2;
+
+/// The cells between an attempt row's label and its state.
+const ATTEMPT_GAP: u16 = 3;
+
+/// The cells between a log entry's time and its text.
+const LOG_GAP: u16 = 2;
+
+/// The title of the rule above the standby section.
+const STANDBY_RULE: &str = "standby";
+
+/// The title of the rule above the activity log.
+const RECENT_RULE: &str = "recent";
 
 /// The state the popup reports, and the colour it reports it in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -72,26 +87,51 @@ pub struct KeyHint {
     pub enabled: bool,
 }
 
+/// A row of two columns: a label, and a text that wraps under itself, so a
+/// continuation line visibly belongs to its row and the label column stays
+/// clear.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Row {
+    pub label: String,
+    pub text: String,
+}
+
+impl Row {
+    pub fn new(label: impl Into<String>, text: impl Into<String>) -> Row {
+        Row {
+            label: label.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// What the popup says, as content rather than as cells.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PopupView {
     /// Drawn into the top border.
     pub title: String,
     pub marker: Marker,
-    /// The first line inside the box, e.g. `● SILENT`.
+    /// The start of the first line inside the box, e.g. `● SILENT`, drawn
+    /// in the marker's colour.
     pub marker_text: String,
+    /// The rest of the first line, after the marker: how the link is
+    /// reached, or how long it has been silent.
+    pub header: String,
+    /// During an outage, one row per means of recovery, each with its own
+    /// state and clock.
+    pub attempts: Vec<Row>,
     /// What was typed while the link was down, and what can be done with it.
     pub held: Vec<String>,
-    /// What the rebuild loop is doing, while it runs.
-    pub recovering: Vec<String>,
-    /// Link quality and identity, one row each.
-    pub status: Vec<String>,
-    /// The standby, when the host offered one.
-    pub standby: Vec<String>,
+    /// The rtt row's text; the sparkline fills the rest of that row.
+    pub rtt: String,
     /// Round-trip time in milliseconds, oldest first; `None` is a gap.
     pub spark: Vec<Option<u64>>,
-    /// The activity log, oldest first.
-    pub log: Vec<String>,
+    /// Link quality below the rtt row, one row each.
+    pub quality: Vec<String>,
+    /// The standby section, when the host offered one.
+    pub standby: Vec<String>,
+    /// The activity log, oldest first: a time, and what happened.
+    pub log: Vec<Row>,
     pub keys: Vec<KeyHint>,
     /// What a screen below [`MIN_BOX`] shows on its one line, longest
     /// first: the first that fits the width is used, and the last is cut
@@ -101,18 +141,40 @@ pub struct PopupView {
 
 /// Lay the popup out for this screen, as cells ready to composite.
 ///
-/// `min(cols - 4, 72)` by `min(rows - 2, 24)`, centred. Top to bottom: the
-/// marker, the held section, the recovering section, the status block, the
-/// standby block, the sparkline, then the log filling whatever is left with
-/// the newest entry at the bottom. The key bar always has the last row inside
-/// the border, because it is how the popup is left.
+/// `min(cols - 4, 72)` wide and as tall as what it says, up to
+/// `min(rows - 2, 24)`; centred either way. Top to bottom: the header
+/// (marker and what follows it), the attempts block, the held section, the
+/// rtt row with its sparkline, the quality rows, then the `standby` and
+/// `recent` sections, each under a rule drawn into the border, and a plain
+/// rule above the key bar. The key bar always has the last row inside the
+/// border, because it is how the popup is left.
+///
+/// A short screen gives way in this order of priority: header, held
+/// section (the question the user has to answer), attempts, rtt, quality,
+/// the plain rule, the standby section, the log. While there is held text
+/// the header keeps to one row, cut rather than wrapped, so it cannot take
+/// a row the held text needs. A section's rule is drawn only with at least
+/// one row of the section under it. The log takes the rows left, its newest
+/// entry last and its oldest giving way.
 pub fn layout_popup(v: &PopupView, size: TermSize) -> Overlay {
     if size.cols < MIN_BOX.cols || size.rows < MIN_BOX.rows {
         return single_line(v, size);
     }
     // At least 16x4 here, so the inner area below is at least 12x2.
     let cols = (size.cols - 4).min(MAX_BOX.cols);
-    let rows = (size.rows - 2).min(MAX_BOX.rows);
+    let cap = (size.rows - 2).min(MAX_BOX.rows);
+    // Laid out once at the tallest the screen allows to learn how many rows
+    // the content takes, then again at that height: a box that fits its
+    // content lays it out exactly as the tall one did.
+    let (_, used) = draw(v, cols, cap);
+    let rows = used.saturating_add(2).clamp(4, cap);
+    let (buf, _) = draw(v, cols, rows);
+    overlay_from_buffer(&buf, (size.rows - rows) / 2, (size.cols - cols) / 2)
+}
+
+/// The box drawn `cols` by `rows`, and how many rows inside its border the
+/// content needs: everything drawn, the plain rule and the key bar.
+fn draw(v: &PopupView, cols: u16, rows: u16) -> (Buffer, u16) {
     let area = Rect::new(0, 0, cols, rows);
     let mut buf = Buffer::empty(area);
 
@@ -135,20 +197,86 @@ pub fn layout_popup(v: &PopupView, size: TermSize) -> Overlay {
         height: inner.height - 1,
         ..inner
     };
-    let marker = [Line::from(Span::styled(
+    body = if v.held.is_empty() {
+        place(&[header_line(v)], body, &mut buf)
+    } else {
+        place_one(header_line(v), body, &mut buf)
+    };
+
+    // The held section is placed below the attempts but sized before them,
+    // so on a short screen it is the attempts that give way.
+    let held = plain(&v.held);
+    let held_rows = wrapped_row_count(&held, body.width, body.height);
+    let above_held = Rect {
+        height: body.height - held_rows,
+        ..body
+    };
+    let after_attempts = place_rows(&v.attempts, ATTEMPT_GAP, above_held, &mut buf);
+    body = Rect {
+        height: body.bottom() - after_attempts.y,
+        ..after_attempts
+    };
+    body = place(&held, body, &mut buf);
+
+    body = place_rtt(&v.rtt, &v.spark, body, &mut buf);
+    body = place(&plain(&v.quality), body, &mut buf);
+
+    if body.height == 0 {
+        return (buf, inner.height);
+    }
+    rule(&mut buf, body.bottom() - 1, cols, None);
+    body.height -= 1;
+    // Where the content ends: the plain rule moves up to it in a box that
+    // is not as tall as the screen allows.
+    let mut end = body.y;
+
+    if !v.standby.is_empty() && body.height >= 2 {
+        rule(&mut buf, body.y, cols, Some(STANDBY_RULE));
+        body = place(&plain(&v.standby), below(body, 1), &mut buf);
+        end = body.y;
+    }
+    if !v.log.is_empty() && body.height >= 2 {
+        rule(&mut buf, body.y, cols, Some(RECENT_RULE));
+        let log = below(body, 1);
+        end = log.y + place_log(&v.log, log, &mut buf);
+    }
+
+    // The content, the plain rule, the key bar.
+    (buf, end - inner.y + 2)
+}
+
+/// `line` on the top row of `area`, cut at its width; return the part of
+/// `area` left below it.
+fn place_one(line: Line<'static>, area: Rect, buf: &mut Buffer) -> Rect {
+    if area.height == 0 {
+        return area;
+    }
+    Paragraph::new(line).render(Rect { height: 1, ..area }, buf);
+    below(area, 1)
+}
+
+/// `area` without its top `n` rows.
+fn below(area: Rect, n: u16) -> Rect {
+    let n = n.min(area.height);
+    Rect {
+        y: area.y + n,
+        height: area.height - n,
+        ..area
+    }
+}
+
+fn header_line(v: &PopupView) -> Line<'static> {
+    let mut spans = vec![Span::styled(
         v.marker_text.clone(),
         Style::default()
             .fg(v.marker.color())
             .add_modifier(Modifier::BOLD),
-    ))];
-    body = place(&marker, body, &mut buf);
-    for section in [&v.held, &v.recovering, &v.status, &v.standby] {
-        body = place(&plain(section), body, &mut buf);
+    )];
+    if !v.header.is_empty() {
+        spans.push(Span::raw(HEADER_GAP));
+        spans.push(Span::raw(v.header.clone()));
     }
-    body = place_spark(&v.spark, body, &mut buf);
-    place_log(&v.log, body, &mut buf);
-
-    overlay_from_buffer(&buf, (size.rows - rows) / 2, (size.cols - cols) / 2)
+    Line::from(spans)
 }
 
 fn plain(lines: &[String]) -> Vec<Line<'static>> {
@@ -171,79 +299,171 @@ fn place(lines: &[Line<'static>], area: Rect, buf: &mut Buffer) -> Rect {
             },
             buf,
         );
-    Rect {
-        y: area.y + used,
-        height: area.height - used,
-        ..area
+    below(area, used)
+}
+
+/// A horizontal rule across the whole box at `y`, joined into both sides of
+/// the border, with `title` drawn into it the way the top border carries
+/// the popup's.
+fn rule(buf: &mut Buffer, y: u16, cols: u16, title: Option<&str>) {
+    let last = cols - 1;
+    buf[(0, y)].set_symbol("\u{251c}");
+    for x in 1..last {
+        buf[(x, y)].set_symbol("\u{2500}");
+    }
+    buf[(last, y)].set_symbol("\u{2524}");
+    if let Some(t) = title {
+        buf.set_stringn(
+            1,
+            y,
+            format!(" {t} "),
+            usize::from(cols.saturating_sub(2)),
+            Style::default(),
+        );
     }
 }
 
-/// One row: a label, then one cell per sample, the newest at the right.
-fn place_spark(spark: &[Option<u64>], area: Rect, buf: &mut Buffer) -> Rect {
-    let label = SPARK_LABEL.len() as u16;
-    if area.height == 0 || area.width <= label || spark.iter().all(Option::is_none) {
-        return area;
+/// The column a block of rows' texts start in: the widest label, then `gap`.
+/// Zero when that leaves the text too little room to be worth a column, so
+/// a narrow box runs label and text together instead.
+fn text_column(rows: &[Row], gap: u16, width: u16) -> u16 {
+    let widest = rows
+        .iter()
+        .map(|r| Line::from(r.label.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let col = u16::try_from(widest)
+        .unwrap_or(u16::MAX)
+        .saturating_add(gap);
+    if col.saturating_add(8) > width {
+        0
+    } else {
+        col
     }
-    Paragraph::new(SPARK_LABEL).render(
-        Rect {
-            width: label,
-            height: 1,
-            ..area
-        },
-        buf,
+}
+
+/// How many rows `row` takes at `col` in `width`, capped at `height`.
+fn row_height(row: &Row, col: u16, width: u16, height: u16) -> u16 {
+    if col == 0 {
+        return wrapped_row_count(&[run_together(row)], width, height).max(1);
+    }
+    wrapped_row_count(&[Line::from(row.text.clone())], width - col, height).max(1)
+}
+
+/// `row` as one line, for a box with no room for a label column: the label,
+/// a space, the text -- or the text alone when there is no label.
+fn run_together(row: &Row) -> Line<'static> {
+    if row.label.is_empty() {
+        Line::from(row.text.clone())
+    } else {
+        Line::from(format!("{} {}", row.label, row.text))
+    }
+}
+
+/// Draw `row` at the top of `area`, `height` rows of it.
+fn draw_row(row: &Row, col: u16, area: Rect, height: u16, buf: &mut Buffer) {
+    if col == 0 {
+        Paragraph::new(run_together(row))
+            .wrap(Wrap { trim: false })
+            .render(Rect { height, ..area }, buf);
+        return;
+    }
+    buf.set_stringn(
+        area.x,
+        area.y,
+        &row.label,
+        usize::from(col),
+        Style::default(),
     );
-    let width = (area.width - label) as usize;
-    let shown = &spark[spark.len().saturating_sub(width)..];
-    let max = shown.iter().flatten().copied().max().unwrap_or(1).max(1);
-    Sparkline::default()
-        .data(shown.to_vec())
-        .max(max)
-        .absent_value_symbol(" ")
+    Paragraph::new(Line::from(row.text.clone()))
+        .wrap(Wrap { trim: false })
         .render(
             Rect {
-                x: area.x + label,
-                width: area.width - label,
-                height: 1,
+                x: area.x + col,
+                width: area.width - col,
+                height,
                 ..area
             },
             buf,
         );
-    Rect {
-        y: area.y + 1,
-        height: area.height - 1,
-        ..area
-    }
 }
 
-/// The log fills `area` from the bottom up, newest last; entries that do not
-/// fit give way oldest first. A long entry wraps and takes the rows it needs.
-fn place_log(log: &[String], area: Rect, buf: &mut Buffer) {
-    if area.height == 0 {
-        return;
+/// Rows at the top of `area`, each text hanging under itself; what does not
+/// fit is cut from the bottom. Returns the part of `area` left below.
+fn place_rows(rows: &[Row], gap: u16, mut area: Rect, buf: &mut Buffer) -> Rect {
+    let col = text_column(rows, gap, area.width);
+    for row in rows {
+        if area.height == 0 {
+            break;
+        }
+        let h = row_height(row, col, area.width, area.height);
+        draw_row(row, col, area, h, buf);
+        area = below(area, h);
     }
-    let mut kept: Vec<(Line<'static>, u16)> = Vec::new();
+    area
+}
+
+/// The rtt row: its text, then one cell per sample filling the rest of the
+/// row, the newest at the right edge -- with fewer samples than cells, the
+/// empty cells are on the left. Returns the part of `area` left below.
+fn place_rtt(text: &str, spark: &[Option<u64>], area: Rect, buf: &mut Buffer) -> Rect {
+    let samples = spark.iter().any(Option::is_some);
+    if area.height == 0 || (text.is_empty() && !samples) {
+        return area;
+    }
+    let row = Rect { height: 1, ..area };
+    Paragraph::new(text.to_string()).render(row, buf);
+    let used = u16::try_from(Line::from(text).width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(SPARK_GAP);
+    if samples && used < area.width {
+        let width = area.width - used;
+        let shown = &spark[spark.len().saturating_sub(usize::from(width))..];
+        let max = shown.iter().flatten().copied().max().unwrap_or(1).max(1);
+        // ratatui draws its data from the left; padded in front, the newest
+        // sample lands in the last cell.
+        let mut data = vec![None; usize::from(width) - shown.len()];
+        data.extend_from_slice(shown);
+        Sparkline::default()
+            .data(data)
+            .max(max)
+            .absent_value_symbol(" ")
+            .render(
+                Rect {
+                    x: area.x + used,
+                    width,
+                    ..row
+                },
+                buf,
+            );
+    }
+    below(area, 1)
+}
+
+/// The log fills `area` from the top, newest last; entries that do not fit
+/// give way oldest first. A long entry wraps under its own text and takes
+/// the rows it needs. Returns how many rows it took.
+fn place_log(log: &[Row], area: Rect, buf: &mut Buffer) -> u16 {
+    if area.height == 0 {
+        return 0;
+    }
+    let col = text_column(log, LOG_GAP, area.width);
+    let mut kept: Vec<(&Row, u16)> = Vec::new();
     let mut used = 0u16;
     for entry in log.iter().rev() {
-        let line = Line::from(entry.clone());
-        let rows = wrapped_row_count(std::slice::from_ref(&line), area.width, area.height).max(1);
+        let rows = row_height(entry, col, area.width, area.height);
         if used + rows > area.height {
             break;
         }
         used += rows;
-        kept.push((line, rows));
+        kept.push((entry, rows));
     }
-    let mut y = area.bottom() - used;
-    for (line, rows) in kept.into_iter().rev() {
-        Paragraph::new(line).wrap(Wrap { trim: false }).render(
-            Rect {
-                y,
-                height: rows,
-                ..area
-            },
-            buf,
-        );
-        y += rows;
+    let mut at = area;
+    for (entry, rows) in kept.into_iter().rev() {
+        draw_row(entry, col, at, rows, buf);
+        at = below(at, rows);
     }
+    used
 }
 
 fn key_line(keys: &[KeyHint]) -> Line<'static> {
@@ -385,18 +605,22 @@ mod tests {
 
     fn view() -> PopupView {
         PopupView {
-            title: "oxutrm \u{b7} bastion".to_string(),
+            title: "oxutrm \u{b7} bastion \u{b7} f00dcafe".to_string(),
             marker: Marker::Silent,
             marker_text: "\u{25cf} SILENT".to_string(),
-            held: vec![],
-            recovering: vec![],
-            status: vec![
-                "silent for 6s".to_string(),
-                "rtt \u{2014} \u{b7} min 30 / avg 35 / max 52 ms".to_string(),
+            header: "silent 6 s".to_string(),
+            attempts: vec![
+                Row::new("standby probe", "probing\u{2026}"),
+                Row::new("ssh rebuild", "in 14 s"),
             ],
-            standby: vec!["standby: searching\u{2026}".to_string()],
+            held: vec![],
+            rtt: "rtt   \u{2014}  (30\u{2013}52)".to_string(),
             spark: vec![Some(30), Some(40), None, Some(52)],
-            log: (1..=30).map(|i| format!("event-{i:02}")).collect(),
+            quality: vec!["loss  0.0 %  \u{2191} 0 B/s  \u{2193} 0 B/s".to_string()],
+            standby: vec!["searching\u{2026}".to_string()],
+            log: (1..=30)
+                .map(|i| Row::new("14:13", format!("event-{i:02}")))
+                .collect(),
             keys: vec![
                 KeyHint {
                     key: "q".to_string(),
@@ -438,12 +662,64 @@ mod tests {
             .unwrap_or_else(|| panic!("no {ch:?} on row {r}: {:?}", row(o, r)))
     }
 
+    /// The first row containing `what`.
+    fn find(o: &Overlay, what: &str) -> Option<u16> {
+        (0..o.rows).find(|&r| row(o, r).contains(what))
+    }
+
+    /// A rule: joined into both sides of the border, `─` in between, and
+    /// `title` drawn into it when there is one.
+    fn is_rule(line: &str, title: Option<&str>) -> bool {
+        let chars: Vec<char> = line.chars().collect();
+        let (Some(&first), Some(&last)) = (chars.first(), chars.last()) else {
+            return false;
+        };
+        if first != '\u{251c}' || last != '\u{2524}' {
+            return false;
+        }
+        let middle: String = chars[1..chars.len() - 1].iter().collect();
+        match title {
+            Some(t) => {
+                let head = format!(" {t} ");
+                middle.starts_with(&head) && middle[head.len()..].chars().all(|c| c == '\u{2500}')
+            }
+            None => middle.chars().all(|c| c == '\u{2500}'),
+        }
+    }
+
+    fn rule_row(o: &Overlay, title: Option<&str>) -> Option<u16> {
+        (0..o.rows).find(|&r| is_rule(&row(o, r), title))
+    }
+
+    /// The bars right after the rtt text and its gap, `n` of them.
+    fn bars(o: &Overlay, v: &PopupView, n: usize) -> Vec<char> {
+        let r = find(o, &v.rtt).unwrap_or_else(|| panic!("no rtt row: {}", text_of(o)));
+        let line = row(o, r);
+        let at = line.find(&v.rtt).unwrap() + v.rtt.len();
+        line[at..]
+            .chars()
+            .skip(SPARK_GAP as usize)
+            .take(n)
+            .collect()
+    }
+
+    /// The last `n` bars of the rtt row, the newest last: the sparkline
+    /// ends at the right edge, two cells in from the end (padding, border).
+    fn last_bars(o: &Overlay, v: &PopupView, n: usize) -> Vec<char> {
+        let r = find(o, &v.rtt).unwrap_or_else(|| panic!("no rtt row: {}", text_of(o)));
+        let line: Vec<char> = row(o, r).chars().collect();
+        let end = line.len() - 2;
+        line[end - n..end].to_vec()
+    }
+
     #[test]
     fn a_popup_is_centred_and_capped() {
         for (cols, rows, want) in [
             (80u16, 24u16, (72u16, 22u16, 1u16, 4u16)),
             (200, 60, (72, 24, 18, 64)),
-            (40, 12, (36, 10, 1, 2)),
+            // The fixture says less than a 36x10 box holds: the box is as
+            // tall as its content, and still centred.
+            (40, 12, (36, 9, 1, 2)),
         ] {
             let o = layout_popup(&view(), TermSize { cols, rows });
             assert_eq!((o.cols, o.rows, o.row, o.col), want, "on {cols}x{rows}");
@@ -463,32 +739,128 @@ mod tests {
         }
     }
 
-    /// The marker is the first row inside the border, the key bar the last:
-    /// asserted together, so a layout that put everything on one row could
-    /// not pass either.
+    /// The marker and the rest of the header share the first row inside the
+    /// border, the key bar has the last: asserted together, so a layout
+    /// that put everything on one row could not pass either.
     #[test]
-    fn the_marker_leads_and_the_key_bar_closes_the_box() {
+    fn the_header_leads_and_the_key_bar_closes_the_box() {
         let o = layout_popup(&view(), TermSize { cols: 80, rows: 24 });
-        assert!(row(&o, 1).contains("\u{25cf} SILENT"), "{}", text_of(&o));
+        assert!(
+            row(&o, 1).contains("\u{25cf} SILENT   silent 6 s"),
+            "{}",
+            text_of(&o)
+        );
         assert!(!row(&o, 1).contains("quit"), "{}", text_of(&o));
         assert!(row(&o, o.rows - 2).contains("q quit"), "{}", text_of(&o));
         assert!(row(&o, o.rows - 2).contains("c config"), "{}", text_of(&o));
+    }
+
+    /// The sections are told apart by rules drawn into the border: one
+    /// titled for each section, and a plain one right above the key bar.
+    #[test]
+    fn the_sections_are_separated_by_rules_in_the_border() {
+        let o = layout_popup(&view(), TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        let standby = rule_row(&o, Some("standby")).unwrap_or_else(|| panic!("{text}"));
+        let recent = rule_row(&o, Some("recent")).unwrap_or_else(|| panic!("{text}"));
+        let plain = rule_row(&o, None).unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(
+            plain,
+            o.rows - 3,
+            "the plain rule is not above the keys: {text}"
+        );
+        assert_eq!(
+            find(&o, "searching"),
+            Some(standby + 1),
+            "the standby section is not under its rule: {text}"
+        );
+        assert!(standby < recent && recent < plain, "{text}");
     }
 
     #[test]
     fn the_newest_log_entry_is_at_the_bottom_and_the_oldest_give_way() {
         let o = layout_popup(&view(), TermSize { cols: 80, rows: 24 });
         let text = text_of(&o);
-        assert!(row(&o, o.rows - 3).contains("event-30"), "{text}");
-        assert!(row(&o, o.rows - 4).contains("event-29"), "{text}");
+        assert!(row(&o, o.rows - 4).contains("event-30"), "{text}");
+        assert!(row(&o, o.rows - 5).contains("event-29"), "{text}");
         assert!(
             !text.contains("event-01"),
             "thirty entries fitted into a box with fewer rows than that: {text}"
         );
     }
 
+    /// A few entries sit right under their rule, not at the far end of an
+    /// empty section.
+    #[test]
+    fn a_short_log_starts_right_under_its_rule() {
+        let v = PopupView {
+            log: vec![Row::new("14:13", "only-one")],
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let recent = rule_row(&o, Some("recent")).unwrap();
+        assert_eq!(find(&o, "only-one"), Some(recent + 1), "{}", text_of(&o));
+    }
+
+    /// The time column stays clear: a wrapped entry's continuation starts
+    /// under its own text, so it visibly belongs to it.
+    #[test]
+    fn a_wrapped_log_entry_hangs_under_its_text() {
+        let long = format!("FIRST {} LAST", "word ".repeat(20));
+        let v = PopupView {
+            log: vec![Row::new("14:13", long)],
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let r = find(&o, "FIRST").unwrap_or_else(|| panic!("{}", text_of(&o)));
+        let first = row(&o, r);
+        let next = row(&o, r + 1);
+        let time_at = first
+            .find("14:13")
+            .expect("no time on the entry's first row");
+        let text_at = first.find("FIRST").unwrap();
+        assert_eq!(
+            text_at - time_at,
+            "14:13".len() + LOG_GAP as usize,
+            "{first:?}"
+        );
+        assert!(
+            next[time_at..text_at].chars().all(|c| c == ' '),
+            "the continuation runs into the time column: {next:?}"
+        );
+        assert_ne!(
+            next[text_at..].chars().next(),
+            Some(' '),
+            "the continuation does not start under the text: {next:?}"
+        );
+        assert!(next.contains("word") || next.contains("LAST"), "{next:?}");
+    }
+
+    /// The attempts block lines its states up in one column, and a reason
+    /// row with no label hangs in that same column.
+    #[test]
+    fn the_attempts_line_their_states_up() {
+        let v = PopupView {
+            attempts: vec![
+                Row::new("standby probe", "no answer"),
+                Row::new("ssh rebuild", "attempt 1 failed"),
+                Row::new("", "REASON"),
+            ],
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let col = |what: &str| {
+            let r = find(&o, what).unwrap_or_else(|| panic!("no {what:?}: {}", text_of(&o)));
+            row(&o, r).find(what).unwrap()
+        };
+        let want = col("standby probe") + "standby probe".len() + ATTEMPT_GAP as usize;
+        assert_eq!(col("no answer"), want, "{}", text_of(&o));
+        assert_eq!(col("attempt 1 failed"), want, "{}", text_of(&o));
+        assert_eq!(col("REASON"), want, "{}", text_of(&o));
+    }
+
     /// On a short screen the held section -- the question the user has to
-    /// answer -- survives, and the status block is what gives way.
+    /// answer -- survives, and the attempts and everything below give way.
     #[test]
     fn the_held_section_survives_a_short_screen() {
         let mut v = view();
@@ -498,8 +870,8 @@ mod tests {
         ];
         let tall = text_of(&layout_popup(&v, TermSize { cols: 80, rows: 24 }));
         assert!(
-            tall.contains("silent for 6s"),
-            "the fixture shows no status: {tall}"
+            tall.contains("ssh rebuild") && tall.contains("rtt"),
+            "the fixture shows no attempts: {tall}"
         );
 
         // 41 columns: the 33-character held line fits the 33-column interior
@@ -507,49 +879,71 @@ mod tests {
         let short = text_of(&layout_popup(&v, TermSize { cols: 41, rows: 8 }));
         assert!(short.contains("make test"), "{short}");
         assert!(short.contains("q quit"), "the key bar was clipped: {short}");
+        assert!(!short.contains("ssh rebuild"), "nothing gave way: {short}");
         assert!(
-            !short.contains("event-"),
-            "the body was not exhausted, a log entry is shown: {short}"
-        );
-        assert!(
-            !short.contains("silent for 6s"),
-            "nothing gave way: {short}"
+            !short.contains("event-") && !short.contains("\u{251c}"),
+            "the body was not exhausted, a log entry or rule is shown: {short}"
         );
     }
 
-    /// The sections run marker, held, recovering, status, standby, sparkline,
-    /// log, top to bottom. Wide log entries mean a log drawn first would show
-    /// past the shorter section rows, so drawing order is guarded too.
+    /// A rule costs a row, and one with nothing under it says nothing: it
+    /// goes with its section. One row short of the standby section's two,
+    /// neither shows; given the row, the section does, and the log does not.
+    #[test]
+    fn a_rule_goes_with_its_section_when_no_row_is_left_under_it() {
+        let v = PopupView {
+            attempts: vec![],
+            ..view()
+        };
+        // Header, rtt, loss, one free row, the plain rule, the key bar: six
+        // inside the border, so eight for the box and ten for the screen.
+        // The free row is not drawn: the box shrinks to what it shows.
+        let short = layout_popup(&v, TermSize { cols: 80, rows: 10 });
+        let text = text_of(&short);
+        assert_eq!(short.rows, 7, "{text}");
+        assert!(rule_row(&short, None).is_some(), "{text}");
+        assert!(rule_row(&short, Some("standby")).is_none(), "{text}");
+        assert!(!text.contains("searching"), "{text}");
+
+        let more = layout_popup(&v, TermSize { cols: 80, rows: 11 });
+        let text = text_of(&more);
+        assert!(rule_row(&more, Some("standby")).is_some(), "{text}");
+        assert!(text.contains("searching"), "{text}");
+        assert!(rule_row(&more, Some("recent")).is_none(), "{text}");
+        assert!(!text.contains("event-"), "{text}");
+    }
+
+    /// The order of the body, top to bottom. Wide log entries mean a log
+    /// drawn first would show past the shorter rows, so drawing order is
+    /// guarded too.
     #[test]
     fn the_sections_run_in_the_documented_order() {
         let v = PopupView {
+            attempts: vec![Row::new("ATTEMPT-LABEL", "x")],
             held: vec!["HELD-LINE".to_string()],
-            recovering: vec!["RECOVERING-LINE".to_string()],
-            status: vec!["STATUS-LINE".to_string()],
+            rtt: "RTT-LINE".to_string(),
+            quality: vec!["QUALITY-LINE".to_string()],
             standby: vec!["STANDBY-LINE".to_string()],
             log: (1..=30)
-                .map(|i| format!("{:.<40} LOG-ENTRY-{i:02}", ""))
+                .map(|i| Row::new("14:13", format!("{:.<40} LOG-ENTRY-{i:02}", "")))
                 .collect(),
             ..view()
         };
         let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
         let text = text_of(&o);
-        let find = |what: &str| {
-            (0..o.rows)
-                .find(|&r| row(&o, r).contains(what))
-                .unwrap_or_else(|| panic!("no {what:?} in: {text}"))
-        };
-        let spark = (0..o.rows)
-            .find(|&r| row(&o, r).contains(SPARK_LABEL))
-            .unwrap_or_else(|| panic!("no sparkline row in: {text}"));
+        let at = |what: &str| find(&o, what).unwrap_or_else(|| panic!("no {what:?} in: {text}"));
         let order = [
-            find("SILENT"),
-            find("HELD-LINE"),
-            find("RECOVERING-LINE"),
-            find("STATUS-LINE"),
-            find("STANDBY-LINE"),
-            spark,
-            find("LOG-ENTRY"),
+            at("SILENT"),
+            at("ATTEMPT-LABEL"),
+            at("HELD-LINE"),
+            at("RTT-LINE"),
+            at("QUALITY-LINE"),
+            rule_row(&o, Some("standby")).unwrap(),
+            at("STANDBY-LINE"),
+            rule_row(&o, Some("recent")).unwrap(),
+            at("LOG-ENTRY"),
+            rule_row(&o, None).unwrap(),
+            at("q quit"),
         ];
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
@@ -568,6 +962,8 @@ mod tests {
             let v = PopupView { marker, ..view() };
             let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
             assert_eq!(cell_of(&o, 1, "\u{25cf}").fg, want, "for {marker:?}");
+            // The marker's colour stops at the marker.
+            assert_ne!(cell_of(&o, 1, "6").fg, want, "for {marker:?}");
         }
     }
 
@@ -590,16 +986,10 @@ mod tests {
             ..view()
         };
         let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
-        // The status row starts with "rtt " too; it is the one with "ms".
-        let line = (0..o.rows)
-            .map(|r| row(&o, r))
-            .find(|l| l.contains(SPARK_LABEL) && !l.contains("ms"))
-            .expect("no sparkline row");
-        let at = line.find(SPARK_LABEL).unwrap() + SPARK_LABEL.len();
-        let bars: Vec<char> = line[at..].chars().take(3).collect();
-        assert_ne!(bars[0], ' ', "{line:?}");
-        assert_eq!(bars[1], ' ', "the outage second was drawn: {line:?}");
-        assert_ne!(bars[2], ' ', "{line:?}");
+        let b = last_bars(&o, &v, 3);
+        assert_ne!(b[0], ' ', "{b:?}");
+        assert_eq!(b[1], ' ', "the outage second was drawn: {b:?}");
+        assert_ne!(b[2], ' ', "{b:?}");
     }
 
     /// The bars are scaled to the largest sample shown, so the biggest one is
@@ -611,19 +1001,46 @@ mod tests {
             ..view()
         };
         let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
-        let line = (0..o.rows)
-            .map(|r| row(&o, r))
-            .find(|l| l.contains(SPARK_LABEL) && !l.contains("ms"))
-            .expect("no sparkline row");
-        let at = line.find(SPARK_LABEL).unwrap() + SPARK_LABEL.len();
-        let bars: Vec<char> = line[at..].chars().take(2).collect();
+        let b = last_bars(&o, &v, 2);
         assert_eq!(
-            bars[1], '\u{2588}',
-            "the largest sample is not a full bar: {line:?}"
+            b[1], '\u{2588}',
+            "the largest sample is not a full bar: {b:?}"
         );
         assert!(
-            bars[0] != ' ' && bars[0] < bars[1],
-            "the smaller sample is not a lower bar: {line:?}"
+            b[0] != ' ' && b[0] < b[1],
+            "the smaller sample is not a lower bar: {b:?}"
+        );
+    }
+
+    /// More samples than room: the sparkline fills the rtt row to its end,
+    /// the newest sample at the right, and the oldest give way.
+    #[test]
+    fn the_sparkline_fills_the_rest_of_the_rtt_row() {
+        // Rising, so the newest is the largest and the only full bar.
+        let v = PopupView {
+            spark: (1..=200).map(Some).collect(),
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let r = find(&o, &v.rtt).unwrap();
+        let line: Vec<char> = row(&o, r).chars().collect();
+        // Border, padding: the last bar is two cells in from the end.
+        let last = line[line.len() - 3];
+        assert_eq!(
+            last, '\u{2588}',
+            "the newest sample is not at the right: {line:?}"
+        );
+        assert_eq!(line[line.len() - 2], ' ', "{line:?}");
+        let b = bars(&o, &v, 1);
+        assert_ne!(
+            b[0], ' ',
+            "the sparkline does not start after the text: {line:?}"
+        );
+        assert_eq!(
+            find(&o, "\u{2588}"),
+            Some(r),
+            "the sparkline has a row of its own: {}",
+            text_of(&o)
         );
     }
 
@@ -669,6 +1086,131 @@ mod tests {
     fn a_one_by_one_screen_does_not_panic() {
         let o = layout_popup(&view(), TermSize { cols: 1, rows: 1 });
         assert_eq!(o.cells.len(), o.rows as usize * o.cols as usize);
+    }
+
+    /// Every size from the minimum box up lays out without a panic: the
+    /// rules, the hanging rows and the reservation arithmetic all subtract.
+    #[test]
+    fn every_small_box_lays_out() {
+        let mut v = view();
+        v.held = vec!["You typed 10 bytes while offline:".to_string()];
+        v.attempts.push(Row::new(
+            "",
+            "a reason long enough to wrap twice in a narrow box",
+        ));
+        for cols in MIN_BOX.cols..40 {
+            for rows in MIN_BOX.rows..16 {
+                let o = layout_popup(&v, TermSize { cols, rows });
+                assert!(
+                    row(&o, o.rows - 2).contains("q quit"),
+                    "{cols}x{rows}: {}",
+                    text_of(&o)
+                );
+            }
+        }
+    }
+
+    /// Review I1. Under `Confirming` the header is the long live one, and
+    /// on a mid-width screen it would wrap and take the row the typed bytes
+    /// need: the question would be asked without showing what it sends. With
+    /// held text present the header keeps to one row.
+    #[test]
+    fn a_long_header_does_not_push_the_held_text_out() {
+        let v = PopupView {
+            marker: Marker::Live,
+            marker_text: "\u{25cf} LIVE".to_string(),
+            header: "IPv4 punched \u{b7} up 1m \u{b7} link 2".to_string(),
+            attempts: vec![],
+            held: vec![
+                "the host is answering again - deliver what you typed?".to_string(),
+                "You typed 10 bytes while offline:".to_string(),
+                "make test\u{21b5}".to_string(),
+            ],
+            ..view()
+        };
+        // 44 columns: a 36-column interior, which the 41-cell header does
+        // not fit on one row.
+        let o = layout_popup(&v, TermSize { cols: 44, rows: 10 });
+        let text = text_of(&o);
+        assert!(text.contains("make test"), "{text}");
+        assert!(text.contains("You typed 10 bytes"), "{text}");
+        assert!(text.contains("\u{25cf} LIVE"), "{text}");
+        assert!(row(&o, o.rows - 2).contains("q quit"), "{text}");
+    }
+
+    /// Review M3. Fewer samples than cells: the newest still sits at the
+    /// right edge, and the empty cells are on the left.
+    #[test]
+    fn a_short_sparkline_ends_at_the_right_edge() {
+        let v = PopupView {
+            spark: vec![Some(10), Some(20), Some(40)],
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let r = find(&o, &v.rtt).unwrap();
+        let line: Vec<char> = row(&o, r).chars().collect();
+        // Border, padding: the last bar is two cells in from the end.
+        assert_eq!(line[line.len() - 3], '\u{2588}', "{line:?}");
+        assert!(
+            line[line.len() - 5] != ' ' && line[line.len() - 5] < line[line.len() - 4],
+            "the older samples are not just left of the newest: {line:?}"
+        );
+        assert_eq!(
+            bars(&o, &v, 1),
+            [' '],
+            "the samples start at the left: {line:?}"
+        );
+    }
+
+    /// Review M7. Too narrow for a label column, a row with no label starts
+    /// at the left of the box, not one space in.
+    #[test]
+    fn a_narrow_unlabelled_row_has_no_leading_space() {
+        let v = PopupView {
+            attempts: vec![
+                Row::new("standby probe", "no answer"),
+                Row::new("", "REASON"),
+            ],
+            ..view()
+        };
+        // An 18-column interior: too narrow for the 16-column label column
+        // and eight cells of text.
+        let o = layout_popup(&v, TermSize { cols: 26, rows: 24 });
+        let r = find(&o, "REASON").unwrap_or_else(|| panic!("{}", text_of(&o)));
+        let line: String = row(&o, r).chars().skip(2).collect();
+        assert!(line.starts_with("REASON"), "{line:?}");
+        let labelled = find(&o, "standby probe").unwrap();
+        assert!(
+            row(&o, labelled)
+                .chars()
+                .skip(2)
+                .collect::<String>()
+                .starts_with("standby probe no"),
+            "{}",
+            text_of(&o)
+        );
+    }
+
+    /// The box is as tall as what it says: a short log leaves no empty rows,
+    /// and the shorter box is still centred.
+    #[test]
+    fn a_popup_with_little_to_say_shrinks_to_it() {
+        let v = PopupView {
+            log: vec![Row::new("14:13", "only-one")],
+            ..view()
+        };
+        let o = layout_popup(&v, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        // Header, two attempts, rtt, loss, standby rule and row, recent rule
+        // and entry, plain rule, keys: eleven inside the border.
+        assert_eq!(o.rows, 13, "{text}");
+        assert_eq!((o.row, o.col), ((24 - 13) / 2, 4), "{text}");
+        for r in 1..o.rows - 1 {
+            let inside: String = row(&o, r).chars().skip(1).take(70).collect();
+            assert!(!inside.trim().is_empty(), "row {r} is empty: {text}");
+        }
+        assert!(row(&o, o.rows - 2).contains("q quit"), "{text}");
+        assert!(is_rule(&row(&o, o.rows - 3), None), "{text}");
     }
 
     #[test]

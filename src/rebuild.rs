@@ -17,6 +17,8 @@
 // through the popup, not printed.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
+use std::time::Instant;
+
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
 use oxutrm_net::NetConfig;
 use oxutrm_proto::{Choice, Signal, TermSize};
@@ -38,9 +40,10 @@ const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 /// connection and then says nothing -- a hung registry read, a stalled NFS
 /// home directory, an ssh that connected and never ran the command. Without
 /// this the task stays alive for ever, `Rebuild::is_running` stays true, the
-/// loop starts no further attempt, and the popup sits at "next try in 0s"
-/// permanently. The feature dead-ends at the exact moment it is needed, and
-/// the link it would otherwise fall back on is by definition the dead one.
+/// loop starts no further attempt, and the popup's `ssh rebuild` row counts
+/// one attempt's running time up for ever. The feature dead-ends at the
+/// exact moment it is needed, and the link it would otherwise fall back on
+/// is by definition the dead one.
 ///
 /// **Two minutes, and it is deliberately the largest number in the picture.**
 /// Every step inside an attempt already has the right budget for itself, and
@@ -210,6 +213,8 @@ pub(crate) struct Rebuild {
     launcher: SshLauncher,
     cfg: NetConfig,
     in_flight: Option<tokio::task::JoinHandle<()>>,
+    /// When the attempt in flight began, for the popup's clock on it.
+    started: Option<Instant>,
     /// An attempt has begun and no swap has happened since, so a `TAKEN_OVER`
     /// on the link this client is holding may be our own doing.
     ///
@@ -229,6 +234,7 @@ impl Rebuild {
             launcher: SshLauncher::ssh(),
             cfg: NetConfig::default(),
             in_flight: None,
+            started: None,
             displacing: false,
         }
     }
@@ -248,6 +254,11 @@ impl Rebuild {
     /// Is an attempt running right now?
     pub(crate) fn is_running(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// When the attempt now running began; `None` while none is.
+    pub(crate) fn running_since(&self) -> Option<Instant> {
+        self.in_flight.as_ref().and(self.started)
     }
 
     /// Could a `TAKEN_OVER` on the current link be this client's own rebuild?
@@ -287,12 +298,14 @@ impl Rebuild {
         self.displacing = false;
     }
 
-    /// Start one, reporting its outcome on `outcomes`.
+    /// Start one at `now`, reporting its outcome on `outcomes`.
     pub(crate) fn begin(
         &mut self,
         size: TermSize,
         outcomes: tokio::sync::mpsc::Sender<AttemptOutcome>,
+        now: Instant,
     ) {
+        self.started = Some(now);
         let launcher = self.launcher.clone();
         let target = self.target.clone();
         let session_id = self.session_id.clone();
@@ -309,6 +322,7 @@ impl Rebuild {
     /// The attempt reported back, so there is nothing left to hold.
     pub(crate) fn finished(&mut self) {
         self.in_flight = None;
+        self.started = None;
     }
 
     /// Give up on the attempt in flight, if there is one.
@@ -320,6 +334,7 @@ impl Rebuild {
     /// `SshChannel`, and `SshChannel::open` spawns with `kill_on_drop`, so the
     /// ssh goes with it.
     pub(crate) fn cancel(&mut self) {
+        self.started = None;
         if let Some(task) = self.in_flight.take() {
             task.abort();
         }

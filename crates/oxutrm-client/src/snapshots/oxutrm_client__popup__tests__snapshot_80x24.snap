@@ -2,25 +2,25 @@
 source: crates/oxutrm-client/src/popup.rs
 expression: "text_of(&layout_popup(&view(), TermSize { cols: 80, rows: 24 }))"
 ---
-╭ oxutrm · bastion ────────────────────────────────────────────────────╮
-│ ● SILENT                                                             │
-│ silent for 6s                                                        │
-│ rtt — · min 30 / avg 35 / max 52 ms                                  │
-│ standby: searching…                                                  │
-│ rtt ▄▆ █                                                             │
-│ event-17                                                             │
-│ event-18                                                             │
-│ event-19                                                             │
-│ event-20                                                             │
-│ event-21                                                             │
-│ event-22                                                             │
-│ event-23                                                             │
-│ event-24                                                             │
-│ event-25                                                             │
-│ event-26                                                             │
-│ event-27                                                             │
-│ event-28                                                             │
-│ event-29                                                             │
-│ event-30                                                             │
+╭ oxutrm · bastion · f00dcafe ─────────────────────────────────────────╮
+│ ● SILENT   silent 6 s                                                │
+│ standby probe   probing…                                             │
+│ ssh rebuild     in 14 s                                              │
+│ rtt   —  (30–52)                                                ▄▆ █ │
+│ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s                                        │
+├ standby ─────────────────────────────────────────────────────────────┤
+│ searching…                                                           │
+├ recent ──────────────────────────────────────────────────────────────┤
+│ 14:13  event-21                                                      │
+│ 14:13  event-22                                                      │
+│ 14:13  event-23                                                      │
+│ 14:13  event-24                                                      │
+│ 14:13  event-25                                                      │
+│ 14:13  event-26                                                      │
+│ 14:13  event-27                                                      │
+│ 14:13  event-28                                                      │
+│ 14:13  event-29                                                      │
+│ 14:13  event-30                                                      │
+├──────────────────────────────────────────────────────────────────────┤
 │ q quit  c config                                                     │
 ╰──────────────────────────────────────────────────────────────────────╯

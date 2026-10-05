@@ -95,6 +95,12 @@ proptest = "1"
 # is not the crate count but that two feature flags no longer claim the client
 # uses machinery it does not.
 ratatui = { version = "0.30", default-features = false, features = ["std"] }
+# The status popup's log shows local wall-clock times. std has no time zone
+# and the root crate forbids `unsafe`, so the zone is read through jiff:
+# `tz-system` finds it (TZ, /etc/localtime), `tzdb-zoneinfo` resolves its
+# name against the system's database. client.log stays UTC and needs none of
+# this.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 insta = "1"
 
 # Not in the contract's table; required by the M4 integration plan and declared
@@ -186,6 +192,7 @@ rustix = { workspace = true, features = ["event", "pty", "time"] }
 # because it is transport POLICY for the session loops, not connectivity, and
 # because oxutrm-net has no business knowing what a Frame is.
 quinn.workspace = true
+jiff.workspace = true
 
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]`, which src/accept.rs
@@ -207,6 +214,9 @@ tempfile = "3"
 # Read back by src/listener.rs's own tests, to check what actually landed on
 # disk rather than trusting the in-memory value the call under test also has.
 serde_json.workspace = true
+# src/view.rs pins what the whole popup -- built from facts, then laid out --
+# looks like, as the client crate does for the layout alone.
+insta.workspace = true
 
 # This workspace grows large test binaries and shares a target directory with
 # other projects. Line tables are enough for a backtrace; full debug info is
