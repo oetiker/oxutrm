@@ -208,6 +208,15 @@
   this: the rebuild's ssh waited out a 75 s TCP connect timeout, and the
   standby answered a second after it gave up.
 
+- **A session no longer ends just after it was rescued.** When an ssh
+  rebuild failed at about the moment the client switched to its standby, or
+  at about the moment the old link came back by itself, its failure was still
+  acted on afterwards. A far end too old for `--connect` then ended the
+  session that had just recovered ("this session cannot be resumed"), and an
+  ordinary failure was logged after the attempt had already been logged as
+  abandoned and pushed the next retry back. The client now only listens to
+  the attempt it is still waiting for.
+
 - **A rebuild's ssh gives up on a dead route after 10 s.** ssh has no
   connect timeout of its own by default, so a rebuild whose target could not
   be reached waited for the operating system's, which is 75 s on macOS. A

@@ -60,7 +60,7 @@ use crate::activity::{Activity, Kind};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
-use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage};
+use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage, Report};
 use crate::ui::{Command, LinkChange, Mode, Ui};
 use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
 
@@ -764,8 +764,9 @@ enum Wake {
     Due,
     /// Time for the splash's next frame, or for the end of its hold.
     SplashFrame,
-    /// A rebuild attempt finished, one way or another.
-    Rebuilt(AttemptOutcome),
+    /// A rebuild attempt finished, one way or another -- or one the loop
+    /// has since given up had already finished (see `Report`).
+    Rebuilt(Report),
     /// A standby search or probe reported back.
     Standby(crate::standby::StandbyEvent),
     /// The standby's connection closed, with this reason.
@@ -1735,7 +1736,7 @@ impl ClientSession {
     /// phase out of `Recovering` by the time this runs, and the attempt in
     /// flight is then not merely redundant -- left running, it could land and
     /// swap the transport under a session that had already come back.
-    fn rebuild_step(&mut self, now: Instant, outcomes: &tokio::sync::mpsc::Sender<AttemptOutcome>) {
+    fn rebuild_step(&mut self, now: Instant, outcomes: &tokio::sync::mpsc::Sender<Report>) {
         let phase = self.link_state.phase_now();
         let size = self.size;
         let Some(rebuild) = self.rebuild.as_mut() else {
@@ -1817,6 +1818,37 @@ impl ClientSession {
         Ok(())
     }
 
+    /// A rebuild attempt reported back. True when it landed and its link is
+    /// now the session's, which the loop has to follow.
+    ///
+    /// A report from an attempt the loop has given up since -- abandoned for
+    /// the standby, or stood down when the old link came back -- changes
+    /// nothing at all (`Rebuild::accept`): not the log, not the schedule,
+    /// and above all not the session's life, which a queued `Definite` used
+    /// to end just after it had been rescued.
+    fn rebuild_reported(&mut self, report: Report, now: Instant) -> Result<bool> {
+        let Some(outcome) = self.rebuild.as_mut().and_then(|r| r.accept(report)) else {
+            return Ok(false);
+        };
+        match outcome {
+            AttemptOutcome::Landed(established) => {
+                self.rebuild_landed(*established, now)
+                    .context("swapping in the rebuilt link")?;
+                Ok(true)
+            }
+            // The network, not the far end. The loop keeps its cadence and
+            // the popup explains the last try.
+            AttemptOutcome::Retry(why) => {
+                self.rebuild_failed(why, now);
+                Ok(false)
+            }
+            // An answer, and repeating the question gets the same one.
+            // `run_connect` prints this after the raw guard is dropped and
+            // exits non-zero.
+            AttemptOutcome::Definite(why) => Err(self.rebuild_refused(&why)),
+        }
+    }
+
     /// How far the rebuild attempt in flight has got, for the standby's
     /// step (see [`RebuildStage`]).
     fn rebuild_stage(&self) -> RebuildStage {
@@ -1837,9 +1869,10 @@ impl ClientSession {
     ///
     /// The phase needs nothing more: the swap leaves it `Recovering` at
     /// attempt 0 with a full backoff ([`LinkState::rebuilt`]), the popup's
-    /// rebuild row reads the cancelled attempt as not running, and an
-    /// abandoned attempt never reports an outcome, so nothing counts it as
-    /// failed either.
+    /// rebuild row reads the cancelled attempt as not running, and nothing
+    /// counts it as failed either: an outcome it had already queued (it may
+    /// have failed before its `Attach` and not been read yet) belongs to a
+    /// generation the abandon ended, and `Rebuild::accept` drops it.
     fn fail_over<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<bool> {
         if self
             .standby
@@ -2248,7 +2281,7 @@ impl ClientSession {
         // the arm below borrows this and not `self` (C1) -- exactly as
         // `HostSession::run_with_attaches` holds its receiver, and for the
         // same reason. Depth one: only one attempt ever runs at a time.
-        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel::<AttemptOutcome>(1);
+        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel::<Report>(1);
         // A `TAKEN_OVER` close that has already been explained: our own
         // rebuild reaching the host. The ARM is disabled rather than the wake
         // being ignored, because a closed connection is permanently ready, so
@@ -2330,7 +2363,7 @@ impl ClientSession {
                 Some(()) = winch.recv() => Wake::Winch,
                 () = tokio::time::sleep_until(deadline) => Wake::Due,
                 () = splash_due(splash_at) => Wake::SplashFrame,
-                Some(outcome) = outcomes.recv() => Wake::Rebuilt(outcome),
+                Some(report) = outcomes.recv() => Wake::Rebuilt(report),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 // Quiet until the standby goes away; a closed connection is
                 // ready for ever, which is why the handler disarms it.
@@ -2394,36 +2427,20 @@ impl ClientSession {
                 // Layer 1 below paints the frame.
                 Wake::SplashFrame => {}
                 // A rebuild attempt finished.
-                Wake::Rebuilt(outcome) => {
-                    if let Some(rebuild) = self.rebuild.as_mut() {
-                        rebuild.finished();
-                    }
-                    match outcome {
-                        AttemptOutcome::Landed(established) => {
-                            self.rebuild_landed(*established, Instant::now())
-                                .context("swapping in the rebuilt link")?;
-                            // Both of these belong to the link that has just
-                            // been replaced: the arm has to watch the new
-                            // connection, and a takeover on the old one can no
-                            // longer arrive because nothing is watching it.
-                            conn = self.link.sink.connection().clone();
-                            takeover_expected = false;
-                            // `swap_in` has forgotten (and closed) the
-                            // standby, which the host dropped as it adopted
-                            // this attach. A search still running over the
-                            // old primary is disowned with it, and stopped.
-                            standby_conn = None;
-                            _search_task = None;
-                        }
-                        // The network, not the far end. The loop keeps its
-                        // cadence and the popup explains the last try.
-                        AttemptOutcome::Retry(why) => self.rebuild_failed(why, Instant::now()),
-                        // An answer, and repeating the question gets the same
-                        // one. `run_connect` prints this after the raw guard
-                        // is dropped and exits non-zero.
-                        AttemptOutcome::Definite(why) => {
-                            return Err(self.rebuild_refused(&why));
-                        }
+                Wake::Rebuilt(report) => {
+                    if self.rebuild_reported(report, Instant::now())? {
+                        // Both of these belong to the link that has just
+                        // been replaced: the arm has to watch the new
+                        // connection, and a takeover on the old one can no
+                        // longer arrive because nothing is watching it.
+                        conn = self.link.sink.connection().clone();
+                        takeover_expected = false;
+                        // `swap_in` has forgotten (and closed) the
+                        // standby, which the host dropped as it adopted
+                        // this attach. A search still running over the
+                        // old primary is disowned with it, and stopped.
+                        standby_conn = None;
+                        _search_task = None;
                     }
                 }
                 Wake::Standby(event) => {
@@ -6368,8 +6385,10 @@ mod tests {
     /// ssh is stuck connecting (there, a 75 s TCP connect timeout to a target
     /// only reachable over the VPN that had dropped), and the standby
     /// answers. The standby is probed and switched to while the attempt
-    /// runs, and the attempt is abandoned before the switch -- its ssh
-    /// killed, and no outcome from it ever arriving to swap anything later.
+    /// runs, and the attempt is abandoned before the switch, its ssh killed.
+    /// What an abandoned attempt may still have queued is the business of
+    /// `a_queued_outcome_of_an_abandoned_attempt_changes_nothing`: this
+    /// one's ssh hangs, so it never has anything to say.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_answering_standby_abandons_a_rebuild_still_connecting() {
         let dir = tempfile::tempdir().expect("a scratch directory");
@@ -6380,7 +6399,7 @@ mod tests {
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         session.standby = Some(standby_holding(standby_client));
         let entered = drive_to_recovering(&mut session);
-        let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+        let (tx, _outcomes) = tokio::sync::mpsc::channel(1);
 
         session.rebuild_step(entered, &tx);
         let ssh = wait_for_pid(&pidfile).await;
@@ -6450,12 +6469,161 @@ mod tests {
         assert_eq!(session.outage.failed_attempts, 0);
 
         assert_gone(ssh, "the abandoned attempt's ssh").await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), outcomes.recv())
-                .await
-                .is_err(),
-            "the abandoned attempt still reported an outcome"
-        );
+    }
+
+    /// An `ssh` that fails before the far end has offered anything: `body`
+    /// is what it does instead, after answering `ssh -G` as every fake must.
+    fn ssh_failing_at_once(dir: &std::path::Path, body: &str) -> SshLauncher {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = dir.join("failing-ssh");
+        std::fs::write(&script, format!("#!/bin/sh\n{ASKED_SSH_G}{body}"))
+            .expect("writing the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the fake ssh executable");
+        SshLauncher::command(&script)
+    }
+
+    /// The two outcomes an attempt can report before it has committed, and
+    /// the fake ssh that produces each: ssh dying is a `Retry`, a far end too
+    /// old for `--connect` a `Definite`. Neither sends an `Attach`, so the
+    /// attempt is still `Connecting` -- and abandonable -- with its outcome
+    /// already queued.
+    const FAILING_BEFORE_THE_LINE: [(&str, &str); 2] = [
+        (
+            "a Retry",
+            "echo 'ssh: connect to host bastion.example.net port 22: \
+             Network is unreachable' >&2\nexit 255\n",
+        ),
+        (
+            "a Definite",
+            "echo 'oxutrm host: unknown option \"--connect\"' >&2\nexit 2\n",
+        ),
+    ];
+
+    /// The report an attempt queued, once it has. Read off the channel the
+    /// way the loop's arm reads it -- the loop just has not got to it yet.
+    async fn queued_report(outcomes: &mut tokio::sync::mpsc::Receiver<Report>) -> Report {
+        tokio::time::timeout(Duration::from_secs(10), outcomes.recv())
+            .await
+            .expect("the attempt never reported")
+            .expect("the attempt's sender went away")
+    }
+
+    /// The rebuild's entries in the activity log, in order.
+    fn rebuild_entries(session: &ClientSession) -> Vec<String> {
+        session
+            .activity
+            .entries()
+            .filter(|e| e.kind == Kind::Rebuild)
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// An attempt that failed before its `Attach`, with its outcome queued
+    /// and not yet read, is abandoned for the standby -- and the outcome then
+    /// arrives at the loop. It belongs to an attempt the loop has given up,
+    /// and changes nothing.
+    ///
+    /// The window is not narrow: the attempt failed, so its commitment never
+    /// left `Connecting` and `abandon` succeeds on a task that has already
+    /// sent. Before outcomes carried their attempt's generation, a queued
+    /// `Definite` ended a session that had just switched to its standby
+    /// ("this session cannot be resumed"), and a queued `Retry` logged
+    /// "attempt N failed" after "abandoned", counted a failure against the
+    /// outage, set the popup's last failure and pushed the schedule back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_outcome_of_an_abandoned_attempt_changes_nothing() {
+        for (what, body) in FAILING_BEFORE_THE_LINE {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+                .via(ssh_failing_at_once(dir.path(), body), stunless());
+            let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+            let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+            session.standby = Some(standby_holding(standby_client));
+            let entered = drive_to_recovering(&mut session);
+            let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+
+            session.rebuild_step(entered, &tx);
+            let report = queued_report(&mut outcomes).await;
+            assert_eq!(
+                session.rebuild_stage(),
+                RebuildStage::Connecting,
+                "{what}: the attempt is not one that can be abandoned with \
+                 its outcome queued, so this tests nothing"
+            );
+
+            let due = entered + crate::linkstate::FAILOVER_GRACE;
+            let mut out = Vec::new();
+            assert!(
+                session.fail_over(due, &mut out).expect("failing over"),
+                "{what}: the fixture did not fail over"
+            );
+            let phase = session.link_state.phase_now();
+            let log = rebuild_entries(&session);
+
+            let read = due + Duration::from_millis(5);
+            let landed = session.rebuild_reported(report, read).unwrap_or_else(|e| {
+                panic!("{what} from the abandoned attempt ended the session: {e:#}")
+            });
+
+            assert!(!landed, "{what}: nothing landed");
+            assert_eq!(
+                session.link_state.phase_now(),
+                phase,
+                "{what}: the abandoned attempt moved the schedule"
+            );
+            assert_eq!(
+                rebuild_entries(&session),
+                log,
+                "{what}: the abandoned attempt was logged as failing after it was abandoned"
+            );
+            assert_eq!(session.outage.failed_attempts, 0, "{what}");
+            assert_eq!(session.last_failure, None, "{what}");
+        }
+    }
+
+    /// The same, for an attempt that the OLD link outran: a frame brought
+    /// the session back while the attempt's failure sat queued, the step
+    /// stood the rebuild down, and then the loop read the outcome. A queued
+    /// `Definite` used to end the session that had just recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_outcome_of_a_stood_down_attempt_changes_nothing() {
+        for (what, body) in FAILING_BEFORE_THE_LINE {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+                .via(ssh_failing_at_once(dir.path(), body), stunless());
+            let (mut host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+            let entered = drive_to_recovering(&mut session);
+            let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+
+            session.rebuild_step(entered, &tx);
+            let report = queued_report(&mut outcomes).await;
+
+            let mut out = Vec::new();
+            host.turn().expect("the host takes a turn");
+            wait_for_frame(&mut session).await;
+            session.turn(&[], &mut out).expect("a pacing lap");
+            assert_eq!(
+                session.link_state.phase_now(),
+                Phase::Live,
+                "{what}: the frame did not revive the link"
+            );
+            session.rebuild_step(Instant::now(), &tx);
+            let log = rebuild_entries(&session);
+
+            let landed = session
+                .rebuild_reported(report, Instant::now())
+                .unwrap_or_else(|e| {
+                    panic!("{what} from a stood-down attempt ended a live session: {e:#}")
+                });
+
+            assert!(!landed, "{what}: nothing landed");
+            assert_eq!(session.link_state.phase_now(), Phase::Live, "{what}");
+            assert_eq!(rebuild_entries(&session), log, "{what}");
+            assert_eq!(session.outage.failed_attempts, 0, "{what}");
+            assert_eq!(session.last_failure, None, "{what}");
+        }
     }
 
     /// Ruling B1, the other side of the line: an attempt that has sent its
