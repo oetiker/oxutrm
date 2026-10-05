@@ -215,7 +215,9 @@
   session that had just recovered ("this session cannot be resumed"), and an
   ordinary failure was logged after the attempt had already been logged as
   abandoned and pushed the next retry back. The client now only listens to
-  the attempt it is still waiting for.
+  failures of the attempt it is still waiting for. A rebuild that reached the
+  host is still taken even when the old link came back first: the host has
+  already moved the session to it.
 
 - **A rebuild's ssh gives up on a dead route after 10 s.** ssh has no
   connect timeout of its own by default, so a rebuild whose target could not

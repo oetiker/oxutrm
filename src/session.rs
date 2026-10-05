@@ -1803,17 +1803,31 @@ impl ClientSession {
 
     /// A rebuild attempt landed: its link replaces the one that stopped
     /// answering, and its path is the session's from here.
+    ///
+    /// Usually inside the outage, which it then ends. It can also land after
+    /// the old link came back by itself (`Rebuild::accept`), and is taken
+    /// then too -- the host adopted it and closed the old link -- but that
+    /// outage is over, and its summary says it came back by itself, which
+    /// was true when it ended. Its notes are left alone, the landing is
+    /// logged as what it is, and `swap_in` leaves a phase that is not
+    /// `Recovering` as it is.
     fn rebuild_landed(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        // Before the swap, which changes nothing about the phase but is
+        // about to change everything else.
+        let ends_the_outage = self.link_state.phase_now().is_outage();
         self.swap_in(e.link, now)?;
-        self.activity.record_detail(
-            Kind::Rebuild,
-            &format!("landed via {}", oxutrm_client::rung_label(&e.path)),
-        );
-        self.outage.ended = Some(format!(
-            "rebuilt over ssh {}",
-            in_parens(&oxutrm_client::rung_label(&e.path))
-        ));
-        self.outage.failed_at_switch = None;
+        let label = oxutrm_client::rung_label(&e.path);
+        if ends_the_outage {
+            self.activity
+                .record_detail(Kind::Rebuild, &format!("landed via {label}"));
+            self.outage.ended = Some(format!("rebuilt over ssh {}", in_parens(&label)));
+            self.outage.failed_at_switch = None;
+        } else {
+            self.activity.record_detail(
+                Kind::Rebuild,
+                &format!("landed via {label} after the old link came back"),
+            );
+        }
         self.path = Some(e.path);
         Ok(())
     }
@@ -1821,11 +1835,13 @@ impl ClientSession {
     /// A rebuild attempt reported back. True when it landed and its link is
     /// now the session's, which the loop has to follow.
     ///
-    /// A report from an attempt the loop has given up since -- abandoned for
-    /// the standby, or stood down when the old link came back -- changes
-    /// nothing at all (`Rebuild::accept`): not the log, not the schedule,
-    /// and above all not the session's life, which a queued `Definite` used
-    /// to end just after it had been rescued.
+    /// A failure reported by an attempt the loop has given up since --
+    /// abandoned for the standby, or stood down when the old link came back
+    /// -- changes nothing at all (`Rebuild::accept`): not the log, not the
+    /// schedule, and above all not the session's life, which a queued
+    /// `Definite` used to end just after it had been rescued. A LANDING is
+    /// swapped in whichever attempt it came from: the host has already moved
+    /// to that link and closed the one this client is on.
     fn rebuild_reported(&mut self, report: Report, now: Instant) -> Result<bool> {
         let Some(outcome) = self.rebuild.as_mut().and_then(|r| r.accept(report)) else {
             return Ok(false);
@@ -6315,6 +6331,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_landed_rebuild_is_recorded_and_its_path_becomes_the_sessions() {
         let (_host, mut client) = pair("").await;
+        drive_to_recovering(&mut client);
         client.identity = Some(Identity {
             target: "bastion".into(),
             session_id: "f0".repeat(16),
@@ -6624,6 +6641,111 @@ mod tests {
             assert_eq!(session.outage.failed_attempts, 0, "{what}");
             assert_eq!(session.last_failure, None, "{what}");
         }
+    }
+
+    /// The race the other way round: the old link answered while the
+    /// attempt's `Attach` was already on its way, the step stood the rebuild
+    /// down, and the host then adopted the attach -- closing the old link as
+    /// taken over -- and the attempt's landing was read after the
+    /// stand-down. A frame on the old link proves only that the host had not
+    /// adopted anything WHEN IT SENT that frame.
+    ///
+    /// The landed link is the only one the host still knows, so it is taken.
+    /// Closing it as given up -- what the client did once it read only the
+    /// attempt in flight -- left the session on the link the host had just
+    /// closed, and it ended as "taken over" a moment after it came back. The
+    /// outage is over already, so the landing changes the link and the path
+    /// and leaves the outage's notes alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_landing_read_after_a_stand_down_is_taken() {
+        let (_, fails) = FAILING_BEFORE_THE_LINE[0];
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16))
+            .via(ssh_failing_at_once(dir.path(), fails), stunless());
+        let (mut host, mut session) = pair_on("127.0.0.1:0", "", Some(rebuild)).await;
+        let entered = drive_to_recovering(&mut session);
+        let (tx, mut outcomes) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        // A real report, for the attempt's real generation; only what it
+        // says is changed, as no fake ssh here can complete an attach.
+        let queued = queued_report(&mut outcomes).await;
+
+        let mut out = Vec::new();
+        host.turn().expect("the host takes a turn");
+        wait_for_frame(&mut session).await;
+        session.turn(&[], &mut out).expect("a pacing lap");
+        session
+            .layer_one(Instant::now(), &mut out)
+            .expect("a layer-one lap");
+        assert_eq!(
+            session.link_state.phase_now(),
+            Phase::Live,
+            "the frame did not revive the link"
+        );
+        session.rebuild_step(Instant::now(), &tx);
+        assert!(
+            !session.rebuild.as_ref().is_some_and(Rebuild::is_running),
+            "the fixture did not stand the rebuild down"
+        );
+
+        // The host adopts the attempt's attach, as `HostSession::adopt` does
+        // for every newer attach: the old link is closed as taken over.
+        let (host_side, landed) = crate::link::fixtures::link_pair().await;
+        let landed_conn = landed.sink.connection().clone();
+        let displaced = session.link.sink.connection().clone();
+        host.adopt(host_side, size()).expect("the host adopts");
+        let reason = closed_as(&displaced).await;
+        assert!(
+            closed_with(&reason, TAKEN_OVER),
+            "the fixture's host did not displace the old link: {reason:?}"
+        );
+        let log = rebuild_entries(&session);
+
+        let report = queued.landed_instead(standby_established(landed));
+        let swapped = session
+            .rebuild_reported(report, Instant::now())
+            .unwrap_or_else(|e| {
+                panic!("a landing read after a stand-down ended the session: {e:#}")
+            });
+
+        assert!(swapped, "the landed link was not taken");
+        assert_eq!(
+            session.link.sink.connection().stable_id(),
+            landed_conn.stable_id(),
+            "the session is not on the link the host adopted"
+        );
+        assert_eq!(session.link_state.phase_now(), Phase::Live);
+        assert_eq!(
+            session.outage.ended, None,
+            "an outage that had already ended was told how it ended a second time"
+        );
+        assert_eq!(session.path.as_ref().map(|p| p.rtt_ms), Some(38));
+        let mut expected = log;
+        expected.push("landed via IPv4 punched after the old link came back".to_owned());
+        assert_eq!(rebuild_entries(&session), expected);
+        assert!(
+            !session
+                .rebuild
+                .as_ref()
+                .is_some_and(Rebuild::may_have_displaced_us),
+            "nothing in flight can displace the landed link"
+        );
+
+        host.term
+            .write_input(b"printf 'after-%s\\r\\n' landing\n")
+            .expect("write");
+        assert!(
+            drive(
+                &mut host,
+                &mut session,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("after-landing")
+            )
+            .await,
+            "nothing crossed the landed link; screen was {:?}",
+            text(session.screen())
+        );
     }
 
     /// Ruling B1, the other side of the line: an attempt that has sent its

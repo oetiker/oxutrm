@@ -186,15 +186,6 @@ impl std::fmt::Debug for AttemptOutcome {
     }
 }
 
-/// Why the client closed a link that a rebuild landed after the loop had
-/// given the attempt up.
-///
-/// Local, like `REBUILT` and the standby's `STALE`: it never reaches anybody
-/// who acts on it, and exists so the close is legible in a packet trace. Its
-/// own phrase rather than `REBUILT`, because nothing replaced the link it
-/// closes -- the link itself is what nobody wanted any more.
-const GIVEN_UP: &[u8] = b"rebuilt for an attempt that was given up";
-
 /// One attempt's [`AttemptOutcome`], as its task sends it to the loop,
 /// carrying the number [`Rebuild::begin`] gave that attempt.
 ///
@@ -206,11 +197,29 @@ const GIVEN_UP: &[u8] = b"rebuilt for an attempt that was given up";
 /// have silenced it. Read as current, a queued `Definite` ended a session
 /// that had just switched to its standby or come back by itself, and a
 /// queued `Retry` logged a failure, counted it and pushed the schedule back
-/// for an attempt the log had already called abandoned. See
+/// for an attempt the log had already called abandoned.
+///
+/// Only a failure is read as stale, though. A `Landed` is the host's own
+/// word that it has ADOPTED that attach, and adopting closed every other
+/// link it held for the session as taken over: whatever the loop has given
+/// up since, the landed link is the only one the host still knows. See
 /// [`Rebuild::accept`].
 pub(crate) struct Report {
     generation: u64,
     outcome: AttemptOutcome,
+}
+
+#[cfg(test)]
+impl Report {
+    /// The same attempt's report, had it landed `established` instead: for
+    /// a session test that needs a landing from a real attempt's generation
+    /// without an ssh fake that can complete an attach.
+    pub(crate) fn landed_instead(self, established: Established) -> Report {
+        Report {
+            generation: self.generation,
+            outcome: AttemptOutcome::Landed(Box::new(established)),
+        }
+    }
 }
 
 /// How far the attempt in flight has got, as far as the standby cares.
@@ -554,9 +563,12 @@ impl Rebuild {
     }
 
     /// A rebuilt link is in place, so nothing still outstanding can displace
-    /// us out of a link we did not build.
+    /// us out of a link we did not build -- unless an attempt is still in
+    /// flight, which can only be when the link that landed was an older
+    /// attempt's ([`Rebuild::accept`]). The one running may land too, and
+    /// its adopt closes the link just swapped in as taken over.
     pub(crate) fn swapped(&mut self) {
-        self.displacing = false;
+        self.displacing = self.in_flight.is_some();
     }
 
     /// The outage ended on the OLD link, so the attempt is given up and
@@ -572,7 +584,11 @@ impl Rebuild {
     /// **Why dropping the latch here is safe.** Reaching this needs the phase
     /// to have left `Recovering`, and only a FRAME on the old link does that.
     /// A host that had adopted a rebuilt link would have closed this one
-    /// instead of sending on it, so a frame is proof that no adopt happened.
+    /// instead of sending on it, so a frame is proof that no adopt had
+    /// happened WHEN THE HOST SENT IT. Not that none happens afterwards: an
+    /// attempt whose `Attach` was already on its way can still be adopted,
+    /// and its landing, read after this, is taken all the same
+    /// ([`Rebuild::accept`]).
     pub(crate) fn stood_down(&mut self) {
         self.cancel();
         self.displacing = false;
@@ -612,32 +628,35 @@ impl Rebuild {
     }
 
     /// An attempt reported back: its outcome, for the loop to act on, if it
-    /// is the attempt in flight; `None` if the loop has given that attempt
-    /// up since (see [`Report`]), and then nothing changes.
+    /// is the attempt in flight or if it landed; `None` for a failure of an
+    /// attempt the loop has given up since (see [`Report`]), and then
+    /// nothing changes.
     ///
     /// Before [`Rebuild::finished`], which is what would otherwise make an
     /// old report look like the end of the attempt now running.
     ///
-    /// A given-up attempt that LANDED has its link closed, as [`GIVEN_UP`],
-    /// rather than dropped: dropping a `Link` does not close its connection
-    /// -- its source's tasks hold clones of it -- so the far end would hold
-    /// a link nobody reads. Only a stand-down can leave one: an attempt is
-    /// abandoned for the standby only before its `Attach`, and an attempt
-    /// that never sent one cannot land. A stand-down means the old link
-    /// answered, and `Rebuild::stood_down` explains why that answer is taken
-    /// as proof that the host adopted nothing.
+    /// A given-up attempt that LANDED is handed on all the same, because the
+    /// host has already moved to its link: `HostSession::adopt` closes the
+    /// link it displaces as taken over the moment it adopts, before the
+    /// attempt can even read its answer. Only a stand-down can leave one --
+    /// an attempt is abandoned for the standby only before its `Attach`, and
+    /// an attempt that never sent one cannot land -- and a stand-down means
+    /// a frame on the old link that the host sent BEFORE it adopted. Closing
+    /// the landed link instead, as this once did, left the client on the
+    /// link the host had just closed, and the session ended as "taken over"
+    /// a moment after it had come back.
+    ///
+    /// A stale landing leaves any attempt in flight now running: that one
+    /// may yet land too, and then has to be heard from to be swapped in.
     pub(crate) fn accept(&mut self, report: Report) -> Option<AttemptOutcome> {
-        if self.in_flight.is_none() || report.generation != self.generation {
-            if let AttemptOutcome::Landed(e) = report.outcome {
-                e.link
-                    .sink
-                    .connection()
-                    .close(quinn::VarInt::from_u32(0), GIVEN_UP);
-            }
-            return None;
+        if self.in_flight.is_some() && report.generation == self.generation {
+            self.finished();
+            return Some(report.outcome);
         }
-        self.finished();
-        Some(report.outcome)
+        match report.outcome {
+            landed @ AttemptOutcome::Landed(_) => Some(landed),
+            AttemptOutcome::Retry(_) | AttemptOutcome::Definite(_) => None,
+        }
     }
 
     /// The attempt reported back, so there is nothing left to hold.
@@ -1121,52 +1140,70 @@ mod tests {
         (report, far)
     }
 
-    /// Only the attempt in flight is heard from. An outcome queued by an
-    /// attempt the loop has since given up -- abandoned for the standby, or
-    /// stood down because the old link came back -- is not handed on, and
-    /// does not end the attempt that is in flight now.
+    /// Only the attempt in flight is heard from when it FAILED. A `Retry` or
+    /// `Definite` queued by an attempt the loop has since given up --
+    /// abandoned for the standby, or stood down because the old link came
+    /// back -- is not handed on, and does not end the attempt that is in
+    /// flight now.
     ///
-    /// A stale `Landed` is not merely dropped: dropping a `Link` does not
-    /// close its connection (its source's tasks hold clones of it), so the
-    /// far end would keep a link nobody reads. It is closed, as
-    /// [`GIVEN_UP`].
+    /// A `Landed` is handed on whatever its generation. The host adopted
+    /// that attach before the attempt could report it, and adopting closed
+    /// every other link the host held for the session as taken over: the
+    /// landed link is the only one the host still knows. Closing it instead,
+    /// as this once did, left the client on a link the host had just closed,
+    /// and the session ended as "taken over" a moment after it was rescued.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn only_the_attempt_in_flight_is_heard_from() {
         let fake = fake_host_that_never_answers();
         let mut rebuild = rebuilding_against(&fake);
         let given_up = rebuild.generation;
-        rebuild.cancel();
+        rebuild.stood_down();
 
         let (stale, far) = a_landed_report(given_up).await;
         assert!(
-            rebuild.accept(stale).is_none(),
-            "a link landed for an attempt that was given up was handed on"
+            matches!(rebuild.accept(stale), Some(AttemptOutcome::Landed(_))),
+            "a link the host has already adopted was not handed on, because \
+             the attempt that built it had been given up"
         );
-        let reason = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            far.sink.connection().closed(),
-        )
-        .await
-        .expect("the stale link was left open");
         assert!(
-            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
-                if c.reason.as_ref() == GIVEN_UP),
-            "closed as {reason:?}"
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                far.sink.connection().closed(),
+            )
+            .await
+            .is_err(),
+            "the landed link was closed under the host that adopted it"
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         rebuild.begin(a_size(), tx, Instant::now());
-        let old = Report {
-            generation: given_up,
-            outcome: AttemptOutcome::Definite("the session is gone".to_owned()),
-        };
+        for old in [
+            AttemptOutcome::Definite("the session is gone".to_owned()),
+            AttemptOutcome::Retry("ssh exited".to_owned()),
+        ] {
+            let old = Report {
+                generation: given_up,
+                outcome: old,
+            };
+            assert!(
+                rebuild.accept(old).is_none(),
+                "a stale failure was handed on"
+            );
+            assert!(
+                rebuild.is_running(),
+                "a stale failure ended the attempt in flight"
+            );
+        }
+
+        let (stale, _far) = a_landed_report(given_up).await;
         assert!(
-            rebuild.accept(old).is_none(),
-            "a stale outcome was handed on"
+            matches!(rebuild.accept(stale), Some(AttemptOutcome::Landed(_))),
+            "a stale landing was not handed on with another attempt in flight"
         );
         assert!(
             rebuild.is_running(),
-            "a stale outcome ended the attempt in flight"
+            "a stale landing ended the attempt in flight, which may still \
+             land itself and then never be heard from"
         );
 
         let current = Report {
