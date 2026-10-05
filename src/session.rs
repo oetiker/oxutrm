@@ -1047,9 +1047,10 @@ struct OutageNotes {
     failed_attempts: u32,
     /// `failed_attempts` when the standby was switched in, while that
     /// switch is what ended the outage. The switch abandons an attempt still
-    /// in flight, but one that had already failed may have its failure on
-    /// the way, read after the switch; that failure is not one the outage
-    /// waited through, so the summary counts to here.
+    /// in flight, and a failure it may still report is dropped as stale
+    /// (`Rebuild::accept`), so while this is `Some` it equals
+    /// `failed_attempts`; it is kept as the marker that the switch ended the
+    /// outage, which the popup's `switched` row reads.
     /// Cleared again if a rebuild lands or a new attempt has to begin: then
     /// the switch did not end it after all.
     failed_at_switch: Option<u32>,

@@ -566,7 +566,9 @@ impl Rebuild {
     /// us out of a link we did not build -- unless an attempt is still in
     /// flight, which can only be when the link that landed was an older
     /// attempt's ([`Rebuild::accept`]). The one running may land too, and
-    /// its adopt closes the link just swapped in as taken over.
+    /// its adopt closes the link just swapped in as taken over. Defensive:
+    /// it needs a stale landing left unread across a whole new outage, which
+    /// the loop's one-deep outcome channel, read every lap, all but rules out.
     pub(crate) fn swapped(&mut self) {
         self.displacing = self.in_flight.is_some();
     }

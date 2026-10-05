@@ -208,16 +208,14 @@
   this: the rebuild's ssh waited out a 75 s TCP connect timeout, and the
   standby answered a second after it gave up.
 
-- **A session no longer ends just after it was rescued.** When an ssh
-  rebuild failed at about the moment the client switched to its standby, or
-  at about the moment the old link came back by itself, its failure was still
-  acted on afterwards. A far end too old for `--connect` then ended the
-  session that had just recovered ("this session cannot be resumed"), and an
-  ordinary failure was logged after the attempt had already been logged as
-  abandoned and pushed the next retry back. The client now only listens to
-  failures of the attempt it is still waiting for. A rebuild that reached the
-  host is still taken even when the old link came back first: the host has
-  already moved the session to it.
+- **A session no longer ends just after its old link came back.** When an
+  ssh rebuild failed at about the moment the old link came back by itself, its
+  failure was still acted on afterwards: a far end too old for `--connect`
+  ended the session that had just recovered ("this session cannot be
+  resumed"), and an ordinary failure pushed the next retry back. The client now
+  only listens to failures of the attempt it is still waiting for. A rebuild
+  that has already landed is still taken, because the host has moved the
+  session to it.
 
 - **A rebuild's ssh gives up on a dead route after 10 s.** ssh has no
   connect timeout of its own by default, so a rebuild whose target could not
