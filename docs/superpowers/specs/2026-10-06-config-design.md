@@ -1,8 +1,8 @@
 # oxutrm — Config file and config screen
 
 Status: draft 2026-10-06, design agreed with the user in chat (three sections);
-revised the same day after a pushback review (§1.1 last five rows, §2.2–§2.4,
-§4.1–§4.3, §5, §6).
+revised the same day after two pushback reviews (§1.1 last seven rows,
+§2.2–§2.4, §4.1–§4.4, §5, §6).
 Sub-project **C** of four: A (no diagnostics on the screen, merged), B (status
 popup, merged), **C (this)**, D (session switcher). Builds on B
 (`docs/superpowers/specs/2026-10-03-status-popup-design.md`), whose key bar
@@ -41,6 +41,8 @@ that host; a missing or broken config file never stops a connect.
 | `config.toml` is a symlink (review #3) | Follow it: write beside the real target and rename there. |
 | `network.birthday = false` (review #8) | Tells the host too, through a `ClientHello` feature, so neither end blasts. |
 | An outage while a field is open (review #9) | The config screen stays, with the outage in its header. |
+| `x` on a global value, saved with `h` (2nd review #3) | Becomes a host override set to the built-in default; the global key is untouched. "This host only" never changes another host. |
+| The screen after a save (2nd review #2) | The text written is re-resolved for display only (origins, layers, warning count); the settings in effect are not re-applied, so other hand edits still wait for the next connect. |
 
 ### 1.2 Not in C
 
@@ -106,7 +108,7 @@ client does now.
 | `popup.linger` | duration | 3 s | 0 – 1 min | now |
 | `popup.splash` | bool | true | | next connect |
 | `recovery.silent_after` | duration | 2 s | 1 s – 1 min | now |
-| `recovery.rebuild_after` | duration | 20 s | 5 s – 10 min | now |
+| `recovery.rebuild_after` | duration | 20 s | 5 s – 10 min (effective value never below `silent_after`, §2.2) | now |
 | `recovery.connect_timeout` | duration, whole seconds | 10 s | 1 s – 2 min | next attempt |
 | `network.standby` | bool | true | | now (see §2.3) |
 | `network.stun_servers` | list of `host:port` or `[v6]:port` | the four above | 0–16 entries | next attempt / search |
@@ -131,15 +133,19 @@ inline tables; all three resolve alike.
   falls back to the next layer down.
 - An unknown key or section is a warning (typos must not be silent).
 - A file that is not valid TOML is one warning, and everything is default.
-- `auto_open_after` is stored and saved as written. Only its **effective**
-  value is `max(auto_open_after, silent_after)`, recomputed in `apply`
-  whenever either changes (the popup cannot open before there is an outage
-  to show). The screen marks a raised value: `1s (2s: silent_after)`.
+- `auto_open_after` and `rebuild_after` are stored and saved as written.
+  Only their **effective** values are `max(value, silent_after)`, recomputed
+  in `apply` whenever either changes (the popup cannot open, and a rebuild
+  should not start, before there is an outage). The screen marks a raised
+  value: `1s (2s: silent_after)`.
 - `popup.key = "off"` leaves the popup reachable only by auto-open; the
   config screen is then reachable only during an outage. Allowed, documented.
   **`popup.key = "off"` together with `auto_open_after = "off"`** would leave
   the popup unreachable: in the file it is a warning and `auto_open_after`
-  falls back to its default; in the screen the edit is refused.
+  falls back to the next layer down (ultimately its default). In the screen
+  the check is on the **effective result of any pending change** — an edit,
+  an `x`, or a global save that removes a host override — and a change that
+  would produce it is refused.
 - `connect_timeout` with a fraction of a second (`1.5s`) is out of range:
   ssh's `ConnectTimeout` takes whole seconds.
 
@@ -153,20 +159,29 @@ module C touches).
 
 ### 2.3 Standby on and off
 
-Turning `network.standby` off mid-session closes the parked standby (as
-`Standby::forget` closes a corpse) and drops the `Standby`. Turning it back on
-creates a new `Standby` only if the host offered one at connect —
-`ClientSession` keeps that feature flag, which today is consulted once and
-thrown away. On a host that did not offer one, the screen shows it as
-`next connect`.
+A `Standby` is created whenever the **host offers one** at connect
+(`src/connect.rs` ~227), whatever the setting says; `network.standby` only
+sets its **`enabled` flag**. So "can standby be turned on here" is simply
+`standby.is_some()`; on a host that offered none, the screen shows the
+setting as `next connect`. The `Standby` is never dropped and rebuilt, so its
+search counter carries on.
 
 The search and probe tasks and the watched standby connection are locals of
-the run loop (`src/session.rs` ~2324, 2560–2600), out of `apply`'s reach. So
-the loop applies an edit that turns standby off: it aborts a search or probe
-in flight and drops the watched connection, then closes the parked standby.
-The `Standby` is **kept, with an `enabled` flag**, rather than dropped and
-rebuilt, so its search counter carries on and a late `Found` from before the
-switch can never match a search started after it.
+the run loop (`src/session.rs` ~2324, 2560–2600), out of `apply`'s reach, so
+the **loop** applies an edit that turns standby off:
+
+1. aborts a search or probe task in flight and drops the watched connection;
+2. disables the `Standby`, which does what `new_primary()` does
+   (`searching = false`, `search += 1`) and also sets `probing = false` and
+   `probe = Idle` — an aborted probe never reports, and a `probing` left
+   `true` would stop every later probe (`src/standby.rs` ~208);
+3. closes the parked standby.
+
+While disabled, `step()` returns `Nothing`, and `found()` **closes** any link
+it is handed (a `Found` may already sit in the two-deep events channel when
+the task is aborted; the bumped `search` makes it stale, and stale is
+closed). Turning it back on sets `next_search = now + STANDBY_DELAY`, as
+after a failover.
 
 ### 2.4 Birthday at both ends
 
@@ -175,10 +190,24 @@ builds `NetConfig::default()` and would still spray guessed ports at the
 client's NAT. With `network.birthday = false` the client adds the feature
 `no-birthday` (a new `oxutrm_proto::FEATURE_NO_BIRTHDAY`) to its
 `ClientHello.features`, and a host that sees it clears `enable_birthday` for
-that exchange — first connect, rebuild attempt and standby search alike. No
+that exchange — first connect, rebuild attempt and standby search alike.
+
+There is one place on each side. The client: every exchange goes through
+`connect::establish` (standby searches via `src/control.rs` ~97, rebuilds
+too), which adds the feature from `cfg.enable_birthday`. The host: all three
+paths go through `run_attach_exchange` → `exchange_hellos` (`src/serve.rs`
+~96, `src/listener.rs` ~104, the control door through the listener), which
+clears the flag on a **per-exchange clone** of its `NetConfig` — the
+listener holds one `cfg` for all its attaches (`src/listener.rs` ~66), and
+one client's choice must not stick to the next. No
 `PROTO_VERSION` bump: `features` is `#[serde(default)]` and an older host
 ignores a feature it does not know, so against an old host only the client's
 half stops (the docs say so). This is the only host-side change in C.
+
+The help line and docs warn: behind a **symmetric NAT** the birthday blast is
+the last rung that can work (rung 4 is not implemented,
+`src/ladder.rs` ~396–410), so `birthday = false` there means a connect that
+cannot punch through fails.
 
 ---
 
@@ -189,7 +218,7 @@ half stops (the docs say so). This is the only host-side change in C.
 | Settings table | `src/config.rs` | `static SETTINGS: &[Setting]`: key, kind, default, range, help line, `Applies::{Now, NextAttempt, NextConnect}`, get/set between `Settings` and a generic value. |
 | `Settings` | `src/config.rs` | The typed values everything else uses. No string lookups at runtime. |
 | Resolver | `src/config.rs` | `resolve(toml_text, target) -> (Settings, Layers, Vec<Warning>)`. Pure. |
-| Saver | `src/config.rs` | `save(dir, target, level, edits)`: re-read the file, change only the named keys with `toml_edit`, write a temp file and rename it into place (§4.3). `Level::{Global, Host}`. An edit is `Set(value)` or `Remove(level)`. |
+| Saver | `src/config.rs` | `save(dir, target, level, edits) -> Result<String>`: re-read the file, change only the named keys with `toml_edit`, write a temp file and rename it into place (§4.3), return the text written. `Level::{Global, Host}`. An edit is `Set(value)` or `Remove(level)`. |
 | Config mode | `src/ui.rs` | `Mode::Config { cursor, scroll, editing }` in the popup state machine. |
 | Config view | `src/view.rs` → `ConfigView` in `crates/oxutrm-client/src/popup.rs` | Rows built from the table + `Settings` + `Layers` + pending edits; drawn with `Paragraph` lines inside the existing box. No new ratatui features. |
 | `apply` | `src/session.rs` | `ClientSession::apply(&Settings)`: the one way values reach the session, at startup and after every edit. |
@@ -234,9 +263,9 @@ New dependencies: `serde` (already in the workspace) and `toml_edit`.
 |---|---|
 | `c` (status view) | Opens the config screen. Not while the "send / drop held input?" question is up (`Confirming` owns the keys); `c config` is enabled in the key bar everywhere else. |
 | ↑ ↓ (and `k` `j`) | Move. |
-| Enter | Edit: a bool flips; a duration opens a text field on its line (Enter accepts, Esc cancels); `stun_servers` opens a sub-list (one row per server; Enter edits, `+` adds, `-` removes, Esc back); `popup.key` asks for the new key to be pressed (h, i, j, m refused with the reason). |
-| `x` | Marks the selected key's override for removal **at the level it came from**, so the next layer shows through. Unsaved until `w`; whatever `w` chooses, a removal happens at its own level. |
-| `w` | "save for **a**ll hosts or **h** <target> only"; `a`/`h` writes every pending `Set` to that level and every `Remove` at its own; Esc cancels. Saving a `Set` to all hosts **also removes this target's override** of the same key, so the value saved is the value in effect here next time. |
+| Enter | Edit: a bool flips; a duration opens a text field on its line (Enter accepts, Esc cancels); `stun_servers` opens a sub-list (one row per server; Enter edits, `+` adds, `-` removes, Esc back); `popup.key` asks for the new key to be pressed — h, i, j, m are refused with the reason, Backspace/DEL (never a valid key) sets `off`, Esc cancels. |
+| `x` | Marks the selected key's override for removal **at the level it came from**, so the next layer shows through. Unsaved until `w`. |
+| `w` | "save for **a**ll hosts or **h** <target> only"; Esc cancels. **`a`** writes every pending `Set` globally and **also removes this target's override** of the same key, so the value saved is the value in effect here next time; a `Remove` happens at its own level. **`h`** writes every pending `Set` to this host's table; a `Remove` of a host value removes it there, and a `Remove` of a **global** value becomes a host override set to the built-in default — `h` never changes another host. |
 | Esc | Back to the status view. Pending edits stay applied and marked. |
 | `q` | Quits, as everywhere in the popup. Pending edits are dropped. |
 
@@ -244,15 +273,37 @@ Every accepted edit calls `apply` at once, so "now" settings act before they
 are saved. An edit is checked against the table first; a refused value keeps
 the field open with the reason on the help line.
 
-If an outage begins while the config screen is open **and a field is open**,
-the screen stays and its header shows the outage (`no reply 4 s`); with no
-field open it switches to the status view, as auto-open does today. Either
-way pending edits stay applied. If the link comes back with held input
-(`Confirming`), the question always takes over: the popup switches to the
-status view and an open field is dropped, so `s`/`d` can never land in it.
+**While a text field or key capture is open, every byte belongs to it**: `q`,
+`x`, `w`, `k`, `j` are text, and the prefix key is text (or, in capture, the
+key being captured). Esc cancels a field or capture (ESC is never a valid
+popup key, so nothing is lost). The only exception is the `Confirming`
+takeover below. A newline in an unbracketed paste accepts the field and the
+rest of that read is dropped, never run as commands.
 
-A failed save leaves the edits pending, shows the reason on the help line,
-and is recorded in `client.log`.
+A successful save clears the pending markers. The text the saver returns is
+re-resolved **for display only** — origins, `Layers` and the
+`config: N warnings` count are rebuilt from it — while the settings in effect
+are not re-applied: a hand edit made elsewhere during the session still waits
+for the next connect (§1.2). A failed save leaves the edits pending, shows
+the reason on the help line, and is recorded in `client.log`.
+
+### 4.4 The config screen and the link
+
+Today auto-open never changes a popup that is already open (`Ui::tick`,
+`src/ui.rs` ~150). With the config screen open:
+
+- **An outage, no field open:** at the moment auto-open would fire (the
+  effective `auto_open_after`; never when it is `off`), the popup switches to
+  the status view **in `Open` mode** — it stays until closed, it does not
+  linger away when the link returns. Decided once per outage, as `dismissed`
+  is: closing a field later in the same outage does not switch.
+- **An outage, a field open:** the screen stays, and its header shows the
+  outage (`no reply 4 s`).
+- **`Confirming`** (the link came back with held input): the question always
+  takes over — the popup switches to the status view and an open field is
+  dropped, so `s`/`d` can never land in it.
+
+Pending edits stay applied in every case.
 
 ### 4.2 Key decoding in config mode
 
@@ -265,16 +316,22 @@ Today `Ui::keys` drops any read that starts with ESC and is not a lone ESC
   goes into an open field with the wrappers stripped and control bytes
   dropped; with no field open it is ignored.
 - `0x7f` and `0x08` delete one character; input is UTF-8.
-- In key capture, the next byte is taken **before** the rule that closes the
-  popup on the prefix or ESC.
+- With a field or key capture open, bytes go to it **before** every other
+  rule — before `q` → quit and before the prefix/ESC close rule
+  (`shown_key`, `src/ui.rs` ~224–239); a lone ESC cancels.
 - `Mode` is `Copy` today; the text field's buffer lives beside it in `Ui`,
   not inside `Mode`.
 
 ### 4.3 Writing the file safely
 
-- **Symlinks are followed**: the path is resolved and the temp file is created
-  beside the real target, then renamed over it, so a dotfile manager keeps
-  tracking it. A read-only target fails the save with the reason.
+- **Symlinks are followed**: the link is resolved with `read_link` (not
+  `canonicalize`, which fails on a dangling link), the temp file is created
+  beside the real target and renamed over it, so a dotfile manager keeps
+  tracking it. A dangling link's target path is written (created). The
+  symlink itself is never replaced.
+- **A read-only target is refused**, not replaced: a rename needs only the
+  directory to be writable, so the saver checks the target with
+  `rustix::fs::access(W_OK)` first and fails the save with the reason.
 - The temp file has a unique name (pid + random), is created with
   `create_new`, and gets the original file's mode before the rename.
 - The first save creates the config directory (`create_dir_all`).
@@ -325,27 +382,39 @@ Test-first throughout, as for B.
   key at its own level and an emptied host table; edits to keys written
   dotted, as subtables and inline; a file changed on disk between load and
   save keeps the other change; through a symlink the link survives and the
-  target changes; the mode is kept; a missing dir is created; an invalid
+  target changes; a dangling link's target is created and the link kept; a
+  read-only target is refused and untouched; the mode is kept; a missing dir
+  is created; an invalid
   file on re-read and a type conflict (`network = "x"`) fail the save without
   touching the file or panicking.
 - **Config mode:** move by arrow sequences (CSI and SS3), edit and accept,
   edit and cancel, backspace, a bracketed paste into a field, refused value,
   key capture (incl. the prefix and ESC captured, `ctrl-m` refused), the
   `stun_servers` sub-list, `x`, `w` → `a`/`h`, Esc back, `c` refused under
-  `Confirming`; an outage with a field open keeps the screen and shows the
-  outage, without one switches to status; `Confirming` always switches and
-  drops the field; both keys `off` refused.
+  `Confirming`; `q`/`x`/`w`/`k`/`j` typed into a field stay text; Esc
+  cancels key capture; Backspace in capture sets `off`; an outage with a
+  field open keeps the screen and shows the outage; without one it switches
+  to status in `Open` mode only when auto-open would fire (never with it
+  `off`), once per outage; `Confirming` always switches and drops the field;
+  both keys `off` refused, including when reached by `x` or by a global save
+  removing a host override; `x` on a global value saved with `h` writes a
+  host override at the default and leaves the global key alone; after a save
+  the origins and warning count are rebuilt and other settings are not
+  re-applied.
 - **Snapshots:** config screen at 80×24 and at a small size (insta, beside the
   status view's).
 - **`apply`:** each consumer takes the new value — e.g. with
   `rebuild_after = 30s` the outage reaches `Recovering` at 30 s, not 20 s,
   and the popup at 25 s of silence reads `in 0:05`; `popup.key = ctrl-]`
   opens the popup on 0x1d and passes 0x1c through; standby off closes the
-  parked link and aborts a search in flight, and a `Found` from before it is
-  never kept.
+  parked link and aborts a search in flight; a `Found` already queued when it
+  was turned off is closed, not parked; after off → on a probe still runs
+  (an aborted probe does not leave `probing` stuck); with `rebuild_after`
+  below `silent_after` the rebuild waits for the outage.
 - **Birthday:** `birthday = false` puts `no-birthday` in every `ClientHello`
   (connect, rebuild, standby search); a host exchange that receives it runs
-  no blast; an old-style hello without it still blasts.
+  no blast; the next exchange on the same listener without it still blasts
+  (per-exchange clone); an old-style hello without it still blasts.
 - **Warnings:** a config warning appears as a shown entry in the popup's log
   and in the splash caption's `config: N warnings`.
 - **Docs:** `docs/config.md` equals what the table generates.
