@@ -218,7 +218,7 @@ cannot punch through fails.
 | Settings table | `src/config.rs` | `static SETTINGS: &[Setting]`: key, kind, default, range, help line, `Applies::{Now, NextAttempt, NextConnect}`, get/set between `Settings` and a generic value. |
 | `Settings` | `src/config.rs` | The typed values everything else uses. No string lookups at runtime. |
 | Resolver | `src/config.rs` | `resolve(toml_text, target) -> (Settings, Layers, Vec<Warning>)`. Pure. |
-| Saver | `src/config.rs` | `save(dir, target, level, edits) -> Result<String>`: re-read the file, change only the named keys with `toml_edit`, write a temp file and rename it into place (§4.3), return the text written. `Level::{Global, Host}`. An edit is `Set(value)` or `Remove(level)`. |
+| Saver | `src/config.rs` | `save(dir, target, level, edits) -> Result<String>`: re-read the file, change only the named keys with `toml_edit`, write a temp file and rename it into place (§4.4), return the text written. `Level::{Global, Host}`. An edit is `Set(value)` or `Remove(level)`. |
 | Config mode | `src/ui.rs` | `Mode::Config { cursor, scroll, editing }` in the popup state machine. |
 | Config view | `src/view.rs` → `ConfigView` in `crates/oxutrm-client/src/popup.rs` | Rows built from the table + `Settings` + `Layers` + pending edits; drawn with `Paragraph` lines inside the existing box. No new ratatui features. |
 | `apply` | `src/session.rs` | `ClientSession::apply(&Settings)`: the one way values reach the session, at startup and after every edit. |
@@ -287,7 +287,7 @@ are not re-applied: a hand edit made elsewhere during the session still waits
 for the next connect (§1.2). A failed save leaves the edits pending, shows
 the reason on the help line, and is recorded in `client.log`.
 
-### 4.4 The config screen and the link
+### 4.2 The config screen and the link
 
 Today auto-open never changes a popup that is already open (`Ui::tick`,
 `src/ui.rs` ~150). With the config screen open:
@@ -305,7 +305,7 @@ Today auto-open never changes a popup that is already open (`Ui::tick`,
 
 Pending edits stay applied in every case.
 
-### 4.2 Key decoding in config mode
+### 4.3 Key decoding in config mode
 
 Today `Ui::keys` drops any read that starts with ESC and is not a lone ESC
 (`src/ui.rs` ~189). The config screen needs more:
@@ -322,7 +322,7 @@ Today `Ui::keys` drops any read that starts with ESC and is not a lone ESC
 - `Mode` is `Copy` today; the text field's buffer lives beside it in `Ui`,
   not inside `Mode`.
 
-### 4.3 Writing the file safely
+### 4.4 Writing the file safely
 
 - **Symlinks are followed**: the link is resolved with `read_link` (not
   `canonicalize`, which fails on a dangling link), the temp file is created
