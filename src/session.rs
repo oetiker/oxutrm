@@ -1018,6 +1018,9 @@ pub struct ClientSession {
     /// The config file's layers for this target and the screen's unsaved
     /// edits. Defaults, with nowhere to save, until `with_config`.
     config: ConfigState,
+    /// The config warnings already recorded as shown entries, so that a
+    /// save's re-read does not log the connect's again.
+    config_warned: std::collections::HashSet<String>,
     /// `network.standby` as last applied. The standby itself is switched by
     /// the loop, which owns the tasks it stops (`standby_switch`).
     standby_wanted: bool,
@@ -1166,6 +1169,7 @@ impl ClientSession {
             splash: None,
             unpainted_splash_end: false,
             config: ConfigState::defaults(),
+            config_warned: std::collections::HashSet::new(),
             standby_wanted: true,
         })
     }
@@ -1301,8 +1305,7 @@ impl ClientSession {
     /// Only a change made on the screen is the loop's to carry out and log.
     pub(crate) fn with_config(mut self, state: ConfigState, warnings: &[String]) -> ClientSession {
         for w in warnings {
-            self.activity
-                .record_shown(Kind::Config, w, &format!("config: {w}"));
+            self.record_config_warning(w);
         }
         let settings = state.applied.clone();
         self.config = state;
@@ -1379,6 +1382,7 @@ impl ClientSession {
                 Ok(settings) => self.apply(&settings),
                 Err(why) => self.ui.say(why),
             },
+            ConfigCmd::Save(level) => self.config_save(level),
         }
     }
 
@@ -1390,6 +1394,48 @@ impl ClientSession {
                 self.ui.accepted();
             }
             Err(why) => self.ui.say(why),
+        }
+    }
+
+    /// `w` answered: the pending edits written at `level`. A failed save
+    /// leaves them pending, says why on the help line, and is recorded.
+    /// The written text's warnings are recorded as at the connect, each
+    /// once a session.
+    fn config_save(&mut self, level: crate::config::Level) {
+        self.ui.accepted();
+        match self.config.save(level) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    self.record_config_warning(w);
+                }
+                let whom = match level {
+                    crate::config::Level::Global => "all hosts".to_string(),
+                    crate::config::Level::Host => oxutrm_client::legible(&self.config.target),
+                };
+                self.activity
+                    .record_detail(Kind::Config, &format!("saved for {whom}"));
+                self.ui.say(format!("saved for {whom}"));
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                self.activity.record_shown(
+                    Kind::Config,
+                    &format!("save failed: {why}"),
+                    "config not saved",
+                );
+                self.ui
+                    .say(format!("not saved: {}", oxutrm_client::summarised(&why)));
+            }
+        }
+    }
+
+    /// A config warning as a shown entry, unless this session has already
+    /// recorded it: a save re-reads the whole file, and the warnings the
+    /// connect logged are still there.
+    fn record_config_warning(&mut self, w: &str) {
+        if self.config_warned.insert(w.to_owned()) {
+            self.activity
+                .record_shown(Kind::Config, w, &format!("config: {w}"));
         }
     }
 
@@ -10057,5 +10103,151 @@ mod tests {
         let screen = session.ui.config_screen().unwrap();
         assert_eq!(screen.note, Some(crate::config::UNREACHABLE));
         assert_eq!(screen.editing, crate::ui::Editing::Text);
+    }
+
+    // ---- saving from the screen --------------------------------------------
+
+    /// A client whose config is `dir`'s, for target `t`, with the config
+    /// screen open on `row`.
+    async fn configured(dir: &std::path::Path, row: usize) -> (HostSession, ClientSession) {
+        let (host, session) = pair("/bin/sh").await;
+        let r = crate::config::load(Some(dir), "t");
+        let mut session = session.with_config(
+            ConfigState::new(Some(dir.to_path_buf()), "t", &r),
+            &r.warnings,
+        );
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"c");
+        for _ in 0..row {
+            type_in(&mut session, b"j");
+        }
+        (host, session)
+    }
+
+    /// `w` `a`: written for every host, this host's own override of the key
+    /// gone, and the screen's origins read from what was written.
+    #[tokio::test]
+    async fn w_then_a_saves_for_every_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        std::fs::write(&file, "[host.\"t\"]\nrecovery.rebuild_after = \"25s\"\n").unwrap();
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f\x7f30s\r");
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        let r = crate::config::resolve(Some(&std::fs::read_to_string(&file).unwrap()), "t");
+        assert_eq!(r.settings.rebuild_after, Duration::from_secs(30));
+        assert!(session.config.pending.is_empty());
+        assert_eq!(
+            session.config.shown(row),
+            (
+                Some(crate::config::Origin::Global),
+                Value::Duration(Some(Duration::from_secs(30))),
+                false
+            )
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("saved for all hosts")
+        );
+    }
+
+    /// After a save the screen shows what the file says now -- a hand edit
+    /// made elsewhere included, and its warnings counted -- but nothing in
+    /// effect changes until the next connect.
+    #[tokio::test]
+    async fn after_a_save_a_hand_edit_is_shown_but_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        std::fs::write(
+            &file,
+            "[recovery]\nrebuild_after = \"40s\"\n[popup]\nx = 1\n",
+        )
+        .unwrap();
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"h");
+        let rebuild = row_of("recovery.rebuild_after");
+        assert_eq!(
+            session.config.shown(rebuild).1,
+            Value::Duration(Some(Duration::from_secs(40)))
+        );
+        assert_eq!(session.config.warnings, 1);
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            crate::linkstate::REBUILD_AFTER,
+            "the hand edit was applied"
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("saved for t")
+        );
+    }
+
+    /// A save that fails leaves the edits pending, says why, and is
+    /// recorded.
+    #[tokio::test]
+    async fn a_failed_save_keeps_the_edits_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(crate::config::FILE)).unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        assert_eq!(session.config.pending.len(), 1);
+        let note = session.ui.config_screen().unwrap().note.map(str::to_owned);
+        assert!(
+            note.as_deref().is_some_and(|n| n.starts_with("not saved")),
+            "{note:?}"
+        );
+        assert!(
+            shown_log(&session)
+                .iter()
+                .any(|(k, s, _)| *k == Kind::Config && s == "config not saved"),
+            "{:?}",
+            shown_log(&session)
+        );
+    }
+
+    /// Every warning is a shown entry, once: one the written text brings
+    /// is recorded at the save, one already recorded at the connect is not
+    /// recorded again.
+    #[tokio::test]
+    async fn a_save_records_only_the_warnings_not_yet_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        let old = "[popup]\nx = 1\n";
+        std::fs::write(&file, old).unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        // A hand edit made since the connect brings a second warning.
+        std::fs::write(&file, format!("{old}[recovery]\ny = 2\n")).unwrap();
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        let written = std::fs::read_to_string(&file).unwrap();
+        let warnings = crate::config::resolve(Some(&written), "t").warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // A repeat folds into the entry before it: count its repeats too.
+        let times = |shown: &str| -> u32 {
+            session
+                .activity
+                .entries()
+                .filter(|e| e.kind == Kind::Config && e.shown == shown && !e.detail)
+                .map(|e| 1 + e.repeats)
+                .sum()
+        };
+        for w in &warnings {
+            let shown = format!("config: {w}");
+            assert_eq!(times(&shown), 1, "{shown}: {:#?}", shown_log(&session));
+        }
     }
 }

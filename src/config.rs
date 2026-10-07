@@ -958,8 +958,6 @@ impl ConfigState {
     /// elsewhere meanwhile still waits for the next connect (spec §4.1). A
     /// failed save leaves the edits pending; `applied` is never touched.
     /// Returns the warnings of the text written, for the log.
-    // Called by the screen's `w` from Task 13, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn save(&mut self, level: Level) -> anyhow::Result<Vec<String>> {
         if self.pending.is_empty() {
             anyhow::bail!("nothing has changed");

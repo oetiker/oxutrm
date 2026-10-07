@@ -515,7 +515,7 @@ pub(crate) fn config(f: &ConfigFacts<'_>) -> ConfigView {
         sections,
         cursor,
         help: config_help(f),
-        keys: config_keys(editing),
+        keys: config_keys(editing, f.identity),
     }
 }
 
@@ -645,7 +645,7 @@ fn config_help(f: &ConfigFacts<'_>) -> String {
     format!("{} \u{b7} {}", row.help, range(row.shape))
 }
 
-fn config_keys(editing: Editing) -> Vec<KeyHint> {
+fn config_keys(editing: Editing, identity: Option<&Identity>) -> Vec<KeyHint> {
     let hint = |key: &str, label: &str| KeyHint {
         key: key.to_string(),
         label: label.to_string(),
@@ -669,6 +669,17 @@ fn config_keys(editing: Editing) -> Vec<KeyHint> {
             hint("+", "add"),
             hint("-", "remove"),
             hint("Esc", "back"),
+        ],
+        Editing::Save => vec![
+            hint("a", "all hosts"),
+            hint(
+                "h",
+                &match identity {
+                    Some(id) => format!("{} only", legible(&id.target)),
+                    None => "this host only".to_string(),
+                },
+            ),
+            hint("Esc", "cancel"),
         ],
     }
 }
@@ -2047,6 +2058,10 @@ mod tests {
                 "- remove",
                 "Esc back"
             ]
+        );
+        assert_eq!(
+            bar(Editing::Save),
+            ["a all hosts", "h thinlinc only", "Esc cancel"]
         );
     }
 

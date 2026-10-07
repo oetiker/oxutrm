@@ -80,6 +80,8 @@ pub(crate) enum Editing {
     /// The `stun_servers` sub-list on its own cursor, with a text field
     /// open on its entry at `cursor` -- or on a new one past the end.
     Servers { cursor: usize, field: bool },
+    /// "save for all hosts or this host only?"
+    Save,
 }
 
 impl Editing {
@@ -118,6 +120,8 @@ pub(crate) enum ConfigCmd {
     Servers { row: usize, list: Vec<String> },
     /// `x`.
     Reset(usize),
+    /// `w`, then `a` or `h`.
+    Save(crate::config::Level),
 }
 
 /// The config screen's state, for the view.
@@ -637,7 +641,7 @@ impl Ui {
 
     /// One key on the config screen. Returns whether the read is over.
     fn config_key(&mut self, key: Key, phase: Phase, r: &mut Routed) -> bool {
-        use crate::config::SETTINGS;
+        use crate::config::{Level, SETTINGS};
         let Mode::Config { cursor, editing } = self.mode else {
             return true;
         };
@@ -757,6 +761,18 @@ impl Ui {
                     _ => {}
                 }
             }
+            Editing::Save => match key {
+                Key::Byte(b'a') => {
+                    r.command = command(ConfigCmd::Save(Level::Global));
+                    return true;
+                }
+                Key::Byte(b'h') => {
+                    r.command = command(ConfigCmd::Save(Level::Host));
+                    return true;
+                }
+                Key::Byte(ESC) => self.mode = to(Editing::None),
+                _ => {}
+            },
             Editing::None => match key {
                 Key::Up | Key::Byte(b'k') => {
                     self.mode = Mode::Config {
@@ -778,6 +794,7 @@ impl Ui {
                     r.command = command(ConfigCmd::Reset(cursor));
                     return true;
                 }
+                Key::Byte(b'w') => self.mode = to(Editing::Save),
                 Key::Byte(b'q') => {
                     r.command = Some(Command::Quit);
                     return true;
@@ -1612,7 +1629,7 @@ mod tests {
 
     // ---- the config screen ----------------------------------------------
 
-    use crate::config::SETTINGS;
+    use crate::config::{Level, SETTINGS};
 
     fn config_at(t: Instant) -> Ui {
         let mut ui = open_at(t);
@@ -1696,12 +1713,32 @@ mod tests {
     }
 
     #[test]
-    fn enter_and_x_ask_the_session() {
+    fn enter_x_and_w_ask_the_session() {
         let t = Instant::now();
         let mut ui = config_at(t);
         ui.keys(b"jj", Phase::Live, t);
         assert_eq!(ui.keys(b"\r", Phase::Live, t), cfg(ConfigCmd::Edit(2)));
         assert_eq!(ui.keys(b"x", Phase::Live, t), cfg(ConfigCmd::Reset(2)));
+        assert_eq!(ui.keys(b"w", Phase::Live, t), Routed::default());
+        assert_eq!(editing(&ui), Editing::Save);
+        assert_eq!(
+            ui.keys(b"q", Phase::Live, t),
+            Routed::default(),
+            "q under the save question"
+        );
+        assert_eq!(
+            ui.keys(b"a", Phase::Live, t),
+            cfg(ConfigCmd::Save(Level::Global))
+        );
+        ui.accepted();
+        ui.keys(b"w", Phase::Live, t);
+        assert_eq!(
+            ui.keys(b"h", Phase::Live, t),
+            cfg(ConfigCmd::Save(Level::Host))
+        );
+        ui.accepted();
+        ui.keys(b"w", Phase::Live, t);
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
         assert_eq!(editing(&ui), Editing::None);
     }
 
