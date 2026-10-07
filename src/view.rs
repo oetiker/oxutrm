@@ -17,12 +17,17 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use jiff::tz::TimeZone;
-use oxutrm_client::{KeyHint, Marker, PopupView, Row, legible, rung_label, summarised};
+use oxutrm_client::{
+    ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, PopupView, Row, legible, rung_label,
+    summarised,
+};
 use oxutrm_proto::PathDescription;
 
 use crate::activity::Activity;
+use crate::config::{ConfigState, Origin, SETTINGS, STANDBY, Value, range, show, show_duration};
 use crate::linkstate::{PROBE_RETRY, Phase, ProbeState, render_held};
 use crate::quality::Quality;
+use crate::ui::{ConfigScreen, Editing};
 
 /// The most log lines a view carries: the tallest box has fewer rows than
 /// this, so building more would only be work for the layout to throw away.
@@ -472,8 +477,198 @@ fn keys(phase: Phase) -> Vec<KeyHint> {
         _ => vec![
             hint("Esc", "close", true),
             hint("q", "quit", true),
-            hint("c", "config", false),
+            hint("c", "config", true),
             hint("s", "sessions", false),
+        ],
+    }
+}
+
+/// What the config screen is built from.
+pub(crate) struct ConfigFacts<'a> {
+    pub(crate) identity: Option<&'a Identity>,
+    pub(crate) state: &'a ConfigState,
+    pub(crate) screen: ConfigScreen<'a>,
+    /// Whether the host offered a standby: on one that did not,
+    /// `network.standby` takes effect at the next connect.
+    pub(crate) standby_offered: bool,
+    pub(crate) phase: Phase,
+    pub(crate) last_heard: Instant,
+    pub(crate) now: Instant,
+}
+
+/// The config screen: the table's rows with their values, origins and
+/// pending marks, or the `stun_servers` sub-list while it is open.
+pub(crate) fn config(f: &ConfigFacts<'_>) -> ConfigView {
+    let editing = f.screen.editing;
+    let (sections, cursor) = match editing {
+        Editing::Servers { cursor, field } => {
+            (vec![servers_section(&f.screen, cursor, field)], cursor)
+        }
+        _ => (settings_sections(f), f.screen.cursor),
+    };
+    ConfigView {
+        title: match f.identity {
+            Some(id) => format!("oxutrm \u{b7} config \u{b7} {}", legible(&id.target)),
+            None => "oxutrm \u{b7} config".to_string(),
+        },
+        header: config_header(f),
+        sections,
+        cursor,
+        help: config_help(f),
+        keys: config_keys(editing),
+    }
+}
+
+/// Warnings, and the outage while there is one.
+fn config_header(f: &ConfigFacts<'_>) -> String {
+    let mut parts = Vec::new();
+    match f.state.warnings {
+        0 => {}
+        1 => parts.push("config: 1 warning".to_string()),
+        n => parts.push(format!("config: {n} warnings")),
+    }
+    let silent_since = match f.phase {
+        Phase::Silent { since } => Some(since),
+        Phase::Recovering { .. } => Some(f.last_heard),
+        _ => None,
+    };
+    if let Some(since) = silent_since {
+        parts.push(format!(
+            "no reply {}",
+            clock(f.now.saturating_duration_since(since))
+        ));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// The field's text with a cursor after it.
+fn field_text(field: &str) -> String {
+    format!("{field}\u{258f}")
+}
+
+fn settings_sections(f: &ConfigFacts<'_>) -> Vec<ConfigSection> {
+    let in_effect = f.state.in_effect();
+    let mut sections: Vec<ConfigSection> = Vec::new();
+    for (i, row) in SETTINGS.iter().enumerate() {
+        if sections.last().is_none_or(|s| s.name != row.section) {
+            sections.push(ConfigSection {
+                name: row.section.to_string(),
+                rows: Vec::new(),
+            });
+        }
+        let (origin, value, changed) = f.state.shown(i);
+        let here = i == f.screen.cursor;
+        let value = match (here, f.screen.editing) {
+            (true, Editing::Text) => field_text(f.screen.field),
+            (true, Editing::Capture) => "press a key\u{2026}".to_string(),
+            _ => match value {
+                // Kept as written, and raised to `silent_after` (spec §2.2).
+                Value::Duration(Some(d))
+                    if matches!(row.name, "auto_open_after" | "rebuild_after")
+                        && d < in_effect.silent_after =>
+                {
+                    format!(
+                        "{} ({}: silent_after)",
+                        show_duration(d),
+                        show_duration(in_effect.silent_after)
+                    )
+                }
+                v => legible(&show(&v)),
+            },
+        };
+        let note = if i == STANDBY && !f.standby_offered {
+            "next connect"
+        } else {
+            row.applies.note()
+        };
+        sections
+            .last_mut()
+            .expect("pushed above")
+            .rows
+            .push(ConfigRow {
+                name: row.name.to_string(),
+                value,
+                changed,
+                origin: match origin {
+                    Some(Origin::Host) => "host".to_string(),
+                    Some(Origin::Global) => "global".to_string(),
+                    _ => String::new(),
+                },
+                note: note.to_string(),
+            });
+    }
+    sections
+}
+
+fn servers_section(screen: &ConfigScreen<'_>, cursor: usize, field: bool) -> ConfigSection {
+    let mut rows: Vec<ConfigRow> = screen
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ConfigRow {
+            name: (i + 1).to_string(),
+            value: if field && i == cursor {
+                field_text(screen.field)
+            } else {
+                legible(s)
+            },
+            ..ConfigRow::default()
+        })
+        .collect();
+    if field && cursor >= screen.servers.len() {
+        rows.push(ConfigRow {
+            name: (rows.len() + 1).to_string(),
+            value: field_text(screen.field),
+            ..ConfigRow::default()
+        });
+    }
+    ConfigSection {
+        name: "network.stun_servers".to_string(),
+        rows,
+    }
+}
+
+/// The line above the key bar: why something was refused, or what a save
+/// did; else what the selected setting is and what it may be.
+fn config_help(f: &ConfigFacts<'_>) -> String {
+    if let Some(note) = f.screen.note {
+        return summarised(note);
+    }
+    let row = match f.screen.editing {
+        Editing::Servers { .. } => SETTINGS
+            .iter()
+            .find(|s| s.name == "stun_servers")
+            .expect("the table has stun_servers"),
+        Editing::Capture => return "press the new popup key \u{b7} Backspace sets off".to_string(),
+        _ => &SETTINGS[f.screen.cursor],
+    };
+    format!("{} \u{b7} {}", row.help, range(row.shape))
+}
+
+fn config_keys(editing: Editing) -> Vec<KeyHint> {
+    let hint = |key: &str, label: &str| KeyHint {
+        key: key.to_string(),
+        label: label.to_string(),
+        enabled: true,
+    };
+    match editing {
+        Editing::None => vec![
+            hint("\u{2191}\u{2193}", "move"),
+            hint("\u{23ce}", "edit"),
+            hint("x", "reset"),
+            hint("w", "save"),
+            hint("Esc", "back"),
+        ],
+        Editing::Text | Editing::Servers { field: true, .. } => {
+            vec![hint("\u{23ce}", "accept"), hint("Esc", "cancel")]
+        }
+        Editing::Capture => vec![hint("\u{232b}", "off"), hint("Esc", "cancel")],
+        Editing::Servers { field: false, .. } => vec![
+            hint("\u{2191}\u{2193}", "move"),
+            hint("\u{23ce}", "edit"),
+            hint("+", "add"),
+            hint("-", "remove"),
+            hint("Esc", "back"),
         ],
     }
 }
@@ -731,8 +926,9 @@ mod tests {
         assert_eq!(two.held, ["2 bytes typed since - kept, not sent"]);
     }
 
-    /// Every bar carries the dimmed `c config`; every bar but the
-    /// question's carries the dimmed `s sessions`, because there `s` sends.
+    /// Every bar carries `c config`, dimmed only under the question; every
+    /// bar but the question's carries the dimmed `s sessions`, because
+    /// there `s` sends.
     /// The question has no `Esc close`: it closes only when answered.
     #[test]
     fn the_key_bar_offers_what_works_in_each_phase() {
@@ -749,7 +945,7 @@ mod tests {
         let shown = [
             own("Esc close", true),
             own("q quit", true),
-            own("c config", false),
+            own("c config", true),
             own("s sessions", false),
         ];
         for phase in [
@@ -1566,5 +1762,323 @@ mod tests {
                 now,
             )
         }));
+    }
+
+    // ---- the config screen --------------------------------------------------
+
+    fn config_state(text: &str) -> ConfigState {
+        ConfigState::new(
+            None,
+            "thinlinc",
+            &crate::config::resolve(Some(text), "thinlinc"),
+        )
+    }
+
+    fn on_row(cursor: usize, editing: Editing) -> ConfigScreen<'static> {
+        ConfigScreen {
+            cursor,
+            editing,
+            field: "",
+            servers: &[],
+            note: None,
+        }
+    }
+
+    fn config_facts<'a>(
+        state: &'a ConfigState,
+        screen: ConfigScreen<'a>,
+        now: Instant,
+    ) -> ConfigFacts<'a> {
+        ConfigFacts {
+            identity: None,
+            state,
+            screen,
+            standby_offered: true,
+            phase: Phase::Live,
+            last_heard: now,
+            now,
+        }
+    }
+
+    /// `(value, changed, origin, note)` of the row named `name`.
+    fn config_row(v: &ConfigView, name: &str) -> (String, bool, String, String) {
+        let r = v
+            .sections
+            .iter()
+            .flat_map(|s| &s.rows)
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("no row {name}"));
+        (r.value.clone(), r.changed, r.origin.clone(), r.note.clone())
+    }
+
+    fn own(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn every_setting_is_shown_with_its_value_origin_and_when_it_acts() {
+        let state = config_state(
+            "[recovery]\nrebuild_after = \"25s\"\n[host.\"thinlinc\"]\nnetwork.standby = false\n",
+        );
+        let v = config(&config_facts(
+            &state,
+            on_row(0, Editing::None),
+            Instant::now(),
+        ));
+        let names: Vec<&str> = v.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["popup", "recovery", "network"]);
+        assert_eq!(
+            v.sections.iter().map(|s| s.rows.len()).sum::<usize>(),
+            SETTINGS.len()
+        );
+        assert_eq!(
+            config_row(&v, "key"),
+            (own("ctrl-\\"), false, own(""), own(""))
+        );
+        assert_eq!(
+            config_row(&v, "rebuild_after"),
+            (own("25s"), false, own("global"), own(""))
+        );
+        assert_eq!(
+            config_row(&v, "standby"),
+            (own("off"), false, own("host"), own(""))
+        );
+        assert_eq!(config_row(&v, "splash").3, "next connect");
+        assert_eq!(config_row(&v, "connect_timeout").3, "next attempt");
+        assert_eq!(
+            config_row(&v, "stun_servers").0,
+            "stun.cloudflare.com:3478 +3"
+        );
+        assert_eq!(v.title, "oxutrm \u{b7} config");
+    }
+
+    #[test]
+    fn a_pending_edit_is_marked_and_has_no_origin_yet() {
+        let mut state = config_state("[popup]\nlinger = \"5s\"\n");
+        let row = SETTINGS.iter().position(|s| s.name == "linger").unwrap();
+        state
+            .set(
+                row,
+                crate::config::Value::Duration(Some(Duration::from_secs(9))),
+            )
+            .unwrap();
+        let v = config(&config_facts(
+            &state,
+            on_row(0, Editing::None),
+            Instant::now(),
+        ));
+        assert_eq!(
+            config_row(&v, "linger"),
+            (own("9s"), true, own(""), own(""))
+        );
+    }
+
+    /// Kept as written, and marked with what it is raised to (spec §2.2).
+    #[test]
+    fn a_value_raised_to_silent_after_says_so() {
+        let state =
+            config_state("[popup]\nauto_open_after = \"1s\"\n[recovery]\nsilent_after = \"8s\"\n");
+        let v = config(&config_facts(
+            &state,
+            on_row(0, Editing::None),
+            Instant::now(),
+        ));
+        assert_eq!(config_row(&v, "auto_open_after").0, "1s (8s: silent_after)");
+        assert_eq!(
+            config_row(&v, "rebuild_after").0,
+            "20s",
+            "20 s is not raised"
+        );
+    }
+
+    /// On a host that offered no standby, turning it on waits for the next
+    /// connect (spec §2.3).
+    #[test]
+    fn standby_on_a_host_that_offered_none_acts_at_the_next_connect() {
+        let state = config_state("");
+        let t = Instant::now();
+        let v = config(&ConfigFacts {
+            standby_offered: false,
+            ..config_facts(&state, on_row(0, Editing::None), t)
+        });
+        assert_eq!(config_row(&v, "standby").3, "next connect");
+    }
+
+    #[test]
+    fn the_header_counts_the_warnings_and_shows_an_outage() {
+        let state = config_state("[popup]\nx = 1\ny = 2\n");
+        let t = Instant::now();
+        let quiet = config(&config_facts(
+            &config_state(""),
+            on_row(0, Editing::None),
+            t,
+        ));
+        assert_eq!(quiet.header, "");
+        let v = config(&ConfigFacts {
+            phase: Phase::Silent {
+                since: t - Duration::from_secs(4),
+            },
+            ..config_facts(&state, on_row(0, Editing::None), t)
+        });
+        assert_eq!(v.header, "config: 2 warnings \u{b7} no reply 4 s");
+        let v = config(&ConfigFacts {
+            phase: Phase::Recovering {
+                attempt: 0,
+                next_try: t,
+            },
+            last_heard: t - Duration::from_secs(31),
+            ..config_facts(&config_state(""), on_row(0, Editing::None), t)
+        });
+        assert_eq!(v.header, "no reply 31 s");
+    }
+
+    #[test]
+    fn the_help_line_is_the_rows_help_and_range_or_the_note() {
+        let state = config_state("");
+        let t = Instant::now();
+        let row = SETTINGS
+            .iter()
+            .position(|s| s.name == "rebuild_after")
+            .unwrap();
+        let v = config(&config_facts(&state, on_row(row, Editing::None), t));
+        assert_eq!(
+            v.help,
+            "silence before an ssh rebuild starts \u{b7} 5s\u{2013}10m"
+        );
+        let v = config(&config_facts(
+            &state,
+            ConfigScreen {
+                note: Some("1s is outside 5s\u{2013}10m"),
+                ..on_row(row, Editing::Text)
+            },
+            t,
+        ));
+        assert_eq!(v.help, "1s is outside 5s\u{2013}10m");
+    }
+
+    #[test]
+    fn an_open_field_and_a_capture_show_on_their_row() {
+        let state = config_state("");
+        let t = Instant::now();
+        let row = SETTINGS.iter().position(|s| s.name == "linger").unwrap();
+        let v = config(&config_facts(
+            &state,
+            ConfigScreen {
+                field: "4",
+                ..on_row(row, Editing::Text)
+            },
+            t,
+        ));
+        assert_eq!(config_row(&v, "linger").0, "4\u{258f}");
+        let v = config(&config_facts(&state, on_row(0, Editing::Capture), t));
+        assert_eq!(config_row(&v, "key").0, "press a key\u{2026}");
+    }
+
+    #[test]
+    fn the_servers_sub_list_is_one_row_per_server_and_one_being_added() {
+        let state = config_state("");
+        let servers = ["a:1".to_string(), "b:2".to_string()];
+        let t = Instant::now();
+        let v = config(&config_facts(
+            &state,
+            ConfigScreen {
+                servers: &servers,
+                field: "c:",
+                ..on_row(
+                    0,
+                    Editing::Servers {
+                        cursor: 2,
+                        field: true,
+                    },
+                )
+            },
+            t,
+        ));
+        assert_eq!(v.sections.len(), 1);
+        assert_eq!(v.sections[0].name, "network.stun_servers");
+        let values: Vec<&str> = v.sections[0]
+            .rows
+            .iter()
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(values, ["a:1", "b:2", "c:\u{258f}"]);
+        assert_eq!(v.cursor, 2);
+    }
+
+    #[test]
+    fn the_config_key_bar_follows_what_is_being_edited() {
+        let state = config_state("");
+        let t = Instant::now();
+        let id = Identity {
+            target: "thinlinc".to_string(),
+            session_id: "f00d".to_string(),
+        };
+        let bar = |editing| -> Vec<String> {
+            config(&ConfigFacts {
+                identity: Some(&id),
+                ..config_facts(&state, on_row(0, editing), t)
+            })
+            .keys
+            .into_iter()
+            .map(|k| format!("{} {}", k.key, k.label))
+            .collect()
+        };
+        assert_eq!(
+            bar(Editing::None),
+            [
+                "\u{2191}\u{2193} move",
+                "\u{23ce} edit",
+                "x reset",
+                "w save",
+                "Esc back"
+            ]
+        );
+        assert_eq!(bar(Editing::Text), ["\u{23ce} accept", "Esc cancel"]);
+        assert_eq!(bar(Editing::Capture), ["\u{232b} off", "Esc cancel"]);
+        assert_eq!(
+            bar(Editing::Servers {
+                cursor: 0,
+                field: false
+            }),
+            [
+                "\u{2191}\u{2193} move",
+                "\u{23ce} edit",
+                "+ add",
+                "- remove",
+                "Esc back"
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_config_80x24() {
+        let state = config_state(
+            "[recovery]\nrebuild_after = \"25s\"\n[host.\"thinlinc\"]\nnetwork.standby = false\n",
+        );
+        let id = Identity {
+            target: "thinlinc".to_string(),
+            session_id: "f00d".to_string(),
+        };
+        let row = SETTINGS
+            .iter()
+            .position(|s| s.name == "rebuild_after")
+            .unwrap();
+        let v = config(&ConfigFacts {
+            identity: Some(&id),
+            ..config_facts(&state, on_row(row, Editing::None), Instant::now())
+        });
+        let o = oxutrm_client::layout_config(&v, oxutrm_proto::TermSize { cols: 80, rows: 24 });
+        let text: Vec<String> = (0..o.rows)
+            .map(|r| {
+                (0..o.cols)
+                    .map(|c| {
+                        o.cells[usize::from(r) * usize::from(o.cols) + usize::from(c)]
+                            .text
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .collect();
+        insta::assert_snapshot!(text.join("\n"));
     }
 }

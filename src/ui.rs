@@ -95,8 +95,6 @@ pub(crate) enum Command {
 /// What the config screen asks of the session. Rows are rows of
 /// [`crate::config::SETTINGS`].
 #[derive(Clone, PartialEq, Eq, Debug)]
-// Answered by the session from Task 10, which removes this attribute.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ConfigCmd {
     /// Enter on a row with nothing open: flip it, or open what edits it.
     Edit(usize),
@@ -113,8 +111,6 @@ pub(crate) enum ConfigCmd {
 }
 
 /// The config screen's state, for the view.
-// Drawn from Task 10, which removes this attribute.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ConfigScreen<'a> {
     pub(crate) cursor: usize,
     pub(crate) editing: Editing,
@@ -411,8 +407,6 @@ impl Ui {
     }
 
     /// The config screen, if it is up, for the view.
-    // Called by the session from Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn config_screen(&self) -> Option<ConfigScreen<'_>> {
         let Mode::Config { cursor, editing } = self.mode else {
             return None;
@@ -427,8 +421,6 @@ impl Ui {
     }
 
     /// Open a text field on the cursor's row, holding `text`.
-    // Called by the session from Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_text(&mut self, text: String) {
         if let Mode::Config { cursor, .. } = self.mode {
             self.field = text;
@@ -440,8 +432,6 @@ impl Ui {
     }
 
     /// Wait for the new popup key.
-    // Called by the session from Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_capture(&mut self) {
         if let Mode::Config { cursor, .. } = self.mode {
             self.mode = Mode::Config {
@@ -452,8 +442,6 @@ impl Ui {
     }
 
     /// Open the `stun_servers` sub-list on `list`.
-    // Called by the session from Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_servers(&mut self, list: Vec<String>) {
         if let Mode::Config { cursor, .. } = self.mode {
             self.servers = list;
@@ -493,8 +481,6 @@ impl Ui {
     /// Put `note` on the help line until the next read: why a change was
     /// refused -- the field, if one is open, stays open -- or what a save
     /// did.
-    // Called by the session from Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn say(&mut self, note: String) {
         self.proposed = None;
         self.note = Some(note);

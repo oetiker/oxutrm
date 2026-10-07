@@ -51,19 +51,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{PopupView, Renderer, layout_popup, status_line, terminal_size_of};
+#[cfg(test)]
+use oxutrm_client::layout_popup;
+use oxutrm_client::{
+    ConfigView, Popup, PopupView, Renderer, layout, status_line, terminal_size_of,
+};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
-use crate::config::{ConfigState, Settings};
+use crate::config::{ConfigState, Settings, Value};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
 use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage, Report};
-use crate::ui::{Command, LinkChange, Mode, Ui};
-use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
+use crate::ui::{Command, ConfigCmd, ConfigScreen, LinkChange, Mode, Ui};
+use crate::view::{ConfigFacts, Facts, Identity, RebuildFacts, StandbyFacts};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -962,7 +966,7 @@ pub struct ClientSession {
     /// every lap. Mirrors the overlay exactly -- `None` means no overlay --
     /// except while the startup splash is up: then the overlay is the
     /// splash, and this is what goes back when it ends.
-    shown: Option<PopupView>,
+    shown: Option<Popup>,
     /// The popup's state, and where keystrokes go.
     ui: Ui,
     /// A minute of the primary link's measurements, for the popup.
@@ -1011,10 +1015,8 @@ pub struct ClientSession {
     /// Whatever took it down without painting -- a resize, a recovery --
     /// leaves this for the next lap of layer 1.
     unpainted_splash_end: bool,
-    /// The config file's layers for this target. Defaults, with nowhere to
-    /// save, until `with_config`.
-    // Read by the config screen in Task 10, which removes this attribute.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The config file's layers for this target and the screen's unsaved
+    /// edits. Defaults, with nowhere to save, until `with_config`.
     config: ConfigState,
     /// `network.standby` as last applied. The standby itself is switched by
     /// the loop, which owns the tasks it stops (`standby_switch`).
@@ -1204,7 +1206,7 @@ impl ClientSession {
             return false;
         }
         self.renderer
-            .set_overlay(self.shown.as_ref().map(|v| layout_popup(v, self.size)));
+            .set_overlay(self.shown.as_ref().map(|v| layout(v, self.size)));
         self.unpainted_splash_end = true;
         true
     }
@@ -1348,6 +1350,47 @@ impl ClientSession {
         let text = if on { "switched on" } else { "switched off" };
         self.activity
             .record_shown(Kind::Standby, text, &format!("standby {text}"));
+    }
+
+    /// What the config screen asked for: checked against the table, applied
+    /// at once when it is accepted, and answered on the screen either way.
+    fn config_command(&mut self, c: ConfigCmd) {
+        use crate::config::{SETTINGS, Shape, check_key, check_servers, parse_text, show};
+        match c {
+            ConfigCmd::Edit(row) => match (SETTINGS[row].shape, self.config.shown(row).1) {
+                (Shape::Bool, Value::Bool(b)) => self.config_set(row, Value::Bool(!b)),
+                (Shape::Key, _) => self.ui.open_capture(),
+                (Shape::Servers, Value::List(list)) => self.ui.open_servers(list),
+                (_, value) => self.ui.open_text(show(&value)),
+            },
+            ConfigCmd::Accept { row, text } => match parse_text(SETTINGS[row].shape, &text) {
+                Ok(value) => self.config_set(row, value),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Capture { row, key } => match key.map_or(Ok(None), check_key) {
+                Ok(key) => self.config_set(row, Value::Key(key)),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Servers { row, list } => match check_servers(list) {
+                Ok(value) => self.config_set(row, value),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Reset(row) => match self.config.reset(row) {
+                Ok(settings) => self.apply(&settings),
+                Err(why) => self.ui.say(why),
+            },
+        }
+    }
+
+    /// Row `row` set to `value`, unless that is refused.
+    fn config_set(&mut self, row: usize, value: Value) {
+        match self.config.set(row, value) {
+            Ok(settings) => {
+                self.apply(&settings);
+                self.ui.accepted();
+            }
+            Err(why) => self.ui.say(why),
+        }
     }
 
     /// Tell the user what connection they got — once, and then be quiet.
@@ -1657,8 +1700,7 @@ impl ClientSession {
                 self.activity
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
-            // Answered from Task 10, which draws the screen.
-            Some(Command::Config(_)) => {}
+            Some(Command::Config(c)) => self.config_command(c),
             None => {}
         }
         Ok(None)
@@ -1692,7 +1734,7 @@ impl ClientSession {
     /// whole seconds, so an open popup with nothing happening repaints
     /// rarely and costs one comparison otherwise; a change of phase is
     /// reported the lap it happens.
-    fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
+    fn layer_at(&mut self, now: Instant) -> Option<Popup> {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
         match self.ui.tick(phase, now) {
@@ -1712,7 +1754,36 @@ impl ClientSession {
             }
             None => {}
         }
-        self.ui.visible(phase).then(|| self.view(phase, now))
+        if !self.ui.visible(phase) {
+            return None;
+        }
+        Some(match self.ui.config_screen() {
+            Some(screen) => Popup::Config(self.config_view(screen, phase, now)),
+            None => Popup::Status(self.view(phase, now)),
+        })
+    }
+
+    /// The status view [`ClientSession::layer_at`] shows, for the tests that
+    /// read it: `None` while the popup is closed or shows the config screen.
+    #[cfg(test)]
+    fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
+        match self.layer_at(now)? {
+            Popup::Status(v) => Some(v),
+            Popup::Config(_) => None,
+        }
+    }
+
+    /// What the config screen says at `now`.
+    fn config_view(&self, screen: ConfigScreen<'_>, phase: Phase, now: Instant) -> ConfigView {
+        crate::view::config(&ConfigFacts {
+            identity: self.identity.as_ref(),
+            state: &self.config,
+            screen,
+            standby_offered: self.standby.is_some(),
+            phase,
+            last_heard: self.link_state.last_heard(),
+            now,
+        })
     }
 
     /// Layer 1 for one lap at `now`: the popup, or the splash while it is
@@ -1724,7 +1795,7 @@ impl ClientSession {
     /// outage that opens it while the splash is up ends the splash: what is
     /// wrong with the link matters more than the logo.
     fn layer_one<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<()> {
-        let view = self.popup_at(now);
+        let view = self.layer_at(now);
         self.sample_quality(now);
         let ended = view.is_some() && self.end_splash();
         if !ended && self.splash_lap(now, out)? {
@@ -1732,7 +1803,7 @@ impl ClientSession {
         }
         if view != self.shown || ended || self.unpainted_splash_end {
             self.renderer
-                .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
+                .set_overlay(view.as_ref().map(|v| layout(v, self.size)));
             self.shown = view;
             self.paint(out, "painting the popup")?;
         }
@@ -2232,7 +2303,7 @@ impl ClientSession {
         // whose view is also `None` would never clear a box stranded on the
         // screen.
         if let Some(v) = self.shown.as_ref() {
-            self.renderer.set_overlay(Some(layout_popup(v, size)));
+            self.renderer.set_overlay(Some(layout(v, size)));
         }
         // The splash is laid out for a screen too, so the frame that was
         // showing is laid out again at the new size, or the splash ends if
@@ -7304,7 +7375,7 @@ mod tests {
         assert!(session.popup_at(t).is_none());
         let view = session.popup_at(t + Duration::from_secs(3));
         assert!(view.is_some(), "the fixture raised no popup");
-        session.shown = view;
+        session.shown = view.map(Popup::Status);
         (host, session)
     }
 
@@ -7323,7 +7394,7 @@ mod tests {
         session.note_heard(now);
         let view = session.popup_at(now);
         assert!(view.is_some(), "the fixture asked the user nothing");
-        session.shown = view;
+        session.shown = view.map(Popup::Status);
         (host, session)
     }
 
@@ -8288,7 +8359,7 @@ mod tests {
             session
                 .renderer
                 .set_overlay(Some(layout_popup(&view, session.size)));
-            session.shown = Some(view.clone());
+            session.shown = Some(Popup::Status(view.clone()));
             let mut painted = Vec::new();
             session
                 .renderer
@@ -9856,5 +9927,135 @@ mod tests {
                 .is_empty(),
             "a standby switched off still has a popup section"
         );
+    }
+
+    /// A client with its popup open on the config screen, cursor on `row`.
+    async fn on_the_config_screen(row: usize) -> (HostSession, ClientSession) {
+        let (host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        session.route_keys(&[crate::ui::PREFIX], &mut out).unwrap();
+        session.route_keys(b"c", &mut out).unwrap();
+        for _ in 0..row {
+            session.route_keys(b"j", &mut out).unwrap();
+        }
+        assert!(
+            matches!(session.layer_at(Instant::now()), Some(Popup::Config(_))),
+            "the config screen did not open"
+        );
+        (host, session)
+    }
+
+    fn row_of(key: &str) -> usize {
+        crate::config::SETTINGS
+            .iter()
+            .position(|s| format!("{}.{}", s.section, s.name) == key)
+            .expect("no such setting")
+    }
+
+    fn type_in(session: &mut ClientSession, keys: &[u8]) {
+        session.route_keys(keys, &mut Vec::new()).unwrap();
+    }
+
+    /// Enter opens the field with the value in it; what is typed and
+    /// accepted is applied at once and marked unsaved.
+    #[tokio::test]
+    async fn an_accepted_edit_is_applied_at_once() {
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = on_the_config_screen(row).await;
+        type_in(&mut session, b"\r");
+        assert_eq!(session.ui.config_screen().unwrap().field, "20s");
+        type_in(&mut session, b"\x7f\x7f\x7f30s");
+        type_in(&mut session, b"\r");
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(30));
+        assert_eq!(
+            session.config.shown(row),
+            (None, Value::Duration(Some(Duration::from_secs(30))), true)
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().editing,
+            crate::ui::Editing::None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_value_keeps_the_field_and_says_why() {
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = on_the_config_screen(row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f\x7f1s\r");
+        let screen = session.ui.config_screen().unwrap();
+        assert_eq!(screen.editing, crate::ui::Editing::Text);
+        assert!(
+            screen.note.is_some_and(|n| n.contains("outside")),
+            "{:?}",
+            screen.note
+        );
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            crate::linkstate::REBUILD_AFTER
+        );
+    }
+
+    /// A bool flips on Enter; `network.standby` off is left for the loop
+    /// to carry out.
+    #[tokio::test]
+    async fn enter_flips_a_bool_and_standby_off_waits_for_the_loop() {
+        let (_host, mut session) = on_the_config_screen(crate::config::STANDBY).await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        type_in(&mut session, b"\r");
+        assert_eq!(session.standby_switch(), Some(false));
+        type_in(&mut session, b"\r");
+        assert_eq!(
+            session.standby_switch(),
+            None,
+            "flipped back, nothing to do"
+        );
+    }
+
+    /// The popup key moved from the screen: `Ctrl-]` captured, and from
+    /// then on `Ctrl-\` is typing. `Ctrl-M` is refused with the reason.
+    #[tokio::test]
+    async fn a_captured_key_becomes_the_popup_key() {
+        let (_host, mut session) = on_the_config_screen(0).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\r");
+        let note = session.ui.config_screen().unwrap().note.map(str::to_owned);
+        assert_eq!(note.as_deref(), Some("ctrl-m is Enter"));
+        type_in(&mut session, &[0x1d]);
+        assert_eq!(session.config.shown(0).1, Value::Key(Some(0x1d)));
+        // Back to the status view, then closed -- by the new key.
+        type_in(&mut session, &[0x1b]);
+        type_in(&mut session, &[0x1d]);
+        assert!(
+            session.popup_at(Instant::now()).is_none(),
+            "ctrl-] did not close it"
+        );
+        type_in(&mut session, &[0x1c]);
+        assert!(
+            spoken(&session).ends_with(&[0x1c]),
+            "{:?}",
+            spoken(&session)
+        );
+    }
+
+    /// Both off is refused on the screen too, whichever way it is reached.
+    #[tokio::test]
+    async fn a_change_that_would_make_the_popup_unreachable_is_refused() {
+        let (_host, mut session) = on_the_config_screen(0).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, &[0x7f]);
+        assert_eq!(
+            session.config.shown(0).1,
+            Value::Key(None),
+            "Backspace did not set off"
+        );
+        type_in(&mut session, b"j\r");
+        type_in(&mut session, b"\x7f\x7foff\r");
+        let screen = session.ui.config_screen().unwrap();
+        assert_eq!(screen.note, Some(crate::config::UNREACHABLE));
+        assert_eq!(screen.editing, crate::ui::Editing::Text);
     }
 }
