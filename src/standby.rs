@@ -32,6 +32,9 @@ use crate::session::{REBUILT, SHELL_EXITED, TAKEN_OVER};
 /// has since been replaced. Local, like [`REBUILT`]: the host just drops it.
 const STALE: &[u8] = b"found for a link that has since been replaced";
 
+/// Why the client closed its standby: `network.standby` was turned off.
+pub(crate) const SWITCHED_OFF: &[u8] = b"standby switched off in the config";
+
 /// Close a link the standby lets go of. Dropping a `Link` does not close its
 /// connection: its source's tasks hold clones of it.
 fn close(link: &Link, reason: &'static [u8]) {
@@ -101,6 +104,8 @@ pub(crate) struct Standby {
     /// Why the last search failed, for the popup's standby section. Cleared the
     /// moment a search succeeds; never printed.
     last_failure: Option<String>,
+    /// `network.standby`. Off, nothing is searched for, probed or kept.
+    enabled: bool,
 }
 
 impl Standby {
@@ -117,12 +122,43 @@ impl Standby {
             probing: false,
             nonce: 0,
             last_failure: None,
+            enabled: true,
         }
+    }
+
+    /// Whether `network.standby` is on for it.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// The network settings the next search runs with.
     pub(crate) fn set_cfg(&mut self, cfg: NetConfig) {
         self.cfg = cfg;
+    }
+
+    /// Turn the standby off or on (spec §2.3). Off: a search in flight is
+    /// disowned as a new primary would disown it, the probe is forgotten --
+    /// an aborted probe never reports, and a `probing` left set would stop
+    /// every later one -- and the parked standby is closed. On: a search is
+    /// due once the link has settled, as after a failover.
+    ///
+    /// The loop has already aborted the search and probe tasks and dropped
+    /// the connection it watched: they are its locals.
+    pub(crate) fn set_enabled(&mut self, on: bool, now: Instant) {
+        if on == self.enabled {
+            return;
+        }
+        self.enabled = on;
+        if on {
+            self.next_search = now + STANDBY_DELAY;
+            return;
+        }
+        self.new_primary();
+        self.probing = false;
+        self.probe = ProbeState::Idle;
+        if let Some(e) = self.link.take() {
+            close(&e.link, SWITCHED_OFF);
+        }
     }
 
     #[cfg(test)]
@@ -188,6 +224,9 @@ impl Standby {
         now: Instant,
         rebuild: RebuildStage,
     ) -> StandbyAction {
+        if !self.enabled {
+            return StandbyAction::Nothing;
+        }
         if !phase.is_outage() {
             // The outage (if there was one) is over, and so is its probe.
             self.probe = ProbeState::Idle;
@@ -228,7 +267,9 @@ impl Standby {
     /// found for a primary that has since been replaced stood by for nothing,
     /// and is closed rather than dropped (see [`close`]).
     pub(crate) fn found(&mut self, search: u64, e: Established) -> bool {
-        if search != self.search {
+        // Switched off since: a `Found` can already sit in the loop's
+        // channel when the search is aborted, and is closed like a stale one.
+        if !self.enabled || search != self.search {
             close(&e.link, STALE);
             return false;
         }
@@ -899,5 +940,79 @@ mod tests {
         assert!(taken.is_some());
         assert!(!s.has_link());
         assert_eq!(s.next_search(), t1 + STANDBY_DELAY);
+    }
+
+    // ---- network.standby off and on (spec §2.3) ----
+
+    /// Off closes the parked standby -- the host end hears why -- and
+    /// nothing is searched for or probed while it stays off.
+    #[tokio::test]
+    async fn switching_off_closes_the_parked_standby_and_stops_everything() {
+        let t0 = Instant::now();
+        let (mut s, host) = with_a_standby(t0).await;
+        s.set_enabled(false, t0);
+        assert!(!s.has_link() && !s.enabled());
+        let reason = tokio::time::timeout(Duration::from_secs(5), host.sink.connection().closed())
+            .await
+            .expect("the close never arrived");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == SWITCHED_OFF),
+            "{reason:?}"
+        );
+        let later = t0 + Duration::from_secs(600);
+        assert_eq!(
+            s.step(Phase::Live, later, RebuildStage::Idle),
+            StandbyAction::Nothing
+        );
+        assert_eq!(
+            s.step(silent(t0), later, RebuildStage::Idle),
+            StandbyAction::Nothing
+        );
+    }
+
+    /// A `Found` already queued when it was switched off is closed, not
+    /// parked.
+    #[tokio::test]
+    async fn a_find_that_lands_after_switching_off_is_closed() {
+        let t0 = Instant::now();
+        let mut s = Standby::new(crate::attach_exchange::fixtures::stun_free(), t0);
+        let search = search_at(&mut s, t0 + STANDBY_DELAY);
+        s.set_enabled(false, t0 + STANDBY_DELAY);
+        let (e, host) = established().await;
+        assert!(!s.found(search, e), "parked while off");
+        assert!(!s.has_link());
+        tokio::time::timeout(Duration::from_secs(5), host.sink.connection().closed())
+            .await
+            .expect("the found link was dropped open");
+    }
+
+    /// Off in the middle of a probe, then on: the next outage still probes.
+    /// A `probing` left set by the aborted probe would stop every later one.
+    #[tokio::test]
+    async fn after_off_and_on_a_probe_still_runs() {
+        let t0 = Instant::now();
+        let (mut s, _host) = with_a_standby(t0).await;
+        assert!(matches!(
+            s.step(silent(t0), t0 + Duration::from_secs(2), RebuildStage::Idle),
+            StandbyAction::Probe { .. }
+        ));
+        s.set_enabled(false, t0 + Duration::from_secs(3));
+        s.set_enabled(true, t0 + Duration::from_secs(4));
+        assert_eq!(s.next_search(), t0 + Duration::from_secs(4) + STANDBY_DELAY);
+        let back = s.next_search();
+        let search = search_at(&mut s, back);
+        let (e, _host2) = established().await;
+        assert!(s.found(search, e));
+        assert!(
+            matches!(
+                s.step(
+                    silent(back),
+                    back + Duration::from_secs(2),
+                    RebuildStage::Idle
+                ),
+                StandbyAction::Probe { .. }
+            ),
+            "the aborted probe left the standby unable to probe"
+        );
     }
 }

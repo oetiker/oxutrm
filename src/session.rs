@@ -1014,6 +1014,9 @@ pub struct ClientSession {
     // Read by the config screen in Task 10, which removes this attribute.
     #[cfg_attr(not(test), allow(dead_code))]
     config: ConfigState,
+    /// `network.standby` as last applied. The standby itself is switched by
+    /// the loop, which owns the tasks it stops (`standby_switch`).
+    standby_wanted: bool,
 }
 
 /// The startup splash while it shows; the picture is
@@ -1159,6 +1162,7 @@ impl ClientSession {
             splash: None,
             unpainted_splash_end: false,
             config: ConfigState::defaults(),
+            standby_wanted: true,
         })
     }
 
@@ -1286,6 +1290,11 @@ impl ClientSession {
     /// shown entries -- they cannot be printed (config spec §2.2). After
     /// `with_activity`, whose log the warnings belong in, and after
     /// `with_standby`, whose network settings it sets.
+    ///
+    /// `network.standby = false` switches the standby off here, before the
+    /// loop runs and without an entry: the file said so, and the user who
+    /// wrote it never hears of that host's standby again (config spec §1).
+    /// Only a change made on the screen is the loop's to carry out and log.
     pub(crate) fn with_config(mut self, state: ConfigState, warnings: &[String]) -> ClientSession {
         for w in warnings {
             self.activity
@@ -1294,12 +1303,17 @@ impl ClientSession {
         let settings = state.in_effect();
         self.config = state;
         self.apply(&settings);
+        if let Some(st) = self.standby.as_mut() {
+            st.set_enabled(settings.standby, Instant::now());
+        }
         self
     }
 
     /// The one way settings reach the session: at startup, and after every
     /// change the config screen accepts. Each consumer takes its value for
-    /// its next read, lap, attempt or search.
+    /// its next read, lap, attempt or search. Switching the standby off or
+    /// on is the loop's to do ([`ClientSession::standby_switch`]): the tasks
+    /// it stops are the loop's locals.
     pub(crate) fn apply(&mut self, s: &Settings) {
         self.ui
             .retune(s.popup_key, s.linger, s.effective_auto_open());
@@ -1312,6 +1326,26 @@ impl ClientSession {
         if let Some(st) = self.standby.as_mut() {
             st.set_cfg(cfg);
         }
+        self.standby_wanted = s.standby;
+    }
+
+    /// `Some(on)` when `network.standby` asks for something the standby is
+    /// not doing; `None` without a standby, on a host that offered none.
+    fn standby_switch(&self) -> Option<bool> {
+        let s = self.standby.as_ref()?;
+        (s.enabled() != self.standby_wanted).then_some(self.standby_wanted)
+    }
+
+    /// Switch the standby off or on, once the loop has stopped what it runs
+    /// for it.
+    fn switch_standby(&mut self, on: bool, now: Instant) {
+        let Some(s) = self.standby.as_mut() else {
+            return;
+        };
+        s.set_enabled(on, now);
+        let text = if on { "switched on" } else { "switched off" };
+        self.activity
+            .record_shown(Kind::Standby, text, &format!("standby {text}"));
     }
 
     /// Tell the user what connection they got — once, and then be quiet.
@@ -1707,14 +1741,19 @@ impl ClientSession {
             Mode::Lingering { outage, .. } => Some(outage),
             _ => None,
         };
-        let standby = self.standby.as_ref().map(|s| StandbyFacts {
-            path: s.path(),
-            rtt: s.rtt(),
-            probe: s.probe(),
-            searching: s.searching(),
-            next_search: s.next_search(),
-            last_search_failed: s.last_failure().is_some(),
-        });
+        // A standby switched off is shown as none at all.
+        let standby = self
+            .standby
+            .as_ref()
+            .filter(|s| s.enabled())
+            .map(|s| StandbyFacts {
+                path: s.path(),
+                rtt: s.rtt(),
+                probe: s.probe(),
+                searching: s.searching(),
+                next_search: s.next_search(),
+                last_search_failed: s.last_failure().is_some(),
+            });
         crate::view::build(&Facts {
             identity: self.identity.as_ref(),
             phase,
@@ -2546,6 +2585,19 @@ impl ClientSession {
                     self.drain(out).await?;
                     return exit_code(&reason);
                 }
+            }
+
+            // `network.standby` changed on the config screen (config spec
+            // §2.3). Off: the search and the probe in flight and the
+            // connection watched for closing are this loop's locals, so they
+            // go here, before the standby closes its link.
+            if let Some(on) = self.standby_switch() {
+                if !on {
+                    _search_task = None;
+                    _probe_task = None;
+                    standby_conn = None;
+                }
+                self.switch_standby(on, Instant::now());
             }
 
             let now = Instant::now();
@@ -9672,5 +9724,84 @@ mod tests {
             ..Settings::default()
         });
         assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(10));
+    }
+
+    /// `network.standby = false` reaches the loop, which closes the parked
+    /// standby -- the host end hears why -- and the session goes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_switches_a_standby_off_and_closes_it() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        client.apply(&Settings {
+            standby: false,
+            ..Settings::default()
+        });
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let client_loop = tokio::spawn(async move {
+            let mut out = Vec::new();
+            let code = client.run_on(keys, &mut out).await;
+            (code, client)
+        });
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            standby_host.sink.connection().closed(),
+        )
+        .await
+        .expect("the standby was never closed");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == crate::standby::SWITCHED_OFF),
+            "{reason:?}"
+        );
+
+        typing.write_all(b"exit 7\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 7);
+        let standby = client.standby.as_ref().expect("the standby");
+        assert!(!standby.enabled() && !standby.has_link());
+        assert!(
+            shown_log(&client)
+                .iter()
+                .any(|(k, s, _)| *k == Kind::Standby && s == "standby switched off"),
+            "{:?}",
+            shown_log(&client)
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+    }
+
+    /// `network.standby = false` in the file switches the standby off at
+    /// connect, silently: only a change made on the screen is recorded
+    /// (config spec §1: the user never sees it again on that host).
+    #[tokio::test]
+    async fn a_standby_off_in_the_file_is_off_from_connect_without_a_word() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        let resolved = crate::config::resolve(Some("[network]\nstandby = false\n"), "t");
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        let session = session.with_config(
+            crate::config::ConfigState::new(None, "t", &resolved),
+            &resolved.warnings,
+        );
+        let standby = session.standby.as_ref().expect("the standby");
+        assert!(!standby.enabled(), "the file's standby = false was ignored");
+        assert_eq!(session.standby_switch(), None, "left for the loop to log");
+        assert_eq!(shown_log(&session), []);
+        let now = Instant::now();
+        assert!(
+            session
+                .view(session.link_state.phase_now(), now)
+                .standby
+                .is_empty(),
+            "a standby switched off still has a popup section"
+        );
     }
 }
