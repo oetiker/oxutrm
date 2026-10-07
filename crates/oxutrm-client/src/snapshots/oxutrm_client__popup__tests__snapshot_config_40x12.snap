@@ -1,0 +1,14 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_config(&config_view(), TermSize { cols: 40, rows: 12 }))"
+---
+╭ oxutrm · config · thinlinc ──────╮
+│ config: 2 warnings               │
+│   splash            on           │
+├ recovery ────────────────────────┤
+│   silent_after      2s           │
+│ ▸ rebuild_after     30s          │
+├──────────────────────────────────┤
+│ silence before an ssh rebuild st │
+│ ↑↓ move  ⏎ edit  x reset  w save │
+╰──────────────────────────────────╯

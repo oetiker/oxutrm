@@ -492,8 +492,7 @@ fn key_line(keys: &[KeyHint]) -> Line<'static> {
 /// Reverse video and the top row, because the bottom rows are where the
 /// cursor usually is and covering those is what the box was centred to avoid.
 fn single_line(v: &PopupView, size: TermSize) -> Overlay {
-    let area = Rect::new(0, 0, size.cols.max(1), 1);
-    let mut buf = Buffer::empty(area);
+    let width = usize::from(size.cols.max(1));
     let marker = [format!("oxutrm: {}", v.marker_text)];
     let texts = if v.line.is_empty() {
         &marker[..]
@@ -502,16 +501,233 @@ fn single_line(v: &PopupView, size: TermSize) -> Overlay {
     };
     let text = texts
         .iter()
-        .find(|t| Line::from(t.as_str()).width() <= usize::from(area.width))
+        .find(|t| Line::from(t.as_str()).width() <= width)
         .or(texts.last())
         .cloned()
         .unwrap_or_default();
+    reversed_line(text, size)
+}
+
+/// `text` in reverse video on the top row, for a screen too small for a
+/// box.
+fn reversed_line(text: String, size: TermSize) -> Overlay {
+    let area = Rect::new(0, 0, size.cols.max(1), 1);
+    let mut buf = Buffer::empty(area);
     Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().add_modifier(Modifier::REVERSED),
     )))
     .render(area, &mut buf);
     overlay_from_buffer(&buf, 0, 0)
+}
+
+/// One row of the config screen.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ConfigRow {
+    pub name: String,
+    /// The value, or the text field while one is open on the row.
+    pub value: String,
+    /// Changed on the screen and not saved: drawn as `*`.
+    pub changed: bool,
+    /// `host` or `global`; empty for the built-in default.
+    pub origin: String,
+    /// When a change takes effect, when that is not now.
+    pub note: String,
+}
+
+/// Rows under a rule with `name` drawn into it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ConfigSection {
+    pub name: String,
+    pub rows: Vec<ConfigRow>,
+}
+
+/// What the config screen says, as content rather than as cells.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ConfigView {
+    /// Drawn into the top border.
+    pub title: String,
+    /// The first line inside the box -- warnings, an outage -- or empty.
+    pub header: String,
+    pub sections: Vec<ConfigSection>,
+    /// The row the cursor is on, counting rows across all sections.
+    pub cursor: usize,
+    /// The line above the key bar: the selected setting's help and range,
+    /// or why a change was refused.
+    pub help: String,
+    pub keys: Vec<KeyHint>,
+}
+
+impl ConfigView {
+    /// The row the cursor is on.
+    fn selected(&self) -> Option<&ConfigRow> {
+        self.sections.iter().flat_map(|s| &s.rows).nth(self.cursor)
+    }
+}
+
+/// What layer 1's popup shows: the status view or the config screen.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Popup {
+    Status(PopupView),
+    Config(ConfigView),
+}
+
+/// Lay out whichever view the popup shows.
+pub fn layout(p: &Popup, size: TermSize) -> Overlay {
+    match p {
+        Popup::Status(v) => layout_popup(v, size),
+        Popup::Config(v) => layout_config(v, size),
+    }
+}
+
+/// The config screen's column widths: the name, then the value.
+const NAME_COLS: usize = 18;
+const VALUE_COLS: usize = 18;
+/// The origin column, after the `*`.
+const ORIGIN_COLS: usize = 7;
+
+/// Lay the config screen out for this screen: the same box as the status
+/// view, `min(cols - 4, 72)` by up to `min(rows - 2, 24)`, centred. The
+/// header, then each section under a rule drawn into the border, then a
+/// plain rule, the help line and the key bar. When the rows do not fit, the
+/// list scrolls so the cursor's row is in view.
+pub fn layout_config(v: &ConfigView, size: TermSize) -> Overlay {
+    if size.cols < MIN_BOX.cols || size.rows < MIN_BOX.rows {
+        let text = match v.selected() {
+            Some(r) => format!("oxutrm config \u{b7} {} {}", r.name, r.value),
+            None => "oxutrm config".to_string(),
+        };
+        return reversed_line(text, size);
+    }
+    let cols = (size.cols - 4).min(MAX_BOX.cols);
+    let cap = (size.rows - 2).min(MAX_BOX.rows);
+    let lines = config_lines(v).len() + usize::from(!v.header.is_empty());
+    // Inside the border: the content, then the rule, the help, the keys.
+    let wanted = u16::try_from(lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3 + 2);
+    let rows = wanted.min(cap);
+    let buf = draw_config(v, cols, rows);
+    overlay_from_buffer(&buf, (size.rows - rows) / 2, (size.cols - cols) / 2)
+}
+
+/// One line of the config screen's list.
+enum ConfigLine<'a> {
+    Rule(&'a str),
+    /// A row, and whether the cursor is on it.
+    Row(&'a ConfigRow, bool),
+}
+
+fn config_lines(v: &ConfigView) -> Vec<ConfigLine<'_>> {
+    let mut lines = Vec::new();
+    let mut n = 0;
+    for s in &v.sections {
+        lines.push(ConfigLine::Rule(&s.name));
+        for r in &s.rows {
+            lines.push(ConfigLine::Row(r, n == v.cursor));
+            n += 1;
+        }
+    }
+    lines
+}
+
+/// `text` padded or cut to `cols` characters; a cut ends in `…`.
+fn column(text: &str, cols: usize) -> String {
+    if text.chars().count() <= cols {
+        format!("{text:<cols$}")
+    } else {
+        let kept: String = text.chars().take(cols.saturating_sub(2)).collect();
+        format!("{kept}\u{2026} ")
+    }
+}
+
+fn row_line(r: &ConfigRow, selected: bool) -> Line<'static> {
+    let text = format!(
+        "{} {}{}{} {}{}",
+        if selected { '\u{25b8}' } else { ' ' },
+        column(&r.name, NAME_COLS),
+        column(&r.value, VALUE_COLS),
+        if r.changed { '*' } else { ' ' },
+        column(&r.origin, ORIGIN_COLS),
+        r.note
+    );
+    let style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(text.trim_end().to_string(), style))
+}
+
+fn draw_config(v: &ConfigView, cols: u16, rows: u16) -> Buffer {
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(format!(" {} ", v.title));
+    let inner = block.inner(area);
+    block.render(area, &mut buf);
+
+    // From the bottom: the key bar, which is how the screen is left, then
+    // the help line and a plain rule while there is room for them. At
+    // least two rows inside the border here.
+    let bar = inner.bottom() - 1;
+    Paragraph::new(key_line(&v.keys)).render(
+        Rect {
+            y: bar,
+            height: 1,
+            ..inner
+        },
+        &mut buf,
+    );
+    if inner.height >= 2 {
+        Paragraph::new(v.help.clone()).render(
+            Rect {
+                y: bar - 1,
+                height: 1,
+                ..inner
+            },
+            &mut buf,
+        );
+    }
+    if inner.height >= 3 {
+        rule(&mut buf, bar - 2, cols, None);
+    }
+    let mut body = Rect {
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    if !v.header.is_empty() {
+        body = place_one(Line::from(v.header.clone()), body, &mut buf);
+    }
+    let lines = config_lines(v);
+    let at = lines
+        .iter()
+        .position(|l| matches!(l, ConfigLine::Row(_, true)))
+        .unwrap_or(0);
+    let height = usize::from(body.height);
+    // Scrolled just enough for the cursor's row to be the last one shown,
+    // and the rule above a first row stays with it.
+    let start = (at + 1).saturating_sub(height);
+    for (i, line) in lines.iter().skip(start).take(height).enumerate() {
+        let y = body.y + u16::try_from(i).unwrap_or(u16::MAX);
+        match line {
+            ConfigLine::Rule(name) => rule(&mut buf, y, cols, Some(name)),
+            ConfigLine::Row(r, selected) => {
+                Paragraph::new(row_line(r, *selected)).render(
+                    Rect {
+                        y,
+                        height: 1,
+                        ..body
+                    },
+                    &mut buf,
+                );
+            }
+        }
+    }
+    buf
 }
 
 /// How many rows `lines` needs when wrapped at `width`, capped at `height`.
@@ -1267,5 +1483,169 @@ mod tests {
         assert!(shown.starts_with("ssh said:"), "{shown}");
         let short = summarised("ssh said: short");
         assert_eq!(short, "ssh said: short", "a short reason was cut");
+    }
+
+    // ---- the config screen ----
+
+    fn config_view() -> ConfigView {
+        let row = |name: &str, value: &str, changed: bool, origin: &str, note: &str| ConfigRow {
+            name: name.to_string(),
+            value: value.to_string(),
+            changed,
+            origin: origin.to_string(),
+            note: note.to_string(),
+        };
+        ConfigView {
+            title: "oxutrm \u{b7} config \u{b7} thinlinc".to_string(),
+            header: "config: 2 warnings".to_string(),
+            sections: vec![
+                ConfigSection {
+                    name: "popup".to_string(),
+                    rows: vec![
+                        row("key", "ctrl-\\", false, "", ""),
+                        row("auto_open_after", "2s", false, "", ""),
+                        row("linger", "3s", false, "", ""),
+                        row("splash", "on", false, "", "next connect"),
+                    ],
+                },
+                ConfigSection {
+                    name: "recovery".to_string(),
+                    rows: vec![
+                        row("silent_after", "2s", false, "", ""),
+                        row("rebuild_after", "30s", true, "host", ""),
+                        row("connect_timeout", "10s", false, "", "next attempt"),
+                    ],
+                },
+                ConfigSection {
+                    name: "network".to_string(),
+                    rows: vec![
+                        row("standby", "off", false, "host", ""),
+                        row(
+                            "stun_servers",
+                            "stun.cloudflare.com:3478 +3",
+                            false,
+                            "",
+                            "next attempt",
+                        ),
+                        row("port_mapping", "on", false, "", "next attempt"),
+                        row("birthday", "on", false, "global", "next attempt"),
+                    ],
+                },
+            ],
+            cursor: 5,
+            help: "silence before an ssh rebuild starts \u{b7} 5s\u{2013}10m".to_string(),
+            keys: [
+                "\u{2191}\u{2193} move",
+                "\u{23ce} edit",
+                "x reset",
+                "w save",
+                "Esc back",
+            ]
+            .iter()
+            .map(|k| {
+                let (key, label) = k.split_once(' ').unwrap();
+                KeyHint {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                    enabled: true,
+                }
+            })
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn the_config_screen_shows_its_sections_under_rules_and_marks_the_cursor() {
+        let o = layout_config(&config_view(), TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        for section in ["popup", "recovery", "network"] {
+            assert!(
+                rule_row(&o, Some(section)).is_some(),
+                "no {section} rule:\n{text}"
+            );
+        }
+        let at = find(&o, "rebuild_after").expect("no rebuild_after row");
+        let line = row(&o, at);
+        assert!(line.contains("\u{25b8} rebuild_after"), "{line}");
+        assert!(
+            line.contains("30s") && line.contains('*') && line.contains("host"),
+            "{line}"
+        );
+        assert!(find(&o, "config: 2 warnings").is_some(), "{text}");
+        assert_eq!(find(&o, "silence before an ssh rebuild"), Some(o.rows - 3));
+        assert_eq!(find(&o, "Esc back"), Some(o.rows - 2));
+    }
+
+    #[test]
+    fn the_config_screen_scrolls_to_keep_the_cursor_in_view() {
+        let mut v = config_view();
+        v.cursor = 10;
+        let o = layout_config(&v, TermSize { cols: 40, rows: 12 });
+        let text = text_of(&o);
+        assert!(
+            find(&o, "birthday").is_some(),
+            "the cursor's row is not shown:\n{text}"
+        );
+        assert!(
+            find(&o, "auto_open_after").is_none(),
+            "nothing scrolled:\n{text}"
+        );
+        assert!(o.rows <= 10);
+        v.cursor = 0;
+        let o = layout_config(&v, TermSize { cols: 40, rows: 12 });
+        assert!(find(&o, "key").is_some(), "{}", text_of(&o));
+    }
+
+    #[test]
+    fn a_long_value_is_cut_and_the_columns_after_it_stay() {
+        let mut v = config_view();
+        v.sections[1].rows[1].value = "x".repeat(60);
+        let o = layout_config(&v, TermSize { cols: 80, rows: 24 });
+        let line = row(&o, find(&o, "rebuild_after").unwrap());
+        assert!(line.contains('\u{2026}') && line.contains("host"), "{line}");
+    }
+
+    /// Review focus 5. Below the minimum box the config screen is one line
+    /// naming the selected row, and no size panics.
+    #[test]
+    fn a_config_screen_below_the_minimum_is_one_line_and_no_size_panics() {
+        let o = layout_config(&config_view(), TermSize { cols: 19, rows: 5 });
+        assert_eq!(o.rows, 1);
+        assert!(row(&o, 0).starts_with("oxutrm config"), "{}", row(&o, 0));
+        for cols in 1..=30 {
+            for rows in 1..=12 {
+                let o = layout_config(&config_view(), TermSize { cols, rows });
+                assert!(o.cols <= cols && o.rows <= rows, "{cols}x{rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn layout_lays_out_whichever_view_the_popup_shows() {
+        let size = TermSize { cols: 80, rows: 24 };
+        assert_eq!(
+            layout(&Popup::Status(view()), size),
+            layout_popup(&view(), size)
+        );
+        assert_eq!(
+            layout(&Popup::Config(config_view()), size),
+            layout_config(&config_view(), size)
+        );
+    }
+
+    #[test]
+    fn snapshot_config_80x24() {
+        insta::assert_snapshot!(text_of(&layout_config(
+            &config_view(),
+            TermSize { cols: 80, rows: 24 }
+        )));
+    }
+
+    #[test]
+    fn snapshot_config_40x12() {
+        insta::assert_snapshot!(text_of(&layout_config(
+            &config_view(),
+            TermSize { cols: 40, rows: 12 }
+        )));
     }
 }

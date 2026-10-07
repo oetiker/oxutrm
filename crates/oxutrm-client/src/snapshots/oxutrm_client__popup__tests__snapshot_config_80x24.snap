@@ -1,0 +1,24 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_config(&config_view(), TermSize { cols: 80, rows: 24 }))"
+---
+╭ oxutrm · config · thinlinc ──────────────────────────────────────────╮
+│ config: 2 warnings                                                   │
+├ popup ───────────────────────────────────────────────────────────────┤
+│   key               ctrl-\                                           │
+│   auto_open_after   2s                                               │
+│   linger            3s                                               │
+│   splash            on                         next connect          │
+├ recovery ────────────────────────────────────────────────────────────┤
+│   silent_after      2s                                               │
+│ ▸ rebuild_after     30s               * host                         │
+│   connect_timeout   10s                        next attempt          │
+├ network ─────────────────────────────────────────────────────────────┤
+│   standby           off                 host                         │
+│   stun_servers      stun.cloudflare.…          next attempt          │
+│   port_mapping      on                         next attempt          │
+│   birthday          on                  global next attempt          │
+├──────────────────────────────────────────────────────────────────────┤
+│ silence before an ssh rebuild starts · 5s–10m                        │
+│ ↑↓ move  ⏎ edit  x reset  w save  Esc back                           │
+╰──────────────────────────────────────────────────────────────────────╯
