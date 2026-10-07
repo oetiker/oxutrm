@@ -547,7 +547,7 @@ fn field_text(field: &str) -> String {
 }
 
 fn settings_sections(f: &ConfigFacts<'_>) -> Vec<ConfigSection> {
-    let in_effect = f.state.in_effect();
+    let in_effect = &f.state.applied;
     let mut sections: Vec<ConfigSection> = Vec::new();
     for (i, row) in SETTINGS.iter().enumerate() {
         if sections.last().is_none_or(|s| s.name != row.section) {

@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use toml_edit::{DocumentMut, Item};
 
+mod save;
+
 /// The file's name inside the config directory.
 pub(crate) const FILE: &str = "config.toml";
 
@@ -882,16 +884,16 @@ pub(crate) const UNREACHABLE: &str =
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigState {
     /// Where the file is; `None` when there is nowhere to save it.
-    // Read by the save in Task 12, which removes this attribute.
-    #[allow(dead_code)]
     pub(crate) dir: Option<PathBuf>,
-    // Read by the save in Task 12, which removes this attribute.
-    #[allow(dead_code)]
     pub(crate) target: String,
     pub(crate) layers: Layers,
     /// How many warnings the file produced, for the screen's header.
     pub(crate) warnings: usize,
     pub(crate) pending: Pending,
+    /// The settings the session runs with. Not derived from `layers`: a
+    /// save re-reads the file into `layers` for the screen, and a hand edit
+    /// made there since the connect must not ride in on the next edit.
+    pub(crate) applied: Settings,
 }
 
 impl ConfigState {
@@ -902,16 +904,13 @@ impl ConfigState {
             layers: resolved.layers.clone(),
             warnings: resolved.warnings.len(),
             pending: Pending::new(),
+            applied: resolved.layers.settings(),
         }
     }
 
     /// No file, no target: a session that was not reached over ssh.
     pub(crate) fn defaults() -> ConfigState {
         ConfigState::new(None, "", &resolve(None, ""))
-    }
-
-    pub(crate) fn in_effect(&self) -> Settings {
-        in_effect(&self.layers, &self.pending)
     }
 
     /// Row `i` as the screen shows it: where its value comes from, the
@@ -922,14 +921,18 @@ impl ConfigState {
         (origin, value, edit.is_some())
     }
 
-    /// `next` instead of the pending edits, unless it leaves the popup
-    /// unreachable. Returns the settings now in effect.
-    fn commit(&mut self, next: Pending) -> Result<Settings, String> {
-        let s = in_effect(&self.layers, &next);
+    /// `next` instead of the pending edits, which differ from them in row
+    /// `i` only, unless it leaves the popup unreachable. Only row `i`
+    /// changes in what is applied: whatever else the layers say since a
+    /// save waits for the next connect. Returns the settings now in effect.
+    fn commit(&mut self, i: usize, next: Pending) -> Result<Settings, String> {
+        let mut s = self.applied.clone();
+        (SETTINGS[i].set)(&mut s, shown_with(&self.layers.0[i], next.get(&i)).1);
         if s.unreachable() {
             return Err(UNREACHABLE.to_string());
         }
         self.pending = next;
+        self.applied = s.clone();
         Ok(s)
     }
 
@@ -942,7 +945,30 @@ impl ConfigState {
         } else {
             next.insert(i, Edit::Set(value));
         }
-        self.commit(next)
+        self.commit(i, next)
+    }
+
+    /// `w`: the pending edits written to the file at `level`. The text
+    /// written is resolved again for the screen only -- origins, layers and
+    /// the warning count -- and nothing is applied from it: a hand edit made
+    /// elsewhere meanwhile still waits for the next connect (spec §4.1). A
+    /// failed save leaves the edits pending; `applied` is never touched.
+    /// Returns the warnings of the text written, for the log.
+    // Called by the screen's `w` from Task 13, which removes this attribute.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn save(&mut self, level: Level) -> anyhow::Result<Vec<String>> {
+        if self.pending.is_empty() {
+            anyhow::bail!("nothing has changed");
+        }
+        let Some(dir) = self.dir.as_deref() else {
+            anyhow::bail!("there is no config directory: neither XDG_CONFIG_HOME nor HOME is set");
+        };
+        let text = save::save(dir, &self.target, level, &self.pending)?;
+        let r = resolve(Some(&text), &self.target);
+        self.layers = r.layers;
+        self.warnings = r.warnings.len();
+        self.pending.clear();
+        Ok(r.warnings)
     }
 
     /// `x` on row `i`: an unsaved change is dropped; otherwise the value is
@@ -955,7 +981,7 @@ impl ConfigState {
             };
             next.insert(i, Edit::Remove(level));
         }
-        self.commit(next)
+        self.commit(i, next)
     }
 }
 
@@ -1495,5 +1521,81 @@ mod tests {
              [host.\"t\"]\npopup.key = \"ctrl-]\"\n",
         );
         assert_eq!(c.reset(POPUP_KEY), Err(UNREACHABLE.to_string()));
+    }
+
+    /// `w` (spec §4.1): what was written is resolved again for the screen
+    /// only -- layers, origins, the warning count -- and a save that fails
+    /// leaves the edits pending.
+    #[test]
+    fn a_save_rebuilds_the_screen_from_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "[popup]\nlinger = \"1s\"\n").unwrap();
+        let r = load(Some(dir.path()), "t");
+        let mut c = ConfigState::new(Some(dir.path().to_path_buf()), "t", &r);
+        let linger = at("popup.linger");
+        let five = Value::Duration(Some(Duration::from_secs(5)));
+        c.set(linger, five.clone()).unwrap();
+        // A hand edit made elsewhere since the connect, with a typo in it.
+        std::fs::write(
+            &path,
+            "[popup]\nlinger = \"1s\"\nsplash = false\nsplosh = 1\n",
+        )
+        .unwrap();
+        let warnings = c.save(Level::Host).unwrap();
+        assert!(c.pending.is_empty());
+        assert_eq!(c.shown(linger), (Some(Origin::Host), five, false));
+        assert_eq!(c.shown(at("popup.splash")).0, Some(Origin::Global));
+        assert_eq!(c.warnings, 1, "the typo was not counted");
+        // Returned for the log: the typo's warning names the key.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("splosh"), "{warnings:?}");
+
+        assert!(c.save(Level::Global).is_err(), "saved nothing");
+
+        let seven = Value::Duration(Some(Duration::from_secs(7)));
+        c.set(linger, seven.clone()).unwrap();
+        std::fs::write(&path, "[popup\n").unwrap();
+        assert!(c.save(Level::Global).is_err(), "a broken file was replaced");
+        assert_eq!(c.pending.len(), 1, "a failed save dropped the edit");
+
+        let mut nowhere = ConfigState::defaults();
+        nowhere.set(linger, seven).unwrap();
+        let e = nowhere.save(Level::Global).unwrap_err();
+        assert!(format!("{e:#}").contains("no config directory"), "{e:#}");
+    }
+
+    /// After a save the written text is re-resolved for the screen only
+    /// (spec §4.1): a hand edit of another key that the save brought in is
+    /// shown, but the next edit on the screen does not apply it -- it waits
+    /// for the next connect.
+    #[test]
+    fn a_hand_edit_a_save_brought_in_is_shown_but_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "[popup]\nlinger = \"1s\"\n").unwrap();
+        let r = load(Some(dir.path()), "t");
+        let mut c = ConfigState::new(Some(dir.path().to_path_buf()), "t", &r);
+        let rebuild = at("recovery.rebuild_after");
+        let before = r.settings.rebuild_after;
+        c.set(at("popup.linger"), Value::Duration(Some(d(5))))
+            .unwrap();
+        // Meanwhile, by hand, another key.
+        std::fs::write(
+            &path,
+            "[popup]\nlinger = \"1s\"\n[recovery]\nrebuild_after = \"40s\"\n",
+        )
+        .unwrap();
+        c.save(Level::Global).unwrap();
+        assert_eq!(
+            c.shown(rebuild),
+            (Some(Origin::Global), Value::Duration(Some(d(40))), false)
+        );
+        // A third key edited on the screen.
+        let s = c.set(at("popup.splash"), Value::Bool(false)).unwrap();
+        assert!(!s.splash);
+        assert_eq!(s.linger, d(5), "the saved edit is still in effect");
+        assert_eq!(s.rebuild_after, before, "the hand edit was applied");
+        assert_eq!(c.applied, s);
     }
 }

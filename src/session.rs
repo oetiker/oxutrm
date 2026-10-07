@@ -1304,7 +1304,7 @@ impl ClientSession {
             self.activity
                 .record_shown(Kind::Config, w, &format!("config: {w}"));
         }
-        let settings = state.in_effect();
+        let settings = state.applied.clone();
         self.config = state;
         self.apply(&settings);
         if let Some(st) = self.standby.as_mut() {
