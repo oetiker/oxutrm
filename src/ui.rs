@@ -82,6 +82,16 @@ pub(crate) enum Editing {
     Servers { cursor: usize, field: bool },
 }
 
+impl Editing {
+    /// A text field or a key capture: every byte is its own.
+    fn takes_every_byte(self) -> bool {
+        matches!(
+            self,
+            Editing::Text | Editing::Capture | Editing::Servers { field: true, .. }
+        )
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Command {
     Quit,
@@ -170,6 +180,10 @@ pub(crate) struct Ui {
     /// How long the host must have been silent before the popup opens by
     /// itself: the effective `popup.auto_open_after`. `None` never opens it.
     auto_open_after: Option<Duration>,
+    /// Whether this outage's moment for opening by itself has come while
+    /// the config screen was up: it is decided once per outage, as
+    /// `dismissed` is (spec §4.2).
+    config_decided: bool,
     /// The config screen's text field.
     field: String,
     /// The bytes of a character typed into the field that has not arrived
@@ -204,6 +218,7 @@ impl Ui {
             // A session's `apply` sets the configured value, which is never
             // below `silent_after` and so changes nothing a lap could see.
             auto_open_after: Some(Duration::ZERO),
+            config_decided: false,
             field: String::new(),
             partial: Vec::new(),
             servers: Vec::new(),
@@ -248,6 +263,11 @@ impl Ui {
     /// answers again, and ends it.
     pub(crate) fn tick(&mut self, phase: Phase, now: Instant) -> Option<LinkChange> {
         self.note_question(phase, now);
+        if phase == Phase::Confirming {
+            // The question takes over the config screen, field and all, so
+            // its `s` and `d` can never land in a field.
+            self.leave_config();
+        }
         if phase.is_outage() {
             let change = if self.outage_since.is_none() {
                 // `Recovering` is only ever entered from `Silent`, so `now`
@@ -259,6 +279,7 @@ impl Ui {
                     _ => now,
                 });
                 self.dismissed = false;
+                self.config_decided = false;
                 Some(LinkChange::WentSilent)
             } else {
                 None
@@ -269,6 +290,15 @@ impl Ui {
             match self.mode {
                 Mode::Closed if !self.dismissed && due => self.mode = Mode::Auto,
                 Mode::Lingering { .. } if due => self.mode = Mode::Auto,
+                // The config screen gives way to the status view at the
+                // moment the popup would have opened -- unless a field is
+                // open, and then it stays for the rest of the outage.
+                Mode::Config { editing, .. } if due && !self.config_decided => {
+                    self.config_decided = true;
+                    if !editing.takes_every_byte() {
+                        self.leave_config();
+                    }
+                }
                 _ => {}
             }
             return change;
@@ -301,6 +331,9 @@ impl Ui {
     /// the command, if one was typed.
     pub(crate) fn keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
         self.note_question(phase, now);
+        if phase == Phase::Confirming {
+            self.leave_config();
+        }
         if matches!(self.mode, Mode::Config { .. }) {
             // The rest of a paste that began in an earlier read is the
             // paste's.
@@ -379,6 +412,11 @@ impl Ui {
                 cursor: 0,
                 editing: Editing::None,
             };
+            // Opened after this outage's moment has passed: there is no
+            // moment left to give way at.
+            self.config_decided = self
+                .outage_since
+                .is_some_and(|since| self.auto_due(since, now));
             return true;
         }
         match b {
@@ -1982,5 +2020,89 @@ mod tests {
         ui.keys(b"\x1b[200~ab", Phase::Live, t);
         ui.mode = Mode::Closed;
         assert_eq!(ui.keys(b"ls\r", Phase::Live, t).to_host, b"ls\r");
+    }
+
+    // ---- the config screen and the link (spec §4.2) ----------------------
+
+    /// Under default tuning the popup would open at the first outage lap;
+    /// these use a threshold so the moment can be stepped over.
+    fn config_tuned(t: Instant, auto: Option<Duration>) -> Ui {
+        let mut ui = config_at(t);
+        ui.retune(Some(PREFIX), LINGER, auto);
+        ui
+    }
+
+    #[test]
+    fn an_outage_with_no_field_open_switches_to_the_status_view_when_auto_open_fires() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, Some(Duration::from_secs(5)));
+        ui.tick(silent(t), ms(t, 2_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "switched before auto_open_after"
+        );
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+        // `Open`, not `Auto`: it does not linger away when the link is back.
+        ui.tick(Phase::Live, ms(t, 6_000));
+        ui.tick(Phase::Live, ms(t, 60_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    #[test]
+    fn an_outage_with_a_field_open_keeps_the_screen_for_the_rest_of_it() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, Some(Duration::from_secs(5)));
+        ui.open_text("20s".to_string());
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(editing(&ui), Editing::Text);
+        // Closing the field later in the same outage does not switch.
+        ui.keys(&[ESC], silent(t), ms(t, 6_000));
+        ui.tick(silent(t), ms(t, 7_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "switched after the moment had passed"
+        );
+        // The next outage decides again.
+        ui.tick(Phase::Live, ms(t, 8_000));
+        ui.tick(silent(ms(t, 9_000)), ms(t, 14_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    #[test]
+    fn with_auto_open_off_an_outage_never_switches() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, None);
+        ui.tick(silent(t), ms(t, 2_000));
+        ui.tick(recovering(t), ms(t, 600_000));
+        assert!(ui.config_screen().is_some());
+    }
+
+    /// The question takes over, from a lap or from a read, and an open
+    /// field goes with it: its `s` and `d` never land in a field.
+    #[test]
+    fn confirming_always_switches_and_drops_the_field() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text("2".to_string());
+        ui.tick(Phase::Confirming, ms(t, 1_000));
+        assert!(ui.config_screen().is_none());
+        assert!(ui.visible(Phase::Confirming));
+
+        let mut ui = config_at(t);
+        ui.open_text("2".to_string());
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, t),
+            Routed::default(),
+            "inside the guard"
+        );
+        assert!(
+            ui.config_screen().is_none(),
+            "the read under Confirming typed into the field"
+        );
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, t + ANSWER_GUARD),
+            command(Command::SendHeld)
+        );
     }
 }
