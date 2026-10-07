@@ -52,17 +52,20 @@ const BATCH_MODE: [&str; 2] = ["-o", "BatchMode=yes"];
 ///
 /// Added only where the user's ssh has no `ConnectTimeout` of its own (see
 /// [`needs_connect_timeout`]): one somebody set is their call, not ours.
-const CONNECT_TIMEOUT: [&str; 2] = ["-o", "ConnectTimeout=10"];
+///
+/// The default of `recovery.connect_timeout`; a session's own value is
+/// [`Rebuild::retune`]'s, and every attempt carries it in its [`Ties`].
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long `ssh -G` may take to say what ssh would do.
 ///
 /// It reads config files and connects to nothing, so it takes milliseconds;
 /// this bound is for the configuration that runs something (a `Match exec`
 /// that hangs). Running out is treated as not knowing, which adds
-/// [`CONNECT_TIMEOUT`].
+/// the connect timeout.
 const CONFIG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether a rebuild's ssh needs [`CONNECT_TIMEOUT`], given what `ssh -G`
+/// Whether a rebuild's ssh needs the connect timeout, given what `ssh -G`
 /// printed -- `None` when it failed or ran out of time.
 ///
 /// `connecttimeout none` is the default, and the case this is for. A number
@@ -85,7 +88,7 @@ fn needs_connect_timeout(ssh_g_output: Option<&str>) -> bool {
 }
 
 /// The launcher a rebuild attempt runs ssh through: `launcher` with
-/// [`BATCH_MODE`], and [`CONNECT_TIMEOUT`] where the user's ssh would
+/// [`BATCH_MODE`], and the connect timeout where the user's ssh would
 /// otherwise have no bound on its connect -- asked of `ssh -G` the first
 /// time, and of `bound` once ssh has answered (see [`ConnectBound`]).
 ///
@@ -96,6 +99,7 @@ async fn rebuild_launcher(
     launcher: &SshLauncher,
     target: &str,
     bound: &ConnectBound,
+    connect_timeout: std::time::Duration,
 ) -> SshLauncher {
     let launcher = BATCH_MODE
         .iter()
@@ -118,9 +122,10 @@ async fn rebuild_launcher(
         }
     };
     if needed {
-        CONNECT_TIMEOUT
-            .iter()
-            .fold(launcher, |bounded, arg| bounded.arg(arg))
+        // Whole seconds: `recovery.connect_timeout` refuses anything finer.
+        launcher
+            .arg("-o")
+            .arg(format!("ConnectTimeout={}", connect_timeout.as_secs()))
     } else {
         launcher
     }
@@ -288,7 +293,7 @@ impl Commitment {
     }
 }
 
-/// Whether a rebuild's ssh needs [`CONNECT_TIMEOUT`], kept once `ssh -G`
+/// Whether a rebuild's ssh needs the connect timeout, kept once `ssh -G`
 /// has given a definite answer, and shared by every attempt of one
 /// [`Rebuild`].
 ///
@@ -308,12 +313,24 @@ impl Commitment {
 struct ConnectBound(Arc<OnceLock<bool>>);
 
 /// What one attempt shares with the [`Rebuild`] that began it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct Ties {
     /// This attempt's own line. A fresh one per attempt.
     commitment: Commitment,
     /// The rebuild's, shared by all its attempts.
     bound: ConnectBound,
+    /// `recovery.connect_timeout` when the attempt began.
+    connect_timeout: std::time::Duration,
+}
+
+impl Default for Ties {
+    fn default() -> Ties {
+        Ties {
+            commitment: Commitment::default(),
+            bound: ConnectBound::default(),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
 }
 
 /// One attempt at getting back into `session_id` on `target`.
@@ -321,7 +338,7 @@ pub(crate) struct Ties {
 /// `launcher` is the injection point, exactly as it is for
 /// [`SshChannel::open`]: production passes [`SshLauncher::ssh`] and the tests
 /// point it at a script that speaks the protocol on stdio. [`BATCH_MODE`] and
-/// [`CONNECT_TIMEOUT`] are added here rather than by the caller (see
+/// the connect timeout are added here rather than by the caller (see
 /// [`rebuild_launcher`]), so every attempt carries them and the tests
 /// exercise the argument list that ships.
 ///
@@ -403,7 +420,7 @@ async fn one_attempt(
     cfg: &NetConfig,
     ties: &Ties,
 ) -> AttemptOutcome {
-    let launcher = rebuild_launcher(launcher, target, &ties.bound).await;
+    let launcher = rebuild_launcher(launcher, target, &ties.bound, ties.connect_timeout).await;
 
     let mut channel = match SshChannel::open(&launcher, target).await {
         Ok(channel) => channel,
@@ -471,6 +488,8 @@ pub(crate) struct Rebuild {
     /// What `ssh -G` said, once it has said it: one answer for every attempt
     /// of this rebuild ([`ConnectBound`]).
     bound: ConnectBound,
+    /// `recovery.connect_timeout`, for the next attempt.
+    connect_timeout: std::time::Duration,
     /// When the attempt in flight began, for the popup's clock on it.
     started: Option<Instant>,
     /// An attempt has begun and no swap has happened since, so a `TAKEN_OVER`
@@ -495,9 +514,23 @@ impl Rebuild {
             generation: 0,
             commitment: Commitment::default(),
             bound: ConnectBound::default(),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             started: None,
             displacing: false,
         }
+    }
+
+    /// The network settings and the connect timeout the next attempt runs
+    /// with, from `apply`. An attempt already running keeps its own.
+    pub(crate) fn retune(&mut self, cfg: NetConfig, connect_timeout: std::time::Duration) {
+        self.cfg = cfg;
+        self.connect_timeout = connect_timeout;
+    }
+
+    /// The network settings the next attempt runs with.
+    #[cfg(test)]
+    pub(crate) fn cfg(&self) -> &NetConfig {
+        &self.cfg
     }
 
     /// Run attempts through `launcher` and `cfg` instead of real ssh and the
@@ -613,6 +646,7 @@ impl Rebuild {
         let ties = Ties {
             commitment: Commitment::default(),
             bound: self.bound.clone(),
+            connect_timeout: self.connect_timeout,
         };
         self.commitment = ties.commitment.clone();
         self.displacing = true;
@@ -1312,6 +1346,31 @@ mod tests {
             rebuild_arguments("connecttimeout 30").await,
             [&["-o", "BatchMode=yes"][..], &remote[..]].concat(),
             "the user's own ConnectTimeout was overridden"
+        );
+    }
+
+    /// `recovery.connect_timeout` reaches the next attempt's ssh, and the
+    /// network settings with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retuned_rebuild_runs_its_next_attempt_with_the_new_settings() {
+        let fake = fake_ssh_recording_its_arguments("connecttimeout none");
+        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
+            .via(fake.launcher.clone(), test_config());
+        let cfg = oxutrm_net::NetConfig {
+            enable_birthday: false,
+            ..test_config()
+        };
+        rebuild.retune(cfg, std::time::Duration::from_secs(25));
+        assert!(!rebuild.cfg().enable_birthday);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        rebuild.begin(a_size(), tx, Instant::now());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the attempt never reported");
+        let args = std::fs::read_to_string(fake.path("args")).expect("no arguments recorded");
+        assert!(
+            args.lines().any(|a| a == "ConnectTimeout=25"),
+            "the retuned timeout did not reach ssh: {args}"
         );
     }
 

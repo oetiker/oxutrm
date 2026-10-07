@@ -113,6 +113,12 @@ where
         )
     })?;
     meta.size = client.size;
+    // A client that asked for no birthday blast gets none from this end
+    // either (config spec §2.4). On a clone: the listener's `cfg` serves
+    // every attach after this one, and one client's choice must not stick
+    // to the next.
+    let narrowed = for_client(cfg, &client.features);
+    let cfg: &NetConfig = &narrowed;
 
     // R8. The controlling side nominates; this side is told.
     //
@@ -271,6 +277,24 @@ struct ClientFacts {
     #[allow(dead_code)]
     caps: TerminalCaps,
     size: TermSize,
+    /// What the client asked of this exchange: `no-birthday`, or nothing.
+    features: Vec<String>,
+}
+
+/// `cfg` as this exchange runs it: the birthday blast switched off when the
+/// client asked for that.
+fn for_client<'a>(cfg: &'a NetConfig, features: &[String]) -> std::borrow::Cow<'a, NetConfig> {
+    if features
+        .iter()
+        .any(|f| f == oxutrm_proto::FEATURE_NO_BIRTHDAY)
+    {
+        std::borrow::Cow::Owned(NetConfig {
+            enable_birthday: false,
+            ..cfg.clone()
+        })
+    } else {
+        std::borrow::Cow::Borrowed(cfg)
+    }
 }
 
 /// R6: the offer, composed before the ladder has run.
@@ -336,6 +360,7 @@ where
             nat_type,
             caps,
             size,
+            features,
             ..
         } => Ok(ClientFacts {
             cert_spki_sha256,
@@ -343,6 +368,7 @@ where
             nat_type,
             caps,
             size,
+            features,
         }),
         // The client's own words, not ours. It is the only explanation
         // anybody has for why this attach is not going to happen.
@@ -909,5 +935,78 @@ mod tests {
         assert_eq!(path.local, nom.local);
         assert_eq!(path.remote, nom.remote);
         assert_eq!(path.nat_type, NatType::Symmetric);
+    }
+
+    // ---- no-birthday (config spec §2.4) ----
+
+    /// Runs one exchange against `cfg` with a client whose hello carries
+    /// `features` and no candidates, so every raced rung is skipped and the
+    /// ladder goes straight to the blast. Returns the reason the exchange
+    /// failed with, which names the blast's verdict.
+    async fn ladder_verdict(cfg: &NetConfig, features: Vec<String>) -> String {
+        let mut meta = fresh_meta("b1");
+        let (theirs, ours) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let _ = oxutrm_host::signalling::read_signal_async(&mut r).await;
+            let mut hello = a_client_hello();
+            if let Signal::ClientHello {
+                candidates,
+                features: f,
+                ..
+            } = &mut hello
+            {
+                *candidates = vec![];
+                *f = features;
+            }
+            let _ = oxutrm_host::signalling::write_signal_async(&mut w, &hello).await;
+            std::future::pending::<()>().await;
+        });
+        let (r, w) = tokio::io::split(ours);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_attach_exchange(tokio::io::BufReader::new(r), w, &mut meta, cfg),
+        )
+        .await
+        .expect("the exchange hung");
+        client.abort();
+        let Err(error) = outcome else {
+            panic!("an exchange with no candidates produced a link");
+        };
+        format!("{error:#}")
+    }
+
+    /// One listener `cfg` with the blast on: a client that asks for
+    /// `no-birthday` gets no blast, and the next client, which does not ask,
+    /// still gets one -- the request is not kept on the shared `cfg`. A hello
+    /// from a client that never heard of the feature is the second case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_birthday_switches_the_blast_off_for_that_exchange_only() {
+        let cfg = NetConfig {
+            enable_birthday: true,
+            ..stun_free()
+        };
+        let off = ladder_verdict(&cfg, vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]).await;
+        assert!(off.contains("switched off in this configuration"), "{off}");
+        let on = ladder_verdict(&cfg, vec![]).await;
+        assert!(
+            !on.contains("switched off") && on.contains("server-reflexive"),
+            "the blast stayed off for the next client: {on}"
+        );
+        assert!(cfg.enable_birthday, "the shared cfg was changed");
+    }
+
+    #[test]
+    fn for_client_clears_only_the_blast_and_only_when_asked() {
+        let cfg = NetConfig {
+            enable_birthday: true,
+            ..stun_free()
+        };
+        assert!(for_client(&cfg, &[]).enable_birthday);
+        assert!(for_client(&cfg, &["control".to_string()]).enable_birthday);
+        let off = for_client(&cfg, &[oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]);
+        assert!(!off.enable_birthday);
+        assert_eq!(off.gather_timeout, cfg.gather_timeout);
     }
 }

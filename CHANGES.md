@@ -142,7 +142,30 @@
   2 MiB, and two clients sharing it cannot interleave inside a line. If it
   cannot be written, the popup says so once and the session carries on.
 
+- **A config file, and a screen to change it from inside a session.**
+  `~/.config/oxutrm/config.toml` (or under `$XDG_CONFIG_HOME`) sets the popup
+  key, when the popup opens by itself and how long it lingers, the splash, the
+  recovery timings (`silent_after`, `rebuild_after`, the rebuild ssh's
+  `connect_timeout`), and the network features: the standby link, the STUN
+  servers, port mapping and the birthday punch. A `[host."<target>"]` table
+  overrides any of them for one ssh target, spelled as on the command line.
+  A missing file is today's behaviour; a broken one, a typo or a value out of
+  range is a warning in the popup's log and in `client.log` -- never a failed
+  connect -- and the splash says how many there were. `c` in the status popup
+  opens the config screen: every setting with its value and where it came
+  from, edited in place and applied at once where it can be, `x` to let the
+  next layer show through, and `w` to save for all hosts (`a`) or for this host
+  only (`h`). Saving changes only the keys you changed and keeps every comment
+  and hand edit in the file; a symlinked file stays a symlink. Every key is
+  described in `docs/config.md`.
+
 ### Compatibility
+
+- **`network.birthday = false` stops the birthday punch at both ends only
+  against an upgraded host.** The client asks with a new `no-birthday` hello
+  feature, which an older host ignores: there only the client's half of the
+  blast stops. Behind a symmetric NAT the birthday punch is the last rung that
+  can get through, so switching it off there means the connect fails.
 
 - **Both ends have to be upgraded together.** The client now runs
   `oxutrm host --connect` on the far end rather than `oxutrm host --serve`, so

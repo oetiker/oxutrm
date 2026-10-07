@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 /// How long a reply may be owed before the user is told. Below this a blip
 /// resolves without ever painting: an indicator that fires on every hiccup is
 /// the noise it was built to remove.
+///
+/// The default of `recovery.silent_after`; a session's own value is a
+/// [`LinkState`] field, set by [`LinkState::retune`].
 pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 
 /// How long silence lasts before the client starts rebuilding the link on its
@@ -22,6 +25,9 @@ pub const SILENT_AFTER: Duration = Duration::from_secs(2);
 /// enough that a rebuild is not raced against an outage about to end by
 /// itself, short enough not to feel abandoned. Revisit it against a real bad
 /// network, not by reasoning about it.
+///
+/// The default of `recovery.rebuild_after`; a session's own value is a
+/// [`LinkState`] field, set by [`LinkState::retune`].
 pub const REBUILD_AFTER: Duration = Duration::from_secs(20);
 
 /// The delay that belongs to attempt `attempt` (zero-based): 1, 2, 4, 8, and
@@ -241,6 +247,12 @@ pub struct LinkState {
     last_sent: Instant,
     /// Typed while not `Live`, and not delivered to anyone yet.
     held: Vec<u8>,
+    /// `recovery.silent_after`: how long a reply may be owed before it is an
+    /// outage.
+    silent_after: Duration,
+    /// The effective `recovery.rebuild_after`: how long the host may be
+    /// silent before the client rebuilds.
+    rebuild_after: Duration,
 }
 
 impl LinkState {
@@ -251,7 +263,22 @@ impl LinkState {
             owed_since: None,
             last_sent: now,
             held: Vec::new(),
+            silent_after: SILENT_AFTER,
+            rebuild_after: REBUILD_AFTER,
         }
+    }
+
+    /// The two recovery timings, from `apply`. Both act on the next
+    /// `evaluate`: an outage already `Silent` escalates as soon as it has
+    /// lasted the new `rebuild_after`.
+    pub fn retune(&mut self, silent_after: Duration, rebuild_after: Duration) {
+        self.silent_after = silent_after;
+        self.rebuild_after = rebuild_after;
+    }
+
+    /// The silence after which a rebuild starts, for the popup's countdown.
+    pub fn rebuild_after(&self) -> Duration {
+        self.rebuild_after
     }
 
     /// The phase, without advancing anything.
@@ -327,7 +354,7 @@ impl LinkState {
         if let Phase::Silent { since } = self.phase {
             // The one escalation. The clock still runs from `last_heard`, so
             // the displayed silence stays continuous across the boundary.
-            if now.duration_since(since) >= REBUILD_AFTER {
+            if now.duration_since(since) >= self.rebuild_after {
                 self.phase = Phase::Recovering {
                     attempt: 0,
                     next_try: now,
@@ -352,7 +379,7 @@ impl LinkState {
 
         if self
             .owed_since
-            .is_some_and(|since| now.duration_since(since) >= SILENT_AFTER)
+            .is_some_and(|since| now.duration_since(since) >= self.silent_after)
         {
             // `last_heard` and not `now`: the counter must report how long the
             // host has been quiet, not how long since we worked it out.
@@ -1018,5 +1045,39 @@ mod tests {
     fn the_standby_backoff_climbs_and_then_holds() {
         let s: Vec<u64> = (0..6).map(|n| standby_backoff(n).as_secs()).collect();
         assert_eq!(s, vec![30, 60, 120, 300, 300, 300]);
+    }
+
+    /// `retune` acts on the next `evaluate`, both timings: an outage needs
+    /// the new `silent_after` of owing to begin, and the new `rebuild_after`
+    /// of silence to escalate.
+    #[test]
+    fn retuned_timings_act_on_the_next_evaluate() {
+        let t0 = Instant::now();
+        let mut state = LinkState::new(t0);
+        state.retune(Duration::from_secs(5), Duration::from_secs(30));
+        assert_eq!(state.rebuild_after(), Duration::from_secs(30));
+        assert_eq!(state.evaluate(t0, true), Phase::Live);
+        assert_eq!(
+            state.evaluate(t0 + SILENT_AFTER, true),
+            Phase::Live,
+            "the old silent_after"
+        );
+        assert!(matches!(
+            state.evaluate(t0 + Duration::from_secs(5), true),
+            Phase::Silent { .. }
+        ));
+        assert!(
+            matches!(
+                state.evaluate(t0 + REBUILD_AFTER, true),
+                Phase::Silent { .. }
+            ),
+            "escalated at the old rebuild_after"
+        );
+        // Lowered mid-outage: the silence already past it escalates at once.
+        state.retune(Duration::from_secs(5), Duration::from_secs(10));
+        assert!(matches!(
+            state.evaluate(t0 + REBUILD_AFTER, true),
+            Phase::Recovering { .. }
+        ));
     }
 }

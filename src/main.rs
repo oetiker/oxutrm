@@ -25,6 +25,7 @@ mod activity;
 mod attach_exchange;
 mod candidates;
 mod choose;
+mod config;
 mod connect;
 mod control;
 mod egress;

@@ -6,9 +6,10 @@
 //!
 //! The rule that decides the keys: **while the popup is shown, every key
 //! is its own.** Nothing typed into it is held or sent, whatever opened it
-//! and whatever the link is doing. While it is closed, `Ctrl-\` opens it and
-//! every other byte goes to the host -- or, during an outage, is held for the
-//! question asked when the link answers again.
+//! and whatever the link is doing. While it is closed, the popup key
+//! (`popup.key`, `Ctrl-\` by default) opens it and every other byte goes to
+//! the host -- or, during an outage, is held for the question asked when the
+//! link answers again.
 
 // This runs while a client session owns the screen: nothing here may print,
 // or it lands raw on the painted raw-mode terminal.
@@ -19,7 +20,8 @@ use std::time::{Duration, Instant};
 use crate::linkstate::Phase;
 
 /// `Ctrl-\`. Opens the popup while it is closed, in every phase; closes it
-/// while it is shown.
+/// while it is shown. The default of `popup.key`: a session's own key is
+/// `Ui::key`.
 pub(crate) const PREFIX: u8 = 0x1c;
 
 /// A read that is exactly this byte is the Esc key. Anywhere else in a read
@@ -27,8 +29,8 @@ pub(crate) const PREFIX: u8 = 0x1c;
 /// runs to the end of the read.
 pub(crate) const ESC: u8 = 0x1b;
 
-/// How soon a second `Ctrl-\` must follow the one that opened the popup for
-/// the pair to mean one literal `Ctrl-\` for the host. Measured between the
+/// How soon a second press of the popup key must follow the one that opened
+/// the popup for the pair to mean that key once, literally, for the host. Measured between the
 /// two reads' timestamps; nothing is armed.
 pub(crate) const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 
@@ -40,7 +42,7 @@ pub(crate) const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 pub(crate) const ANSWER_GUARD: Duration = Duration::from_millis(500);
 
 /// How long the popup stays up showing the outcome after the link it opened
-/// for comes back.
+/// for comes back. The default of `popup.linger`.
 pub(crate) const LINGER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,7 +50,7 @@ pub(crate) enum Mode {
     Closed,
     /// Opened by hand, or touched by a key; stays until closed.
     Open {
-        /// When the `Ctrl-\` that opened it arrived, for the double press.
+        /// When the popup key that opened it arrived, for the double press.
         pressed: Option<Instant>,
     },
     /// Opened because the link went quiet.
@@ -59,14 +61,93 @@ pub(crate) enum Mode {
         since: Instant,
         outage: Duration,
     },
+    /// The config screen. `cursor` is the row of [`crate::config::SETTINGS`]
+    /// it is on; the field's text lives in `Ui`, because `Mode` is `Copy`.
+    Config {
+        cursor: usize,
+        editing: Editing,
+    },
 }
 
+/// What the config screen is doing with the keys.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Editing {
+    /// Browsing the list.
+    None,
+    /// A text field on the cursor's row.
+    Text,
+    /// Waiting for the new popup key to be pressed.
+    Capture,
+    /// The `stun_servers` sub-list on its own cursor, with a text field
+    /// open on its entry at `cursor` -- or on a new one past the end.
+    Servers { cursor: usize, field: bool },
+    /// "save for all hosts or this host only?"
+    Save,
+}
+
+impl Editing {
+    /// A text field or a key capture: every byte is its own.
+    fn takes_every_byte(self) -> bool {
+        matches!(
+            self,
+            Editing::Text | Editing::Capture | Editing::Servers { field: true, .. }
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Command {
     Quit,
     SendHeld,
     DropHeld,
+    /// Something the config screen needs the session to check or do. The
+    /// session answers with [`Ui::accepted`] or [`Ui::say`].
+    Config(ConfigCmd),
 }
+
+/// What the config screen asks of the session. Rows are rows of
+/// [`crate::config::SETTINGS`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum ConfigCmd {
+    /// Enter on a row with nothing open: flip it, or open what edits it.
+    Edit(usize),
+    /// Enter in a text field.
+    Accept { row: usize, text: String },
+    /// The key pressed in a key capture; `None` for Backspace, which is
+    /// `off`.
+    Capture { row: usize, key: Option<u8> },
+    /// The `stun_servers` sub-list as it would be after an entry was
+    /// accepted, added or removed.
+    Servers { row: usize, list: Vec<String> },
+    /// `x`.
+    Reset(usize),
+    /// `w`, then `a` or `h`.
+    Save(crate::config::Level),
+}
+
+/// The config screen's state, for the view.
+pub(crate) struct ConfigScreen<'a> {
+    pub(crate) cursor: usize,
+    pub(crate) editing: Editing,
+    pub(crate) field: &'a str,
+    pub(crate) servers: &'a [String],
+    /// Why the last change was refused, or what a save did.
+    pub(crate) note: Option<&'a str>,
+}
+
+/// A key the config screen reads out of an escape sequence or a byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Key {
+    Up,
+    Down,
+    Byte(u8),
+}
+
+/// The end of a bracketed paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// The most a text field holds: a pasted file stops here.
+const FIELD_MAX: usize = 256;
 
 /// Where one read's bytes go. A command ends the read: bytes after it in the
 /// same read are dropped -- neither sent, held nor seen by the popup.
@@ -96,6 +177,36 @@ pub(crate) struct Ui {
     /// When the current `Confirming` question was first seen, by a lap or a
     /// read, for [`ANSWER_GUARD`]. `None` outside `Confirming`.
     asked_at: Option<Instant>,
+    /// The byte that opens and closes the popup: `popup.key`. `None` is
+    /// `off`, and then that byte is ordinary input.
+    key: Option<u8>,
+    /// How long the popup stays up after the link it opened for answers.
+    linger: Duration,
+    /// How long the host must have been silent before the popup opens by
+    /// itself: the effective `popup.auto_open_after`. `None` never opens it.
+    auto_open_after: Option<Duration>,
+    /// Whether this outage's moment for opening by itself has come while
+    /// the config screen was up: it is decided once per outage, as
+    /// `dismissed` is (spec §4.2).
+    config_decided: bool,
+    /// The config screen's text field.
+    field: String,
+    /// The bytes of a character typed into the field that has not arrived
+    /// whole yet.
+    partial: Vec<u8>,
+    /// The `stun_servers` sub-list as the screen shows it.
+    servers: Vec<String>,
+    /// The sub-list as the last command proposed it, until the session
+    /// accepts it.
+    proposed: Option<Vec<String>>,
+    /// What the help line says instead of the help: why a change was
+    /// refused, or what a save did. Gone with the next read.
+    note: Option<String>,
+    /// Inside a bracketed paste on the config screen whose end has not
+    /// arrived yet, and how many bytes of that end the last read finished
+    /// on: a large paste is cut into reads wherever the buffer ends, its end
+    /// marker too.
+    pasting: Option<usize>,
 }
 
 impl Ui {
@@ -106,7 +217,40 @@ impl Ui {
             outage_since: None,
             last_outage: Duration::ZERO,
             asked_at: None,
+            key: Some(PREFIX),
+            linger: LINGER,
+            // At the first lap of an outage, as before the setting existed.
+            // A session's `apply` sets the configured value, which is never
+            // below `silent_after` and so changes nothing a lap could see.
+            auto_open_after: Some(Duration::ZERO),
+            config_decided: false,
+            field: String::new(),
+            partial: Vec::new(),
+            servers: Vec::new(),
+            proposed: None,
+            note: None,
+            pasting: None,
         }
+    }
+
+    /// The popup's three settings, from `apply`. They act from the next
+    /// read or lap: a popup already open stays open.
+    pub(crate) fn retune(
+        &mut self,
+        key: Option<u8>,
+        linger: Duration,
+        auto_open_after: Option<Duration>,
+    ) {
+        self.key = key;
+        self.linger = linger;
+        self.auto_open_after = auto_open_after;
+    }
+
+    /// Whether an outage that began at `since` has lasted long enough at
+    /// `now` for the popup to open by itself.
+    fn auto_due(&self, since: Instant, now: Instant) -> bool {
+        self.auto_open_after
+            .is_some_and(|after| now.saturating_duration_since(since) >= after)
     }
 
     pub(crate) fn mode(&self) -> Mode {
@@ -124,6 +268,11 @@ impl Ui {
     /// answers again, and ends it.
     pub(crate) fn tick(&mut self, phase: Phase, now: Instant) -> Option<LinkChange> {
         self.note_question(phase, now);
+        if phase == Phase::Confirming {
+            // The question takes over the config screen, field and all, so
+            // its `s` and `d` can never land in a field.
+            self.leave_config();
+        }
         if phase.is_outage() {
             let change = if self.outage_since.is_none() {
                 // `Recovering` is only ever entered from `Silent`, so `now`
@@ -135,13 +284,26 @@ impl Ui {
                     _ => now,
                 });
                 self.dismissed = false;
+                self.config_decided = false;
                 Some(LinkChange::WentSilent)
             } else {
                 None
             };
+            let due = self
+                .outage_since
+                .is_some_and(|since| self.auto_due(since, now));
             match self.mode {
-                Mode::Closed if !self.dismissed => self.mode = Mode::Auto,
-                Mode::Lingering { .. } => self.mode = Mode::Auto,
+                Mode::Closed if !self.dismissed && due => self.mode = Mode::Auto,
+                Mode::Lingering { .. } if due => self.mode = Mode::Auto,
+                // The config screen gives way to the status view at the
+                // moment the popup would have opened -- unless a field is
+                // open, and then it stays for the rest of the outage.
+                Mode::Config { editing, .. } if due && !self.config_decided => {
+                    self.config_decided = true;
+                    if !editing.takes_every_byte() {
+                        self.leave_config();
+                    }
+                }
                 _ => {}
             }
             return change;
@@ -160,7 +322,9 @@ impl Ui {
                     outage: self.last_outage,
                 };
             }
-            Mode::Lingering { since, .. } if now.saturating_duration_since(since) >= LINGER => {
+            Mode::Lingering { since, .. }
+                if now.saturating_duration_since(since) >= self.linger =>
+            {
                 self.mode = Mode::Closed;
             }
             _ => {}
@@ -172,13 +336,28 @@ impl Ui {
     /// the command, if one was typed.
     pub(crate) fn keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
         self.note_question(phase, now);
+        if phase == Phase::Confirming {
+            self.leave_config();
+        }
+        if matches!(self.mode, Mode::Config { .. }) {
+            // The rest of a paste that began in an earlier read is the
+            // paste's.
+            let bytes = match self.pasting {
+                Some(_) => self.paste(bytes),
+                None => bytes,
+            };
+            return self.config_keys(bytes, phase);
+        }
+        // Pastes are only ever tracked on the config screen: anywhere else a
+        // paste's bytes go where they always went, the host's included.
+        self.pasting = None;
         let mut routed = Routed::default();
         let lone_esc = bytes == [ESC];
         let mut rest = bytes;
         while let Some((&b, tail)) = rest.split_first() {
             rest = tail;
             if !self.visible(phase) {
-                if b == PREFIX {
+                if Some(b) == self.key {
                     self.mode = Mode::Open { pressed: Some(now) };
                 } else {
                     deliver(b, phase, &mut routed);
@@ -233,29 +412,409 @@ impl Ui {
             r.command = command;
             return true;
         }
+        if b == b'c' && !confirming {
+            self.mode = Mode::Config {
+                cursor: 0,
+                editing: Editing::None,
+            };
+            // Opened after this outage's moment has passed: there is no
+            // moment left to give way at.
+            self.config_decided = self
+                .outage_since
+                .is_some_and(|since| self.auto_due(since, now));
+            return true;
+        }
         match b {
             // The question about held input has to be answered before the
             // popup can go.
-            PREFIX | ESC if !confirming => self.close(b, phase, now, r),
-            // `c` and `s` are offered by a later version; they, and every
-            // other key, only count as touching the popup.
+            _ if (b == ESC || Some(b) == self.key) && !confirming => self.close(b, phase, now, r),
+            // `s` is offered by a later version (the session switcher); it,
+            // and every other key, only count as touching the popup.
             _ => self.touch(),
         }
         false
     }
 
-    /// Close the popup with `b`, `Esc` or `Ctrl-\`.
+    /// Close the popup with `b`, `Esc` or the popup key.
     fn close(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) {
-        if b == PREFIX
+        if Some(b) == self.key
             && let Mode::Open { pressed: Some(at) } = self.mode
             && now.saturating_duration_since(at) < DOUBLE_PRESS
         {
-            deliver(PREFIX, phase, r);
+            deliver(b, phase, r);
         }
         self.mode = Mode::Closed;
         if phase.is_outage() {
             self.dismissed = true;
         }
+    }
+
+    /// The config screen, if it is up, for the view.
+    pub(crate) fn config_screen(&self) -> Option<ConfigScreen<'_>> {
+        let Mode::Config { cursor, editing } = self.mode else {
+            return None;
+        };
+        Some(ConfigScreen {
+            cursor,
+            editing,
+            field: &self.field,
+            servers: &self.servers,
+            note: self.note.as_deref(),
+        })
+    }
+
+    /// Open a text field on the cursor's row, holding `text`.
+    pub(crate) fn open_text(&mut self, text: String) {
+        if let Mode::Config { cursor, .. } = self.mode {
+            self.field = text;
+            self.mode = Mode::Config {
+                cursor,
+                editing: Editing::Text,
+            };
+        }
+    }
+
+    /// Wait for the new popup key.
+    pub(crate) fn open_capture(&mut self) {
+        if let Mode::Config { cursor, .. } = self.mode {
+            self.mode = Mode::Config {
+                cursor,
+                editing: Editing::Capture,
+            };
+        }
+    }
+
+    /// Open the `stun_servers` sub-list on `list`.
+    pub(crate) fn open_servers(&mut self, list: Vec<String>) {
+        if let Mode::Config { cursor, .. } = self.mode {
+            self.servers = list;
+            self.mode = Mode::Config {
+                cursor,
+                editing: Editing::Servers {
+                    cursor: 0,
+                    field: false,
+                },
+            };
+        }
+    }
+
+    /// The session took the change: the field or capture closes, and the
+    /// sub-list becomes what was proposed.
+    pub(crate) fn accepted(&mut self) {
+        let Mode::Config { cursor, editing } = self.mode else {
+            return;
+        };
+        self.field.clear();
+        self.partial.clear();
+        let editing = match editing {
+            Editing::Servers { cursor: at, .. } => {
+                if let Some(list) = self.proposed.take() {
+                    self.servers = list;
+                }
+                Editing::Servers {
+                    cursor: at.min(self.servers.len().saturating_sub(1)),
+                    field: false,
+                }
+            }
+            _ => Editing::None,
+        };
+        self.mode = Mode::Config { cursor, editing };
+    }
+
+    /// Put `note` on the help line until the next read: why a change was
+    /// refused -- the field, if one is open, stays open -- or what a save
+    /// did.
+    pub(crate) fn say(&mut self, note: String) {
+        self.proposed = None;
+        self.note = Some(note);
+    }
+
+    /// Back from the config screen to the status view, dropping whatever
+    /// field was open. The pending edits are the session's and stay.
+    fn leave_config(&mut self) {
+        if matches!(self.mode, Mode::Config { .. }) {
+            self.mode = Mode::Open { pressed: None };
+            self.field.clear();
+            self.partial.clear();
+            self.proposed = None;
+            self.note = None;
+            self.pasting = None;
+        }
+    }
+
+    /// One read on the config screen. A command ends the read, as it does
+    /// on the status view.
+    fn config_keys(&mut self, bytes: &[u8], phase: Phase) -> Routed {
+        let mut r = Routed::default();
+        self.note = None;
+        let lone_esc = bytes == [ESC];
+        let mut rest = bytes;
+        while let Some((&b, tail)) = rest.split_first() {
+            if !matches!(self.mode, Mode::Config { .. }) {
+                break;
+            }
+            let key = if b == ESC && !lone_esc {
+                let (key, used) = escape(tail);
+                rest = &tail[used..];
+                match key {
+                    Some(key) => key,
+                    None if tail.starts_with(b"[200~") => {
+                        self.pasting = Some(0);
+                        rest = self.paste(rest);
+                        continue;
+                    }
+                    None => continue,
+                }
+            } else {
+                rest = tail;
+                Key::Byte(b)
+            };
+            if self.config_key(key, phase, &mut r) {
+                break;
+            }
+        }
+        r
+    }
+
+    /// A paste's text up to its end, if the end is in `bytes`: into an open
+    /// field, or nowhere. Returns what follows the end. The start of an end
+    /// marker that the read stops in is kept in `pasting` until the next read
+    /// says whether it was one.
+    fn paste<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        for (i, &b) in bytes.iter().enumerate() {
+            let matched = self.pasting.unwrap_or(0);
+            if b == PASTE_END[matched] {
+                if matched + 1 == PASTE_END.len() {
+                    self.pasting = None;
+                    return &bytes[i + 1..];
+                }
+                self.pasting = Some(matched + 1);
+                continue;
+            }
+            // What looked like the end's beginning was text after all. Only
+            // its ESC can begin the end again: the marker has no other
+            // overlap with itself.
+            for &h in &PASTE_END[..matched] {
+                self.paste_byte(h);
+            }
+            if b == PASTE_END[0] {
+                self.pasting = Some(1);
+            } else {
+                self.pasting = Some(0);
+                self.paste_byte(b);
+            }
+        }
+        &bytes[bytes.len()..]
+    }
+
+    /// One byte of a paste: into the field, if one is open. `type_byte`
+    /// drops control characters, the paste's ESC and newlines among them.
+    fn paste_byte(&mut self, b: u8) {
+        if matches!(
+            self.mode,
+            Mode::Config {
+                editing: Editing::Text | Editing::Servers { field: true, .. },
+                ..
+            }
+        ) {
+            self.type_byte(b);
+        }
+    }
+
+    /// A byte typed into the field: input is UTF-8, so a character is added
+    /// once all of its bytes have arrived. Control characters never are.
+    fn type_byte(&mut self, b: u8) {
+        self.partial.push(b);
+        match std::str::from_utf8(&self.partial) {
+            Ok(s) => {
+                for c in s.chars().filter(|c| !c.is_control()) {
+                    if self.field.chars().count() < FIELD_MAX {
+                        self.field.push(c);
+                    }
+                }
+                self.partial.clear();
+            }
+            // The rest of the character is still to come.
+            Err(e) if e.error_len().is_none() => {}
+            Err(_) => self.partial.clear(),
+        }
+    }
+
+    /// One key on the config screen. Returns whether the read is over.
+    fn config_key(&mut self, key: Key, phase: Phase, r: &mut Routed) -> bool {
+        use crate::config::{Level, SETTINGS};
+        let Mode::Config { cursor, editing } = self.mode else {
+            return true;
+        };
+        let to = |editing| Mode::Config { cursor, editing };
+        let command = |c| Some(Command::Config(c));
+        let enter = |k| matches!(k, Key::Byte(b'\r' | b'\n'));
+        let erase = |k| matches!(k, Key::Byte(0x7f | 0x08));
+        match editing {
+            // A text field: every byte is its own; an arrow is nothing.
+            Editing::Text | Editing::Servers { field: true, .. } => match key {
+                Key::Byte(ESC) => {
+                    self.field.clear();
+                    self.partial.clear();
+                    self.mode = to(match editing {
+                        Editing::Servers { cursor: at, .. } => Editing::Servers {
+                            cursor: at.min(self.servers.len().saturating_sub(1)),
+                            field: false,
+                        },
+                        _ => Editing::None,
+                    });
+                }
+                k if enter(k) => {
+                    let text = self.field.trim().to_string();
+                    r.command = match editing {
+                        Editing::Servers { cursor: at, .. } => {
+                            let mut list = self.servers.clone();
+                            match (list.get_mut(at), text.is_empty()) {
+                                (Some(_), true) => {
+                                    list.remove(at);
+                                }
+                                (Some(entry), false) => *entry = text,
+                                (None, false) => list.push(text),
+                                // Adding nothing: the field just closes.
+                                (None, true) => {
+                                    self.accepted();
+                                    return true;
+                                }
+                            }
+                            self.proposed = Some(list.clone());
+                            command(ConfigCmd::Servers { row: cursor, list })
+                        }
+                        _ => command(ConfigCmd::Accept { row: cursor, text }),
+                    };
+                    // A newline ends the read: the rest of an unbracketed
+                    // paste is dropped, never run as commands.
+                    return true;
+                }
+                k if erase(k) => {
+                    self.partial.clear();
+                    self.field.pop();
+                }
+                Key::Byte(b) if b >= 0x20 => self.type_byte(b),
+                _ => {}
+            },
+            Editing::Capture => match key {
+                Key::Byte(ESC) => self.mode = to(Editing::None),
+                k if erase(k) => {
+                    r.command = command(ConfigCmd::Capture {
+                        row: cursor,
+                        key: None,
+                    });
+                    return true;
+                }
+                Key::Byte(b) => {
+                    r.command = command(ConfigCmd::Capture {
+                        row: cursor,
+                        key: Some(b),
+                    });
+                    return true;
+                }
+                _ => {}
+            },
+            Editing::Servers {
+                cursor: at,
+                field: false,
+            } => {
+                let last = self.servers.len().saturating_sub(1);
+                match key {
+                    Key::Up | Key::Byte(b'k') => {
+                        self.mode = to(Editing::Servers {
+                            cursor: at.saturating_sub(1),
+                            field: false,
+                        });
+                    }
+                    Key::Down | Key::Byte(b'j') => {
+                        self.mode = to(Editing::Servers {
+                            cursor: (at + 1).min(last),
+                            field: false,
+                        });
+                    }
+                    k if enter(k) && at < self.servers.len() => {
+                        self.field = self.servers[at].clone();
+                        self.mode = to(Editing::Servers {
+                            cursor: at,
+                            field: true,
+                        });
+                    }
+                    Key::Byte(b'+') => {
+                        self.field.clear();
+                        self.mode = to(Editing::Servers {
+                            cursor: self.servers.len(),
+                            field: true,
+                        });
+                    }
+                    Key::Byte(b'-') if at < self.servers.len() => {
+                        let mut list = self.servers.clone();
+                        list.remove(at);
+                        self.proposed = Some(list.clone());
+                        r.command = command(ConfigCmd::Servers { row: cursor, list });
+                        return true;
+                    }
+                    Key::Byte(ESC) => self.mode = to(Editing::None),
+                    Key::Byte(b'q') => {
+                        r.command = Some(Command::Quit);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            Editing::Save => match key {
+                Key::Byte(b'a') => {
+                    r.command = command(ConfigCmd::Save(Level::Global));
+                    return true;
+                }
+                Key::Byte(b'h') => {
+                    r.command = command(ConfigCmd::Save(Level::Host));
+                    return true;
+                }
+                Key::Byte(ESC) => self.mode = to(Editing::None),
+                _ => {}
+            },
+            Editing::None => match key {
+                Key::Up | Key::Byte(b'k') => {
+                    self.mode = Mode::Config {
+                        cursor: cursor.saturating_sub(1),
+                        editing,
+                    };
+                }
+                Key::Down | Key::Byte(b'j') => {
+                    self.mode = Mode::Config {
+                        cursor: (cursor + 1).min(SETTINGS.len() - 1),
+                        editing,
+                    };
+                }
+                k if enter(k) => {
+                    r.command = command(ConfigCmd::Edit(cursor));
+                    return true;
+                }
+                Key::Byte(b'x') => {
+                    r.command = command(ConfigCmd::Reset(cursor));
+                    return true;
+                }
+                Key::Byte(b'w') => self.mode = to(Editing::Save),
+                Key::Byte(b'q') => {
+                    r.command = Some(Command::Quit);
+                    return true;
+                }
+                // Back to the status view; the edits stay applied.
+                Key::Byte(ESC) => self.leave_config(),
+                // The popup key closes the popup, as on the status view.
+                Key::Byte(b) if Some(b) == self.key => {
+                    self.leave_config();
+                    self.mode = Mode::Closed;
+                    if phase.is_outage() {
+                        self.dismissed = true;
+                    }
+                    return true;
+                }
+                _ => {}
+            },
+        }
+        false
     }
 
     /// A key that does nothing still tells an outage's popup that someone is
@@ -267,13 +826,37 @@ impl Ui {
     }
 }
 
+/// The key an escape sequence stands for on the config screen, and how many
+/// bytes after the ESC the sequence took. Only the arrows mean anything; any
+/// other sequence is skipped whole. A bracketed paste's start is `None` too,
+/// with its five bytes used: the caller tells it from the rest by looking.
+fn escape(tail: &[u8]) -> (Option<Key>, usize) {
+    match tail {
+        [b'[' | b'O', b'A', ..] => (Some(Key::Up), 2),
+        [b'[' | b'O', b'B', ..] => (Some(Key::Down), 2),
+        [b'[', b'2', b'0', b'0', b'~', ..] => (None, 5),
+        [b'[', rest @ ..] => {
+            // CSI: parameter and intermediate bytes, then one final byte.
+            let end = rest
+                .iter()
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map_or(rest.len(), |i| i + 1);
+            (None, 1 + end)
+        }
+        [b'O', _, ..] => (None, 2),
+        // Alt and a key.
+        [_, ..] => (None, 1),
+        [] => (None, 0),
+    }
+}
+
 /// Where a byte typed with the popup closed goes: the host while the link
 /// answers, the held buffer during an outage.
 ///
 /// This is also the route of the literal a double press stands for. During an
 /// outage that literal is held with the other typed bytes, and reaches the host
 /// only through the `Confirming` answer. Under `Confirming` itself a quick
-/// second `Ctrl-\` sends nothing, so no literal runs ahead of the held input.
+/// second press of the popup key sends nothing, so no literal runs ahead of the held input.
 fn deliver(b: u8, phase: Phase, r: &mut Routed) {
     if phase.is_outage() {
         r.to_hold.push(b);
@@ -505,21 +1088,13 @@ mod tests {
     }
 
     #[test]
-    fn c_and_s_are_offered_later_and_do_nothing_now() {
+    fn s_is_offered_later_and_does_nothing_now() {
         let t = Instant::now();
-        for key in *b"cs" {
-            let mut ui = open_at(t);
-            assert_eq!(ui.keys(&[key], Phase::Live, t), Routed::default());
-            assert!(matches!(ui.mode(), Mode::Open { .. }), "{}", key as char);
-
-            let mut ui = auto_at(t);
-            assert_eq!(
-                ui.keys(&[key], silent(t), t),
-                Routed::default(),
-                "{} under an outage",
-                key as char
-            );
-        }
+        let mut ui = open_at(t);
+        assert_eq!(ui.keys(b"s", Phase::Live, t), Routed::default());
+        assert!(matches!(ui.mode(), Mode::Open { .. }));
+        let mut ui = auto_at(t);
+        assert_eq!(ui.keys(b"s", silent(t), t), Routed::default());
     }
 
     #[test]
@@ -622,7 +1197,7 @@ mod tests {
             );
             assert_eq!(
                 ui.keys(&[key], Phase::Confirming, ms(t, 600)),
-                command(want),
+                command(want.clone()),
                 "{}",
                 key as char
             );
@@ -926,5 +1501,665 @@ mod tests {
 
         ui.tick(Phase::Live, ms(t, 4_600));
         assert!(!ui.visible(Phase::Live), "the answered question stayed up");
+    }
+
+    // ---- the popup's settings -------------------------------------------
+
+    const CTRL_BRACKET: u8 = 0x1d;
+
+    fn tuned(key: Option<u8>, linger: Duration, auto: Option<Duration>) -> Ui {
+        let mut ui = Ui::new();
+        ui.retune(key, linger, auto);
+        ui
+    }
+
+    /// `popup.key = ctrl-]`: 0x1d opens the popup, and `Ctrl-\` is typing.
+    #[test]
+    fn the_configured_key_opens_the_popup_and_ctrl_backslash_is_typing() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), host(&[PREFIX]));
+        assert_eq!(ui.mode(), Mode::Closed);
+        assert_eq!(ui.keys(&[CTRL_BRACKET], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) });
+        assert_eq!(
+            ui.keys(&[CTRL_BRACKET], Phase::Live, ms(t, 2_000)),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.mode(),
+            Mode::Closed,
+            "the configured key did not close it"
+        );
+    }
+
+    /// Review focus 3. The double press belongs to the configured key: two
+    /// quick `Ctrl-]` send one literal `Ctrl-]`, not a `Ctrl-\`.
+    #[test]
+    fn a_double_press_of_the_configured_key_sends_one_literal_of_it() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        assert_eq!(
+            ui.keys(&[CTRL_BRACKET, CTRL_BRACKET], Phase::Live, t),
+            host(&[CTRL_BRACKET])
+        );
+        assert_eq!(ui.mode(), Mode::Closed);
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        ui.keys(&[CTRL_BRACKET], Phase::Live, t);
+        assert_eq!(
+            ui.keys(&[PREFIX], Phase::Live, ms(t, 100)),
+            Routed::default()
+        );
+        assert!(
+            matches!(ui.mode(), Mode::Open { .. }),
+            "Ctrl-\\ still closes it"
+        );
+    }
+
+    /// `popup.key = "off"`: the old key is typing, and Esc still closes a
+    /// popup the outage opened.
+    #[test]
+    fn with_no_key_the_old_prefix_is_typing_and_esc_still_closes() {
+        let t = Instant::now();
+        let mut ui = tuned(None, LINGER, Some(Duration::ZERO));
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), host(&[PREFIX]));
+        assert!(!ui.visible(Phase::Live));
+        ui.tick(silent(t), ms(t, 2_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+        assert_eq!(
+            ui.keys(&[PREFIX], silent(t), ms(t, 2_100)),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.mode(),
+            Mode::Open { pressed: None },
+            "a key that is not one only touches"
+        );
+        assert_eq!(ui.keys(&[ESC], silent(t), ms(t, 2_200)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    /// `auto_open_after = 25s`: an outage two seconds old does not open the
+    /// popup; one twenty-five seconds old does, counted from when the host
+    /// went quiet.
+    #[test]
+    fn the_popup_opens_by_itself_once_the_silence_reaches_auto_open_after() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, Some(Duration::from_secs(25)));
+        assert_eq!(
+            ui.tick(silent(t), ms(t, 2_000)),
+            Some(LinkChange::WentSilent)
+        );
+        assert_eq!(ui.mode(), Mode::Closed, "opened before auto_open_after");
+        ui.tick(recovering(ms(t, 20_000)), ms(t, 24_999));
+        assert_eq!(ui.mode(), Mode::Closed);
+        ui.tick(recovering(ms(t, 20_000)), ms(t, 25_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+    }
+
+    /// `auto_open_after = "off"`: no outage opens it, and the key still does.
+    #[test]
+    fn with_auto_open_off_no_outage_opens_the_popup() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, None);
+        ui.tick(silent(t), ms(t, 2_000));
+        ui.tick(recovering(t), ms(t, 600_000));
+        assert_eq!(ui.mode(), Mode::Closed);
+        assert_eq!(
+            ui.keys(&[PREFIX], recovering(t), ms(t, 600_001)),
+            Routed::default()
+        );
+        assert!(matches!(ui.mode(), Mode::Open { .. }));
+    }
+
+    #[test]
+    fn the_popup_lingers_for_the_configured_time() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), Duration::from_secs(10), Some(Duration::ZERO));
+        ui.tick(silent(t), ms(t, 2_000));
+        let back = ms(t, 4_000);
+        ui.tick(Phase::Live, back);
+        ui.tick(Phase::Live, back + LINGER);
+        assert!(
+            matches!(ui.mode(), Mode::Lingering { .. }),
+            "closed at the old LINGER"
+        );
+        ui.tick(Phase::Live, back + Duration::from_secs(10));
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    // ---- the config screen ----------------------------------------------
+
+    use crate::config::{Level, SETTINGS};
+
+    fn config_at(t: Instant) -> Ui {
+        let mut ui = open_at(t);
+        assert_eq!(ui.keys(b"c", Phase::Live, t), Routed::default());
+        assert_eq!(
+            ui.mode(),
+            Mode::Config {
+                cursor: 0,
+                editing: Editing::None
+            }
+        );
+        ui
+    }
+
+    fn cfg(c: ConfigCmd) -> Routed {
+        command(Command::Config(c))
+    }
+
+    fn editing(ui: &Ui) -> Editing {
+        ui.config_screen().expect("the config screen is up").editing
+    }
+
+    fn cursor(ui: &Ui) -> usize {
+        ui.config_screen().expect("the config screen is up").cursor
+    }
+
+    #[test]
+    fn c_opens_the_config_screen_from_the_status_view() {
+        let t = Instant::now();
+        config_at(t);
+        let mut ui = auto_at(t);
+        assert_eq!(ui.keys(b"c", silent(t), t), Routed::default());
+        assert!(ui.config_screen().is_some(), "not from the outage's popup");
+        assert!(ui.visible(silent(t)));
+    }
+
+    /// `c` pressed after this outage's moment to open by itself has
+    /// passed: there is no moment left to give way at, so the next lap
+    /// leaves the config screen up.
+    #[test]
+    fn a_config_screen_opened_late_in_an_outage_stays() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, Some(Duration::from_secs(5)));
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+        assert_eq!(ui.keys(b"c", silent(t), ms(t, 6_000)), Routed::default());
+        assert!(ui.config_screen().is_some(), "c did not open it");
+        ui.tick(silent(t), ms(t, 7_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "the config screen gave way to a moment already past: {:?}",
+            ui.mode()
+        );
+    }
+
+    #[test]
+    fn c_does_nothing_under_confirming() {
+        let t = Instant::now();
+        let mut ui = confirming_at(t);
+        assert_eq!(
+            ui.keys(b"c", Phase::Confirming, t + ANSWER_GUARD),
+            Routed::default()
+        );
+        assert!(ui.config_screen().is_none());
+    }
+
+    #[test]
+    fn arrows_in_both_encodings_and_k_and_j_move_the_cursor_within_the_list() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        for (keys, want) in [
+            (&b"\x1b[B"[..], 1),
+            (b"\x1bOB", 2),
+            (b"\x1b[A", 1),
+            (b"j", 2),
+            (b"k", 1),
+            (b"kkk", 0),
+            (b"\x1b[B\x1b[B", 2),
+        ] {
+            assert_eq!(ui.keys(keys, Phase::Live, t), Routed::default(), "{keys:?}");
+            assert_eq!(cursor(&ui), want, "{keys:?}");
+        }
+        for _ in 0..SETTINGS.len() + 3 {
+            ui.keys(b"j", Phase::Live, t);
+        }
+        assert_eq!(cursor(&ui), SETTINGS.len() - 1);
+    }
+
+    /// Other escape sequences are skipped whole, and what follows them in
+    /// the read is still read.
+    #[test]
+    fn other_escape_sequences_are_skipped_whole() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        assert_eq!(
+            ui.keys(b"\x1b[1;5Cj\x1bOqj", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(cursor(&ui), 2, "the q of ESC O q quit, or a j was lost");
+    }
+
+    #[test]
+    fn enter_x_and_w_ask_the_session() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.keys(b"jj", Phase::Live, t);
+        assert_eq!(ui.keys(b"\r", Phase::Live, t), cfg(ConfigCmd::Edit(2)));
+        assert_eq!(ui.keys(b"x", Phase::Live, t), cfg(ConfigCmd::Reset(2)));
+        assert_eq!(ui.keys(b"w", Phase::Live, t), Routed::default());
+        assert_eq!(editing(&ui), Editing::Save);
+        assert_eq!(
+            ui.keys(b"q", Phase::Live, t),
+            Routed::default(),
+            "q under the save question"
+        );
+        assert_eq!(
+            ui.keys(b"a", Phase::Live, t),
+            cfg(ConfigCmd::Save(Level::Global))
+        );
+        ui.accepted();
+        ui.keys(b"w", Phase::Live, t);
+        assert_eq!(
+            ui.keys(b"h", Phase::Live, t),
+            cfg(ConfigCmd::Save(Level::Host))
+        );
+        ui.accepted();
+        ui.keys(b"w", Phase::Live, t);
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(editing(&ui), Editing::None);
+    }
+
+    #[test]
+    fn esc_goes_back_to_the_status_view_and_q_quits() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+        let mut ui = config_at(t);
+        assert_eq!(ui.keys(b"q", Phase::Live, t), command(Command::Quit));
+        let mut ui = config_at(t);
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed, "the popup key closes the popup");
+    }
+
+    #[test]
+    fn a_text_field_takes_every_byte_until_enter() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text("20s".to_string());
+        assert_eq!(
+            ui.keys(b"\x7f\x7f\x7f30sqxwkj", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(ui.config_screen().unwrap().field, "30sqxwkj");
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(
+            editing(&ui),
+            Editing::Text,
+            "the popup key closed the field"
+        );
+        assert_eq!(ui.keys(b"\x1b[A", Phase::Live, t), Routed::default());
+        assert_eq!(cursor(&ui), 0, "an arrow moved the list under the field");
+        for _ in 0..5 {
+            ui.keys(&[0x08], Phase::Live, t);
+        }
+        assert_eq!(
+            ui.keys(b"\r", Phase::Live, t),
+            cfg(ConfigCmd::Accept {
+                row: 0,
+                text: "30s".to_string()
+            })
+        );
+        assert_eq!(
+            editing(&ui),
+            Editing::Text,
+            "the field closed before the session answered"
+        );
+        ui.accepted();
+        assert_eq!(editing(&ui), Editing::None);
+    }
+
+    #[test]
+    fn esc_cancels_a_field_and_backspace_takes_one_character() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text(String::new());
+        ui.keys("1müx".as_bytes(), Phase::Live, t);
+        ui.keys(b"\x7f\x7f", Phase::Live, t);
+        assert_eq!(ui.config_screen().unwrap().field, "1m");
+        // A character split across two reads arrives whole.
+        let u = "ü".as_bytes();
+        ui.keys(&u[..1], Phase::Live, t);
+        ui.keys(&u[1..], Phase::Live, t);
+        assert_eq!(ui.config_screen().unwrap().field, "1mü");
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(editing(&ui), Editing::None);
+        assert_eq!(ui.config_screen().unwrap().field, "");
+    }
+
+    #[test]
+    fn a_refused_value_keeps_the_field_open_with_the_reason() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text("1.5s".to_string());
+        ui.keys(b"\r", Phase::Live, t);
+        ui.say("1.5s is not a whole number of seconds".to_string());
+        let screen = ui.config_screen().unwrap();
+        assert_eq!(screen.editing, Editing::Text);
+        assert_eq!(screen.field, "1.5s");
+        assert_eq!(screen.note, Some("1.5s is not a whole number of seconds"));
+        ui.keys(b"\x7f", Phase::Live, t);
+        assert_eq!(
+            ui.config_screen().unwrap().note,
+            None,
+            "the reason outlived the next key"
+        );
+    }
+
+    /// A newline in an unbracketed paste accepts the field, and the rest of
+    /// the read is dropped: its `q` does not quit.
+    #[test]
+    fn a_newline_in_an_unbracketed_paste_accepts_and_drops_the_rest() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text(String::new());
+        assert_eq!(
+            ui.keys(b"45s\rq", Phase::Live, t),
+            cfg(ConfigCmd::Accept {
+                row: 0,
+                text: "45s".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_bracketed_paste_goes_into_the_field_without_wrappers_or_controls() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text(String::new());
+        assert_eq!(
+            ui.keys(b"\x1b[200~4\x1b5\ts\r\x1b[201~", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(ui.config_screen().unwrap().field, "45s");
+        // Split across reads: the middle read is all paste, `q` included.
+        ui.open_text(String::new());
+        ui.keys(b"\x1b[200~1m", Phase::Live, t);
+        assert_eq!(ui.keys(b" q", Phase::Live, t), Routed::default());
+        assert_eq!(
+            ui.keys(b"\x1b[201~\r", Phase::Live, t),
+            cfg(ConfigCmd::Accept {
+                row: 0,
+                text: "1m q".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_paste_with_no_field_open_is_ignored() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        assert_eq!(
+            ui.keys(b"\x1b[200~q\rx\x1b[201~", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.mode(),
+            Mode::Config {
+                cursor: 0,
+                editing: Editing::None
+            }
+        );
+    }
+
+    #[test]
+    fn key_capture_takes_the_next_key_whatever_it_is() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_capture();
+        assert_eq!(
+            ui.keys(&[PREFIX], Phase::Live, t),
+            cfg(ConfigCmd::Capture {
+                row: 0,
+                key: Some(PREFIX)
+            }),
+            "the popup key itself can be captured"
+        );
+        assert_eq!(
+            ui.keys(b"\r", Phase::Live, t),
+            cfg(ConfigCmd::Capture {
+                row: 0,
+                key: Some(b'\r')
+            }),
+            "Enter is captured, for the session to refuse"
+        );
+        assert_eq!(
+            ui.keys(b"q", Phase::Live, t),
+            cfg(ConfigCmd::Capture {
+                row: 0,
+                key: Some(b'q')
+            })
+        );
+        assert_eq!(
+            ui.keys(&[0x7f], Phase::Live, t),
+            cfg(ConfigCmd::Capture { row: 0, key: None })
+        );
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(
+            editing(&ui),
+            Editing::None,
+            "Esc did not cancel the capture"
+        );
+    }
+
+    #[test]
+    fn the_servers_sub_list_edits_adds_and_removes() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_servers(vec!["a:1".to_string(), "b:2".to_string()]);
+        ui.keys(b"j", Phase::Live, t);
+        assert_eq!(
+            ui.keys(b"-", Phase::Live, t),
+            cfg(ConfigCmd::Servers {
+                row: 0,
+                list: vec!["a:1".to_string()]
+            })
+        );
+        ui.accepted();
+        assert_eq!(ui.config_screen().unwrap().servers, ["a:1"]);
+        assert_eq!(
+            editing(&ui),
+            Editing::Servers {
+                cursor: 0,
+                field: false
+            }
+        );
+
+        ui.keys(b"+", Phase::Live, t);
+        assert_eq!(
+            editing(&ui),
+            Editing::Servers {
+                cursor: 1,
+                field: true
+            }
+        );
+        assert_eq!(
+            ui.keys(b"c:3\r", Phase::Live, t),
+            cfg(ConfigCmd::Servers {
+                row: 0,
+                list: vec!["a:1".to_string(), "c:3".to_string()]
+            })
+        );
+        ui.say("refused".to_string());
+        assert_eq!(
+            ui.config_screen().unwrap().servers,
+            ["a:1"],
+            "a refused list was kept"
+        );
+        assert_eq!(
+            editing(&ui),
+            Editing::Servers {
+                cursor: 1,
+                field: true
+            }
+        );
+        ui.keys(&[ESC], Phase::Live, t);
+        assert_eq!(
+            editing(&ui),
+            Editing::Servers {
+                cursor: 0,
+                field: false
+            }
+        );
+
+        ui.keys(b"\r", Phase::Live, t);
+        assert_eq!(ui.config_screen().unwrap().field, "a:1");
+        assert_eq!(
+            ui.keys(b"\x7f9\r", Phase::Live, t),
+            cfg(ConfigCmd::Servers {
+                row: 0,
+                list: vec!["a:9".to_string()]
+            })
+        );
+        ui.accepted();
+        ui.keys(&[ESC], Phase::Live, t);
+        assert_eq!(editing(&ui), Editing::None);
+    }
+
+    /// A large paste is cut into reads wherever the buffer ends, its end
+    /// marker too: the end is still found, and what follows it is read.
+    #[test]
+    fn a_paste_end_split_across_reads_still_ends_the_paste() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text(String::new());
+        assert_eq!(
+            ui.keys(b"\x1b[200~ab\x1b[20", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.keys(b"1~\r", Phase::Live, t),
+            cfg(ConfigCmd::Accept {
+                row: 0,
+                text: "ab".to_string()
+            })
+        );
+        // What looked like the end's beginning was text after all.
+        ui.open_text(String::new());
+        ui.keys(b"\x1b[200~a\x1b[2", Phase::Live, t);
+        ui.keys(b"x\x1b[201~", Phase::Live, t);
+        assert_eq!(ui.config_screen().unwrap().field, "a[2x");
+    }
+
+    /// With no field open the paste is ignored, but its end is still found
+    /// across reads, and the screen's keys work after it.
+    #[test]
+    fn a_split_paste_end_with_no_field_open_does_not_swallow_the_keys() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.keys(b"\x1b[200~ab\x1b[20", Phase::Live, t);
+        assert_eq!(ui.keys(b"1~j", Phase::Live, t), Routed::default());
+        assert_eq!(cursor(&ui), 1, "the j after the paste was swallowed");
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    /// Paste tracking is the config screen's: with the popup closed a
+    /// bracketed paste is the host's, byte for byte, split end and all --
+    /// or held, during an outage.
+    #[test]
+    fn a_paste_with_the_popup_closed_goes_where_typing_goes() {
+        let t = Instant::now();
+        let first = b"\x1b[200~ls -l\x1b[20";
+        let second = b"1~\r";
+        let mut ui = Ui::new();
+        assert_eq!(ui.keys(first, Phase::Live, t).to_host, first);
+        assert_eq!(ui.keys(second, Phase::Live, t).to_host, second);
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.keys(first, silent(t), t).to_hold, first);
+        assert_eq!(ui.keys(second, silent(t), t).to_hold, second);
+        // An unended paste on the config screen does not follow the user
+        // out of it.
+        let mut ui = config_at(t);
+        ui.keys(b"\x1b[200~ab", Phase::Live, t);
+        ui.mode = Mode::Closed;
+        assert_eq!(ui.keys(b"ls\r", Phase::Live, t).to_host, b"ls\r");
+    }
+
+    // ---- the config screen and the link (spec §4.2) ----------------------
+
+    /// Under default tuning the popup would open at the first outage lap;
+    /// these use a threshold so the moment can be stepped over.
+    fn config_tuned(t: Instant, auto: Option<Duration>) -> Ui {
+        let mut ui = config_at(t);
+        ui.retune(Some(PREFIX), LINGER, auto);
+        ui
+    }
+
+    #[test]
+    fn an_outage_with_no_field_open_switches_to_the_status_view_when_auto_open_fires() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, Some(Duration::from_secs(5)));
+        ui.tick(silent(t), ms(t, 2_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "switched before auto_open_after"
+        );
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+        // `Open`, not `Auto`: it does not linger away when the link is back.
+        ui.tick(Phase::Live, ms(t, 6_000));
+        ui.tick(Phase::Live, ms(t, 60_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    #[test]
+    fn an_outage_with_a_field_open_keeps_the_screen_for_the_rest_of_it() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, Some(Duration::from_secs(5)));
+        ui.open_text("20s".to_string());
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(editing(&ui), Editing::Text);
+        // Closing the field later in the same outage does not switch.
+        ui.keys(&[ESC], silent(t), ms(t, 6_000));
+        ui.tick(silent(t), ms(t, 7_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "switched after the moment had passed"
+        );
+        // The next outage decides again.
+        ui.tick(Phase::Live, ms(t, 8_000));
+        ui.tick(silent(ms(t, 9_000)), ms(t, 14_000));
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    #[test]
+    fn with_auto_open_off_an_outage_never_switches() {
+        let t = Instant::now();
+        let mut ui = config_tuned(t, None);
+        ui.tick(silent(t), ms(t, 2_000));
+        ui.tick(recovering(t), ms(t, 600_000));
+        assert!(ui.config_screen().is_some());
+    }
+
+    /// The question takes over, from a lap or from a read, and an open
+    /// field goes with it: its `s` and `d` never land in a field.
+    #[test]
+    fn confirming_always_switches_and_drops_the_field() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text("2".to_string());
+        ui.tick(Phase::Confirming, ms(t, 1_000));
+        assert!(ui.config_screen().is_none());
+        assert!(ui.visible(Phase::Confirming));
+
+        let mut ui = config_at(t);
+        ui.open_text("2".to_string());
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, t),
+            Routed::default(),
+            "inside the guard"
+        );
+        assert!(
+            ui.config_screen().is_none(),
+            "the read under Confirming typed into the field"
+        );
+        assert_eq!(
+            ui.keys(b"s", Phase::Confirming, t + ANSWER_GUARD),
+            command(Command::SendHeld)
+        );
     }
 }

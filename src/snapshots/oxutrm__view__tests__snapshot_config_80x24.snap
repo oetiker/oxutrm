@@ -1,0 +1,23 @@
+---
+source: src/view.rs
+expression: "text.join(\"\\n\")"
+---
+╭ oxutrm · config · thinlinc ──────────────────────────────────────────╮
+├ popup ───────────────────────────────────────────────────────────────┤
+│   key               ctrl-\                                           │
+│   auto_open_after   2s                                               │
+│   linger            3s                                               │
+│   splash            on                         next connect          │
+├ recovery ────────────────────────────────────────────────────────────┤
+│   silent_after      2s                                               │
+│ ▸ rebuild_after     25s                 global                       │
+│   connect_timeout   10s                        next attempt          │
+├ network ─────────────────────────────────────────────────────────────┤
+│   standby           off                 host                         │
+│   stun_servers      stun.cloudflare.…          next attempt          │
+│   port_mapping      on                         next attempt          │
+│   birthday          on                         next attempt          │
+├──────────────────────────────────────────────────────────────────────┤
+│ silence before an ssh rebuild starts · 5s–10m                        │
+│ ↑↓ move  ⏎ edit  x reset  w save  Esc back                           │
+╰──────────────────────────────────────────────────────────────────────╯

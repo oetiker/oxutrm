@@ -38,6 +38,8 @@ pub(crate) enum Kind {
     /// One line for a whole outage, once it is over: how long it was and
     /// how it ended.
     Outage,
+    /// The config file: a warning about it, a save, a save that failed.
+    Config,
 }
 
 impl Kind {
@@ -50,6 +52,7 @@ impl Kind {
             Kind::Input => "input",
             Kind::Log => "log",
             Kind::Outage => "outage",
+            Kind::Config => "config",
         }
     }
 }
@@ -417,6 +420,7 @@ mod tests {
             Kind::Input,
             Kind::Log,
             Kind::Outage,
+            Kind::Config,
         ]
         .into_iter()
         .map(Kind::name)
@@ -424,7 +428,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "link", "standby", "failover", "rebuild", "input", "log", "outage"
+                "link", "standby", "failover", "rebuild", "input", "log", "outage", "config"
             ]
         );
     }

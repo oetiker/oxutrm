@@ -51,18 +51,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_client::{PopupView, Renderer, layout_popup, status_line, terminal_size_of};
+#[cfg(test)]
+use oxutrm_client::layout_popup;
+use oxutrm_client::{
+    ConfigView, Popup, PopupView, Renderer, layout, status_line, terminal_size_of,
+};
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
+use crate::config::{ConfigState, Settings, Value};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
 use crate::rebuild::{AttemptOutcome, Rebuild, RebuildStage, Report};
-use crate::ui::{Command, LinkChange, Mode, Ui};
-use crate::view::{Facts, Identity, RebuildFacts, StandbyFacts};
+use crate::ui::{Command, ConfigCmd, ConfigScreen, LinkChange, Mode, Ui};
+use crate::view::{ConfigFacts, Facts, Identity, RebuildFacts, StandbyFacts};
 
 /// How long a loop waits for something to happen before looking again.
 ///
@@ -961,7 +966,7 @@ pub struct ClientSession {
     /// every lap. Mirrors the overlay exactly -- `None` means no overlay --
     /// except while the startup splash is up: then the overlay is the
     /// splash, and this is what goes back when it ends.
-    shown: Option<PopupView>,
+    shown: Option<Popup>,
     /// The popup's state, and where keystrokes go.
     ui: Ui,
     /// A minute of the primary link's measurements, for the popup.
@@ -1010,6 +1015,15 @@ pub struct ClientSession {
     /// Whatever took it down without painting -- a resize, a recovery --
     /// leaves this for the next lap of layer 1.
     unpainted_splash_end: bool,
+    /// The config file's layers for this target and the screen's unsaved
+    /// edits. Defaults, with nowhere to save, until `with_config`.
+    config: ConfigState,
+    /// The config warnings already recorded as shown entries, so that a
+    /// save's re-read does not log the connect's again.
+    config_warned: std::collections::HashSet<String>,
+    /// `network.standby` as last applied. The standby itself is switched by
+    /// the loop, which owns the tasks it stops (`standby_switch`).
+    standby_wanted: bool,
 }
 
 /// The startup splash while it shows; the picture is
@@ -1154,6 +1168,9 @@ impl ClientSession {
             zone: jiff::tz::TimeZone::system(),
             splash: None,
             unpainted_splash_end: false,
+            config: ConfigState::defaults(),
+            config_warned: std::collections::HashSet::new(),
+            standby_wanted: true,
         })
     }
 
@@ -1193,7 +1210,7 @@ impl ClientSession {
             return false;
         }
         self.renderer
-            .set_overlay(self.shown.as_ref().map(|v| layout_popup(v, self.size)));
+            .set_overlay(self.shown.as_ref().map(|v| layout(v, self.size)));
         self.unpainted_splash_end = true;
         true
     }
@@ -1274,6 +1291,158 @@ impl ClientSession {
     pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
         self.activity = activity;
         self
+    }
+
+    /// The config file as resolved for this target: its settings applied,
+    /// its layers kept for the config screen, and its `warnings` recorded as
+    /// shown entries -- they cannot be printed (config spec §2.2). After
+    /// `with_activity`, whose log the warnings belong in, and after
+    /// `with_standby`, whose network settings it sets.
+    ///
+    /// `network.standby = false` switches the standby off here, before the
+    /// loop runs and without an entry: the file said so, and the user who
+    /// wrote it never hears of that host's standby again (config spec §1).
+    /// Only a change made on the screen is the loop's to carry out and log.
+    pub(crate) fn with_config(mut self, state: ConfigState, warnings: &[String]) -> ClientSession {
+        for w in warnings {
+            self.record_config_warning(w);
+        }
+        let settings = state.applied.clone();
+        self.config = state;
+        self.apply(&settings);
+        if let Some(st) = self.standby.as_mut() {
+            st.set_enabled(settings.standby, Instant::now());
+        }
+        self
+    }
+
+    /// The one way settings reach the session: at startup, and after every
+    /// change the config screen accepts. Each consumer takes its value for
+    /// its next read, lap, attempt or search. Switching the standby off or
+    /// on is the loop's to do ([`ClientSession::standby_switch`]): the tasks
+    /// it stops are the loop's locals.
+    pub(crate) fn apply(&mut self, s: &Settings) {
+        self.ui
+            .retune(s.popup_key, s.linger, s.effective_auto_open());
+        self.link_state
+            .retune(s.silent_after, s.effective_rebuild_after());
+        let cfg = s.net_config();
+        if let Some(r) = self.rebuild.as_mut() {
+            r.retune(cfg.clone(), s.connect_timeout);
+        }
+        if let Some(st) = self.standby.as_mut() {
+            st.set_cfg(cfg);
+        }
+        self.standby_wanted = s.standby;
+    }
+
+    /// `Some(on)` when `network.standby` asks for something the standby is
+    /// not doing; `None` without a standby, on a host that offered none.
+    fn standby_switch(&self) -> Option<bool> {
+        let s = self.standby.as_ref()?;
+        (s.enabled() != self.standby_wanted).then_some(self.standby_wanted)
+    }
+
+    /// Switch the standby off or on, once the loop has stopped what it runs
+    /// for it.
+    fn switch_standby(&mut self, on: bool, now: Instant) {
+        let Some(s) = self.standby.as_mut() else {
+            return;
+        };
+        s.set_enabled(on, now);
+        let text = if on { "switched on" } else { "switched off" };
+        self.activity
+            .record_shown(Kind::Standby, text, &format!("standby {text}"));
+    }
+
+    /// What the config screen asked for: checked against the table, applied
+    /// at once when it is accepted, and answered on the screen either way.
+    fn config_command(&mut self, c: ConfigCmd) {
+        use crate::config::{SETTINGS, Shape, check_key, check_servers, parse_text, show};
+        match c {
+            ConfigCmd::Edit(row) => match (SETTINGS[row].shape, self.config.shown(row).1) {
+                (Shape::Bool, Value::Bool(b)) => self.config_set(row, Value::Bool(!b)),
+                (Shape::Key, _) => self.ui.open_capture(),
+                (Shape::Servers, Value::List(list)) => self.ui.open_servers(list),
+                (_, value) => self.ui.open_text(show(&value)),
+            },
+            ConfigCmd::Accept { row, text } => match parse_text(SETTINGS[row].shape, &text) {
+                Ok(value) => self.config_set(row, value),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Capture { row, key } => match key.map_or(Ok(None), check_key) {
+                Ok(key) => self.config_set(row, Value::Key(key)),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Servers { row, list } => match check_servers(list) {
+                Ok(value) => self.config_set(row, value),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Reset(row) => match self.config.reset(row) {
+                Ok(settings) => self.apply(&settings),
+                Err(why) => self.ui.say(why),
+            },
+            ConfigCmd::Save(level) => self.config_save(level),
+        }
+    }
+
+    /// Row `row` set to `value`, unless that is refused.
+    fn config_set(&mut self, row: usize, value: Value) {
+        match self.config.set(row, value) {
+            Ok(settings) => {
+                self.apply(&settings);
+                self.ui.accepted();
+            }
+            Err(why) => self.ui.say(why),
+        }
+    }
+
+    /// `w` answered: the pending edits written at `level`. A failed save
+    /// leaves them pending, says why on the help line, and is recorded.
+    /// The written text's warnings are recorded as at the connect, each
+    /// once a session.
+    fn config_save(&mut self, level: crate::config::Level) {
+        self.ui.accepted();
+        // Nothing pending is no failure: the help line says so, and neither
+        // the activity log nor the file hears of it.
+        if self.config.pending.is_empty() {
+            self.ui.say("not saved: nothing has changed".to_string());
+            return;
+        }
+        match self.config.save(level) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    self.record_config_warning(w);
+                }
+                let whom = match level {
+                    crate::config::Level::Global => "all hosts".to_string(),
+                    crate::config::Level::Host => oxutrm_client::legible(&self.config.target),
+                };
+                self.activity
+                    .record_detail(Kind::Config, &format!("saved for {whom}"));
+                self.ui.say(format!("saved for {whom}"));
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                self.activity.record_shown(
+                    Kind::Config,
+                    &format!("save failed: {why}"),
+                    "config not saved",
+                );
+                self.ui
+                    .say(format!("not saved: {}", oxutrm_client::summarised(&why)));
+            }
+        }
+    }
+
+    /// A config warning as a shown entry, unless this session has already
+    /// recorded it: a save re-reads the whole file, and the warnings the
+    /// connect logged are still there.
+    fn record_config_warning(&mut self, w: &str) {
+        if self.config_warned.insert(w.to_owned()) {
+            self.activity
+                .record_shown(Kind::Config, w, &format!("config: {w}"));
+        }
     }
 
     /// Tell the user what connection they got — once, and then be quiet.
@@ -1583,6 +1752,7 @@ impl ClientSession {
                 self.activity
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
+            Some(Command::Config(c)) => self.config_command(c),
             None => {}
         }
         Ok(None)
@@ -1616,7 +1786,7 @@ impl ClientSession {
     /// whole seconds, so an open popup with nothing happening repaints
     /// rarely and costs one comparison otherwise; a change of phase is
     /// reported the lap it happens.
-    fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
+    fn layer_at(&mut self, now: Instant) -> Option<Popup> {
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
         match self.ui.tick(phase, now) {
@@ -1636,7 +1806,36 @@ impl ClientSession {
             }
             None => {}
         }
-        self.ui.visible(phase).then(|| self.view(phase, now))
+        if !self.ui.visible(phase) {
+            return None;
+        }
+        Some(match self.ui.config_screen() {
+            Some(screen) => Popup::Config(self.config_view(screen, phase, now)),
+            None => Popup::Status(self.view(phase, now)),
+        })
+    }
+
+    /// The status view [`ClientSession::layer_at`] shows, for the tests that
+    /// read it: `None` while the popup is closed or shows the config screen.
+    #[cfg(test)]
+    fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
+        match self.layer_at(now)? {
+            Popup::Status(v) => Some(v),
+            Popup::Config(_) => None,
+        }
+    }
+
+    /// What the config screen says at `now`.
+    fn config_view(&self, screen: ConfigScreen<'_>, phase: Phase, now: Instant) -> ConfigView {
+        crate::view::config(&ConfigFacts {
+            identity: self.identity.as_ref(),
+            state: &self.config,
+            screen,
+            standby_offered: self.standby.is_some(),
+            phase,
+            last_heard: self.link_state.last_heard(),
+            now,
+        })
     }
 
     /// Layer 1 for one lap at `now`: the popup, or the splash while it is
@@ -1648,7 +1847,7 @@ impl ClientSession {
     /// outage that opens it while the splash is up ends the splash: what is
     /// wrong with the link matters more than the logo.
     fn layer_one<W: Write>(&mut self, now: Instant, out: &mut W) -> Result<()> {
-        let view = self.popup_at(now);
+        let view = self.layer_at(now);
         self.sample_quality(now);
         let ended = view.is_some() && self.end_splash();
         if !ended && self.splash_lap(now, out)? {
@@ -1656,7 +1855,7 @@ impl ClientSession {
         }
         if view != self.shown || ended || self.unpainted_splash_end {
             self.renderer
-                .set_overlay(view.as_ref().map(|v| layout_popup(v, self.size)));
+                .set_overlay(view.as_ref().map(|v| layout(v, self.size)));
             self.shown = view;
             self.paint(out, "painting the popup")?;
         }
@@ -1669,19 +1868,25 @@ impl ClientSession {
             Mode::Lingering { outage, .. } => Some(outage),
             _ => None,
         };
-        let standby = self.standby.as_ref().map(|s| StandbyFacts {
-            path: s.path(),
-            rtt: s.rtt(),
-            probe: s.probe(),
-            searching: s.searching(),
-            next_search: s.next_search(),
-            last_search_failed: s.last_failure().is_some(),
-        });
+        // A standby switched off is shown as none at all.
+        let standby = self
+            .standby
+            .as_ref()
+            .filter(|s| s.enabled())
+            .map(|s| StandbyFacts {
+                path: s.path(),
+                rtt: s.rtt(),
+                probe: s.probe(),
+                searching: s.searching(),
+                next_search: s.next_search(),
+                last_search_failed: s.last_failure().is_some(),
+            });
         crate::view::build(&Facts {
             identity: self.identity.as_ref(),
             phase,
             lingering,
             last_heard: self.link_state.last_heard(),
+            rebuild_after: self.link_state.rebuild_after(),
             path: self.path.as_ref(),
             quality: &self.quality,
             rejected: self.rejected_total(),
@@ -2150,7 +2355,7 @@ impl ClientSession {
         // whose view is also `None` would never clear a box stranded on the
         // screen.
         if let Some(v) = self.shown.as_ref() {
-            self.renderer.set_overlay(Some(layout_popup(v, size)));
+            self.renderer.set_overlay(Some(layout(v, size)));
         }
         // The splash is laid out for a screen too, so the frame that was
         // showing is laid out again at the new size, or the splash ends if
@@ -2516,6 +2721,19 @@ impl ClientSession {
                     self.drain(out).await?;
                     return exit_code(&reason);
                 }
+            }
+
+            // `network.standby` changed on the config screen (config spec
+            // §2.3). Off: the search and the probe in flight and the
+            // connection watched for closing are this loop's locals, so they
+            // go here, before the standby closes its link.
+            if let Some(on) = self.standby_switch() {
+                if !on {
+                    _search_task = None;
+                    _probe_task = None;
+                    standby_conn = None;
+                }
+                self.switch_standby(on, Instant::now());
             }
 
             let now = Instant::now();
@@ -7209,7 +7427,7 @@ mod tests {
         assert!(session.popup_at(t).is_none());
         let view = session.popup_at(t + Duration::from_secs(3));
         assert!(view.is_some(), "the fixture raised no popup");
-        session.shown = view;
+        session.shown = view.map(Popup::Status);
         (host, session)
     }
 
@@ -7228,7 +7446,7 @@ mod tests {
         session.note_heard(now);
         let view = session.popup_at(now);
         assert!(view.is_some(), "the fixture asked the user nothing");
-        session.shown = view;
+        session.shown = view.map(Popup::Status);
         (host, session)
     }
 
@@ -8193,7 +8411,7 @@ mod tests {
             session
                 .renderer
                 .set_overlay(Some(layout_popup(&view, session.size)));
-            session.shown = Some(view.clone());
+            session.shown = Some(Popup::Status(view.clone()));
             let mut painted = Vec::new();
             session
                 .renderer
@@ -9566,5 +9784,527 @@ mod tests {
             next_pacing_deadline(false, deadline, now, interval),
             now + interval
         );
+    }
+
+    // ---- the config file and screen ----------------------------------------
+
+    /// A config file's warnings cannot be printed: each is a shown entry in
+    /// the popup's log, and in client.log with the `config` kind.
+    #[tokio::test]
+    async fn config_warnings_are_shown_in_the_popups_log() {
+        let (_host, session) = pair("/bin/sh").await;
+        let resolved = crate::config::resolve(Some("[popup]\nlingr = \"5s\"\n"), "t");
+        let session = session.with_config(
+            crate::config::ConfigState::new(None, "t", &resolved),
+            &resolved.warnings,
+        );
+        assert_eq!(
+            shown_log(&session),
+            [(
+                Kind::Config,
+                "config: popup.lingr: unknown setting".to_string(),
+                false
+            )]
+        );
+        assert_eq!(session.config.warnings, 1);
+    }
+
+    /// `apply` reaches every consumer: the popup's key, the recovery
+    /// timings, and the network settings of the next rebuild attempt and
+    /// standby search.
+    #[tokio::test]
+    async fn apply_reaches_every_consumer() {
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16));
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        session.apply(&Settings {
+            popup_key: Some(0x1d),
+            rebuild_after: Duration::from_secs(30),
+            stun_servers: vec![],
+            birthday: false,
+            ..Settings::default()
+        });
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(30));
+        let rebuild = session.rebuild.as_ref().expect("the rebuild");
+        assert!(!rebuild.cfg().enable_birthday && rebuild.cfg().stun_servers.is_empty());
+        let standby = session.standby.as_ref().expect("the standby");
+        assert!(!standby.cfg.enable_birthday && standby.cfg.stun_servers.is_empty());
+
+        // `popup.key = ctrl-]`: 0x1c is typing, 0x1d opens the popup.
+        let mut out = Vec::new();
+        assert_eq!(session.route_keys(&[0x1c], &mut out).unwrap(), None);
+        assert!(
+            spoken(&session).ends_with(&[0x1c]),
+            "{:?}",
+            spoken(&session)
+        );
+        assert!(session.popup_at(Instant::now()).is_none());
+        session.route_keys(&[0x1d], &mut out).unwrap();
+        assert!(
+            session.popup_at(Instant::now()).is_some(),
+            "ctrl-] opened nothing"
+        );
+    }
+
+    /// `rebuild_after = 30s`: the outage is still `Silent` at 20 s, the
+    /// popup's countdown reads from 30 s, and `Recovering` comes at 30 s.
+    #[tokio::test]
+    async fn a_retuned_rebuild_after_moves_the_rebuild_and_its_countdown() {
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16));
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.apply(&Settings {
+            rebuild_after: Duration::from_secs(30),
+            ..Settings::default()
+        });
+        let t = Instant::now();
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.popup_at(t).is_none());
+        let at = |s| t + Duration::from_secs(s);
+        let v = session
+            .popup_at(at(25))
+            .expect("no popup 25 s into an outage");
+        let row = v
+            .attempts
+            .iter()
+            .find(|r| r.label == "ssh rebuild")
+            .expect("no ssh rebuild row");
+        assert_eq!(row.text, "in 5 s");
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Silent { .. }
+        ));
+        let _ = session.popup_at(at(29));
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Silent { .. }),
+            "rebuilt before rebuild_after"
+        );
+        let _ = session.popup_at(at(30));
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Recovering { .. }
+        ));
+    }
+
+    /// A `rebuild_after` below `silent_after` is raised to it: there is no
+    /// rebuild before there is an outage.
+    #[tokio::test]
+    async fn a_rebuild_after_below_silent_after_waits_for_the_outage() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.apply(&Settings {
+            silent_after: Duration::from_secs(10),
+            rebuild_after: Duration::from_secs(5),
+            ..Settings::default()
+        });
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(10));
+    }
+
+    /// `network.standby = false` reaches the loop, which closes the parked
+    /// standby -- the host end hears why -- and the session goes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_switches_a_standby_off_and_closes_it() {
+        let (mut host, mut client) = pair("").await;
+        let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
+        client.standby = Some(standby_holding(standby_client));
+        client.apply(&Settings {
+            standby: false,
+            ..Settings::default()
+        });
+        let host_loop = tokio::spawn(async move { host.run().await });
+        let (keys, mut typing) = keyboard();
+        let client_loop = tokio::spawn(async move {
+            let mut out = Vec::new();
+            let code = client.run_on(keys, &mut out).await;
+            (code, client)
+        });
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            standby_host.sink.connection().closed(),
+        )
+        .await
+        .expect("the standby was never closed");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == crate::standby::SWITCHED_OFF),
+            "{reason:?}"
+        );
+
+        typing.write_all(b"exit 7\n").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(15), client_loop)
+            .await
+            .expect("the client never finished")
+            .expect("client task");
+        assert_eq!(code.expect("the client loop failed"), 7);
+        let standby = client.standby.as_ref().expect("the standby");
+        assert!(!standby.enabled() && !standby.has_link());
+        assert!(
+            shown_log(&client)
+                .iter()
+                .any(|(k, s, _)| *k == Kind::Standby && s == "standby switched off"),
+            "{:?}",
+            shown_log(&client)
+        );
+        assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
+    }
+
+    /// `network.standby = false` in the file switches the standby off at
+    /// connect, silently: only a change made on the screen is recorded
+    /// (config spec §1: the user never sees it again on that host).
+    #[tokio::test]
+    async fn a_standby_off_in_the_file_is_off_from_connect_without_a_word() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        let resolved = crate::config::resolve(Some("[network]\nstandby = false\n"), "t");
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        let session = session.with_config(
+            crate::config::ConfigState::new(None, "t", &resolved),
+            &resolved.warnings,
+        );
+        let standby = session.standby.as_ref().expect("the standby");
+        assert!(!standby.enabled(), "the file's standby = false was ignored");
+        assert_eq!(session.standby_switch(), None, "left for the loop to log");
+        assert_eq!(shown_log(&session), []);
+        let now = Instant::now();
+        assert!(
+            session
+                .view(session.link_state.phase_now(), now)
+                .standby
+                .is_empty(),
+            "a standby switched off still has a popup section"
+        );
+    }
+
+    /// A client with its popup open on the config screen, cursor on `row`.
+    async fn on_the_config_screen(row: usize) -> (HostSession, ClientSession) {
+        let (host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        session.route_keys(&[crate::ui::PREFIX], &mut out).unwrap();
+        session.route_keys(b"c", &mut out).unwrap();
+        for _ in 0..row {
+            session.route_keys(b"j", &mut out).unwrap();
+        }
+        assert!(
+            matches!(session.layer_at(Instant::now()), Some(Popup::Config(_))),
+            "the config screen did not open"
+        );
+        (host, session)
+    }
+
+    fn row_of(key: &str) -> usize {
+        crate::config::SETTINGS
+            .iter()
+            .position(|s| format!("{}.{}", s.section, s.name) == key)
+            .expect("no such setting")
+    }
+
+    fn type_in(session: &mut ClientSession, keys: &[u8]) {
+        session.route_keys(keys, &mut Vec::new()).unwrap();
+    }
+
+    /// Enter opens the field with the value in it; what is typed and
+    /// accepted is applied at once and marked unsaved.
+    #[tokio::test]
+    async fn an_accepted_edit_is_applied_at_once() {
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = on_the_config_screen(row).await;
+        type_in(&mut session, b"\r");
+        assert_eq!(session.ui.config_screen().unwrap().field, "20s");
+        type_in(&mut session, b"\x7f\x7f\x7f30s");
+        type_in(&mut session, b"\r");
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(30));
+        assert_eq!(
+            session.config.shown(row),
+            (None, Value::Duration(Some(Duration::from_secs(30))), true)
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().editing,
+            crate::ui::Editing::None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_value_keeps_the_field_and_says_why() {
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = on_the_config_screen(row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f\x7f1s\r");
+        let screen = session.ui.config_screen().unwrap();
+        assert_eq!(screen.editing, crate::ui::Editing::Text);
+        assert!(
+            screen.note.is_some_and(|n| n.contains("outside")),
+            "{:?}",
+            screen.note
+        );
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            crate::linkstate::REBUILD_AFTER
+        );
+    }
+
+    /// A bool flips on Enter; `network.standby` off is left for the loop
+    /// to carry out.
+    #[tokio::test]
+    async fn enter_flips_a_bool_and_standby_off_waits_for_the_loop() {
+        let (_host, mut session) = on_the_config_screen(crate::config::STANDBY).await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        type_in(&mut session, b"\r");
+        assert_eq!(session.standby_switch(), Some(false));
+        type_in(&mut session, b"\r");
+        assert_eq!(
+            session.standby_switch(),
+            None,
+            "flipped back, nothing to do"
+        );
+    }
+
+    /// The popup key moved from the screen: `Ctrl-]` captured, and from
+    /// then on `Ctrl-\` is typing. `Ctrl-M` is refused with the reason.
+    #[tokio::test]
+    async fn a_captured_key_becomes_the_popup_key() {
+        let (_host, mut session) = on_the_config_screen(0).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\r");
+        let note = session.ui.config_screen().unwrap().note.map(str::to_owned);
+        assert_eq!(note.as_deref(), Some("ctrl-m is Enter"));
+        type_in(&mut session, &[0x1d]);
+        assert_eq!(session.config.shown(0).1, Value::Key(Some(0x1d)));
+        // Back to the status view, then closed -- by the new key.
+        type_in(&mut session, &[0x1b]);
+        type_in(&mut session, &[0x1d]);
+        assert!(
+            session.popup_at(Instant::now()).is_none(),
+            "ctrl-] did not close it"
+        );
+        type_in(&mut session, &[0x1c]);
+        assert!(
+            spoken(&session).ends_with(&[0x1c]),
+            "{:?}",
+            spoken(&session)
+        );
+    }
+
+    /// Both off is refused on the screen too, whichever way it is reached.
+    #[tokio::test]
+    async fn a_change_that_would_make_the_popup_unreachable_is_refused() {
+        let (_host, mut session) = on_the_config_screen(0).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, &[0x7f]);
+        assert_eq!(
+            session.config.shown(0).1,
+            Value::Key(None),
+            "Backspace did not set off"
+        );
+        type_in(&mut session, b"j\r");
+        type_in(&mut session, b"\x7f\x7foff\r");
+        let screen = session.ui.config_screen().unwrap();
+        assert_eq!(screen.note, Some(crate::config::UNREACHABLE));
+        assert_eq!(screen.editing, crate::ui::Editing::Text);
+    }
+
+    // ---- saving from the screen --------------------------------------------
+
+    /// A client whose config is `dir`'s, for target `t`, with the config
+    /// screen open on `row`.
+    async fn configured(dir: &std::path::Path, row: usize) -> (HostSession, ClientSession) {
+        let (host, session) = pair("/bin/sh").await;
+        let r = crate::config::load(Some(dir), "t");
+        let mut session = session.with_config(
+            ConfigState::new(Some(dir.to_path_buf()), "t", &r),
+            &r.warnings,
+        );
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"c");
+        for _ in 0..row {
+            type_in(&mut session, b"j");
+        }
+        (host, session)
+    }
+
+    /// `x` on a value from the file takes the layer below into effect at
+    /// once -- here the host's 25s gives way to the global 40s -- and marks
+    /// the row unsaved.
+    #[tokio::test]
+    async fn x_on_a_file_value_applies_the_layer_below() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::FILE),
+            "[recovery]\nrebuild_after = \"40s\"\n[host.\"t\"]\nrecovery.rebuild_after = \"25s\"\n",
+        )
+        .unwrap();
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(25));
+        type_in(&mut session, b"x");
+        assert_eq!(
+            session.config.shown(row),
+            (
+                Some(crate::config::Origin::Global),
+                Value::Duration(Some(Duration::from_secs(40))),
+                true
+            )
+        );
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            Duration::from_secs(40),
+            "the reset was not applied"
+        );
+    }
+
+    /// `w` `a`: written for every host, this host's own override of the key
+    /// gone, and the screen's origins read from what was written.
+    #[tokio::test]
+    async fn w_then_a_saves_for_every_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        std::fs::write(&file, "[host.\"t\"]\nrecovery.rebuild_after = \"25s\"\n").unwrap();
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f\x7f30s\r");
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        let r = crate::config::resolve(Some(&std::fs::read_to_string(&file).unwrap()), "t");
+        assert_eq!(r.settings.rebuild_after, Duration::from_secs(30));
+        assert!(session.config.pending.is_empty());
+        assert_eq!(
+            session.config.shown(row),
+            (
+                Some(crate::config::Origin::Global),
+                Value::Duration(Some(Duration::from_secs(30))),
+                false
+            )
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("saved for all hosts")
+        );
+    }
+
+    /// After a save the screen shows what the file says now -- a hand edit
+    /// made elsewhere included, and its warnings counted -- but nothing in
+    /// effect changes until the next connect.
+    #[tokio::test]
+    async fn after_a_save_a_hand_edit_is_shown_but_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        std::fs::write(
+            &file,
+            "[recovery]\nrebuild_after = \"40s\"\n[popup]\nx = 1\n",
+        )
+        .unwrap();
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"h");
+        let rebuild = row_of("recovery.rebuild_after");
+        assert_eq!(
+            session.config.shown(rebuild).1,
+            Value::Duration(Some(Duration::from_secs(40)))
+        );
+        assert_eq!(session.config.warnings, 1);
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            crate::linkstate::REBUILD_AFTER,
+            "the hand edit was applied"
+        );
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("saved for t")
+        );
+    }
+
+    /// A save that fails leaves the edits pending, says why, and is
+    /// recorded.
+    #[tokio::test]
+    async fn a_failed_save_keeps_the_edits_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(crate::config::FILE)).unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        assert_eq!(session.config.pending.len(), 1);
+        let note = session.ui.config_screen().unwrap().note.map(str::to_owned);
+        assert!(
+            note.as_deref().is_some_and(|n| n.starts_with("not saved")),
+            "{note:?}"
+        );
+        assert!(
+            shown_log(&session)
+                .iter()
+                .any(|(k, s, _)| *k == Kind::Config && s == "config not saved"),
+            "{:?}",
+            shown_log(&session)
+        );
+    }
+
+    /// `w` `a` with nothing pending is not a failure: the help line says so,
+    /// and neither the activity log nor the file hears of it.
+    #[tokio::test]
+    async fn saving_with_nothing_pending_only_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("not saved: nothing has changed")
+        );
+        assert!(
+            session.activity.entries().all(|e| e.kind != Kind::Config),
+            "{:?}",
+            shown_log(&session)
+        );
+        assert!(!dir.path().join(crate::config::FILE).exists());
+    }
+
+    /// Every warning is a shown entry, once: one the written text brings
+    /// is recorded at the save, one already recorded at the connect is not
+    /// recorded again.
+    #[tokio::test]
+    async fn a_save_records_only_the_warnings_not_yet_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::config::FILE);
+        let old = "[popup]\nx = 1\n";
+        std::fs::write(&file, old).unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"\r");
+        type_in(&mut session, b"\x7f\x7f5s\r");
+        // A hand edit made since the connect brings a second warning.
+        std::fs::write(&file, format!("{old}[recovery]\ny = 2\n")).unwrap();
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        let written = std::fs::read_to_string(&file).unwrap();
+        let warnings = crate::config::resolve(Some(&written), "t").warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // A repeat folds into the entry before it: count its repeats too.
+        let times = |shown: &str| -> u32 {
+            session
+                .activity
+                .entries()
+                .filter(|e| e.kind == Kind::Config && e.shown == shown && !e.detail)
+                .map(|e| 1 + e.repeats)
+                .sum()
+        };
+        for w in &warnings {
+            let shown = format!("config: {w}");
+            assert_eq!(times(&shown), 1, "{shown}: {:#?}", shown_log(&session));
+        }
     }
 }

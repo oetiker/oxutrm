@@ -102,6 +102,11 @@ ratatui = { version = "0.30", default-features = false, features = ["std"] }
 # this.
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 insta = "1"
+# The client's config file (src/config.rs): read and, from the config screen,
+# written back with every comment and key it did not change kept as written.
+# Default features only -- `parse` and `display`; no serde: each key is read
+# and checked on its own, so one bad value costs only that key.
+toml_edit = "0.25"
 
 # Not in the contract's table; required by the M4 integration plan and declared
 # here so its tasks do not each re-pin them.
@@ -193,6 +198,7 @@ rustix = { workspace = true, features = ["event", "pty", "time"] }
 # because oxutrm-net has no business knowing what a Frame is.
 quinn.workspace = true
 jiff.workspace = true
+toml_edit.workspace = true
 
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]`, which src/accept.rs

@@ -99,7 +99,15 @@ pub fn run_connect(args: &[String]) -> Result<()> {
 
 /// L3 to L13.
 async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
-    let cfg = NetConfig::default();
+    // The config file, for this target. Nothing is printed about it: a
+    // line written here would be painted over within milliseconds. Its
+    // warnings go to the activity log once the session has one.
+    let config_dir = crate::config::config_dir(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    );
+    let config = crate::config::load(config_dir.as_deref(), target);
+    let cfg = config.settings.net_config();
 
     // L3. Spawns `ssh <target> oxutrm host --connect` and drains its stderr
     // continuously -- an undrained stderr is a deadlock, not an inconvenience.
@@ -212,20 +220,36 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
             LogFile::open_default(),
             target,
             &established.session_id,
-        ))
-        // The startup splash, painted by the session's own loop through the
-        // renderer once raw mode is on -- never earlier, where ssh may still
-        // be asking for a passphrase. Here and nowhere else: a rebuild or a
-        // failover happens inside the running session and never comes back
-        // through this function.
-        .with_splash(
-            splash_seed(),
-            &splash_caption(&chosen, &established.session_id, &established.path),
-        );
+        ));
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
+    // Created whatever `network.standby` says: the setting only switches it
+    // (config spec §2.3), so it can be switched on from the screen.
     if standby {
         session = session.with_standby(Standby::new(cfg.clone(), std::time::Instant::now()));
+    }
+    // After the activity log, which records its warnings, and after the
+    // standby, which it switches.
+    let warnings = config.warnings.len();
+    session = session.with_config(
+        crate::config::ConfigState::new(config_dir, target, &config),
+        &config.warnings,
+    );
+    // The startup splash, painted by the session's own loop through the
+    // renderer once raw mode is on -- never earlier, where ssh may still be
+    // asking for a passphrase. Here and nowhere else: a rebuild or a
+    // failover happens inside the running session and never comes back
+    // through this function.
+    if config.settings.splash {
+        session = session.with_splash(
+            splash_seed(),
+            &splash_caption(
+                &chosen,
+                &established.session_id,
+                &established.path,
+                warnings,
+            ),
+        );
     }
 
     // L12. The SECOND of the two lines a session opens with, and the last.
@@ -288,16 +312,28 @@ fn opening_line(chosen: &Choice, session_id: &str) -> String {
 ///
 /// Eight characters of the id, not all of it: the caption has to fit under
 /// a 32-column logo on a small screen, and `--attach` takes as few as four.
-fn splash_caption(chosen: &Choice, session_id: &str, path: &PathDescription) -> String {
+///
+/// `config: N warnings` last, while the config file had any: the warnings
+/// themselves are in the popup's log, and this is the one place they are
+/// mentioned before anybody opens it.
+fn splash_caption(
+    chosen: &Choice,
+    session_id: &str,
+    path: &PathDescription,
+    warnings: usize,
+) -> String {
     let id: String = session_id.chars().take(8).collect();
     let news = match chosen {
         Choice::Attach { .. } => "resumed session",
         Choice::New => "new session",
     };
-    oxutrm_client::legible(&format!(
-        "{news} {id} \u{b7} {}",
-        oxutrm_client::rung_label(path)
-    ))
+    let mut caption = format!("{news} {id} \u{b7} {}", oxutrm_client::rung_label(path));
+    match warnings {
+        0 => {}
+        1 => caption.push_str(" \u{b7} config: 1 warning"),
+        n => caption.push_str(&format!(" \u{b7} config: {n} warnings")),
+    }
+    oxutrm_client::legible(&caption)
 }
 
 /// One completed client-side attach, and the two identities the rebuild loop
@@ -316,6 +352,18 @@ pub(crate) struct Established {
     /// What the host said it can do. The session searches for a standby only
     /// when this contains `FEATURE_STANDBY`; see [`offers_standby`].
     pub host_features: Vec<String>,
+}
+
+/// What the client asks of the host in its hello: `no-birthday` when the
+/// blast is switched off here, so neither end blasts (config spec §2.4). Every
+/// exchange -- a first connect, a rebuild attempt, a standby search -- comes
+/// through [`establish`], and so through this.
+fn client_features(cfg: &NetConfig) -> Vec<String> {
+    if cfg.enable_birthday {
+        vec![]
+    } else {
+        vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]
+    }
 }
 
 /// Whether a host's hello offered a standby (spec §2.1).
@@ -382,8 +430,7 @@ where
             nat_type: nat,
             caps: detect_caps(),
             size,
-            // The client offers nothing; the host decides.
-            features: vec![],
+            features: client_features(cfg),
         },
     )
     .await
@@ -850,12 +897,20 @@ mod tests {
             mtu: 1400,
         };
         assert_eq!(
-            splash_caption(&Choice::Attach { id: id.clone() }, &id, &path),
+            splash_caption(&Choice::Attach { id: id.clone() }, &id, &path, 0),
             "resumed session 3ff1218f \u{b7} IPv4 punched"
         );
         assert_eq!(
-            splash_caption(&Choice::New, &id, &path),
+            splash_caption(&Choice::New, &id, &path, 0),
             "new session 3ff1218f \u{b7} IPv4 punched"
+        );
+        assert_eq!(
+            splash_caption(&Choice::New, &id, &path, 1),
+            "new session 3ff1218f \u{b7} IPv4 punched \u{b7} config: 1 warning"
+        );
+        assert_eq!(
+            splash_caption(&Choice::New, &id, &path, 3),
+            "new session 3ff1218f \u{b7} IPv4 punched \u{b7} config: 3 warnings"
         );
     }
 
@@ -983,5 +1038,50 @@ mod tests {
             format!("{error:#}").contains("no client completed a QUIC handshake"),
             "the host's own reason was thrown away: {error:#}"
         );
+    }
+
+    /// `network.birthday = false` puts `no-birthday` in the hello, and the
+    /// default does not. Every exchange is an `establish`, so this is the
+    /// first connect, every rebuild attempt and every standby search.
+    #[tokio::test]
+    async fn the_hello_asks_for_no_birthday_when_the_blast_is_off() {
+        for (birthday, want) in [
+            (true, vec![]),
+            (false, vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]),
+        ] {
+            let cfg = oxutrm_net::NetConfig {
+                enable_birthday: birthday,
+                ..test_config()
+            };
+            let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+            let (host_read, mut host_write) = tokio::io::split(host_side);
+            let (client_read, client_write) = tokio::io::split(client_side);
+            let client = tokio::spawn(async move {
+                let size = TermSize { cols: 80, rows: 24 };
+                let _ = establish(
+                    tokio::io::BufReader::new(client_read),
+                    client_write,
+                    size,
+                    &cfg,
+                    None,
+                )
+                .await;
+            });
+            write_signal_async(&mut host_write, &a_host_hello())
+                .await
+                .expect("writing the offer");
+            let hello = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_signal_async(&mut tokio::io::BufReader::new(host_read)),
+            )
+            .await
+            .expect("the client never answered")
+            .expect("reading the client's hello");
+            client.abort();
+            let Signal::ClientHello { features, .. } = hello else {
+                panic!("expected the client's hello, got {hello:?}");
+            };
+            assert_eq!(features, want, "birthday = {birthday}");
+        }
     }
 }
