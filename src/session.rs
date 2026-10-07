@@ -57,6 +57,7 @@ use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
+use crate::config::ConfigState;
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
@@ -1008,6 +1009,11 @@ pub struct ClientSession {
     /// Whatever took it down without painting -- a resize, a recovery --
     /// leaves this for the next lap of layer 1.
     unpainted_splash_end: bool,
+    /// The config file's layers for this target. Defaults, with nowhere to
+    /// save, until `with_config`.
+    // Read by the config screen in Task 10, which removes this attribute.
+    #[cfg_attr(not(test), allow(dead_code))]
+    config: ConfigState,
 }
 
 /// The startup splash while it shows; the picture is
@@ -1152,6 +1158,7 @@ impl ClientSession {
             zone: jiff::tz::TimeZone::system(),
             splash: None,
             unpainted_splash_end: false,
+            config: ConfigState::defaults(),
         })
     }
 
@@ -1271,6 +1278,19 @@ impl ClientSession {
     /// `connect` opens -- instead of the ring-only log `new` starts with.
     pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
         self.activity = activity;
+        self
+    }
+
+    /// The config file as resolved for this target: its layers kept for the
+    /// config screen, and its `warnings` recorded as shown entries -- they
+    /// cannot be printed (config spec §2.2). After `with_activity`, whose log
+    /// the warnings belong in.
+    pub(crate) fn with_config(mut self, state: ConfigState, warnings: &[String]) -> ClientSession {
+        for w in warnings {
+            self.activity
+                .record_shown(Kind::Config, w, &format!("config: {w}"));
+        }
+        self.config = state;
         self
     }
 
@@ -9515,5 +9535,28 @@ mod tests {
             next_pacing_deadline(false, deadline, now, interval),
             now + interval
         );
+    }
+
+    // ---- the config file and screen ----------------------------------------
+
+    /// A config file's warnings cannot be printed: each is a shown entry in
+    /// the popup's log, and in client.log with the `config` kind.
+    #[tokio::test]
+    async fn config_warnings_are_shown_in_the_popups_log() {
+        let (_host, session) = pair("/bin/sh").await;
+        let resolved = crate::config::resolve(Some("[popup]\nlingr = \"5s\"\n"), "t");
+        let session = session.with_config(
+            crate::config::ConfigState::new(None, "t", &resolved),
+            &resolved.warnings,
+        );
+        assert_eq!(
+            shown_log(&session),
+            [(
+                Kind::Config,
+                "config: popup.lingr: unknown setting".to_string(),
+                false
+            )]
+        );
+        assert_eq!(session.config.warnings, 1);
     }
 }

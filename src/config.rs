@@ -848,6 +848,41 @@ fn keep_the_popup_reachable(layers: &mut Layers, warnings: &mut Vec<String>) {
     }
 }
 
+/// The config as the session holds it: the file's layers for this target.
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigState {
+    /// Where the file is; `None` when there is nowhere to save it.
+    // Read by the save in Task 12, which removes this attribute.
+    #[allow(dead_code)]
+    pub(crate) dir: Option<PathBuf>,
+    // Read by the save in Task 12, which removes this attribute.
+    #[allow(dead_code)]
+    pub(crate) target: String,
+    pub(crate) layers: Layers,
+    /// How many warnings the file produced, for the screen's header.
+    pub(crate) warnings: usize,
+}
+
+impl ConfigState {
+    pub(crate) fn new(dir: Option<PathBuf>, target: &str, resolved: &Resolved) -> ConfigState {
+        ConfigState {
+            dir,
+            target: target.to_owned(),
+            layers: resolved.layers.clone(),
+            warnings: resolved.warnings.len(),
+        }
+    }
+
+    /// No file, no target: a session that was not reached over ssh.
+    pub(crate) fn defaults() -> ConfigState {
+        ConfigState::new(None, "", &resolve(None, ""))
+    }
+
+    pub(crate) fn in_effect(&self) -> Settings {
+        self.layers.settings()
+    }
+}
+
 /// `docs/config.md`, generated from the table. Run by the test that keeps
 /// the file in step with it.
 #[cfg(test)]
