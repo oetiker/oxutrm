@@ -6,9 +6,10 @@
 //!
 //! The rule that decides the keys: **while the popup is shown, every key
 //! is its own.** Nothing typed into it is held or sent, whatever opened it
-//! and whatever the link is doing. While it is closed, `Ctrl-\` opens it and
-//! every other byte goes to the host -- or, during an outage, is held for the
-//! question asked when the link answers again.
+//! and whatever the link is doing. While it is closed, the popup key
+//! (`popup.key`, `Ctrl-\` by default) opens it and every other byte goes to
+//! the host -- or, during an outage, is held for the question asked when the
+//! link answers again.
 
 // This runs while a client session owns the screen: nothing here may print,
 // or it lands raw on the painted raw-mode terminal.
@@ -28,8 +29,8 @@ pub(crate) const PREFIX: u8 = 0x1c;
 /// runs to the end of the read.
 pub(crate) const ESC: u8 = 0x1b;
 
-/// How soon a second `Ctrl-\` must follow the one that opened the popup for
-/// the pair to mean one literal `Ctrl-\` for the host. Measured between the
+/// How soon a second press of the popup key must follow the one that opened
+/// the popup for the pair to mean that key once, literally, for the host. Measured between the
 /// two reads' timestamps; nothing is armed.
 pub(crate) const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 
@@ -49,7 +50,7 @@ pub(crate) enum Mode {
     Closed,
     /// Opened by hand, or touched by a key; stays until closed.
     Open {
-        /// When the `Ctrl-\` that opened it arrived, for the double press.
+        /// When the popup key that opened it arrived, for the double press.
         pressed: Option<Instant>,
     },
     /// Opened because the link went quiet.
@@ -434,7 +435,7 @@ impl Ui {
         false
     }
 
-    /// Close the popup with `b`, `Esc` or `Ctrl-\`.
+    /// Close the popup with `b`, `Esc` or the popup key.
     fn close(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) {
         if Some(b) == self.key
             && let Mode::Open { pressed: Some(at) } = self.mode
@@ -855,7 +856,7 @@ fn escape(tail: &[u8]) -> (Option<Key>, usize) {
 /// This is also the route of the literal a double press stands for. During an
 /// outage that literal is held with the other typed bytes, and reaches the host
 /// only through the `Confirming` answer. Under `Confirming` itself a quick
-/// second `Ctrl-\` sends nothing, so no literal runs ahead of the held input.
+/// second press of the popup key sends nothing, so no literal runs ahead of the held input.
 fn deliver(b: u8, phase: Phase, r: &mut Routed) {
     if phase.is_outage() {
         r.to_hold.push(b);
