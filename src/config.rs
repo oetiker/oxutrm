@@ -144,6 +144,8 @@ pub(crate) enum Applies {
     Now,
     /// The next ssh rebuild attempt or standby search.
     NextAttempt,
+    /// The next ssh rebuild attempt only: a standby search runs no ssh.
+    NextRebuild,
     NextConnect,
 }
 
@@ -152,7 +154,7 @@ impl Applies {
     pub(crate) fn note(self) -> &'static str {
         match self {
             Applies::Now => "",
-            Applies::NextAttempt => "next attempt",
+            Applies::NextAttempt | Applies::NextRebuild => "next attempt",
             Applies::NextConnect => "next connect",
         }
     }
@@ -323,7 +325,7 @@ pub(crate) static SETTINGS: &[Setting] = &[
             off: false,
             whole_secs: true,
         },
-        applies: Applies::NextAttempt,
+        applies: Applies::NextRebuild,
         help: "ssh ConnectTimeout for a rebuild, where ssh has none of its own",
         doc: "Whole seconds: ssh's `ConnectTimeout` takes nothing finer. Added to \
               the rebuild's ssh only where `ssh -G` reports no `ConnectTimeout` \
@@ -1024,6 +1026,7 @@ pub(crate) fn docs() -> String {
         let effect = match s.applies {
             Applies::Now => "now",
             Applies::NextAttempt => "next rebuild attempt or standby search",
+            Applies::NextRebuild => "next rebuild attempt",
             Applies::NextConnect => "next connect",
         };
         // As the file would spell it.
@@ -1113,6 +1116,19 @@ mod tests {
             SETTINGS[at("recovery.connect_timeout")].applies.note(),
             "next attempt"
         );
+    }
+
+    /// `connect_timeout` reaches only the rebuild's ssh; a standby search
+    /// runs no ssh, so the docs must not promise it there.
+    #[test]
+    fn the_docs_say_connect_timeout_acts_on_the_next_rebuild_only() {
+        let docs = docs();
+        let line = docs
+            .lines()
+            .find(|l| l.starts_with("| `recovery.connect_timeout`"))
+            .expect("no connect_timeout row");
+        assert!(line.contains("| next rebuild attempt |"), "{line}");
+        assert!(!line.contains("standby"), "{line}");
     }
 
     #[test]

@@ -16,7 +16,7 @@ The config screen (`c` in the status popup) changes a setting for the running se
 | `popup.splash` | `true` | true or false | next connect | the startup splash |
 | `recovery.silent_after` | `"2s"` | 1s–1m | now | silence before it is an outage: input held, standby probed |
 | `recovery.rebuild_after` | `"20s"` | 5s–10m | now | silence before an ssh rebuild starts |
-| `recovery.connect_timeout` | `"10s"` | 1s–2m | next rebuild attempt or standby search | ssh ConnectTimeout for a rebuild, where ssh has none of its own |
+| `recovery.connect_timeout` | `"10s"` | 1s–2m | next rebuild attempt | ssh ConnectTimeout for a rebuild, where ssh has none of its own |
 | `network.standby` | `true` | true or false | now | keep a second path ready to fail over to |
 | `network.stun_servers` | `["stun.cloudflare.com:3478", "stun.l.google.com:19302", "stun.nextcloud.com:443", "stun.sipgate.net:3478"]` | 0–16 host:port | next rebuild attempt or standby search | STUN servers that tell this side its public address |
 | `network.port_mapping` | `true` | true or false | next rebuild attempt or standby search | ask the router for a port mapping (UPnP / NAT-PMP / PCP) |
