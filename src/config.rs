@@ -848,6 +848,79 @@ fn keep_the_popup_reachable(layers: &mut Layers, warnings: &mut Vec<String>) {
     }
 }
 
+/// `docs/config.md`, generated from the table. Run by the test that keeps
+/// the file in step with it.
+#[cfg(test)]
+pub(crate) fn docs() -> String {
+    let mut out = String::from(
+        "# oxutrm configuration\n\
+         \n\
+         <!-- Generated from src/config.rs by `OXUTRM_BLESS=1 cargo test \
+         the_docs_are_generated_from_the_table`. Do not edit by hand. -->\n\
+         \n\
+         The client reads `$XDG_CONFIG_HOME/oxutrm/config.toml`, else \
+         `~/.config/oxutrm/config.toml`, when it connects. A missing file is all \
+         defaults; a broken one never stops a connect: each problem is a warning \
+         in the status popup's log and in `client.log`, and the setting it is \
+         about falls back to the next layer down.\n\
+         \n\
+         Every setting resolves through its built-in default, then the top-level \
+         section, then `[host.\"<target>\"]`, where `<target>` is the ssh target \
+         exactly as typed. Durations are strings: `\"20s\"`, `\"1m\"`, \
+         `\"1m 30s\"`.\n\
+         \n\
+         The config screen (`c` in the status popup) changes a setting for the \
+         running session and saves it, for every host (`w` `a`) or for this host \
+         only (`w` `h`), keeping everything else in the file as written.\n\
+         \n\
+         | Key | Default | Range | Takes effect | |\n\
+         |---|---|---|---|---|\n",
+    );
+    for s in SETTINGS {
+        let effect = match s.applies {
+            Applies::Now => "now",
+            Applies::NextAttempt => "next rebuild attempt or standby search",
+            Applies::NextConnect => "next connect",
+        };
+        // As the file would spell it.
+        let default = match s.default_value() {
+            Value::Bool(b) => b.to_string(),
+            Value::List(l) => format!("{l:?}"),
+            v => format!("{:?}", show(&v)),
+        };
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} |\n",
+            s.key(),
+            default.replace('|', "\\|"),
+            match s.shape {
+                Shape::Bool => "true or false".to_string(),
+                shape => range(shape),
+            }
+            .replace('|', "\\|"),
+            effect,
+            s.help
+        ));
+    }
+    for s in SETTINGS.iter().filter(|s| !s.doc.is_empty()) {
+        out.push_str(&format!("\n**`{}`** -- {}\n", s.key(), s.doc));
+    }
+    out.push_str(
+        "\n## Example\n\
+         \n\
+         ```toml\n\
+         [popup]\n\
+         key = \"ctrl-]\"\n\
+         \n\
+         [recovery]\n\
+         rebuild_after = \"30s\"\n\
+         \n\
+         [host.\"thinlinc\"]\n\
+         network.standby = false\n\
+         ```\n",
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +934,22 @@ mod tests {
 
     fn d(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    /// `docs/config.md` is what the table generates. Run with
+    /// `OXUTRM_BLESS=1` to write it after changing the table.
+    #[test]
+    fn the_docs_are_generated_from_the_table() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/config.md");
+        if std::env::var_os("OXUTRM_BLESS").is_some() {
+            std::fs::write(&path, docs()).expect("writing docs/config.md");
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            on_disk == docs(),
+            "docs/config.md is not what the table generates; run \
+             `OXUTRM_BLESS=1 cargo test --workspace the_docs_are_generated_from_the_table`"
+        );
     }
 
     #[test]
