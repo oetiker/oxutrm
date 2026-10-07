@@ -1655,6 +1655,8 @@ impl ClientSession {
                 self.activity
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
+            // Answered from Task 10, which draws the screen.
+            Some(Command::Config(_)) => {}
             None => {}
         }
         Ok(None)
