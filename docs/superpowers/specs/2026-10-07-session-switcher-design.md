@@ -1,6 +1,8 @@
 # oxutrm — Session switcher
 
-Status: draft 2026-10-07, design agreed with the user in chat (four sections).
+Status: draft 2026-10-07, design agreed with the user in chat (four sections);
+revised 2026-10-08 after a pushback review (13 findings; the user settled the
+four that were theirs — rows marked *(review)* in §1.1).
 Sub-project **D1** of D: A (no diagnostics on the screen, merged), B (status
 popup, merged), C (config file and config screen, merged), **D1 (this)**, D2
 (preview, deferred — §1.2). Builds on B
@@ -41,7 +43,11 @@ until they pick another.
 | A session attached to another client | Listed as `in use`; switching to it asks for confirmation, then takes it over as `--attach` does today. |
 | Connect without `--attach`/`--new` | If any session exists — even exactly one — the selector opens; nothing is resumed silently. With none, a new session starts as today. |
 | Connect-time UI | The same full-screen selector as in the popup (not the line picker). |
-| Killing the session you are in | Allowed. Its process stays as a **lobby** feeding the selector; the client ends only when no session is left, or when you quit. |
+| Killing the session you are in | Allowed. Its process stays as a **lobby** feeding the selector; the client ends only when you quit. |
+| Killing the last session *(review)* | The client stays in the lobby, with only `+ new session` offered; `q` ends it. Killing never ends the client by itself. |
+| How long a silent lobby lives *(review)* | `DETACH_AFTER` (30 s), the silence rule sessions already use. |
+| Where new shells start *(review)* | In `$HOME`, as a login shell (`argv[0]` = `-<basename>`), as ssh would give you — for first connects too, which today start `$SHELL` without arguments in `/`. |
+| Names vs id prefixes *(review)* | A name must contain at least one character outside `[0-9a-f]`, so it can never be read as an id prefix. No precedence rule. |
 | The shell exits on its own (`exit`, crash) | The client ends, as today. Only a kill from the selector leads to the lobby. |
 
 ### 1.2 Not in D1
@@ -55,7 +61,7 @@ until they pick another.
   connected to.
 - Polling the list. It is fetched when the selector opens and after each
   action that changes it.
-- Sessions on rung 4 (ssh tunnel): they cannot be switched from or to (§3.6).
+- Rung 4 (ssh tunnel), which is not implemented (§3.6).
 
 ---
 
@@ -77,30 +83,58 @@ reasons:
 - **Kill-self.** A session whose shell was killed *on request* (§3.4) drops its
   registry entry and becomes a lobby, so the selector keeps working.
 
-A lobby ends when its link closes for any reason — a switch away, `q`, or an
-outage. It never waits for a client to come back.
+A lobby ends when its client moves away (a switch, `q`) or when it has heard
+nothing from its client for `DETACH_AFTER` (30 s) — the same silence rule a
+session uses to detach. (The QUIC idle timeout is off, `oxutrm-net`'s
+`max_idle_timeout(None)`, so "the link closed" is never observed for a client
+that simply vanished.) It never waits for a client to come back beyond that.
 
-A lobby that receives `New` starts its shell, registers and **becomes** the
-new session: no second attach, no second ICE exchange.
+A lobby has a **session id from the start**, minted like any session's and
+sent in its `HostHello`. It is not registered under it until it has a shell.
+
+A lobby that receives `New` starts its shell, registers under the id it
+already has, and **becomes** the new session: no second attach, no second ICE
+exchange, and the client's `Identity` and rebuild target need no new id. The
+lobby's control stream is served by the door dispatcher (§2.2) from the start,
+so after `New` the link is an ordinary session link; the client arms its
+standby search only once it is in a session, never in a lobby.
 
 ### 2.2 Doors
 
-A session process has two doors: its QUIC **control stream** (from its
+A session process (or lobby) has two doors: its QUIC **control stream** (from its
 client) and its Unix **socket** (from a sibling session, or from
 `oxutrm host --attach` over ssh). Both doors read the same first line, an
-`Open` (§4.1), and dispatch it in one place. A request is always served by the
+`Open` (§4.1), and dispatch it in one place.
+
+**Each connection gets its own task**, which reads the `Open` line under a
+short timeout and dispatches it. Only `Open::Attach` enters the session's
+existing serial attach loop (`src/listener.rs`, one exchange at a time under
+the meta lock, bounded by `ATTACH_TIMEOUT`); only `Attach { role: Primary }`
+pre-empts a standby exchange there, as today. `Myself`, `Kill` and `Rename`
+are served from state that is not held across an exchange, so they answer
+within milliseconds even while the session is mid-attach, and a `Sessions`
+fetch never disturbs a sibling's standby search.
+
+A request is always served by the
 process that owns what it touches: a session only ever signals its own shell
 and writes its own `meta.json`; `Kill` and `Rename` for a sibling are
 forwarded to the sibling's socket.
 
 ### 2.3 Names
 
-`Name`: 1–24 characters, printable, no leading or trailing whitespace, not
-32 hex characters (it must never be mistakable for an id). Unique per host
-among live sessions; uniqueness is checked by the session asked to take the
-name, against a fresh registry read. Stored as `name` in `meta.json`
-(`serde(default)`: an entry written by an older binary must keep parsing,
-because a running host keeps its old binary).
+`Name`: 1–24 characters, printable, no leading or trailing whitespace, and
+at least one character outside `[0-9a-f]` — so a name can never be read as an
+id prefix and `--attach x` needs no precedence rule. Unique per host among live
+sessions.
+
+Uniqueness is checked by the session asked to take the name, under an
+exclusive lock on a `names.lock` file in the registry directory, against a
+fresh registry read; the new `meta.json` is written while the lock is held.
+`meta.json` is written atomically (temporary file + rename) — today it is
+truncated and rewritten in place, and `Registry::list_in` skips an entry it
+cannot parse, so a torn read could hide a name from the check. Stored as
+`name` in `meta.json` (`serde(default)`: an entry written by an older binary
+must keep parsing, because a running host keeps its old binary).
 
 ---
 
@@ -113,12 +147,16 @@ because a running host keeps its old binary).
 | Flags | Sessions offered | Choice |
 |---|---|---|
 | `--new [--name n]` | any | `New { name }` |
-| `--attach x` | any | `Attach(Id)` if `x` is an id prefix (≥ 4 chars) of exactly one; `Attach(Name)` if it equals a name; else refused, listing names and ids |
+| `--attach x` | any | `Attach { id }` of the one session whose name equals `x`, or whose id `x` prefixes (≥ 4 chars, exactly one match); else refused, listing names and ids. A name always has a non-hex character (§2.3), so the two cannot both match. |
 | none | none | `New { name: None }` |
 | none | one or more | `Lobby` |
 
 `--name` without `--new` is refused. The line picker (`choose::pick`) is
 removed: there is no case left that asks on the line.
+
+`Lobby` takes the same path on the host as `New` — `run_host_connect` forks
+first, before any runtime exists, then runs the ordinary attach exchange on
+ssh's pipes — and differs only in not starting a shell and not registering.
 
 After a `Lobby` connect the splash plays as usual (skippable), then the
 selector opens. `q` there ends the client; the lobby exits with its link.
@@ -142,7 +180,9 @@ under the popup's box rules (fits content, capped 72×24, named rules).
 - **Row:** name, else the first 8 characters of the id; shell basename;
   start time (local `HH:MM` today, else `Mon DD`); size; mark — `this` (the
   session you are in), `in use` (attached to another client), blank
-  (detached). Non-detachable sessions are listed dimmed; choosing one is
+  (detached), `?` (the sibling did not answer in time), `old version` (the
+  sibling runs a binary with another protocol version; it can be killed only
+  by ending its shell, and is not offered for switching). Non-detachable sessions are listed dimmed; choosing one is
   refused with the picker's existing reason. Sessions are ordered by start
   time; `+ new session` is always last. The selection starts on `this`, else
   on the first row.
@@ -160,7 +200,7 @@ under the popup's box rules (fits content, capped 72×24, named rules).
   as one line under the list and as a popup activity entry; detail goes to
   `client.log`. Nothing is printed.
 - **Greyed out:** `s` in the popup is dimmed while the link is not Live
-  (outage or rebuild in progress) and on rung 4, each with its reason.
+  (outage or rebuild in progress), with that reason.
 - **An outage while the selector is open:** it stays, with the outage in its
   header, and its actions are refused until Live again (as the config screen
   does).
@@ -174,7 +214,7 @@ under the popup's box rules (fits content, capped 72×24, named rules).
    switch-only code path, same rule as `crates/oxutrm-host/src/attach.rs`.
 3. **Make before break.** The client keeps the old link until the new one is
    `Established`. Only then does it adopt the new link, close the old one with
-   the new close reason `SWITCHED`, drop the old link's parked standby, reset
+   the new close reason `MOVED_AWAY`, drop the old link's parked standby, reset
    the renderer to the new session's screen, and point its rebuild path at the
    new session id. The selector closes; a popup entry records
    `switched to build`.
@@ -184,25 +224,46 @@ under the popup's box rules (fits content, capped 72×24, named rules).
    the reason. If the old link dropped, ordinary recovery restores it. There
    is no resume of a half-done switch.
 6. An `in use` target is taken over: its other client receives `TAKEN_OVER`,
-   as with `--attach` today.
+   as with `--attach` today. If the switch then fails after the target
+   adopted the new link, that other client has been displaced for nothing;
+   accepted — it reconnects like after any takeover.
 
 ### 3.4 New, kill, rename
 
 - **New from a lobby:** the lobby starts its shell, registers (with the name,
   if given) and becomes the session (§2.1). The client resets its screen and
   rebuild target as after a switch.
-- **New from a session:** the session spawns a sibling — its own executable
-  (`current_exe`, so the same version) as a detached `oxutrm host` process
-  that starts the same login shell in `$HOME` a first connect gets, registers,
-  and listens on its socket — then proceeds exactly as `Switch` to it. One
-  code path makes a session process, whoever asks.
-- **Kill a sibling:** forwarded to its socket; it SIGHUPs its shell's process
-  group and ends the ordinary shell-exited way (its own client, if any, sees
-  the shell exit). The list is refetched.
-- **Kill this session:** the session SIGHUPs its shell's process group, marks
-  the exit as *on request*, removes its registry entry and becomes a lobby.
-  The selector stays open without the `this` row. If no session is left, the
-  lobby says so and the client ends with `last session ended`.
+- **New from a session:** the session spawns a sibling as the ordinary
+  `oxutrm host --serve` (the entry point ssh runs on a first connect), with
+  its stdin and stdout on a socket pair the parent holds, and relays the
+  client's control stream into that pair exactly as ssh carries a first
+  connect. The sibling forks, runs the attach exchange, settles
+  detachability, severs from its pipes (R12), registers and starts its shell
+  in the order `serve()` already uses. **One startup path** makes every
+  session process, whoever asks. The parent is a relay only, as in a switch.
+- **Which binary a sibling runs:** the running session's own — on Linux
+  `/proc/self/exe`, which still opens after the file was replaced by a
+  rebuild; elsewhere the path the session was started from, recorded at
+  start. The path is passed in, never looked up inside the spawning code
+  (tests inject the built binary). If that path now holds another protocol
+  version, the attach is refused like any version mismatch and the selector
+  shows the reason.
+- **Shells** start in `$HOME` as login shells, whoever starts them (first
+  connect, lobby `New`, sibling).
+- **How a kill is done:** the owning session hangs up its shell the way the
+  kernel does when a terminal goes away (SIGHUP to the pty's foreground
+  process group and to the shell, then closing the pty master), and sends
+  SIGKILL to the shell's process group if it is still there after 3 s. It
+  answers `Done` only after the shell was reaped and its registry entry
+  removed, so the refetched list never shows it.
+- **Kill a sibling:** forwarded to its socket; the sibling then ends the
+  ordinary shell-exited way (its own client, if any, sees the shell exit).
+  The list is refetched.
+- **Kill this session:** the session kills its shell as above, marks the
+  exit as *on request*, removes its registry entry and becomes a lobby (same
+  id, unregistered). The selector stays open without the `this` row — with
+  only `+ new session` if it was the last one. The client's rebuild switches
+  to `Choice::Lobby` (§3.5).
 - A shell exiting on its own takes today's `SHELL_EXITED` path; the client
   ends.
 - **Rename:** forwarded to the owning session, which validates the name
@@ -210,20 +271,23 @@ under the popup's box rules (fits content, capped 72×24, named rules).
 
 ### 3.5 Recovery
 
-- The rebuild path aims at the client's *current* session id, which a switch
-  or a lobby `New` updates.
-- A lobby's rebuild finds no lobby to return to (it ended with its link). The
-  rebuild answers the offer with `Choice::Lobby` instead of refusing, so the
-  client lands in a fresh lobby with the selector still open.
+- The rebuild path aims at the client's *current* session — a session id
+  (updated by a switch or a sibling `New`) or, while the client is in a lobby
+  (connect-time or after kill-self), `Choice::Lobby`.
+- A lobby is never reattached (it ended after `DETACH_AFTER` of silence, or
+  will): the rebuild answers the offer with `Choice::Lobby`, so the client
+  lands in a fresh lobby with the selector still open. The old lobby times
+  out on its own.
 - A rebuild finding its session killed meanwhile (by another client) ends the
   client as today.
 
-### 3.6 Rung 4
+### 3.6 Rung 4 (note)
 
-A rung-4 link tunnels QUIC through the ssh that created the session; nothing
-else on the host is reachable without a UDP path. The selector is greyed out
-on rung 4. An attach relayed over a socket never nominates rung 4 (there is no
-ssh to tunnel through), as with `host --attach` today.
+Rung 4 (QUIC tunnelled through ssh) is not implemented today
+(`src/ladder.rs`, `crates/oxutrm-host/src/lib.rs`); D1 adds nothing for it.
+When it lands, its spec has to settle the selector on a rung-4 link — at
+least `New` in a rung-4 lobby, since a connect-time lobby is chosen before the
+rung is known.
 
 ---
 
@@ -234,44 +298,64 @@ ssh to tunnel through), as with `host --attach` today.
 ### 4.1 `Open` — the first line of every door
 
 ```rust
-enum Open {
+struct Open { proto: u32, req: Request }        // proto = PROTO_VERSION
+enum Request {
     Attach { role: Role },                      // the attach exchange follows
     Probe { .. },                               // unchanged semantics
-    Sessions,                                   // -> SessionList
-    Myself,                                     // -> SessionEntry (sibling-to-sibling)
-    Switch { to: SessionRef },                  // relayed as Attach { Primary }
-    New { name: Option<Name> },
-    Kill { id: SessionId },                     // -> Done | Refused(String)
-    Rename { id: SessionId, name: Option<Name> },
+    Sessions,                                   // -> Reply::Sessions(Vec<SessionEntry>)
+    Myself,                                     // -> Reply::Entry(SessionEntry)  (sibling-to-sibling)
+    Switch { to: SessionId },                   // relayed as Attach { Primary }; then the attach exchange
+    New { name: Option<Name> },                 // -> Reply::Entry, then (sibling) the attach exchange
+    Kill { id: SessionId },                     // -> Reply::Done
+    Rename { id: SessionId, name: Option<Name> }, // -> Reply::Entry
 }
-enum SessionRef { Id(SessionId), Name(Name) }
+enum Reply {
+    Sessions(Vec<SessionEntry>),
+    Entry(SessionEntry),
+    Done,
+    Refused(String),                            // any request; the reason is for the user
+}
 struct SessionEntry {
     id: SessionId, name: Option<Name>, shell: String, created_unix: u64,
     size: TermSize, detachable: bool, attached: Attached, this: bool,
 }
-enum Attached { No, Here, Elsewhere }
+enum Attached { No, Here, Elsewhere, Unknown, OtherVersion }
 ```
 
-- `SessionId` and `Name` are validated newtypes; parsing is the only way to
-  make one.
+- **Every request has exactly one reply before anything else on the stream.**
+  For `Switch` and a sibling `New` that reply is the first line of the attach
+  exchange (`HostHello`) or a `Refused`; a lobby `New` replies
+  `Entry` (the lobby, now a session, same id) and the stream ends.
+- `proto` lets a door refuse a request from another version with a reason
+  instead of misreading it; an asker that gets an attach-exchange line or a
+  version refusal back from `Myself` lists that sibling as `OtherVersion`.
+- `SessionId` and `Name` are validated newtypes with private fields; parsing
+  is the only way to make one. (Today's `SessionId(pub [u8; 16])` loses its
+  `pub`.)
 - `Sessions` is answered by reading the registry and asking each live entry
-  `Myself` over its socket (bounded by a short timeout per sibling; a sibling
-  that does not answer is listed from its `meta.json` with `attached` unknown,
-  shown as `?`). `this` and `Attached::Here` are for the asker's own entry.
-- `StandbyRequest` and `Probe` leave `Signal` and become `Open` variants.
+  `Myself` over its socket, each bounded by a short timeout; a sibling that
+  does not answer is listed from its `meta.json` as `Unknown` (shown `?`).
+  `this` and `Here` are for the asker's own entry.
+- **Names never travel as references.** The client resolves a name to an id
+  from the list it already has; the wire carries ids only.
+- `StandbyRequest` and `Probe` leave `Signal` and become `Request` variants.
   `Signal` is purely the attach exchange.
 
 ### 4.2 The ssh offer
 
-`Signal::Sessions { list: Vec<SessionEntry> }`;
-`Choice = Attach(SessionRef) | New { name: Option<Name> } | Lobby`. The client
-resolves prefixes in `choose::decide`; the host only ever receives an exact id
-or an exact name.
+`Signal::Sessions { list: Vec<OfferEntry> }`, where `OfferEntry` is
+`SessionEntry` without `attached` and `this`: the offer is built by
+`run_host_connect` with blocking I/O before its fork, where no runtime may
+exist, so it reads `meta.json` only and never asks a sibling. The lobby's
+`Sessions` fills in the rest once the selector opens.
+`Choice = Attach { id: SessionId } | New { name: Option<Name> } | Lobby`.
 
 ### 4.3 Close reasons
 
-New: `SWITCHED` (the client moved to another session; the session detaches
-quietly). Existing `TAKEN_OVER` and `SHELL_EXITED` are unchanged.
+New: `MOVED_AWAY` (the client moved to another session; the session detaches
+quietly). `SWITCHED` already exists and keeps its meaning (a primary replaced
+by its own client's standby). `TAKEN_OVER` and `SHELL_EXITED` are
+unchanged.
 
 ---
 
@@ -282,10 +366,15 @@ quietly). Existing `TAKEN_OVER` and `SHELL_EXITED` are unchanged.
 - `src/door.rs` — the one `Open` dispatcher both doors call (Sessions,
   Myself, Switch relay, New, Kill, Rename).
 - The lobby — a state of the host session, not a second process type.
+- `src/listener.rs` — accept loop split: a task per connection reads `Open`;
+  only `Attach` enters the serial exchange loop.
+- `crates/oxutrm-host/src/registry.rs` — atomic `meta.json` writes;
+  `names.lock`.
+- The binary path for siblings is resolved once at startup and passed in.
 - `src/selector.rs` — the selector's pure state and key handling; drawn from
   `src/view.rs` like the popup and config screen.
-- `crates/oxutrm-proto` — `Open`, `SessionEntry`, `SessionId`, `Name`; the
-  reshaped `Signal`/`Choice`.
+- `crates/oxutrm-proto` — `Open`, `Request`, `Reply`, `SessionEntry`,
+  `OfferEntry`, `SessionId`, `Name`; the reshaped `Signal`/`Choice`.
 - `crates/oxutrm-host/src/registry.rs` — `name` in `SessionMeta`; name column
   in `--list`.
 - Every module that runs while a session owns the screen carries
@@ -309,8 +398,15 @@ quietly). Existing `TAKEN_OVER` and `SHELL_EXITED` are unchanged.
   - switch to a dead target: still in the old session, reason shown;
   - switch to an `in use` session: confirm, the other client gets `TAKEN_OVER`;
   - new from a live session and from a lobby (named);
-  - kill a sibling; kill self into a lobby; kill the last session;
-  - rename, and a rename to a taken name refused;
+  - kill a sibling; kill self into a lobby; kill the last session (still in
+    the lobby); kill a shell that ignores SIGHUP (escalates, then `Done`);
+  - `Myself`/`Kill`/`Rename` answered promptly while the sibling is
+    mid-attach; a `Sessions` fetch does not cancel a sibling's standby
+    search;
+  - a vanished client's lobby exits after `DETACH_AFTER`;
+  - a rebuild after kill-self lands in a fresh lobby;
+  - rename, a rename to a taken name refused, an all-hex name refused;
+  - new shells start in `$HOME` as login shells;
   - bare connect with one session lands in a lobby;
   - a lobby's link lost: rebuild lands in a fresh lobby;
   - `--attach <name>` and `--attach <prefix>`.
