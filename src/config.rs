@@ -925,10 +925,14 @@ impl ConfigState {
     /// `i` only, unless it leaves the popup unreachable. Only row `i`
     /// changes in what is applied: whatever else the layers say since a
     /// save waits for the next connect. Returns the settings now in effect.
+    ///
+    /// The refusal checks both the session and the layers with `next` on
+    /// top: a hand-written `key = "off"` a save brought in is not applied,
+    /// yet the screen shows it and the next save writes it.
     fn commit(&mut self, i: usize, next: Pending) -> Result<Settings, String> {
         let mut s = self.applied.clone();
         (SETTINGS[i].set)(&mut s, shown_with(&self.layers.0[i], next.get(&i)).1);
-        if s.unreachable() {
+        if s.unreachable() || in_effect(&self.layers, &next).unreachable() {
             return Err(UNREACHABLE.to_string());
         }
         self.pending = next;
@@ -1597,5 +1601,33 @@ mod tests {
         assert_eq!(s.linger, d(5), "the saved edit is still in effect");
         assert_eq!(s.rebuild_after, before, "the hand edit was applied");
         assert_eq!(c.applied, s);
+        // x on the saved key: the hand edit still does not ride in.
+        let s = c.reset(at("popup.linger")).unwrap();
+        assert_eq!(s.linger, Settings::default().linger);
+        assert_eq!(s.rebuild_after, before, "the hand edit was applied by x");
+        assert_eq!(c.applied, s);
+    }
+
+    /// The refusal checks what the screen shows and a save would write as
+    /// well as what the session runs with: a hand-written `key = "off"`
+    /// that a save brought in is not applied, but auto-open off on top of
+    /// it would leave a file whose popup can never open.
+    #[test]
+    fn a_hand_edit_a_save_brought_in_counts_for_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let r = load(Some(dir.path()), "t");
+        let mut c = ConfigState::new(Some(dir.path().to_path_buf()), "t", &r);
+        c.set(at("popup.linger"), Value::Duration(Some(d(5))))
+            .unwrap();
+        // Meanwhile, by hand, the popup key off.
+        std::fs::write(&path, "[popup]\nkey = \"off\"\n").unwrap();
+        c.save(Level::Global).unwrap();
+        assert!(c.applied.popup_key.is_some(), "the hand edit was applied");
+        assert_eq!(
+            c.set(AUTO_OPEN, Value::Duration(None)),
+            Err(UNREACHABLE.to_string())
+        );
+        assert!(c.pending.is_empty());
     }
 }
