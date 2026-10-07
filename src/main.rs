@@ -25,6 +25,10 @@ mod activity;
 mod attach_exchange;
 mod candidates;
 mod choose;
+// Read at connect from Task 3; the config screen consumes the rest of it in
+// Task 10, which removes this attribute.
+#[allow(dead_code)]
+mod config;
 mod connect;
 mod control;
 mod egress;
