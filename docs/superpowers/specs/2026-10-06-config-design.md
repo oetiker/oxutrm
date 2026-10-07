@@ -267,7 +267,7 @@ New dependencies: `serde` (already in the workspace) and `toml_edit`.
 | `x` | Marks the selected key's override for removal **at the level it came from**, so the next layer shows through. Unsaved until `w`. |
 | `w` | "save for **a**ll hosts or **h** <target> only"; Esc cancels. **`a`** writes every pending `Set` globally and **also removes this target's override** of the same key, so the value saved is the value in effect here next time; a `Remove` happens at its own level. **`h`** writes every pending `Set` to this host's table; a `Remove` of a host value removes it there, and a `Remove` of a **global** value becomes a host override set to the built-in default — `h` never changes another host. |
 | Esc | Back to the status view. Pending edits stay applied and marked. |
-| `q` | Quits, as everywhere in the popup. Pending edits are dropped. |
+| `q` | Quits, as everywhere in the popup. Pending edits are dropped. Not under the `w` question: there only `a`, `h` and Esc act, and `q` and the popup key do nothing, so a stray key cannot drop the edits being saved (user decision 2026-10-07). |
 
 Every accepted edit calls `apply` at once, so "now" settings act before they
 are saved. An edit is checked against the table first; a refused value keeps
