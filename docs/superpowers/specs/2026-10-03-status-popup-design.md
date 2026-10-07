@@ -172,7 +172,17 @@ Derived, all pure functions over the ring:
 
 **A link swap** (failover or a landed rebuild) starts a new segment: the new
 connection's counters start at zero, so no delta is ever taken across two
-connections. The header reads "<path> · up <age> · link <N>".
+connections. The header reads "<path> · up <age> · link <N> · mtu <N>"
+(the MTU last: a header too wide for the box is cut at its end).
+The MTU is the newest sample's `stats().path.current_mtu`, not
+`PathDescription::mtu`: that one is read at attach, before path MTU
+discovery has run, and is always the 1200 floor. A rise in the link's
+`black_holes_detected` between two samples of one segment is logged as
+"path MTU reduced to <N>"; a segment's first sample is only its baseline,
+because a failover adopts a standby whose counters have been running since
+its own handshake (loss and throughput, which only take deltas within a
+segment, never noticed). Only the client's send direction is measured;
+screen updates travel the host's direction, which the client cannot see.
 
 **Standby section**, from new read-only accessors on `Standby`:
 
@@ -322,7 +332,7 @@ snapshots in `src/view.rs`). The box is as tall as its content:
   (8 characters, escaped);
 - **header**, the first row: the state marker in its colour and bold --
   `● LIVE` (green), `● SILENT` (amber), `● RECOVERING` (red), `● LIVE again`
-  while lingering -- then, after three spaces, `<path> · up <age> · link <N>`
+  while lingering -- then, after three spaces, `<path> · up <age> · link <N> · mtu <N>`
   (lingering: `outage <N.N> s · ` in front), or during an outage
   `silent <N> s` (from `Silent`'s `since`, or `last_heard` in `Recovering`;
   truncated);

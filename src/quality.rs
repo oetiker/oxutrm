@@ -31,6 +31,11 @@ pub(crate) struct Reading {
     pub(crate) lost: u64,
     pub(crate) tx_bytes: u64,
     pub(crate) rx_bytes: u64,
+    /// The path MTU the connection uses now: discovery raises it after the
+    /// handshake, a black hole drops it back.
+    pub(crate) mtu: u16,
+    /// MTU black holes the connection has detected so far.
+    pub(crate) black_holes: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,6 +139,27 @@ impl Quality {
             .map(|s| s.reading.rtt)
     }
 
+    /// The current link's MTU at its newest sample. Not filtered for
+    /// outages: a silent link still has the MTU it last used. Zero is a
+    /// reading that carried none; quinn never reports it.
+    pub(crate) fn mtu_now(&self) -> Option<u16> {
+        self.current()
+            .next_back()
+            .map(|s| s.reading.mtu)
+            .filter(|&m| m > 0)
+    }
+
+    /// The MTU the current link fell back to, if its newest sample saw a
+    /// black hole the one before it had not. A link's first sample is only
+    /// its baseline: a failover adopts a standby whose count has been
+    /// running since its own handshake, possibly for hours.
+    pub(crate) fn mtu_reduced(&self) -> Option<u16> {
+        let mut newest = self.current().rev();
+        let now = newest.next()?;
+        let before = newest.next()?;
+        (now.reading.black_holes > before.reading.black_holes).then_some(now.reading.mtu)
+    }
+
     pub(crate) fn rtt_stats(&self) -> Option<RttStats> {
         let rtts: Vec<Duration> = self
             .current()
@@ -192,6 +218,7 @@ mod tests {
             lost,
             tx_bytes: tx,
             rx_bytes: rx,
+            ..Reading::default()
         }
     }
 
@@ -343,5 +370,78 @@ mod tests {
         q.push(t, r(38, 0, 0, 0, 0), false);
         q.push(secs(t, 1), r(1_250, 0, 0, 0, 0), false);
         assert_eq!(q.sparkline(), vec![Some(38), Some(1_250)]);
+    }
+
+    fn m(mtu: u16, black_holes: u64) -> Reading {
+        Reading {
+            mtu,
+            black_holes,
+            ..r(30, 0, 0, 0, 0)
+        }
+    }
+
+    /// The MTU shown is the one the link has now, not the one it started
+    /// with: discovery raises it after the handshake, a black hole drops it.
+    #[test]
+    fn the_mtu_is_the_newest_samples_on_this_link() {
+        let t = Instant::now();
+        let mut q = Quality::new(t);
+        assert_eq!(q.mtu_now(), None, "an MTU from no samples");
+        q.push(t, m(1200, 0), false);
+        q.push(secs(t, 1), m(1452, 0), false);
+        assert_eq!(q.mtu_now(), Some(1452));
+
+        q.new_segment(secs(t, 2));
+        assert_eq!(
+            q.mtu_now(),
+            None,
+            "the new link inherited the old one's MTU"
+        );
+        q.push(secs(t, 2), m(1280, 0), false);
+        assert_eq!(q.mtu_now(), Some(1280));
+    }
+
+    /// A reading without an MTU says nothing about it: quinn never reports
+    /// 0, so "mtu 0" on the screen could only be a reading that did not
+    /// carry one.
+    #[test]
+    fn an_mtu_of_zero_is_no_mtu() {
+        let t = Instant::now();
+        let mut q = Quality::new(t);
+        q.push(t, m(0, 0), false);
+        assert_eq!(q.mtu_now(), None);
+    }
+
+    /// A rise in the black-hole count is reported once, with the MTU the
+    /// link fell back to; discovery raising the MTU is not news.
+    #[test]
+    fn a_black_hole_is_reported_once_with_the_mtu_it_left() {
+        let t = Instant::now();
+        let mut q = Quality::new(t);
+        q.push(t, m(1200, 0), false);
+        q.push(secs(t, 1), m(1452, 0), false);
+        assert_eq!(q.mtu_reduced(), None, "discovery raising the MTU");
+        q.push(secs(t, 2), m(1200, 1), false);
+        assert_eq!(q.mtu_reduced(), Some(1200));
+        q.push(secs(t, 3), m(1200, 1), false);
+        assert_eq!(q.mtu_reduced(), None, "the same black hole twice");
+    }
+
+    /// A link's first sample is its baseline, not zero: a failover adopts
+    /// a standby that may have been up for hours and counted black holes
+    /// of its own. Neither that count nor the old link's is news.
+    #[test]
+    fn a_links_first_sample_is_its_baseline() {
+        let t = Instant::now();
+        let mut q = Quality::new(t);
+        q.push(t, m(1200, 3), false);
+        q.new_segment(secs(t, 1));
+        q.push(secs(t, 1), m(1300, 5), false);
+        assert_eq!(q.mtu_reduced(), None, "the adopted standby's old count");
+        q.push(secs(t, 2), m(1250, 6), false);
+        assert_eq!(q.mtu_reduced(), Some(1250));
+        q.new_segment(secs(t, 3));
+        q.push(secs(t, 3), m(1200, 1), false);
+        assert_eq!(q.mtu_reduced(), None, "compared with the old link's 6");
     }
 }
