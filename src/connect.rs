@@ -354,6 +354,18 @@ pub(crate) struct Established {
     pub host_features: Vec<String>,
 }
 
+/// What the client asks of the host in its hello: `no-birthday` when the
+/// blast is switched off here, so neither end blasts (config spec §2.4). Every
+/// exchange -- a first connect, a rebuild attempt, a standby search -- comes
+/// through [`establish`], and so through this.
+fn client_features(cfg: &NetConfig) -> Vec<String> {
+    if cfg.enable_birthday {
+        vec![]
+    } else {
+        vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]
+    }
+}
+
 /// Whether a host's hello offered a standby (spec §2.1).
 pub(crate) fn offers_standby(features: &[String]) -> bool {
     features.iter().any(|f| f == oxutrm_proto::FEATURE_STANDBY)
@@ -418,8 +430,7 @@ where
             nat_type: nat,
             caps: detect_caps(),
             size,
-            // The client offers nothing; the host decides.
-            features: vec![],
+            features: client_features(cfg),
         },
     )
     .await
@@ -1027,5 +1038,50 @@ mod tests {
             format!("{error:#}").contains("no client completed a QUIC handshake"),
             "the host's own reason was thrown away: {error:#}"
         );
+    }
+
+    /// `network.birthday = false` puts `no-birthday` in the hello, and the
+    /// default does not. Every exchange is an `establish`, so this is the
+    /// first connect, every rebuild attempt and every standby search.
+    #[tokio::test]
+    async fn the_hello_asks_for_no_birthday_when_the_blast_is_off() {
+        for (birthday, want) in [
+            (true, vec![]),
+            (false, vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]),
+        ] {
+            let cfg = oxutrm_net::NetConfig {
+                enable_birthday: birthday,
+                ..test_config()
+            };
+            let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+            let (host_read, mut host_write) = tokio::io::split(host_side);
+            let (client_read, client_write) = tokio::io::split(client_side);
+            let client = tokio::spawn(async move {
+                let size = TermSize { cols: 80, rows: 24 };
+                let _ = establish(
+                    tokio::io::BufReader::new(client_read),
+                    client_write,
+                    size,
+                    &cfg,
+                    None,
+                )
+                .await;
+            });
+            write_signal_async(&mut host_write, &a_host_hello())
+                .await
+                .expect("writing the offer");
+            let hello = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_signal_async(&mut tokio::io::BufReader::new(host_read)),
+            )
+            .await
+            .expect("the client never answered")
+            .expect("reading the client's hello");
+            client.abort();
+            let Signal::ClientHello { features, .. } = hello else {
+                panic!("expected the client's hello, got {hello:?}");
+            };
+            assert_eq!(features, want, "birthday = {birthday}");
+        }
     }
 }

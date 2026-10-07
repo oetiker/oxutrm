@@ -129,6 +129,10 @@ pub const PROTO_VERSION: u32 = 2;
 pub const FEATURE_CONTROL: &str = "control";
 /// The host parks a standby link on request (spec §3).
 pub const FEATURE_STANDBY: &str = "standby";
+/// Sent by a client, in `ClientHello.features`: do not run the birthday blast
+/// for this exchange. A host that does not know it ignores it, so against an
+/// older host only the client's own half of the blast stops.
+pub const FEATURE_NO_BIRTHDAY: &str = "no-birthday";
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProtoError {
