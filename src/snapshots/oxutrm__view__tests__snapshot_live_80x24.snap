@@ -3,7 +3,7 @@ source: src/view.rs
 expression: "screen(&Facts\n{\n    identity: Some(&id), path: Some(&p), standby:\n    Some(StandbyFacts\n    {\n        next_search: now + Duration::from_secs(23), last_search_failed: true,\n        ..standby(None, t)\n    }), ..facts(&q, &a, Phase::Live, now)\n})"
 ---
 ╭ oxutrm · thinlinc · 3ff1218f ────────────────────────────────────────╮
-│ ● LIVE   IPv4 punched · up 1m · link 2                               │
+│ ● LIVE   IPv4 punched · up 1m · link 2 · mtu 1452                    │
 │ rtt   140 ms  (70–171)  ▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆█▅▄▃▄▅▆ │
 │ loss  0.0 %  ↑ 0 B/s  ↓ 0 B/s                                        │
 ├ standby ─────────────────────────────────────────────────────────────┤

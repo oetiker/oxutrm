@@ -198,8 +198,14 @@ fn marker(f: &Facts<'_>) -> (Marker, String) {
 fn header(f: &Facts<'_>) -> String {
     let link = || {
         let q = f.quality;
+        // The live MTU, not `PathDescription::mtu`: that one was read at
+        // attach, before discovery had run. Last, because a header too wide
+        // for the box is cut at its end.
+        let mtu = q
+            .mtu_now()
+            .map_or_else(String::new, |m| format!(" \u{b7} mtu {m}"));
         format!(
-            "{} \u{b7} up {} \u{b7} link {}",
+            "{} \u{b7} up {} \u{b7} link {}{mtu}",
             path_label(f.path),
             age(f.now.saturating_duration_since(q.segment_since())),
             q.segment()
@@ -556,6 +562,7 @@ mod tests {
             lost,
             tx_bytes: tx,
             rx_bytes: rx,
+            ..Default::default()
         }
     }
 
@@ -992,6 +999,33 @@ mod tests {
         });
         assert_eq!(v.header, "IPv4 punched \u{b7} up 2m \u{b7} link 2");
         assert_eq!(v.marker_text, "\u{25cf} LIVE");
+    }
+
+    /// The MTU is the link's live one, not the path's: the path was
+    /// described at attach, before discovery had run, and says 1200
+    /// whatever the path can carry.
+    #[test]
+    fn the_header_shows_the_links_live_mtu_not_the_one_announced_at_attach() {
+        let t = Instant::now();
+        let a = Activity::new();
+        let mut q = Quality::new(t);
+        q.push(
+            t,
+            crate::quality::Reading {
+                mtu: 1452,
+                ..reading(30, 0, 0, 0, 0)
+            },
+            false,
+        );
+        let p = path();
+        let v = build(&Facts {
+            path: Some(&p),
+            ..facts(&q, &a, Phase::Live, secs(t, 5))
+        });
+        assert_eq!(
+            v.header,
+            "IPv4 punched \u{b7} up 5s \u{b7} link 1 \u{b7} mtu 1452"
+        );
     }
 
     #[test]
@@ -1461,7 +1495,11 @@ mod tests {
         q.new_segment(t);
         for i in 0..60u64 {
             let rtt = [70, 90, 111, 140, 171, 120, 97][(i % 7) as usize];
-            q.push(secs(t, i), reading(rtt, 100 + i * 3, 0, 0, 0), false);
+            let r = crate::quality::Reading {
+                mtu: 1452,
+                ..reading(rtt, 100 + i * 3, 0, 0, 0)
+            };
+            q.push(secs(t, i), r, false);
         }
     }
 

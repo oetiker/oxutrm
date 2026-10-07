@@ -197,6 +197,16 @@
 
 ### Fixed
 
+- **The status popup shows the link's real MTU.** The header now ends in
+  `mtu <N>`, sampled once a second from the link that is carrying the
+  session, so it follows a failover or a rebuild. The only figure the client
+  had before was read at attach, before path MTU discovery had run, and so
+  was always 1200 (the one-line status printed at connect still shows that
+  attach-time figure). When the link detects an MTU black hole and falls
+  back, the popup's log says `path MTU reduced to <N>`. This is the client's
+  send direction only; screen updates travel the host's, which the client
+  cannot measure.
+
 - **A standby that answers is used even while ssh is still trying.** Once an
   ssh rebuild had started, 20 s into an outage, the standby was no longer
   probed until the attempt ended, for fear that the host would adopt the
