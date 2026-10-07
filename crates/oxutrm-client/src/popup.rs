@@ -747,8 +747,11 @@ fn draw_config(v: &ConfigView, cols: u16, rows: u16) -> Buffer {
         .position(|l| matches!(l, ConfigLine::Row(_, true, _)))
         .unwrap_or(0);
     let height = usize::from(body.height);
-    // Scrolled just enough for the cursor's row to be the last one shown,
-    // and the rule above a first row stays with it.
+    // Scrolled just enough for the cursor's row to be the last one shown.
+    // The rule of the first row shown can scroll off the top: keeping it
+    // would cost the cursor's row, which is then exactly one line too low.
+    // The cursor's own rule, when its row opens a section, shows whenever
+    // the list has two lines.
     let start = (at + 1).saturating_sub(height);
     for (i, line) in lines.iter().skip(start).take(height).enumerate() {
         let y = body.y + u16::try_from(i).unwrap_or(u16::MAX);
