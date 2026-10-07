@@ -57,7 +57,7 @@ use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
 use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
-use crate::config::ConfigState;
+use crate::config::{ConfigState, Settings};
 use crate::link::{Link, SendOutcome};
 use crate::linkstate::{LinkState, Phase};
 use crate::quality::{Quality, Reading};
@@ -1281,17 +1281,37 @@ impl ClientSession {
         self
     }
 
-    /// The config file as resolved for this target: its layers kept for the
-    /// config screen, and its `warnings` recorded as shown entries -- they
-    /// cannot be printed (config spec §2.2). After `with_activity`, whose log
-    /// the warnings belong in.
+    /// The config file as resolved for this target: its settings applied,
+    /// its layers kept for the config screen, and its `warnings` recorded as
+    /// shown entries -- they cannot be printed (config spec §2.2). After
+    /// `with_activity`, whose log the warnings belong in, and after
+    /// `with_standby`, whose network settings it sets.
     pub(crate) fn with_config(mut self, state: ConfigState, warnings: &[String]) -> ClientSession {
         for w in warnings {
             self.activity
                 .record_shown(Kind::Config, w, &format!("config: {w}"));
         }
+        let settings = state.in_effect();
         self.config = state;
+        self.apply(&settings);
         self
+    }
+
+    /// The one way settings reach the session: at startup, and after every
+    /// change the config screen accepts. Each consumer takes its value for
+    /// its next read, lap, attempt or search.
+    pub(crate) fn apply(&mut self, s: &Settings) {
+        self.ui
+            .retune(s.popup_key, s.linger, s.effective_auto_open());
+        self.link_state
+            .retune(s.silent_after, s.effective_rebuild_after());
+        let cfg = s.net_config();
+        if let Some(r) = self.rebuild.as_mut() {
+            r.retune(cfg.clone(), s.connect_timeout);
+        }
+        if let Some(st) = self.standby.as_mut() {
+            st.set_cfg(cfg);
+        }
     }
 
     /// Tell the user what connection they got — once, and then be quiet.
@@ -1700,6 +1720,7 @@ impl ClientSession {
             phase,
             lingering,
             last_heard: self.link_state.last_heard(),
+            rebuild_after: self.link_state.rebuild_after(),
             path: self.path.as_ref(),
             quality: &self.quality,
             rejected: self.rejected_total(),
@@ -9558,5 +9579,98 @@ mod tests {
             )]
         );
         assert_eq!(session.config.warnings, 1);
+    }
+
+    /// `apply` reaches every consumer: the popup's key, the recovery
+    /// timings, and the network settings of the next rebuild attempt and
+    /// standby search.
+    #[tokio::test]
+    async fn apply_reaches_every_consumer() {
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16));
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.standby = Some(crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now(),
+        ));
+        session.apply(&Settings {
+            popup_key: Some(0x1d),
+            rebuild_after: Duration::from_secs(30),
+            stun_servers: vec![],
+            birthday: false,
+            ..Settings::default()
+        });
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(30));
+        let rebuild = session.rebuild.as_ref().expect("the rebuild");
+        assert!(!rebuild.cfg().enable_birthday && rebuild.cfg().stun_servers.is_empty());
+        let standby = session.standby.as_ref().expect("the standby");
+        assert!(!standby.cfg.enable_birthday && standby.cfg.stun_servers.is_empty());
+
+        // `popup.key = ctrl-]`: 0x1c is typing, 0x1d opens the popup.
+        let mut out = Vec::new();
+        assert_eq!(session.route_keys(&[0x1c], &mut out).unwrap(), None);
+        assert!(
+            spoken(&session).ends_with(&[0x1c]),
+            "{:?}",
+            spoken(&session)
+        );
+        assert!(session.popup_at(Instant::now()).is_none());
+        session.route_keys(&[0x1d], &mut out).unwrap();
+        assert!(
+            session.popup_at(Instant::now()).is_some(),
+            "ctrl-] opened nothing"
+        );
+    }
+
+    /// `rebuild_after = 30s`: the outage is still `Silent` at 20 s, the
+    /// popup's countdown reads from 30 s, and `Recovering` comes at 30 s.
+    #[tokio::test]
+    async fn a_retuned_rebuild_after_moves_the_rebuild_and_its_countdown() {
+        let rebuild = Rebuild::new("bastion.example.net".to_owned(), "f0".repeat(16));
+        let (_host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.apply(&Settings {
+            rebuild_after: Duration::from_secs(30),
+            ..Settings::default()
+        });
+        let t = Instant::now();
+        session.note_heard(t);
+        session.note_sent(t);
+        assert!(session.popup_at(t).is_none());
+        let at = |s| t + Duration::from_secs(s);
+        let v = session
+            .popup_at(at(25))
+            .expect("no popup 25 s into an outage");
+        let row = v
+            .attempts
+            .iter()
+            .find(|r| r.label == "ssh rebuild")
+            .expect("no ssh rebuild row");
+        assert_eq!(row.text, "in 5 s");
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Silent { .. }
+        ));
+        let _ = session.popup_at(at(29));
+        assert!(
+            matches!(session.link_state.phase_now(), Phase::Silent { .. }),
+            "rebuilt before rebuild_after"
+        );
+        let _ = session.popup_at(at(30));
+        assert!(matches!(
+            session.link_state.phase_now(),
+            Phase::Recovering { .. }
+        ));
+    }
+
+    /// A `rebuild_after` below `silent_after` is raised to it: there is no
+    /// rebuild before there is an outage.
+    #[tokio::test]
+    async fn a_rebuild_after_below_silent_after_waits_for_the_outage() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        session.apply(&Settings {
+            silent_after: Duration::from_secs(10),
+            rebuild_after: Duration::from_secs(5),
+            ..Settings::default()
+        });
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(10));
     }
 }

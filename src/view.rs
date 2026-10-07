@@ -21,7 +21,7 @@ use oxutrm_client::{KeyHint, Marker, PopupView, Row, legible, rung_label, summar
 use oxutrm_proto::PathDescription;
 
 use crate::activity::Activity;
-use crate::linkstate::{PROBE_RETRY, Phase, ProbeState, REBUILD_AFTER, render_held};
+use crate::linkstate::{PROBE_RETRY, Phase, ProbeState, render_held};
 use crate::quality::Quality;
 
 /// The most log lines a view carries: the tallest box has fewer rows than
@@ -64,6 +64,9 @@ pub(crate) struct Facts<'a> {
     /// How long the outage was, while the popup lingers after it.
     pub(crate) lingering: Option<Duration>,
     pub(crate) last_heard: Instant,
+    /// The silence after which a rebuild starts: the effective
+    /// `recovery.rebuild_after`, for the countdown.
+    pub(crate) rebuild_after: Duration,
     /// The primary's path, as announced or as last swapped in.
     pub(crate) path: Option<&'a PathDescription>,
     pub(crate) quality: &'a Quality,
@@ -257,7 +260,10 @@ fn attempts(f: &Facts<'_>) -> Vec<Row> {
             label,
             format!(
                 "in {}",
-                clock(REBUILD_AFTER.saturating_sub(f.now.saturating_duration_since(since)))
+                clock(
+                    f.rebuild_after
+                        .saturating_sub(f.now.saturating_duration_since(since))
+                )
             ),
         )),
         // `attempt` is zero-based and counts the attempts begun: the one
@@ -536,6 +542,7 @@ mod tests {
             phase,
             lingering: None,
             last_heard: now,
+            rebuild_after: crate::linkstate::REBUILD_AFTER,
             path: None,
             quality: q,
             rejected: 0,

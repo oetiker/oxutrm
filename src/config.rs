@@ -69,9 +69,7 @@ impl Default for Settings {
             splash: true,
             silent_after: crate::linkstate::SILENT_AFTER,
             rebuild_after: crate::linkstate::REBUILD_AFTER,
-            // `rebuild::CONNECT_TIMEOUT`'s ten seconds; Task 4 names the
-            // constant it becomes.
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: crate::rebuild::DEFAULT_CONNECT_TIMEOUT,
             standby: true,
             stun_servers: net.stun_servers,
             port_mapping: net.enable_port_mapping,

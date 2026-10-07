@@ -120,6 +120,11 @@ impl Standby {
         }
     }
 
+    /// The network settings the next search runs with.
+    pub(crate) fn set_cfg(&mut self, cfg: NetConfig) {
+        self.cfg = cfg;
+    }
+
     #[cfg(test)]
     pub(crate) fn has_link(&self) -> bool {
         self.link.is_some()

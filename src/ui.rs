@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use crate::linkstate::Phase;
 
 /// `Ctrl-\`. Opens the popup while it is closed, in every phase; closes it
-/// while it is shown.
+/// while it is shown. The default of `popup.key`: a session's own key is
+/// `Ui::key`.
 pub(crate) const PREFIX: u8 = 0x1c;
 
 /// A read that is exactly this byte is the Esc key. Anywhere else in a read
@@ -40,7 +41,7 @@ pub(crate) const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 pub(crate) const ANSWER_GUARD: Duration = Duration::from_millis(500);
 
 /// How long the popup stays up showing the outcome after the link it opened
-/// for comes back.
+/// for comes back. The default of `popup.linger`.
 pub(crate) const LINGER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +97,14 @@ pub(crate) struct Ui {
     /// When the current `Confirming` question was first seen, by a lap or a
     /// read, for [`ANSWER_GUARD`]. `None` outside `Confirming`.
     asked_at: Option<Instant>,
+    /// The byte that opens and closes the popup: `popup.key`. `None` is
+    /// `off`, and then that byte is ordinary input.
+    key: Option<u8>,
+    /// How long the popup stays up after the link it opened for answers.
+    linger: Duration,
+    /// How long the host must have been silent before the popup opens by
+    /// itself: the effective `popup.auto_open_after`. `None` never opens it.
+    auto_open_after: Option<Duration>,
 }
 
 impl Ui {
@@ -106,7 +115,33 @@ impl Ui {
             outage_since: None,
             last_outage: Duration::ZERO,
             asked_at: None,
+            key: Some(PREFIX),
+            linger: LINGER,
+            // At the first lap of an outage, as before the setting existed.
+            // A session's `apply` sets the configured value, which is never
+            // below `silent_after` and so changes nothing a lap could see.
+            auto_open_after: Some(Duration::ZERO),
         }
+    }
+
+    /// The popup's three settings, from `apply`. They act from the next
+    /// read or lap: a popup already open stays open.
+    pub(crate) fn retune(
+        &mut self,
+        key: Option<u8>,
+        linger: Duration,
+        auto_open_after: Option<Duration>,
+    ) {
+        self.key = key;
+        self.linger = linger;
+        self.auto_open_after = auto_open_after;
+    }
+
+    /// Whether an outage that began at `since` has lasted long enough at
+    /// `now` for the popup to open by itself.
+    fn auto_due(&self, since: Instant, now: Instant) -> bool {
+        self.auto_open_after
+            .is_some_and(|after| now.saturating_duration_since(since) >= after)
     }
 
     pub(crate) fn mode(&self) -> Mode {
@@ -139,9 +174,12 @@ impl Ui {
             } else {
                 None
             };
+            let due = self
+                .outage_since
+                .is_some_and(|since| self.auto_due(since, now));
             match self.mode {
-                Mode::Closed if !self.dismissed => self.mode = Mode::Auto,
-                Mode::Lingering { .. } => self.mode = Mode::Auto,
+                Mode::Closed if !self.dismissed && due => self.mode = Mode::Auto,
+                Mode::Lingering { .. } if due => self.mode = Mode::Auto,
                 _ => {}
             }
             return change;
@@ -160,7 +198,9 @@ impl Ui {
                     outage: self.last_outage,
                 };
             }
-            Mode::Lingering { since, .. } if now.saturating_duration_since(since) >= LINGER => {
+            Mode::Lingering { since, .. }
+                if now.saturating_duration_since(since) >= self.linger =>
+            {
                 self.mode = Mode::Closed;
             }
             _ => {}
@@ -178,7 +218,7 @@ impl Ui {
         while let Some((&b, tail)) = rest.split_first() {
             rest = tail;
             if !self.visible(phase) {
-                if b == PREFIX {
+                if Some(b) == self.key {
                     self.mode = Mode::Open { pressed: Some(now) };
                 } else {
                     deliver(b, phase, &mut routed);
@@ -236,7 +276,7 @@ impl Ui {
         match b {
             // The question about held input has to be answered before the
             // popup can go.
-            PREFIX | ESC if !confirming => self.close(b, phase, now, r),
+            _ if (b == ESC || Some(b) == self.key) && !confirming => self.close(b, phase, now, r),
             // `c` and `s` are offered by a later version; they, and every
             // other key, only count as touching the popup.
             _ => self.touch(),
@@ -246,11 +286,11 @@ impl Ui {
 
     /// Close the popup with `b`, `Esc` or `Ctrl-\`.
     fn close(&mut self, b: u8, phase: Phase, now: Instant, r: &mut Routed) {
-        if b == PREFIX
+        if Some(b) == self.key
             && let Mode::Open { pressed: Some(at) } = self.mode
             && now.saturating_duration_since(at) < DOUBLE_PRESS
         {
-            deliver(PREFIX, phase, r);
+            deliver(b, phase, r);
         }
         self.mode = Mode::Closed;
         if phase.is_outage() {
@@ -926,5 +966,130 @@ mod tests {
 
         ui.tick(Phase::Live, ms(t, 4_600));
         assert!(!ui.visible(Phase::Live), "the answered question stayed up");
+    }
+
+    // ---- the popup's settings -------------------------------------------
+
+    const CTRL_BRACKET: u8 = 0x1d;
+
+    fn tuned(key: Option<u8>, linger: Duration, auto: Option<Duration>) -> Ui {
+        let mut ui = Ui::new();
+        ui.retune(key, linger, auto);
+        ui
+    }
+
+    /// `popup.key = ctrl-]`: 0x1d opens the popup, and `Ctrl-\` is typing.
+    #[test]
+    fn the_configured_key_opens_the_popup_and_ctrl_backslash_is_typing() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), host(&[PREFIX]));
+        assert_eq!(ui.mode(), Mode::Closed);
+        assert_eq!(ui.keys(&[CTRL_BRACKET], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: Some(t) });
+        assert_eq!(
+            ui.keys(&[CTRL_BRACKET], Phase::Live, ms(t, 2_000)),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.mode(),
+            Mode::Closed,
+            "the configured key did not close it"
+        );
+    }
+
+    /// Review focus 3. The double press belongs to the configured key: two
+    /// quick `Ctrl-]` send one literal `Ctrl-]`, not a `Ctrl-\`.
+    #[test]
+    fn a_double_press_of_the_configured_key_sends_one_literal_of_it() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        assert_eq!(
+            ui.keys(&[CTRL_BRACKET, CTRL_BRACKET], Phase::Live, t),
+            host(&[CTRL_BRACKET])
+        );
+        assert_eq!(ui.mode(), Mode::Closed);
+        let mut ui = tuned(Some(CTRL_BRACKET), LINGER, Some(Duration::from_secs(2)));
+        ui.keys(&[CTRL_BRACKET], Phase::Live, t);
+        assert_eq!(
+            ui.keys(&[PREFIX], Phase::Live, ms(t, 100)),
+            Routed::default()
+        );
+        assert!(
+            matches!(ui.mode(), Mode::Open { .. }),
+            "Ctrl-\\ still closes it"
+        );
+    }
+
+    /// `popup.key = "off"`: the old key is typing, and Esc still closes a
+    /// popup the outage opened.
+    #[test]
+    fn with_no_key_the_old_prefix_is_typing_and_esc_still_closes() {
+        let t = Instant::now();
+        let mut ui = tuned(None, LINGER, Some(Duration::ZERO));
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), host(&[PREFIX]));
+        assert!(!ui.visible(Phase::Live));
+        ui.tick(silent(t), ms(t, 2_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+        assert_eq!(
+            ui.keys(&[PREFIX], silent(t), ms(t, 2_100)),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.mode(),
+            Mode::Open { pressed: None },
+            "a key that is not one only touches"
+        );
+        assert_eq!(ui.keys(&[ESC], silent(t), ms(t, 2_200)), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    /// `auto_open_after = 25s`: an outage two seconds old does not open the
+    /// popup; one twenty-five seconds old does, counted from when the host
+    /// went quiet.
+    #[test]
+    fn the_popup_opens_by_itself_once_the_silence_reaches_auto_open_after() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, Some(Duration::from_secs(25)));
+        assert_eq!(
+            ui.tick(silent(t), ms(t, 2_000)),
+            Some(LinkChange::WentSilent)
+        );
+        assert_eq!(ui.mode(), Mode::Closed, "opened before auto_open_after");
+        ui.tick(recovering(ms(t, 20_000)), ms(t, 24_999));
+        assert_eq!(ui.mode(), Mode::Closed);
+        ui.tick(recovering(ms(t, 20_000)), ms(t, 25_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+    }
+
+    /// `auto_open_after = "off"`: no outage opens it, and the key still does.
+    #[test]
+    fn with_auto_open_off_no_outage_opens_the_popup() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, None);
+        ui.tick(silent(t), ms(t, 2_000));
+        ui.tick(recovering(t), ms(t, 600_000));
+        assert_eq!(ui.mode(), Mode::Closed);
+        assert_eq!(
+            ui.keys(&[PREFIX], recovering(t), ms(t, 600_001)),
+            Routed::default()
+        );
+        assert!(matches!(ui.mode(), Mode::Open { .. }));
+    }
+
+    #[test]
+    fn the_popup_lingers_for_the_configured_time() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), Duration::from_secs(10), Some(Duration::ZERO));
+        ui.tick(silent(t), ms(t, 2_000));
+        let back = ms(t, 4_000);
+        ui.tick(Phase::Live, back);
+        ui.tick(Phase::Live, back + LINGER);
+        assert!(
+            matches!(ui.mode(), Mode::Lingering { .. }),
+            "closed at the old LINGER"
+        );
+        ui.tick(Phase::Live, back + Duration::from_secs(10));
+        assert_eq!(ui.mode(), Mode::Closed);
     }
 }
