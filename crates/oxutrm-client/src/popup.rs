@@ -533,6 +533,9 @@ pub struct ConfigRow {
     pub origin: String,
     /// When a change takes effect, when that is not now.
     pub note: String,
+    /// The value is an open text field: when it is cut, its end -- where
+    /// the cursor is -- stays in view rather than its start.
+    pub field: bool,
 }
 
 /// Rows under a rule with `name` drawn into it.
@@ -540,6 +543,10 @@ pub struct ConfigRow {
 pub struct ConfigSection {
     pub name: String,
     pub rows: Vec<ConfigRow>,
+    /// A plain list, like the `stun_servers` sub-list: each row is an
+    /// index and a value that gets the rest of the line, with no origin or
+    /// note columns to make room for.
+    pub list: bool,
 }
 
 /// What the config screen says, as content rather than as cells.
@@ -585,6 +592,8 @@ const NAME_COLS: usize = 18;
 const VALUE_COLS: usize = 18;
 /// The origin column, after the `*`.
 const ORIGIN_COLS: usize = 7;
+/// The index column of a list section such as the `stun_servers` sub-list.
+const INDEX_COLS: usize = 4;
 
 /// Lay the config screen out for this screen: the same box as the status
 /// view, `min(cols - 4, 72)` by up to `min(rows - 2, 24)`, centred. The
@@ -614,8 +623,9 @@ pub fn layout_config(v: &ConfigView, size: TermSize) -> Overlay {
 /// One line of the config screen's list.
 enum ConfigLine<'a> {
     Rule(&'a str),
-    /// A row, and whether the cursor is on it.
-    Row(&'a ConfigRow, bool),
+    /// A row, whether the cursor is on it, and whether its section is a
+    /// plain list.
+    Row(&'a ConfigRow, bool, bool),
 }
 
 fn config_lines(v: &ConfigView) -> Vec<ConfigLine<'_>> {
@@ -624,33 +634,62 @@ fn config_lines(v: &ConfigView) -> Vec<ConfigLine<'_>> {
     for s in &v.sections {
         lines.push(ConfigLine::Rule(&s.name));
         for r in &s.rows {
-            lines.push(ConfigLine::Row(r, n == v.cursor));
+            lines.push(ConfigLine::Row(r, n == v.cursor, s.list));
             n += 1;
         }
     }
     lines
 }
 
-/// `text` padded or cut to `cols` characters; a cut ends in `…`.
-fn column(text: &str, cols: usize) -> String {
-    if text.chars().count() <= cols {
-        format!("{text:<cols$}")
+/// `text` in at most `cols` characters. A cut is marked with `…`: at the
+/// end, or -- for an open text field, whose cursor is at the end and must
+/// stay in view while typing -- at the start.
+fn cut(text: &str, cols: usize, keep_end: bool) -> String {
+    let n = text.chars().count();
+    if n <= cols {
+        text.to_string()
+    } else if cols == 0 {
+        String::new()
+    } else if keep_end {
+        let tail: String = text.chars().skip(n - (cols - 1)).collect();
+        format!("\u{2026}{tail}")
     } else {
-        let kept: String = text.chars().take(cols.saturating_sub(2)).collect();
-        format!("{kept}\u{2026} ")
+        let head: String = text.chars().take(cols - 1).collect();
+        format!("{head}\u{2026}")
     }
 }
 
-fn row_line(r: &ConfigRow, selected: bool) -> Line<'static> {
-    let text = format!(
-        "{} {}{}{} {}{}",
-        if selected { '\u{25b8}' } else { ' ' },
-        column(&r.name, NAME_COLS),
-        column(&r.value, VALUE_COLS),
-        if r.changed { '*' } else { ' ' },
-        column(&r.origin, ORIGIN_COLS),
-        r.note
-    );
+/// `text` padded or cut to `cols` characters, with a space after a cut so
+/// the next column stays apart.
+fn column(text: &str, cols: usize, keep_end: bool) -> String {
+    if text.chars().count() <= cols {
+        format!("{text:<cols$}")
+    } else {
+        format!("{} ", cut(text, cols.saturating_sub(1), keep_end))
+    }
+}
+
+/// One row as a line `width` characters wide: a setting's name, value,
+/// pending mark, origin and note; or, in a list section, an index and a
+/// value that gets the rest of the line.
+fn row_line(r: &ConfigRow, selected: bool, list: bool, width: usize) -> Line<'static> {
+    let marker = if selected { '\u{25b8}' } else { ' ' };
+    let text = if list {
+        format!(
+            "{marker} {}{}",
+            column(&r.name, INDEX_COLS, false),
+            cut(&r.value, width.saturating_sub(2 + INDEX_COLS), r.field)
+        )
+    } else {
+        format!(
+            "{marker} {}{}{} {}{}",
+            column(&r.name, NAME_COLS, false),
+            column(&r.value, VALUE_COLS, r.field),
+            if r.changed { '*' } else { ' ' },
+            column(&r.origin, ORIGIN_COLS, false),
+            r.note
+        )
+    };
     let style = if selected {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -705,7 +744,7 @@ fn draw_config(v: &ConfigView, cols: u16, rows: u16) -> Buffer {
     let lines = config_lines(v);
     let at = lines
         .iter()
-        .position(|l| matches!(l, ConfigLine::Row(_, true)))
+        .position(|l| matches!(l, ConfigLine::Row(_, true, _)))
         .unwrap_or(0);
     let height = usize::from(body.height);
     // Scrolled just enough for the cursor's row to be the last one shown,
@@ -715,8 +754,8 @@ fn draw_config(v: &ConfigView, cols: u16, rows: u16) -> Buffer {
         let y = body.y + u16::try_from(i).unwrap_or(u16::MAX);
         match line {
             ConfigLine::Rule(name) => rule(&mut buf, y, cols, Some(name)),
-            ConfigLine::Row(r, selected) => {
-                Paragraph::new(row_line(r, *selected)).render(
+            ConfigLine::Row(r, selected, list) => {
+                Paragraph::new(row_line(r, *selected, *list, usize::from(body.width))).render(
                     Rect {
                         y,
                         height: 1,
@@ -1494,6 +1533,7 @@ mod tests {
             changed,
             origin: origin.to_string(),
             note: note.to_string(),
+            field: false,
         };
         ConfigView {
             title: "oxutrm \u{b7} config \u{b7} thinlinc".to_string(),
@@ -1507,6 +1547,7 @@ mod tests {
                         row("linger", "3s", false, "", ""),
                         row("splash", "on", false, "", "next connect"),
                     ],
+                    list: false,
                 },
                 ConfigSection {
                     name: "recovery".to_string(),
@@ -1515,6 +1556,7 @@ mod tests {
                         row("rebuild_after", "30s", true, "host", ""),
                         row("connect_timeout", "10s", false, "", "next attempt"),
                     ],
+                    list: false,
                 },
                 ConfigSection {
                     name: "network".to_string(),
@@ -1530,6 +1572,7 @@ mod tests {
                         row("port_mapping", "on", false, "", "next attempt"),
                         row("birthday", "on", false, "global", "next attempt"),
                     ],
+                    list: false,
                 },
             ],
             cursor: 5,
@@ -1631,6 +1674,93 @@ mod tests {
             layout(&Popup::Config(config_view()), size),
             layout_config(&config_view(), size)
         );
+    }
+
+    /// The four built-in servers, 22 to 24 characters each.
+    const SERVERS: [&str; 4] = [
+        "stun.cloudflare.com:3478",
+        "stun.l.google.com:19302",
+        "stun.nextcloud.com:443",
+        "stun.sipgate.net:3478",
+    ];
+
+    /// The `stun_servers` sub-list, as the client builds it.
+    fn servers_view() -> ConfigView {
+        ConfigView {
+            header: String::new(),
+            sections: vec![ConfigSection {
+                name: "network.stun_servers".to_string(),
+                rows: SERVERS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| ConfigRow {
+                        name: (i + 1).to_string(),
+                        value: s.to_string(),
+                        ..ConfigRow::default()
+                    })
+                    .collect(),
+                list: true,
+            }],
+            cursor: 0,
+            ..config_view()
+        }
+    }
+
+    #[test]
+    fn the_servers_sub_list_shows_each_server_in_full() {
+        let o = layout_config(&servers_view(), TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        for s in SERVERS {
+            assert!(find(&o, s).is_some(), "{s} is not shown whole:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_text_field_on_a_long_server_keeps_its_end_and_cursor_in_view() {
+        let mut v = servers_view();
+        let long = format!("stun.{}.example.org:3478", "x".repeat(80));
+        v.sections[0].rows[1].value = format!("{long}\u{258f}");
+        v.sections[0].rows[1].field = true;
+        v.cursor = 1;
+        let o = layout_config(&v, TermSize { cols: 80, rows: 24 });
+        let line = row(&o, find(&o, "\u{258f}").expect("no cursor shown"));
+        assert!(line.contains("example.org:3478\u{258f}"), "{line}");
+        assert!(line.contains('\u{2026}'), "the cut is not marked: {line}");
+        // An open field on a realistic server shows it whole.
+        let mut v = servers_view();
+        v.sections[0].rows[0].value = "stun.cloudflare.com:3478\u{258f}".to_string();
+        v.sections[0].rows[0].field = true;
+        let o = layout_config(&v, TermSize { cols: 80, rows: 24 });
+        assert!(
+            find(&o, "stun.cloudflare.com:3478\u{258f}").is_some(),
+            "{}",
+            text_of(&o)
+        );
+    }
+
+    #[test]
+    fn a_text_field_in_the_main_list_keeps_its_end_and_cursor_in_view() {
+        let mut v = config_view();
+        let r = &mut v.sections[1].rows[1];
+        r.value = "1234567890abcdefghijXYZ\u{258f}".to_string();
+        r.field = true;
+        let o = layout_config(&v, TermSize { cols: 80, rows: 24 });
+        let line = row(&o, find(&o, "rebuild_after").unwrap());
+        assert!(line.contains("\u{2026}"), "{line}");
+        assert!(
+            line.contains("XYZ\u{258f}"),
+            "the cursor is cut off: {line}"
+        );
+        assert!(line.contains("host"), "the columns after it moved: {line}");
+    }
+
+    #[test]
+    fn snapshot_config_servers_80x24() {
+        let mut v = servers_view();
+        v.cursor = 2;
+        v.sections[0].rows[2].value = "stun.nextcloud.com:443\u{258f}".to_string();
+        v.sections[0].rows[2].field = true;
+        insta::assert_snapshot!(text_of(&layout_config(&v, TermSize { cols: 80, rows: 24 })));
     }
 
     #[test]

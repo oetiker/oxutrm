@@ -1,0 +1,14 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_config(&v, TermSize { cols: 80, rows: 24 }))"
+---
+╭ oxutrm · config · thinlinc ──────────────────────────────────────────╮
+├ network.stun_servers ────────────────────────────────────────────────┤
+│   1   stun.cloudflare.com:3478                                       │
+│   2   stun.l.google.com:19302                                        │
+│ ▸ 3   stun.nextcloud.com:443▏                                        │
+│   4   stun.sipgate.net:3478                                          │
+├──────────────────────────────────────────────────────────────────────┤
+│ silence before an ssh rebuild starts · 5s–10m                        │
+│ ↑↓ move  ⏎ edit  x reset  w save  Esc back                           │
+╰──────────────────────────────────────────────────────────────────────╯

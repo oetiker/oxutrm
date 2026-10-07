@@ -554,10 +554,12 @@ fn settings_sections(f: &ConfigFacts<'_>) -> Vec<ConfigSection> {
             sections.push(ConfigSection {
                 name: row.section.to_string(),
                 rows: Vec::new(),
+                list: false,
             });
         }
         let (origin, value, changed) = f.state.shown(i);
         let here = i == f.screen.cursor;
+        let field = here && matches!(f.screen.editing, Editing::Text);
         let value = match (here, f.screen.editing) {
             (true, Editing::Text) => field_text(f.screen.field),
             (true, Editing::Capture) => "press a key\u{2026}".to_string(),
@@ -595,6 +597,7 @@ fn settings_sections(f: &ConfigFacts<'_>) -> Vec<ConfigSection> {
                     _ => String::new(),
                 },
                 note: note.to_string(),
+                field,
             });
     }
     sections
@@ -612,6 +615,7 @@ fn servers_section(screen: &ConfigScreen<'_>, cursor: usize, field: bool) -> Con
             } else {
                 legible(s)
             },
+            field: field && i == cursor,
             ..ConfigRow::default()
         })
         .collect();
@@ -619,12 +623,14 @@ fn servers_section(screen: &ConfigScreen<'_>, cursor: usize, field: bool) -> Con
         rows.push(ConfigRow {
             name: (rows.len() + 1).to_string(),
             value: field_text(screen.field),
+            field: true,
             ..ConfigRow::default()
         });
     }
     ConfigSection {
         name: "network.stun_servers".to_string(),
         rows,
+        list: true,
     }
 }
 
@@ -1981,6 +1987,19 @@ mod tests {
             t,
         ));
         assert_eq!(config_row(&v, "linger").0, "4\u{258f}");
+        let fields: Vec<&str> = v
+            .sections
+            .iter()
+            .flat_map(|s| &s.rows)
+            .filter(|r| r.field)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            ["linger"],
+            "only the open field keeps its end in view"
+        );
+        assert!(v.sections.iter().all(|s| !s.list));
         let v = config(&config_facts(&state, on_row(0, Editing::Capture), t));
         assert_eq!(config_row(&v, "key").0, "press a key\u{2026}");
     }
@@ -2013,6 +2032,9 @@ mod tests {
             .map(|r| r.value.as_str())
             .collect();
         assert_eq!(values, ["a:1", "b:2", "c:\u{258f}"]);
+        assert!(v.sections[0].list, "the sub-list is drawn as a plain list");
+        let fields: Vec<bool> = v.sections[0].rows.iter().map(|r| r.field).collect();
+        assert_eq!(fields, [false, false, true]);
         assert_eq!(v.cursor, 2);
     }
 
