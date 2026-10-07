@@ -187,8 +187,11 @@ pub(crate) struct Ui {
     /// What the help line says instead of the help: why a change was
     /// refused, or what a save did. Gone with the next read.
     note: Option<String>,
-    /// Inside a bracketed paste whose end has not arrived yet.
-    pasting: bool,
+    /// Inside a bracketed paste on the config screen whose end has not
+    /// arrived yet, and how many bytes of that end the last read finished
+    /// on: a large paste is cut into reads wherever the buffer ends, its end
+    /// marker too.
+    pasting: Option<usize>,
 }
 
 impl Ui {
@@ -210,7 +213,7 @@ impl Ui {
             servers: Vec::new(),
             proposed: None,
             note: None,
-            pasting: false,
+            pasting: None,
         }
     }
 
@@ -302,16 +305,18 @@ impl Ui {
     /// the command, if one was typed.
     pub(crate) fn keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
         self.note_question(phase, now);
-        // The rest of a paste that began in an earlier read is the paste's,
-        // whatever the screen is now.
-        let bytes = if self.pasting {
-            self.paste(bytes)
-        } else {
-            bytes
-        };
         if matches!(self.mode, Mode::Config { .. }) {
+            // The rest of a paste that began in an earlier read is the
+            // paste's.
+            let bytes = match self.pasting {
+                Some(_) => self.paste(bytes),
+                None => bytes,
+            };
             return self.config_keys(bytes, phase);
         }
+        // Pastes are only ever tracked on the config screen: anywhere else a
+        // paste's bytes go where they always went, the host's included.
+        self.pasting = None;
         let mut routed = Routed::default();
         let lone_esc = bytes == [ESC];
         let mut rest = bytes;
@@ -504,6 +509,7 @@ impl Ui {
             self.partial.clear();
             self.proposed = None;
             self.note = None;
+            self.pasting = None;
         }
     }
 
@@ -524,7 +530,7 @@ impl Ui {
                 match key {
                     Some(key) => key,
                     None if tail.starts_with(b"[200~") => {
-                        self.pasting = true;
+                        self.pasting = Some(0);
                         rest = self.paste(rest);
                         continue;
                     }
@@ -542,29 +548,48 @@ impl Ui {
     }
 
     /// A paste's text up to its end, if the end is in `bytes`: into an open
-    /// field, control bytes dropped, or nowhere. Returns what follows the
-    /// end.
+    /// field, or nowhere. Returns what follows the end. The start of an end
+    /// marker that the read stops in is kept in `pasting` until the next read
+    /// says whether it was one.
     fn paste<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
-        let (text, rest) = match bytes.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
-            Some(i) => {
-                self.pasting = false;
-                (&bytes[..i], &bytes[i + PASTE_END.len()..])
+        for (i, &b) in bytes.iter().enumerate() {
+            let matched = self.pasting.unwrap_or(0);
+            if b == PASTE_END[matched] {
+                if matched + 1 == PASTE_END.len() {
+                    self.pasting = None;
+                    return &bytes[i + 1..];
+                }
+                self.pasting = Some(matched + 1);
+                continue;
             }
-            None => (bytes, &bytes[bytes.len()..]),
-        };
-        let open = matches!(
+            // What looked like the end's beginning was text after all. Only
+            // its ESC can begin the end again: the marker has no other
+            // overlap with itself.
+            for &h in &PASTE_END[..matched] {
+                self.paste_byte(h);
+            }
+            if b == PASTE_END[0] {
+                self.pasting = Some(1);
+            } else {
+                self.pasting = Some(0);
+                self.paste_byte(b);
+            }
+        }
+        &bytes[bytes.len()..]
+    }
+
+    /// One byte of a paste: into the field, if one is open. `type_byte`
+    /// drops control characters, the paste's ESC and newlines among them.
+    fn paste_byte(&mut self, b: u8) {
+        if matches!(
             self.mode,
             Mode::Config {
                 editing: Editing::Text | Editing::Servers { field: true, .. },
                 ..
             }
-        );
-        if open {
-            for &b in text.iter().filter(|&&b| b >= 0x20 && b != 0x7f) {
-                self.type_byte(b);
-            }
+        ) {
+            self.type_byte(b);
         }
-        rest
     }
 
     /// A byte typed into the field: input is UTF-8, so a character is added
@@ -761,8 +786,8 @@ impl Ui {
 
 /// The key an escape sequence stands for on the config screen, and how many
 /// bytes after the ESC the sequence took. Only the arrows mean anything; any
-/// other sequence is skipped whole. A bracketed paste's start is `None` with
-/// nothing used: the caller looks for it.
+/// other sequence is skipped whole. A bracketed paste's start is `None` too,
+/// with its five bytes used: the caller tells it from the rest by looking.
 fn escape(tail: &[u8]) -> (Option<Key>, usize) {
     match tail {
         [b'[' | b'O', b'A', ..] => (Some(Key::Up), 2),
@@ -1911,5 +1936,65 @@ mod tests {
         ui.accepted();
         ui.keys(&[ESC], Phase::Live, t);
         assert_eq!(editing(&ui), Editing::None);
+    }
+
+    /// A large paste is cut into reads wherever the buffer ends, its end
+    /// marker too: the end is still found, and what follows it is read.
+    #[test]
+    fn a_paste_end_split_across_reads_still_ends_the_paste() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.open_text(String::new());
+        assert_eq!(
+            ui.keys(b"\x1b[200~ab\x1b[20", Phase::Live, t),
+            Routed::default()
+        );
+        assert_eq!(
+            ui.keys(b"1~\r", Phase::Live, t),
+            cfg(ConfigCmd::Accept {
+                row: 0,
+                text: "ab".to_string()
+            })
+        );
+        // What looked like the end's beginning was text after all.
+        ui.open_text(String::new());
+        ui.keys(b"\x1b[200~a\x1b[2", Phase::Live, t);
+        ui.keys(b"x\x1b[201~", Phase::Live, t);
+        assert_eq!(ui.config_screen().unwrap().field, "a[2x");
+    }
+
+    /// With no field open the paste is ignored, but its end is still found
+    /// across reads, and the screen's keys work after it.
+    #[test]
+    fn a_split_paste_end_with_no_field_open_does_not_swallow_the_keys() {
+        let t = Instant::now();
+        let mut ui = config_at(t);
+        ui.keys(b"\x1b[200~ab\x1b[20", Phase::Live, t);
+        assert_eq!(ui.keys(b"1~j", Phase::Live, t), Routed::default());
+        assert_eq!(cursor(&ui), 1, "the j after the paste was swallowed");
+        assert_eq!(ui.keys(&[ESC], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Open { pressed: None });
+    }
+
+    /// Paste tracking is the config screen's: with the popup closed a
+    /// bracketed paste is the host's, byte for byte, split end and all --
+    /// or held, during an outage.
+    #[test]
+    fn a_paste_with_the_popup_closed_goes_where_typing_goes() {
+        let t = Instant::now();
+        let first = b"\x1b[200~ls -l\x1b[20";
+        let second = b"1~\r";
+        let mut ui = Ui::new();
+        assert_eq!(ui.keys(first, Phase::Live, t).to_host, first);
+        assert_eq!(ui.keys(second, Phase::Live, t).to_host, second);
+        let mut ui = dismissed_at(t);
+        assert_eq!(ui.keys(first, silent(t), t).to_hold, first);
+        assert_eq!(ui.keys(second, silent(t), t).to_hold, second);
+        // An unended paste on the config screen does not follow the user
+        // out of it.
+        let mut ui = config_at(t);
+        ui.keys(b"\x1b[200~ab", Phase::Live, t);
+        ui.mode = Mode::Closed;
+        assert_eq!(ui.keys(b"ls\r", Phase::Live, t).to_host, b"ls\r");
     }
 }
