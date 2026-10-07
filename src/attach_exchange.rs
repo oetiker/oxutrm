@@ -422,6 +422,99 @@ pub(crate) mod fixtures {
             ..Default::default()
         }
     }
+
+    // ---- a live connection, for the numbers only QUIC can give ---------------
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use oxutrm_net::{
+        ALPN, CERT_NAME, PinnedClientSpki, PinnedSpki, generate_cert, install_crypto_provider,
+        provider,
+    };
+    use oxutrm_proto::HostSpki;
+    use quinn::rustls;
+
+    /// Deliberately not a round number and not the QUIC floor, so no plausible
+    /// constant can collide with it.
+    pub(crate) const PINNED_MTU: u16 = 1337;
+
+    fn transport() -> Arc<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        // Freeze the path MTU: discovery would raise it on loopback and the
+        // assertion below is about WHERE the number comes from, not how big it
+        // is.
+        t.initial_mtu(PINNED_MTU);
+        t.min_mtu(PINNED_MTU);
+        t.mtu_discovery_config(None);
+        Arc::new(t)
+    }
+
+    /// A real QUIC connection on loopback whose MTU is [`PINNED_MTU`].
+    ///
+    /// The endpoints come back because dropping them closes the connection.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn connected() -> (quinn::Connection, (quinn::Connection, Vec<quinn::Endpoint>))
+    {
+        install_crypto_provider();
+        let (cert, key, fingerprint) = generate_cert().expect("host certificate");
+        let (client_cert, client_key, client_fp) = generate_cert().expect("client certificate");
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("a loopback address");
+
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_client_cert_verifier(Arc::new(PinnedClientSpki::new(
+                oxutrm_proto::ClientSpki::new(client_fp),
+            )))
+            .with_single_cert(vec![cert], key)
+            .expect("a server config");
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("a QUIC server config"),
+        ));
+        server_cfg.transport_config(transport());
+
+        let server_ep = quinn::Endpoint::server(server_cfg, addr).expect("a server endpoint");
+        let server_addr = server_ep.local_addr().expect("the server's address");
+        let accepting = {
+            let ep = server_ep.clone();
+            tokio::spawn(async move {
+                ep.accept()
+                    .await
+                    .expect("a connection attempt")
+                    .await
+                    .expect("a completed handshake")
+            })
+        };
+
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(HostSpki::new(fingerprint))))
+            .with_client_auth_cert(vec![client_cert], client_key)
+            .expect("a client config");
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a QUIC client config"),
+        ));
+        client_cfg.transport_config(transport());
+
+        let mut client_ep = quinn::Endpoint::client(addr).expect("a client endpoint");
+        client_ep.set_default_client_config(client_cfg);
+        let client_conn = client_ep
+            .connect(server_addr, CERT_NAME)
+            .expect("a connect attempt")
+            .await
+            .expect("a completed handshake");
+        let server_conn = accepting.await.expect("the accept task");
+
+        // The client connection is returned, not dropped: dropping it closes
+        // the connection, and every assertion below reads live numbers off the
+        // server side of it.
+        (server_conn, (client_conn, vec![server_ep, client_ep]))
+    }
 }
 
 #[cfg(test)]
@@ -778,93 +871,8 @@ mod tests {
     // MTU the connection could only have got from its own configuration, so a
     // constant of any value fails.
 
-    use std::net::SocketAddr;
+    use oxutrm_proto::Rung;
     use std::sync::Arc;
-
-    use oxutrm_net::{
-        ALPN, CERT_NAME, PinnedClientSpki, PinnedSpki, generate_cert, install_crypto_provider,
-        provider,
-    };
-    use oxutrm_proto::{HostSpki, Rung};
-    use quinn::rustls;
-
-    /// Deliberately not a round number and not the QUIC floor, so no plausible
-    /// constant can collide with it.
-    const PINNED_MTU: u16 = 1337;
-
-    fn transport() -> Arc<quinn::TransportConfig> {
-        let mut t = quinn::TransportConfig::default();
-        // Freeze the path MTU: discovery would raise it on loopback and the
-        // assertion below is about WHERE the number comes from, not how big it
-        // is.
-        t.initial_mtu(PINNED_MTU);
-        t.min_mtu(PINNED_MTU);
-        t.mtu_discovery_config(None);
-        Arc::new(t)
-    }
-
-    /// A real QUIC connection on loopback whose MTU is [`PINNED_MTU`].
-    ///
-    /// The endpoints come back because dropping them closes the connection.
-    #[allow(clippy::type_complexity)]
-    async fn connected() -> (quinn::Connection, (quinn::Connection, Vec<quinn::Endpoint>)) {
-        install_crypto_provider();
-        let (cert, key, fingerprint) = generate_cert().expect("host certificate");
-        let (client_cert, client_key, client_fp) = generate_cert().expect("client certificate");
-        let addr: SocketAddr = "127.0.0.1:0".parse().expect("a loopback address");
-
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3")
-            .with_client_cert_verifier(Arc::new(PinnedClientSpki::new(ClientSpki::new(client_fp))))
-            .with_single_cert(vec![cert], key)
-            .expect("a server config");
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("a QUIC server config"),
-        ));
-        server_cfg.transport_config(transport());
-
-        let server_ep = quinn::Endpoint::server(server_cfg, addr).expect("a server endpoint");
-        let server_addr = server_ep.local_addr().expect("the server's address");
-        let accepting = {
-            let ep = server_ep.clone();
-            tokio::spawn(async move {
-                ep.accept()
-                    .await
-                    .expect("a connection attempt")
-                    .await
-                    .expect("a completed handshake")
-            })
-        };
-
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedSpki::new(HostSpki::new(fingerprint))))
-            .with_client_auth_cert(vec![client_cert], client_key)
-            .expect("a client config");
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a QUIC client config"),
-        ));
-        client_cfg.transport_config(transport());
-
-        let mut client_ep = quinn::Endpoint::client(addr).expect("a client endpoint");
-        client_ep.set_default_client_config(client_cfg);
-        let client_conn = client_ep
-            .connect(server_addr, CERT_NAME)
-            .expect("a connect attempt")
-            .await
-            .expect("a completed handshake");
-        let server_conn = accepting.await.expect("the accept task");
-
-        // The client connection is returned, not dropped: dropping it closes
-        // the connection, and every assertion below reads live numbers off the
-        // server side of it.
-        (server_conn, (client_conn, vec![server_ep, client_ep]))
-    }
 
     async fn nomination(rung: Rung, probes: u32) -> crate::ladder::Nomination {
         let socket = Arc::new(

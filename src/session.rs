@@ -901,6 +901,8 @@ fn reading_of(conn: &quinn::Connection) -> Reading {
         lost: stats.path.lost_packets,
         tx_bytes: stats.udp_tx.bytes,
         rx_bytes: stats.udp_rx.bytes,
+        mtu: stats.path.current_mtu,
+        black_holes: stats.path.black_holes_detected,
     }
 }
 
@@ -1785,9 +1787,18 @@ impl ClientSession {
         if !self.quality.due(now) {
             return;
         }
+        self.take_sample(now, reading_of(self.link.sink.connection()));
+    }
+
+    /// [`ClientSession::sample_quality`] once the link has been read: the
+    /// part a test can reach without a link that loses packets.
+    fn take_sample(&mut self, now: Instant, reading: Reading) {
         let outage = self.link_state.phase_now().is_outage();
-        self.quality
-            .push(now, reading_of(self.link.sink.connection()), outage);
+        self.quality.push(now, reading, outage);
+        if let Some(mtu) = self.quality.mtu_reduced() {
+            self.activity
+                .record(Kind::Link, &format!("path MTU reduced to {mtu}"));
+        }
     }
 
     /// Whether the popup at `now` is reporting an outage: the question the
@@ -4647,6 +4658,18 @@ mod tests {
             error_code: quinn::VarInt::from_u32(code),
             reason: reason.into(),
         })
+    }
+
+    /// The popup's MTU is sampled off the link carrying the session, so a
+    /// failover or a rebuild shows the new link's. A constant -- 1200 is
+    /// the QUIC floor and reads as an answer -- fails here.
+    #[tokio::test]
+    async fn a_reading_takes_the_mtu_from_the_live_connection() {
+        let (conn, _alive) = crate::attach_exchange::fixtures::connected().await;
+        assert_eq!(
+            reading_of(&conn).mtu,
+            crate::attach_exchange::fixtures::PINNED_MTU
+        );
     }
 
     #[test]
@@ -8038,6 +8061,34 @@ mod tests {
             session.quality.sparkline(),
             vec![None, None],
             "with_popup is Silent: both are outage seconds"
+        );
+    }
+
+    /// A black hole is logged once, as a line the popup shows, with the
+    /// MTU the link fell back to.
+    #[tokio::test]
+    async fn a_black_hole_on_the_link_is_logged_once() {
+        let t = Instant::now();
+        let (_host, mut session) = with_popup().await;
+        let r = |mtu, black_holes| Reading {
+            mtu,
+            black_holes,
+            ..Reading::default()
+        };
+
+        session.take_sample(t, r(1452, 0));
+        session.take_sample(t + Duration::from_secs(1), r(1200, 1));
+        session.take_sample(t + Duration::from_secs(2), r(1200, 1));
+
+        let logged: Vec<_> = session
+            .activity
+            .entries()
+            .filter(|e| e.text.contains("MTU"))
+            .map(|e| (e.shown.clone(), e.detail, e.repeats))
+            .collect();
+        assert_eq!(
+            logged,
+            vec![("path MTU reduced to 1200".to_string(), false, 0)]
         );
     }
 
