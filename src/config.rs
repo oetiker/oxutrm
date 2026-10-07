@@ -717,7 +717,7 @@ pub(crate) fn resolve(text: Option<&str>, target: &str) -> Resolved {
             )),
         }
     }
-    keep_the_popup_reachable(&mut layers, &mut warnings);
+    keep_the_popup_reachable(&mut layers, target, &mut warnings);
     Resolved {
         settings: layers.settings(),
         layers,
@@ -822,7 +822,9 @@ fn read_section(
 
 /// `popup.key = "off"` with `popup.auto_open_after = "off"` would leave the
 /// popup unreachable: the auto-open falls back a layer until it is not.
-fn keep_the_popup_reachable(layers: &mut Layers, warnings: &mut Vec<String>) {
+/// Each warning names the key it dropped, host or global, so the two never
+/// read the same (the activity log keeps a repeated text only once).
+fn keep_the_popup_reachable(layers: &mut Layers, target: &str, warnings: &mut Vec<String>) {
     while layers.settings().unreachable() {
         let auto = &mut layers.0[AUTO_OPEN];
         // The default opens it; never reached.
@@ -830,11 +832,14 @@ fn keep_the_popup_reachable(layers: &mut Layers, warnings: &mut Vec<String>) {
             return;
         };
         *auto.at_mut(level) = None;
-        warnings.push(
-            "popup.auto_open_after = \"off\" with popup.key = \"off\" would leave the \
-             popup unreachable; the next layer's auto_open_after is used"
-                .to_string(),
-        );
+        let at = match level {
+            Level::Host => format!("host.{}.popup.auto_open_after", quoted(target)),
+            Level::Global => "popup.auto_open_after".to_string(),
+        };
+        warnings.push(format!(
+            "{at} = \"off\" with popup.key = \"off\" would leave the popup \
+             unreachable; the next layer's auto_open_after is used"
+        ));
     }
 }
 
@@ -1246,6 +1251,32 @@ mod tests {
             r.settings.auto_open_after,
             Some(d(5)),
             "fell back to the global"
+        );
+    }
+
+    /// Both layers off: two warnings, each naming the key it dropped, so
+    /// the log (which drops a repeated text) shows both that the header
+    /// counts.
+    #[test]
+    fn both_layers_off_warn_once_each_naming_their_key() {
+        let r = resolve(
+            Some(
+                "[popup]\nkey = \"off\"\nauto_open_after = \"off\"\n\
+                 [host.\"t\"]\npopup.auto_open_after = \"off\"\n",
+            ),
+            "t",
+        );
+        assert_eq!(r.settings.auto_open_after, Some(d(2)));
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].starts_with("host.\"t\".popup.auto_open_after = \"off\""),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[1].starts_with("popup.auto_open_after = \"off\""),
+            "{:?}",
+            r.warnings
         );
     }
 
