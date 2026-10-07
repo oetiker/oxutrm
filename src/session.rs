@@ -10130,6 +10130,36 @@ mod tests {
         (host, session)
     }
 
+    /// `x` on a value from the file takes the layer below into effect at
+    /// once -- here the host's 25s gives way to the global 40s -- and marks
+    /// the row unsaved.
+    #[tokio::test]
+    async fn x_on_a_file_value_applies_the_layer_below() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::FILE),
+            "[recovery]\nrebuild_after = \"40s\"\n[host.\"t\"]\nrecovery.rebuild_after = \"25s\"\n",
+        )
+        .unwrap();
+        let row = row_of("recovery.rebuild_after");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        assert_eq!(session.link_state.rebuild_after(), Duration::from_secs(25));
+        type_in(&mut session, b"x");
+        assert_eq!(
+            session.config.shown(row),
+            (
+                Some(crate::config::Origin::Global),
+                Value::Duration(Some(Duration::from_secs(40))),
+                true
+            )
+        );
+        assert_eq!(
+            session.link_state.rebuild_after(),
+            Duration::from_secs(40),
+            "the reset was not applied"
+        );
+    }
+
     /// `w` `a`: written for every host, this host's own override of the key
     /// gone, and the screen's origins read from what was written.
     #[tokio::test]
