@@ -1403,6 +1403,12 @@ impl ClientSession {
     /// once a session.
     fn config_save(&mut self, level: crate::config::Level) {
         self.ui.accepted();
+        // Nothing pending is no failure: the help line says so, and neither
+        // the activity log nor the file hears of it.
+        if self.config.pending.is_empty() {
+            self.ui.say("not saved: nothing has changed".to_string());
+            return;
+        }
         match self.config.save(level) {
             Ok(warnings) => {
                 for w in &warnings {
@@ -10214,6 +10220,27 @@ mod tests {
             "{:?}",
             shown_log(&session)
         );
+    }
+
+    /// `w` `a` with nothing pending is not a failure: the help line says so,
+    /// and neither the activity log nor the file hears of it.
+    #[tokio::test]
+    async fn saving_with_nothing_pending_only_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = row_of("popup.linger");
+        let (_host, mut session) = configured(dir.path(), row).await;
+        type_in(&mut session, b"w");
+        type_in(&mut session, b"a");
+        assert_eq!(
+            session.ui.config_screen().unwrap().note,
+            Some("not saved: nothing has changed")
+        );
+        assert!(
+            session.activity.entries().all(|e| e.kind != Kind::Config),
+            "{:?}",
+            shown_log(&session)
+        );
+        assert!(!dir.path().join(crate::config::FILE).exists());
     }
 
     /// Every warning is a shown entry, once: one the written text brings
