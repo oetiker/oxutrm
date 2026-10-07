@@ -1667,6 +1667,25 @@ mod tests {
         assert!(ui.visible(silent(t)));
     }
 
+    /// `c` pressed after this outage's moment to open by itself has
+    /// passed: there is no moment left to give way at, so the next lap
+    /// leaves the config screen up.
+    #[test]
+    fn a_config_screen_opened_late_in_an_outage_stays() {
+        let t = Instant::now();
+        let mut ui = tuned(Some(PREFIX), LINGER, Some(Duration::from_secs(5)));
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(ui.mode(), Mode::Auto);
+        assert_eq!(ui.keys(b"c", silent(t), ms(t, 6_000)), Routed::default());
+        assert!(ui.config_screen().is_some(), "c did not open it");
+        ui.tick(silent(t), ms(t, 7_000));
+        assert!(
+            ui.config_screen().is_some(),
+            "the config screen gave way to a moment already past: {:?}",
+            ui.mode()
+        );
+    }
+
     #[test]
     fn c_does_nothing_under_confirming() {
         let t = Instant::now();
