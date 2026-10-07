@@ -12,6 +12,7 @@
 // or it lands raw on the painted raw-mode terminal.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -651,18 +652,11 @@ impl KeyLayers {
 
     /// The value with `level` taken out: what `x` shows through.
     pub(crate) fn without(&self, level: Level) -> (Origin, &Value) {
-        let mut rest = self.clone();
-        match level {
-            Level::Global => rest.global = None,
-            Level::Host => rest.host = None,
+        match (level, &self.host, &self.global) {
+            (Level::Global, Some(v), _) => (Origin::Host, v),
+            (Level::Host, _, Some(v)) => (Origin::Global, v),
+            _ => (Origin::Default, &self.default),
         }
-        let (origin, _) = rest.winner();
-        let value = match origin {
-            Origin::Host => self.host.as_ref().expect("the winner is there"),
-            Origin::Global => self.global.as_ref().expect("the winner is there"),
-            Origin::Default => &self.default,
-        };
-        (origin, value)
     }
 
     fn at_mut(&mut self, level: Level) -> &mut Option<Value> {
@@ -694,11 +688,7 @@ impl Layers {
 
     /// The winners, as typed settings.
     pub(crate) fn settings(&self) -> Settings {
-        let mut s = Settings::default();
-        for (row, layers) in SETTINGS.iter().zip(&self.0) {
-            (row.set)(&mut s, layers.winner().1.clone());
-        }
-        s
+        in_effect(self, &Pending::new())
     }
 }
 
@@ -846,7 +836,49 @@ fn keep_the_popup_reachable(layers: &mut Layers, warnings: &mut Vec<String>) {
     }
 }
 
-/// The config as the session holds it: the file's layers for this target.
+/// One unsaved change on the screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Edit {
+    /// A new value, for whichever level it is saved to.
+    Set(Value),
+    /// Take the value out at this level, so the next one shows through.
+    Remove(Level),
+}
+
+/// The unsaved changes, by row of [`SETTINGS`].
+pub(crate) type Pending = BTreeMap<usize, Edit>;
+
+/// What a row shows with `edit` pending: its value, and where that value
+/// comes from (`None` for a value that is only on the screen).
+pub(crate) fn shown_with(layers: &KeyLayers, edit: Option<&Edit>) -> (Option<Origin>, Value) {
+    match edit {
+        Some(Edit::Set(v)) => (None, v.clone()),
+        Some(Edit::Remove(level)) => {
+            let (o, v) = layers.without(*level);
+            (Some(o), v.clone())
+        }
+        None => {
+            let (o, v) = layers.winner();
+            (Some(o), v.clone())
+        }
+    }
+}
+
+/// The settings in effect with `pending` applied.
+pub(crate) fn in_effect(layers: &Layers, pending: &Pending) -> Settings {
+    let mut s = Settings::default();
+    for (i, (row, l)) in SETTINGS.iter().zip(&layers.0).enumerate() {
+        (row.set)(&mut s, shown_with(l, pending.get(&i)).1);
+    }
+    s
+}
+
+/// The popup could not be reached: the reason a change is refused.
+pub(crate) const UNREACHABLE: &str =
+    "refused: with popup.key and auto_open_after both off the popup could never open";
+
+/// The config as the session holds it: the file's layers for this target,
+/// and what has been changed on the screen since.
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigState {
     /// Where the file is; `None` when there is nowhere to save it.
@@ -859,6 +891,7 @@ pub(crate) struct ConfigState {
     pub(crate) layers: Layers,
     /// How many warnings the file produced, for the screen's header.
     pub(crate) warnings: usize,
+    pub(crate) pending: Pending,
 }
 
 impl ConfigState {
@@ -868,6 +901,7 @@ impl ConfigState {
             target: target.to_owned(),
             layers: resolved.layers.clone(),
             warnings: resolved.warnings.len(),
+            pending: Pending::new(),
         }
     }
 
@@ -877,7 +911,51 @@ impl ConfigState {
     }
 
     pub(crate) fn in_effect(&self) -> Settings {
-        self.layers.settings()
+        in_effect(&self.layers, &self.pending)
+    }
+
+    /// Row `i` as the screen shows it: where its value comes from, the
+    /// value, and whether it is changed and not saved.
+    pub(crate) fn shown(&self, i: usize) -> (Option<Origin>, Value, bool) {
+        let edit = self.pending.get(&i);
+        let (origin, value) = shown_with(&self.layers.0[i], edit);
+        (origin, value, edit.is_some())
+    }
+
+    /// `next` instead of the pending edits, unless it leaves the popup
+    /// unreachable. Returns the settings now in effect.
+    fn commit(&mut self, next: Pending) -> Result<Settings, String> {
+        let s = in_effect(&self.layers, &next);
+        if s.unreachable() {
+            return Err(UNREACHABLE.to_string());
+        }
+        self.pending = next;
+        Ok(s)
+    }
+
+    /// Row `i` set to `value` on the screen. Setting it back to what the
+    /// file says is no change at all.
+    pub(crate) fn set(&mut self, i: usize, value: Value) -> Result<Settings, String> {
+        let mut next = self.pending.clone();
+        if *self.layers.0[i].winner().1 == value {
+            next.remove(&i);
+        } else {
+            next.insert(i, Edit::Set(value));
+        }
+        self.commit(next)
+    }
+
+    /// `x` on row `i`: an unsaved change is dropped; otherwise the value is
+    /// marked for removal at the level it came from.
+    pub(crate) fn reset(&mut self, i: usize) -> Result<Settings, String> {
+        let mut next = self.pending.clone();
+        if next.remove(&i).is_none() {
+            let Some(level) = self.layers.0[i].winner().0.level() else {
+                return Err("already the default".to_string());
+            };
+            next.insert(i, Edit::Remove(level));
+        }
+        self.commit(next)
     }
 }
 
@@ -1366,5 +1444,56 @@ mod tests {
             };
             assert_eq!(parse_text(s.shape, &text), Ok(v), "{}", s.key());
         }
+    }
+
+    // ---- the screen's edits ----
+
+    fn state(text: &str) -> ConfigState {
+        ConfigState::new(None, "t", &resolve(Some(text), "t"))
+    }
+
+    #[test]
+    fn an_edit_is_in_effect_and_marked_until_it_is_set_back() {
+        let mut c = state("");
+        let row = at("recovery.rebuild_after");
+        let s = c.set(row, Value::Duration(Some(d(30)))).unwrap();
+        assert_eq!(s.rebuild_after, d(30));
+        assert_eq!(c.shown(row), (None, Value::Duration(Some(d(30))), true));
+        c.set(row, Value::Duration(Some(d(20)))).unwrap();
+        assert_eq!(
+            c.shown(row),
+            (Some(Origin::Default), Value::Duration(Some(d(20))), false)
+        );
+    }
+
+    #[test]
+    fn x_removes_at_the_level_the_value_came_from() {
+        let mut c = state("[popup]\nlinger = \"5s\"\n[host.\"t\"]\npopup.linger = \"7s\"\n");
+        let row = at("popup.linger");
+        let s = c.reset(row).unwrap();
+        assert_eq!(s.linger, d(5), "the global shows through");
+        assert_eq!(c.pending.get(&row), Some(&Edit::Remove(Level::Host)));
+        assert_eq!(c.shown(row).0, Some(Origin::Global));
+        // x again drops the unsaved removal.
+        c.reset(row).unwrap();
+        assert!(c.pending.is_empty());
+        let mut c = state("");
+        assert!(c.reset(row).is_err(), "x on a default");
+    }
+
+    #[test]
+    fn a_change_that_leaves_the_popup_unreachable_is_refused() {
+        let mut c = state("[popup]\nkey = \"off\"\n");
+        assert_eq!(
+            c.set(AUTO_OPEN, Value::Duration(None)),
+            Err(UNREACHABLE.to_string())
+        );
+        assert!(c.pending.is_empty());
+        // Reached by x: the host's key override removed leaves the global off.
+        let mut c = state(
+            "[popup]\nkey = \"off\"\nauto_open_after = \"off\"\n\
+             [host.\"t\"]\npopup.key = \"ctrl-]\"\n",
+        );
+        assert_eq!(c.reset(POPUP_KEY), Err(UNREACHABLE.to_string()));
     }
 }
