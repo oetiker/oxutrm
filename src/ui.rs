@@ -670,6 +670,7 @@ impl Ui {
         if let Some(key) = self.key
             && bytes.first() == Some(&key)
             && self.selector.rename().is_none()
+            && !self.selector.pasting()
         {
             if !self.lobby {
                 self.mode = Mode::Closed;
@@ -741,34 +742,12 @@ impl Ui {
     }
 
     /// A paste's text up to its end, if the end is in `bytes`: into an open
-    /// field, or nowhere. Returns what follows the end. The start of an end
-    /// marker that the read stops in is kept in `pasting` until the next read
-    /// says whether it was one.
+    /// field, or nowhere. Returns what follows the end.
     fn paste<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
-        for (i, &b) in bytes.iter().enumerate() {
-            let matched = self.pasting.unwrap_or(0);
-            if b == PASTE_END[matched] {
-                if matched + 1 == PASTE_END.len() {
-                    self.pasting = None;
-                    return &bytes[i + 1..];
-                }
-                self.pasting = Some(matched + 1);
-                continue;
-            }
-            // What looked like the end's beginning was text after all. Only
-            // its ESC can begin the end again: the marker has no other
-            // overlap with itself.
-            for &h in &PASTE_END[..matched] {
-                self.paste_byte(h);
-            }
-            if b == PASTE_END[0] {
-                self.pasting = Some(1);
-            } else {
-                self.pasting = Some(0);
-                self.paste_byte(b);
-            }
-        }
-        &bytes[bytes.len()..]
+        let mut pasting = self.pasting;
+        let rest = paste_through(&mut pasting, bytes, |b| self.paste_byte(b));
+        self.pasting = pasting;
+        rest
     }
 
     /// One byte of a paste: into the field, if one is open. `type_byte`
@@ -969,10 +948,48 @@ impl Ui {
     }
 }
 
-/// The key an escape sequence stands for on the config screen, and how many
-/// bytes after the ESC the sequence took. Only the arrows mean anything; any
-/// other sequence is skipped whole. A bracketed paste's start is `None` too,
-/// with its five bytes used: the caller tells it from the rest by looking.
+/// A bracketed paste's text, read up to its end if the end is in `bytes`:
+/// each byte goes to `sink`, and what follows the end is returned.
+/// `pasting` is how many bytes of the end marker the last read finished on:
+/// `Some` while a paste is open, `None` once its end has arrived. A read
+/// that stops inside the end marker leaves it to the next read to say
+/// whether it was one.
+pub(crate) fn paste_through<'a>(
+    pasting: &mut Option<usize>,
+    bytes: &'a [u8],
+    mut sink: impl FnMut(u8),
+) -> &'a [u8] {
+    for (i, &b) in bytes.iter().enumerate() {
+        let matched = pasting.unwrap_or(0);
+        if b == PASTE_END[matched] {
+            if matched + 1 == PASTE_END.len() {
+                *pasting = None;
+                return &bytes[i + 1..];
+            }
+            *pasting = Some(matched + 1);
+            continue;
+        }
+        // What looked like the end's beginning was text after all. Only its
+        // ESC can begin the end again: the marker has no other overlap with
+        // itself.
+        for &h in &PASTE_END[..matched] {
+            sink(h);
+        }
+        if b == PASTE_END[0] {
+            *pasting = Some(1);
+        } else {
+            *pasting = Some(0);
+            sink(b);
+        }
+    }
+    &bytes[bytes.len()..]
+}
+
+/// The key an escape sequence stands for on the config screen and the
+/// selector, and how many bytes after the ESC the sequence took. Only the
+/// arrows mean anything; any other sequence is skipped whole. A bracketed
+/// paste's start is `None` too, with its five bytes used: the caller tells
+/// it from the rest by looking, and reads the paste with [`paste_through`].
 pub(crate) fn escape(tail: &[u8]) -> (Option<Key>, usize) {
     match tail {
         [b'[' | b'O', b'A', ..] => (Some(Key::Up), 2),
@@ -1260,7 +1277,7 @@ mod tests {
         for (key, want) in [(b's', Command::SendHeld), (b'd', Command::DropHeld)] {
             assert_eq!(
                 confirming_at(t).keys(&[key], Phase::Confirming, t + ANSWER_GUARD),
-                command(want.clone())
+                command(want)
             );
             assert_eq!(
                 auto_at(t).keys(&[key], silent(t), t),
@@ -1268,9 +1285,14 @@ mod tests {
                 "{} was honoured under an outage",
                 key as char
             );
-            // On a live link `s` opens the selector: it is never `SendHeld`.
-            assert_ne!(open_at(t).keys(&[key], Phase::Live, t), command(want));
         }
+        // On a live link `s` opens the selector and `d` only touches the
+        // popup: neither is ever an answer to a question that is not up.
+        assert_eq!(
+            open_at(t).keys(b"s", Phase::Live, t),
+            command(Command::Ask(crate::switcher::Ask::Sessions))
+        );
+        assert_eq!(open_at(t).keys(b"d", Phase::Live, t), Routed::default());
     }
 
     #[test]
@@ -2414,5 +2436,21 @@ mod tests {
         assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
         assert_eq!(ui.mode(), Mode::Sessions);
         assert_eq!(ui.selector().rename(), Some("build"));
+    }
+
+    /// A paste on the selector is text, never keys: an `n` in it asks for
+    /// nothing, and the popup key in it, at the start of a later read of
+    /// the same paste, does not close the selector.
+    #[test]
+    fn a_paste_on_the_selector_is_neither_a_command_nor_a_close() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        assert_eq!(ui.keys(b"\x1b[200~n\r", Phase::Live, t), Routed::default());
+        assert_eq!(ui.keys(&[PREFIX, b'j'], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Sessions);
+        assert_eq!(ui.keys(b"\x1b[201~", Phase::Live, t), Routed::default());
+        assert_eq!(ui.selector().cursor(), 1, "nothing in the paste moved it");
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed, "after the paste, the key closes");
     }
 }

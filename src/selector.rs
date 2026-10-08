@@ -85,10 +85,16 @@ pub(crate) struct Selector {
     loading: bool,
     /// The question up, and when it was asked, for [`ANSWER_GUARD`].
     question: Option<(Question, Instant)>,
-    /// The name being typed for the cursor's row, while `r` is open.
-    rename: Option<Field>,
+    /// The session being renamed and the name being typed for it, while
+    /// `r` is open. The id, not the cursor: a refetch can move the rows.
+    rename: Option<(SessionId, Field)>,
     /// The line under the list: why something was refused or failed.
     note: Option<String>,
+    /// Inside a bracketed paste whose end has not arrived yet, and how many
+    /// bytes of that end the last read finished on (see
+    /// [`crate::ui::paste_through`]). A paste is never a command: its text
+    /// goes into the rename field, or nowhere.
+    pasting: Option<usize>,
 }
 
 impl Selector {
@@ -104,8 +110,21 @@ impl Selector {
     /// A fetched list. Ordered by start time, `+ new session` last. The
     /// first after opening puts the selection on `this`, else the first
     /// row; a later one keeps it on the same session if it is still there.
+    /// A rename whose session is no longer listed ends, and the line under
+    /// the list says so.
     pub(crate) fn set_rows(&mut self, mut rows: Vec<SessionEntry>) {
         rows.sort_by_key(|e| e.created_unix);
+        if let Some((id, _)) = &self.rename
+            && !rows.iter().any(|e| e.id == *id)
+        {
+            let gone = self
+                .rows
+                .iter()
+                .find(|e| e.id == *id)
+                .map_or_else(|| id.short(), label);
+            self.note = Some(format!("{gone} has ended; it was not renamed"));
+            self.rename = None;
+        }
         let at = match (self.loading, self.selected()) {
             (true, _) => rows.iter().position(|e| e.this).unwrap_or(0),
             (false, Some(id)) => rows
@@ -144,7 +163,7 @@ impl Selector {
 
     /// The name being typed, while `r` is open.
     pub(crate) fn rename(&self) -> Option<&str> {
-        self.rename.as_ref().map(Field::as_str)
+        self.rename.as_ref().map(|(_, f)| f.as_str())
     }
 
     pub(crate) fn note(&self) -> Option<&str> {
@@ -156,21 +175,36 @@ impl Selector {
         self.rows.get(self.cursor).map(|e| e.id)
     }
 
+    /// Inside a paste whose end has not arrived yet: the popup key in it
+    /// is text, not a close.
+    pub(crate) fn pasting(&self) -> bool {
+        self.pasting.is_some()
+    }
+
     /// One read's bytes. Stops at the first key that produces an [`Out`]:
     /// the rest of the read is dropped, as on the popup.
     pub(crate) fn keys(&mut self, bytes: &[u8], ctx: Ctx, now: Instant) -> Option<Out> {
         // A note lasts until the next read.
         self.note = None;
         let lone_esc = bytes == [ESC];
-        let mut rest = bytes;
+        // The rest of a paste that began in an earlier read is the paste's.
+        let mut rest = match self.pasting {
+            Some(_) => self.paste(bytes),
+            None => bytes,
+        };
         while let Some((&b, tail)) = rest.split_first() {
             let key = if b == ESC && !lone_esc {
                 let (key, used) = crate::ui::escape(tail);
                 rest = &tail[used..];
                 match key {
                     Some(k) => k,
-                    // Any other sequence -- a function key, a paste's
-                    // markers -- means nothing here.
+                    None if tail.starts_with(b"[200~") => {
+                        self.pasting = Some(0);
+                        rest = self.paste(rest);
+                        continue;
+                    }
+                    // Any other sequence -- a function key -- means
+                    // nothing here.
                     None => continue,
                 }
             } else {
@@ -182,6 +216,18 @@ impl Selector {
             }
         }
         None
+    }
+
+    /// A paste's text up to its end: typed into the rename field, control
+    /// characters dropped so a pasted newline never saves; anywhere else,
+    /// dropped. Returns what follows the end.
+    fn paste<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        let field = &mut self.rename;
+        crate::ui::paste_through(&mut self.pasting, bytes, |b| {
+            if let Some((_, f)) = field.as_mut() {
+                f.type_byte(b);
+            }
+        })
     }
 
     /// One key.
@@ -205,7 +251,7 @@ impl Selector {
                 } else {
                     let mut field = Field::default();
                     field.set(row.name.as_ref().map(Name::to_string).unwrap_or_default());
-                    self.rename = Some(field);
+                    self.rename = Some((row.id, field));
                 }
             }
             Key::Byte(b'x') => {
@@ -290,12 +336,11 @@ impl Selector {
     /// editing. `⏎` saves -- nothing typed clears the name -- and `Esc`
     /// cancels.
     fn rename_key(&mut self, key: Key, ctx: Ctx) -> Option<Out> {
-        let selected = self.selected();
-        let field = self.rename.as_mut()?;
+        let (id, field) = self.rename.as_mut()?;
+        let id = *id;
         match key {
             Key::Byte(ESC) => self.rename = None,
             Key::Byte(b'\r' | b'\n') => {
-                let id = selected?;
                 let text = field.as_str().trim().to_string();
                 let name = if text.is_empty() {
                     None
@@ -664,6 +709,63 @@ mod tests {
         rows.retain(|e| e.id != id(LOGS) && e.id != id(FISH));
         s.set_rows(rows);
         assert_eq!(s.cursor(), 1, "the + new session row");
+    }
+
+    #[test]
+    fn a_paste_is_never_a_command() {
+        let t = Instant::now();
+        let mut s = opened(three());
+        assert_eq!(s.keys(b"\x1b[200~nj\r\x1b[201~", LIVE, t), None);
+        assert_eq!(s.cursor(), 1, "j inside the paste moved nothing");
+        // A paste cut across reads, its end marker too.
+        assert_eq!(s.keys(b"\x1b[200~n", LIVE, t), None);
+        assert_eq!(s.keys(b"jx\r\x1b[2", LIVE, t), None);
+        assert!(s.question().is_none());
+        assert_eq!(s.keys(b"01~j", LIVE, t), None);
+        assert_eq!(s.cursor(), 2, "after the paste, j moves again");
+    }
+
+    #[test]
+    fn a_paste_while_renaming_is_typed_and_its_newline_does_not_save() {
+        let t = Instant::now();
+        let mut s = opened(three());
+        s.keys(b"r", LIVE, t);
+        assert_eq!(s.keys(b"\x1b[200~-c\ri\x1b[201~", LIVE, t), None);
+        assert_eq!(s.rename(), Some("build-ci"), "control characters dropped");
+        assert_eq!(
+            s.keys(b"\r", LIVE, t),
+            Some(Out::Ask(Ask::Rename {
+                id: id(BUILD),
+                name: Some(Name::parse("build-ci").unwrap())
+            }))
+        );
+    }
+
+    #[test]
+    fn a_rename_stays_on_its_session_through_a_refetch_or_ends_with_it() {
+        let t = Instant::now();
+        let mut s = opened(three());
+        s.keys(b"jr", LIVE, t);
+        assert_eq!(s.rename(), Some("logs"));
+        // `a3f9c01e` was killed elsewhere: the rows shift, the rename does not.
+        let mut rows = three();
+        rows.remove(1);
+        s.set_rows(rows);
+        s.keys(b"\x7f\x7f\x7f\x7ftail", LIVE, t);
+        assert_eq!(
+            s.keys(b"\r", LIVE, t),
+            Some(Out::Ask(Ask::Rename {
+                id: id(LOGS),
+                name: Some(Name::parse("tail").unwrap())
+            }))
+        );
+        // The session being renamed is gone: so is its rename.
+        s.keys(b"r", LIVE, t);
+        let mut rows = three();
+        rows.retain(|e| e.id != id(LOGS));
+        s.set_rows(rows);
+        assert_eq!(s.rename(), None);
+        assert!(s.note().unwrap().contains("logs"), "{:?}", s.note());
     }
 
     #[test]
