@@ -558,7 +558,7 @@ mod tests {
     /// A size no screen can be built at must fail the ATTACH, not the session.
     ///
     /// `ScreenState::blank` refuses anything past I7's bounds, and the caller
-    /// that builds one on a REATTACH is [`crate::session::HostSession::adopt`]
+    /// that builds one on a REATTACH is [`crate::host_session::HostSession::adopt`]
     /// — which runs after the old link has been closed and replaced, and whose
     /// `?` propagates out of `run_with_attaches` and takes a running shell with
     /// it. The exchange is where that has to be caught: it is the last point

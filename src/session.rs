@@ -1,4 +1,5 @@
-//! The two loops that make a remote terminal.
+//! The two loops that make a remote terminal. The host's lives in
+//! `host_session.rs`; this module keeps the client's and what both share.
 //!
 //! ```text
 //!   host:    PTY -> HostTerm -> Sender<ScreenState> -> QUIC
@@ -58,7 +59,6 @@ use oxutrm_client::{
 };
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
-use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
 use crate::config::{ConfigState, Settings, Value};
@@ -73,7 +73,7 @@ use crate::view::{ConfigFacts, Facts, Identity, RebuildFacts, StandbyFacts};
 ///
 /// Short enough that a keystroke is never sitting in a buffer, long enough
 /// that an idle session costs nothing.
-const IDLE_POLL: Duration = Duration::from_millis(4);
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(4);
 
 /// How long [`ClientSession::drain`] will keep taking frames off a closed
 /// link before handing the user their prompt back.
@@ -82,31 +82,6 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// reached in practice. It exists so that a reader task which somehow outlives
 /// its connection cannot hold a person's terminal hostage.
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
-
-/// How long the host keeps building frames for a client it has not heard from.
-///
-/// **This is the guarantee quinn used to provide and no longer does.** Until
-/// phase 2 the host asked `close_reason()`, which answered once the transport's
-/// 30 s idle timeout had fired. `max_idle_timeout` is `None` now, so
-/// `close_reason()` stays `None` for ever on a silent peer and the question has
-/// to be answered from a clock of our own.
-///
-/// Thirty seconds, so the behaviour is unchanged by construction: it is
-/// exactly what quinn enforced before -- with one difference. Quinn's idle
-/// timer was reset by *any* transport activity, including the 10 s
-/// keep-alive, so a client whose quinn stack kept answering keep-alives while
-/// its application loop was wedged used to stay attached for ever. `last_heard`
-/// moves only on an application frame, so that peer now detaches at 30 s
-/// instead -- a stricter and more honest reading of "still there". Six times
-/// `HEARTBEAT_IDLE`, so an attached client that is merely quiet is nowhere
-/// near it -- it heartbeats at 0.2 Hz and every heartbeat is a frame.
-///
-/// Detaching closes nothing. It stops snapshotting and stops offering frames;
-/// the pty is still drained and the emulator still fed, because the screen being
-/// current on reattach is the whole reason a detached session keeps emulating.
-/// A peer that comes back is heard on its first frame and `screen_stale` forces
-/// the snapshot.
-pub const DETACH_AFTER: Duration = Duration::from_secs(30);
 
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
@@ -136,620 +111,6 @@ pub struct Turn {
     /// Reported rather than inferred: "no frame was sent" is also what a
     /// paced turn looks like, and the two are not the same thing.
     pub detached: bool,
-}
-
-/// The remote half: owns the PTY and the authoritative screen.
-pub struct HostSession {
-    term: HostTerm,
-    screen_tx: oxutrm_sync::Sender<ScreenState>,
-    input_rx: Receiver<InputState>,
-    link: Link,
-    size: TermSize,
-    last_send: Option<Instant>,
-    /// How much of the receiver's pending input has already gone to the PTY.
-    /// See [`HostSession::drain_input`].
-    written: usize,
-    /// The emulator moved while nobody was attached, so the snapshot the
-    /// sender holds is older than the screen. Forces one snapshot on the
-    /// turn a peer comes back, whether or not the pty moved on that turn.
-    screen_stale: bool,
-    /// The last time anything arrived from the client. The host's own liveness
-    /// clock, because `close_reason()` stopped being one when the transport's
-    /// idle timeout went. See [`DETACH_AFTER`].
-    last_heard: Instant,
-}
-
-impl HostSession {
-    /// Start a shell and serve it over `link`.
-    ///
-    /// `TERM` and `COLORTERM` come from [`oxutrm_term::negotiate_term`], which
-    /// takes no arguments on purpose.
-    pub fn spawn(
-        shell: &str,
-        size: TermSize,
-        scrollback: usize,
-        link: Link,
-    ) -> Result<HostSession> {
-        let (term_name, colorterm) = oxutrm_term::negotiate_term();
-        let mut env = vec![("TERM".to_owned(), term_name)];
-        if let Some(ct) = colorterm {
-            env.push(("COLORTERM".to_owned(), ct));
-        }
-
-        let term = HostTerm::spawn(shell, &[], &env, size, scrollback)
-            .context("starting the shell on a pty")?;
-        let blank = ScreenState::blank(size.rows, size.cols)?;
-        let empty = InputState {
-            seq: 1,
-            pending: Vec::new(),
-            size,
-        };
-
-        Ok(HostSession {
-            term,
-            screen_tx: oxutrm_sync::Sender::new(blank),
-            input_rx: Receiver::new(empty),
-            link,
-            size,
-            last_send: None,
-            written: 0,
-            screen_stale: false,
-            // An attach has just completed and R5 obliges the client to send
-            // immediately, so "now" is true rather than optimistic.
-            last_heard: Instant::now(),
-        })
-    }
-
-    /// One turn: apply whatever arrived, drain the PTY, offer a frame.
-    pub fn turn(&mut self) -> Result<Turn> {
-        self.turn_at(Instant::now(), None)
-    }
-
-    /// [`HostSession::turn`], plus a frame the caller has already taken off
-    /// the source.
-    ///
-    /// `run`'s select has to *receive* a frame to know one arrived, so it
-    /// arrives holding one; `try_recv` below would never see it and the
-    /// keystrokes in it would be silently dropped.
-    pub fn turn_with(&mut self, first: Option<Frame>) -> Result<Turn> {
-        self.turn_at(Instant::now(), first)
-    }
-
-    /// [`HostSession::turn_with`], with the clock injected.
-    ///
-    /// The clock is a parameter for the same reason it is one throughout
-    /// `LinkState` and `ClientSession::note_heard`: [`DETACH_AFTER`] is thirty
-    /// seconds, and a threshold that can only be tested by sleeping thirty
-    /// seconds is a threshold nobody tests.
-    pub fn turn_at(&mut self, now: Instant, mut first: Option<Frame>) -> Result<Turn> {
-        let mut turn = Turn::default();
-
-        // ---- inbound: the client's keystrokes ------------------------------
-        // (the size the client wants rides on the same diff, and is applied
-        // below once the frames have been taken in)
-        while let Some(frame) = first.take().or_else(|| self.link.source.try_recv()) {
-            // Any frame at all is evidence of a peer, including one `on_frame`
-            // rejects: a stale sequence number says the client is behind, not
-            // that it is gone.
-            self.last_heard = now;
-            // A rejected frame is not a disconnection: the state and the ack
-            // are both untouched, and the peer's next diff will apply.
-            match self.input_rx.on_frame(&frame) {
-                Ok(true) => {
-                    turn.applied += 1;
-                    self.drain_input()?;
-                }
-                Ok(false) => {}
-                // Not a disconnection, but not nothing either: a BaseMismatch
-                // is the peer diffing from a base we do not hold, and silence
-                // here once hid a deadlock for a whole day.
-                Err(e) => {
-                    turn.rejected += 1;
-                    #[cfg_attr(
-                        not(test),
-                        expect(
-                            clippy::print_stderr,
-                            reason = "the host daemon's own stderr, from turn_at on \
-                                      HostSession; never a client's screen"
-                        )
-                    )]
-                    {
-                        eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
-                    }
-                }
-            }
-        }
-
-        // The client's requested size arrives on the input diff. This has to
-        // live in `turn` rather than in `run`, or a caller driving the loop
-        // itself - which is every test, and will be M3's reattach path -
-        // silently never resizes.
-        let wanted = self.input_rx.state().size;
-        if wanted != self.size && wanted.cols > 0 && wanted.rows > 0 {
-            self.resize(wanted)?;
-        }
-
-        // ---- is anyone listening? -------------------------------------------
-        // A detached session must keep DRAINING the pty below - a child whose
-        // output nobody reads fills the buffer and blocks forever - and must
-        // keep feeding the emulator, because the whole point of a detachable
-        // session is that the screen is current when you come back. But
-        // everything after that exists only to build a frame for a peer, and
-        // there is no peer.
-        //
-        // Measured: a detached session whose child was writing five lines a
-        // second burned 17-20% of a core doing exactly that, for a screen
-        // nobody would ever see. Quiet ones cost 1.2%, which is why this hid.
-        //
-        // Two questions, and since phase 2 they have different answers.
-        // `close_reason` still catches a peer that closed properly or a
-        // transport error -- both are immediate and certain. What it no longer
-        // catches is silence: `max_idle_timeout` is `None`, so quinn will hold
-        // a connection to a peer that vanished for ever, and this used to read
-        // "turns off only once quinn has given the connection up".
-        //
-        // So the recency window is what answers it now. Generous on purpose:
-        // during a blip the connection is open and we WANT the work to
-        // continue, so the session resumes instantly when the peer comes back.
-        // `DETACH_AFTER` is six times the client's heartbeat interval.
-        let closed = self.link.sink.connection().close_reason().is_some();
-        let quiet_too_long = now.duration_since(self.last_heard) >= DETACH_AFTER;
-        let attached = !closed && !quiet_too_long;
-        turn.detached = !attached;
-
-        // ---- the terminal --------------------------------------------------
-        let moved = self.term.poll().context("draining the pty")?;
-        if attached {
-            if moved || self.screen_stale {
-                // The sequence number is a placeholder; `update` mints the real
-                // one, keeping numbering in exactly one place.
-                let snapshot = self.term.snapshot(1);
-                self.screen_tx.update(snapshot);
-                self.screen_stale = false;
-            }
-        } else if moved {
-            self.screen_stale = true;
-        }
-
-        // ---- outbound: the screen ------------------------------------------
-        if attached {
-            turn.sent = self.offer_frame();
-        }
-        turn.exited = self.term.child_exited();
-        Ok(turn)
-    }
-
-    /// Write newly acknowledged input to the PTY, exactly once.
-    ///
-    /// The receiver's `pending` holds bytes until the client's next diff trims
-    /// them, so a loop that wrote all of `pending` on every turn would send
-    /// the same keystrokes to the shell repeatedly. `written` tracks how much
-    /// of the current `pending` has already gone out, and the client's
-    /// `consumed` count is what shrinks it back.
-    fn drain_input(&mut self) -> Result<()> {
-        let pending = self.input_rx.state().pending.clone();
-        // A diff that consumed from the front makes `pending` shorter; the
-        // offset has to shrink with it or we would skip real input.
-        if self.written > pending.len() {
-            self.written = pending.len();
-        }
-        if self.written < pending.len() {
-            let fresh = pending[self.written..].to_vec();
-            self.term
-                .write_input(&fresh)
-                .context("writing to the pty")?;
-            self.written = pending.len();
-        }
-        Ok(())
-    }
-
-    /// The frame the current state owes the peer, if any, and the bookkeeping
-    /// that says it has been offered.
-    ///
-    /// Split out from [`HostSession::offer_frame`] so the two ways of putting
-    /// it on the wire — paced and unreliable, or final and reliable — differ
-    /// only in the sending, never in what is sent.
-    fn next_frame(&mut self) -> Option<Frame> {
-        self.screen_tx.on_ack(self.input_rx.peer_ack());
-        match self.screen_tx.make_frame(self.input_rx.ack()) {
-            Ok(Some(f)) => {
-                self.last_send = Some(Instant::now());
-                Some(f)
-            }
-            // Nothing to send, or a diff that could not be built. Neither ends
-            // the session.
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    fn offer_frame(&mut self) -> Option<SendOutcome> {
-        if !self.due() {
-            return None;
-        }
-        let frame = self.next_frame()?;
-        Some(self.link.sink.send(&frame))
-    }
-
-    /// [`HostSession::offer_frame`], on a stream that is finished and
-    /// acknowledged before this returns.
-    ///
-    /// For the last frame of a session only. See [`crate::link::FrameSink::send_final`].
-    async fn offer_frame_reliably(&mut self) -> Option<SendOutcome> {
-        if !self.due() {
-            return None;
-        }
-        let frame = self.next_frame()?;
-        Some(self.link.sink.send_final(&frame).await)
-    }
-
-    fn due(&self) -> bool {
-        match self.last_send {
-            // Idle: go now rather than waiting out an interval.
-            None => true,
-            Some(t) => t.elapsed() >= self.link.sink.pacing_interval(),
-        }
-    }
-
-    /// Resize the PTY and the emulator. The next diff carries it.
-    pub fn resize(&mut self, size: TermSize) -> Result<()> {
-        if size == self.size {
-            return Ok(());
-        }
-        self.term.resize(size).context("resizing the pty")?;
-        self.size = size;
-        Ok(())
-    }
-
-    /// Run until the child exits, waiting on descriptors rather than polling.
-    ///
-    /// A thin wrapper over [`HostSession::run_with_attaches`], with a receiver
-    /// whose sender has already been dropped. `Some(a) = attaches.recv()`
-    /// makes a closed receiver disable that arm rather than make it hot — see
-    /// `run_with_attaches`' own note — so this costs nothing and every
-    /// existing caller and test is unchanged.
-    pub async fn run(&mut self) -> Result<i32> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        // Dropped, not merely unnamed. `let (_tx, ...)` binds the sender for
-        // the whole `await`, which leaves an open-and-empty channel whose
-        // `recv()` pends for ever — the behaviour is the same, but it is not
-        // the mechanism the sentence above describes, and it means the arm
-        // that `Some(a) = ...` is there to disable is never actually
-        // disabled by anything `run` does.
-        drop(tx);
-        self.run_with_attaches(&mut rx).await
-    }
-
-    /// [`HostSession::run`], plus a second inbound connection completing an
-    /// attach exchange elsewhere in the process. Carries the whole
-    /// [`crate::attach_exchange::Attached`] rather than just the [`Link`],
-    /// because [`HostSession::adopt`] needs the size and
-    /// [`HostSession::on_attached`] the role: a primary is adopted at once, a
-    /// standby is parked until the client's first frame arrives on it.
-    ///
-    /// The descriptors are duplicated out of the terminal before the loop so
-    /// the arms borrow locals rather than `self`, which is what lets the body
-    /// call `&mut self` methods afterwards (C1). A `dup` shares the file
-    /// description, harmless here in a way it is NOT for the client's
-    /// keyboard: this description is ours and we set its `O_NONBLOCK`
-    /// ourselves in `Pty::spawn`.
-    pub async fn run_with_attaches(
-        &mut self,
-        attaches: &mut tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
-    ) -> Result<i32> {
-        let output = self.term.output_fd().try_clone_to_owned()?;
-        let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
-            .context("waiting on the pty")?;
-        let exit = match self.term.exit_wake().as_fd() {
-            Some(fd) => Some(
-                tokio::io::unix::AsyncFd::with_interest(
-                    fd.try_clone_to_owned()?,
-                    tokio::io::Interest::READABLE,
-                )
-                .context("waiting on the child")?,
-            ),
-            // Already gone when it was watched. The first turn below reports
-            // the exit before anything waits, so there is nothing to miss.
-            None => None,
-        };
-
-        // A frame taken off the source by the select, owed to the next turn.
-        let mut pending: Option<Frame> = None;
-        // The client's parked standby (spec §3.5): a link held, not used,
-        // until the client's first frame arrives on it. A local rather than a
-        // field so the arm watching it borrows the loop, not `self` (C1).
-        let mut standby: Option<Link> = None;
-        // A standby whose first frame has arrived, owed to the next turn with
-        // that frame. `promote_standby` does the reset and the feed together,
-        // in that order.
-        let mut promote: Option<(Link, Frame)> = None;
-        // The exit wake fired but `child_exited` disagreed. It is edge
-        // triggered and will not fire twice, so re-check on a timer instead of
-        // trusting the hint — the same rule that keeps PTY EOF out of this.
-        let mut recheck_child = false;
-
-        loop {
-            let turn = match (promote.take(), pending.take()) {
-                // `pending` is always empty here: a lap sets one or the other.
-                (Some((link, first)), _) => self
-                    .promote_standby(link, first)
-                    .context("switching to the standby")?,
-                (None, None) => self.turn()?,
-                (None, Some(frame)) => self.turn_with(Some(frame))?,
-            };
-            if let Some(code) = turn.exited {
-                // Closed, not dropped: its control server holds the
-                // connection open for as long as it is not.
-                if let Some(parked) = standby.take() {
-                    close_as_exited(parked.sink.connection(), code);
-                }
-                self.finish(code).await;
-                return Ok(code);
-            }
-
-            // Bytes are still in the PTY buffer, and readiness for them has
-            // already been delivered. Go round again rather than sleeping on
-            // an edge that will not come.
-            //
-            // Honest about its status: NO test currently fails without this.
-            // Removing it leaves the suite green, because a child that has
-            // more to write supplies another edge when it writes, and the exit
-            // wake supplies the last one. What it removes is a staleness
-            // window - a detached session whose child bursts and then falls
-            // quiet would hold an emulator behind the child until something
-            // else happened, and the screen being current on reattach is the
-            // whole reason a detached session keeps emulating at all. It is
-            // kept as the cheap half of a guarantee whose expensive half
-            // (`READ_BUDGET` versus the kernel's PTY buffer) is not ours.
-            if self.term.more_output_waiting() {
-                continue;
-            }
-
-            // Armed only when a frame is owed but paced out, so a session with
-            // nothing to say holds no timer at all. `due()` goes true on the
-            // lap after it fires, which is what stops it re-arming for ever.
-            let mut deadline = if self.due() {
-                None
-            } else {
-                Some(tokio::time::Instant::now() + self.link.sink.pacing_interval())
-            };
-            if std::mem::take(&mut recheck_child) {
-                let at = tokio::time::Instant::now() + IDLE_POLL;
-                deadline = Some(deadline.map_or(at, |d| d.min(at)));
-            }
-
-            // Nothing here touches `self`; every borrow starts after the
-            // select expression has ended and dropped these futures (C1).
-            //
-            // There is deliberately NO `conn.closed()` arm. A closed
-            // connection is permanently ready, so an arm watching one would
-            // spin — and the host must not end the session anyway, since
-            // outliving a vanished client is the entire point. `turn` re-reads
-            // `close_reason` whenever something else wakes it, which is
-            // exactly when the answer can matter.
-            let wake: HostWake = tokio::select! {
-                r = output.readable() => match r {
-                    // Cleared HERE, having just established above that the PTY
-                    // came up empty. Read-then-clear is the ordering `try_io`
-                    // uses, and clearing while bytes remain would stall the
-                    // screen until the child happened to write again.
-                    Ok(mut g) => { g.clear_ready(); HostWake::Pty }
-                    Err(e) => return Err(e).context("waiting on the pty"),
-                },
-                r = async { exit.as_ref().expect("armed").readable().await }, if exit.is_some() => match r {
-                    Ok(mut g) => { g.clear_ready(); HostWake::Exit }
-                    Err(e) => return Err(e).context("waiting on the child"),
-                },
-                Some(frame) = self.link.source.recv() => HostWake::Frame(frame),
-                () = async { tokio::time::sleep_until(deadline.expect("armed")).await },
-                    if deadline.is_some() => HostWake::Due,
-                // A closed mpsc receiver (the `run()` wrapper's, forever)
-                // yields `None` immediately, and `Some(a) = ...` disables the
-                // arm rather than making it hot — the same reason there is no
-                // `conn.closed()` arm above.
-                Some(a) = attaches.recv() => HostWake::Attached(a),
-                // A parked standby carries nothing until the client fails
-                // over onto it, so this arm is quiet until it matters. A
-                // closed one yields `None` once, and is then un-parked.
-                f = async { standby.as_mut().expect("armed").source.recv().await },
-                    if standby.is_some() => match f {
-                        Some(frame) => HostWake::StandbyFrame(frame),
-                        None => HostWake::StandbyGone,
-                    },
-            };
-
-            match wake {
-                HostWake::Frame(frame) => pending = Some(frame),
-                HostWake::Exit => recheck_child = true,
-                HostWake::Pty | HostWake::Due => {}
-                HostWake::Attached(a) => self.on_attached(a, &mut standby)?,
-                HostWake::StandbyFrame(frame) => {
-                    let link = standby.take().expect("the arm was armed");
-                    promote = Some((link, frame));
-                }
-                // Its connection is already closed, which is what ended the
-                // source; there is nothing left to close.
-                HostWake::StandbyGone => standby = None,
-            }
-        }
-    }
-
-    /// The last screen, and only then the close. `ls; exit` lives or dies here.
-    ///
-    /// Three separate things were losing it, and all three had to go:
-    ///
-    /// **The shell's last write and its exit are two events.** `turn` polls
-    /// the pty and *then* reaps the child, so a shell that printed and exited
-    /// in the same breath leaves its output in the pty buffer, unread, on the
-    /// very turn that reports the exit. One more poll collects it.
-    ///
-    /// **Pacing has nothing left to defer to.** `offer_frame` is gated by
-    /// `due()`, which at an 8 ms interval against a 4 ms poll is false on
-    /// roughly half the turns. Normally that costs one interval; here it costs
-    /// the screen, because there is no next interval. Clearing `last_send` is
-    /// what makes the final offer unconditional.
-    ///
-    /// **`close` discards whatever is still in flight.** A datagram, or a
-    /// stream whose writer task has not yet reached `open_uni`. So the final
-    /// frame goes on a stream that is finished and *acknowledged* before the
-    /// close is sent.
-    ///
-    /// Infallible on purpose: nothing here is worth reporting instead of the
-    /// status of a shell that has already exited.
-    pub async fn finish(&mut self, code: i32) {
-        if self.term.poll().unwrap_or(false) {
-            let snapshot = self.term.snapshot(1);
-            self.screen_tx.update(snapshot);
-        }
-        self.last_send = None;
-        self.offer_frame_reliably().await;
-        self.close(code);
-    }
-
-    /// Tell the client the shell is gone, and with what status.
-    ///
-    /// The exit code has no field in the protocol and needs none. QUIC's own
-    /// close carries an application error code, so the status travels on the
-    /// mechanism that *is* the end of the session rather than in a frame that
-    /// would have to arrive first — and a frame is exactly what cannot be
-    /// relied on here, since the close discards whatever is still in flight.
-    ///
-    /// A code outside `u32` cannot come from a shell; `child_exited` invents
-    /// `-1` for a child it can no longer wait on, and that becomes 255, the
-    /// same thing every shell reports for "something went wrong out here".
-    ///
-    /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
-    /// decoration. See its own note.
-    pub fn close(&self, code: i32) {
-        close_as_exited(self.link.sink.connection(), code);
-    }
-
-    /// The authoritative screen, for tests. Nothing in the session loop reads
-    /// it: the loop ships diffs and never inspects what it shipped.
-    #[allow(dead_code)]
-    pub fn screen(&self) -> &ScreenState {
-        self.screen_tx.current()
-    }
-
-    /// Swap a freshly attached link in for the current one.
-    ///
-    /// Design spec §8.5: both sync channels restart at sequence 1 and the
-    /// first datagram of the new attach is a full state. `screen_stale` is
-    /// what forces that snapshot on the next turn.
-    pub fn adopt(&mut self, link: Link, size: TermSize) -> Result<()> {
-        self.adopt_as(link, size, TAKEN_OVER)
-    }
-
-    /// [`HostSession::adopt`], closing the displaced link with `reason`:
-    /// [`TAKEN_OVER`] for a newer attach, [`SWITCHED`] for the client's own
-    /// standby.
-    pub fn adopt_as(&mut self, link: Link, size: TermSize, reason: &'static [u8]) -> Result<()> {
-        // Close the displaced connection FIRST, and say why. A displaced
-        // client that is merely dropped reports silence, which is the one
-        // thing that did not happen.
-        self.link
-            .sink
-            .connection()
-            .close(quinn::VarInt::from_u32(0), reason);
-
-        self.link = link;
-        // `resize`, not `self.size = size`. The field means "the size the
-        // terminal currently IS", and writing it directly left the emulator
-        // and the pty at the FIRST client's geometry while every frame
-        // announced the newcomer's. Nothing downstream healed it either: the
-        // `input_rx` seeded below carries this same size, so `turn_at`'s
-        // `wanted != self.size` self-heal is false on every subsequent turn
-        // and the client only re-sends a size on a window change. A newcomer
-        // on a differently-sized terminal is the common case for reattach.
-        self.resize(size)
-            .context("resizing for the second attach")?;
-
-        // §8.5. New generation, so both channels restart at 1. The screen
-        // itself is NOT reset — the emulator kept running — so the base state
-        // is blank and `screen_stale` forces the snapshot that fills it.
-        // Built from `self.size`, which the resize above has just made current
-        // (and which `resize` leaves untouched when the size did not change).
-        let blank = ScreenState::blank(self.size.rows, self.size.cols)?;
-        self.screen_tx = oxutrm_sync::Sender::new(blank);
-        self.input_rx = Receiver::new(InputState {
-            seq: 1,
-            pending: Vec::new(),
-            size,
-        });
-        self.written = 0;
-        self.last_send = None;
-        self.screen_stale = true;
-        // An attach has just completed and the client sends immediately, so
-        // "now" is true rather than optimistic — the same reasoning as `spawn`.
-        self.last_heard = Instant::now();
-        Ok(())
-    }
-
-    /// One completed attach, by role. `standby` is the loop's local slot.
-    ///
-    /// Every link this lets go of is closed, and with a reason: a dropped
-    /// link is not closed at all, because its control server holds a handle
-    /// to the connection for as long as the connection is open.
-    pub(crate) fn on_attached(
-        &mut self,
-        a: crate::attach_exchange::Attached,
-        standby: &mut Option<Link>,
-    ) -> Result<()> {
-        match a.role {
-            crate::control::Role::Primary => {
-                // A takeover. The standby belongs to the displaced client, and
-                // leaving it parked would let that client take the session back
-                // by failing over onto it, without going through ssh.
-                if let Some(old) = standby.take() {
-                    old.sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
-                }
-                self.adopt(a.link, a.client_size)
-                    .context("adopting a second attach")
-            }
-            crate::control::Role::Standby => {
-                // One slot. A newer standby supersedes the older one.
-                //
-                // Nothing checks that the client which asked for this one is
-                // still the primary's. The listener can finish a standby's
-                // exchange just after a takeover, so the displaced client's
-                // standby may land here. It does no harm: that client exits on
-                // its `TAKEN_OVER` and never sends on it. It stays parked
-                // until a standby the new client finds supersedes it, or the
-                // next primary attach drops it.
-                if let Some(old) = standby.replace(a.link) {
-                    old.sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), SUPERSEDED);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// The client has failed over: its first frame arrived on the parked
-    /// standby. Adopt the standby, then take that frame in, in one turn.
-    ///
-    /// Reset first, THEN feed. `adopt_as` restarts the input receiver at a
-    /// fresh generation, and the client's first frame after its own reset
-    /// belongs to that generation. Fed first, it would meet the old
-    /// generation's receiver, be taken for a stale frame and thrown away.
-    ///
-    /// The size is the session's current one. The client's frame carries its
-    /// real size in `InputState`, and `turn_at` reconciles it.
-    pub(crate) fn promote_standby(&mut self, link: Link, first: Frame) -> Result<Turn> {
-        let size = self.size;
-        self.adopt_as(link, size, SWITCHED)?;
-        self.turn_with(Some(first))
-    }
-}
-
-/// Close `conn` saying the shell exited, with `code` as its status.
-///
-/// A code outside `u32` cannot come from a shell; see [`HostSession::close`].
-fn close_as_exited(conn: &quinn::Connection, code: i32) {
-    let code = u32::try_from(code).unwrap_or(255);
-    conn.close(quinn::VarInt::from_u32(code), SHELL_EXITED);
 }
 
 /// What woke [`ClientSession::run_on`].
@@ -791,26 +152,6 @@ fn is_takeover(reason: &quinn::ConnectionError) -> bool {
         reason,
         quinn::ConnectionError::ApplicationClosed(closed) if closed.reason.as_ref() == TAKEN_OVER
     )
-}
-
-/// The host's half of the same idea. Separate from [`Wake`] because the two
-/// loops wake for entirely different reasons and a shared enum would give each
-/// of them variants it can never produce.
-enum HostWake {
-    /// The child wrote something.
-    Pty,
-    /// The child exited — a hint; `child_exited` is the authority.
-    Exit,
-    Frame(Frame),
-    /// A frame was owed but paced out, and the pace has come round.
-    Due,
-    /// A second attach completed. Carries the whole thing, because the
-    /// session needs the size as well as the link.
-    Attached(crate::attach_exchange::Attached),
-    /// A frame arrived on the parked standby: the client has failed over.
-    StandbyFrame(Frame),
-    /// The parked standby's connection is gone.
-    StandbyGone,
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -3039,6 +2380,7 @@ mod tests {
     use super::*;
     // `use super::*` reaches the session module's own imports, not `crate`'s
     // other modules, so the route pace has to be named explicitly.
+    use crate::host_session::{DETACH_AFTER, HostSession};
     use crate::roam::ROUTE_PROBE_EVERY;
     use crate::view::words;
     use oxutrm_client::Marker;
@@ -3165,7 +2507,7 @@ mod tests {
 
         let mut host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
         let client = ClientSession::new(size, caps(), client_link, None).unwrap();
-        host.term.write_input(shell.as_bytes()).unwrap();
+        host.term_mut().write_input(shell.as_bytes()).unwrap();
         (host, client, relay)
     }
 
@@ -3205,7 +2547,7 @@ mod tests {
         // the script is fed as input instead, which is also how a real session
         // works.
         let mut host = host;
-        host.term.write_input(shell.as_bytes()).unwrap();
+        host.term_mut().write_input(shell.as_bytes()).unwrap();
         (host, client)
     }
 
@@ -3322,7 +2664,7 @@ mod tests {
         let mut quiet = 0;
         let settled_by = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < settled_by && quiet < 2 {
-            if host.term.poll().expect("polling the pty") {
+            if host.term_mut().poll().expect("polling the pty") {
                 quiet = 0;
             } else {
                 quiet += 1;
@@ -3553,7 +2895,7 @@ mod tests {
         let mut out = Vec::new();
 
         // One burst of typing, then the client goes quiet for good.
-        host.term
+        host.term_mut()
             .write_input(b"printf 'first\r\n'\n")
             .expect("write");
         assert!(
@@ -3571,7 +2913,7 @@ mod tests {
         // Well past STATE_RING updates, so a run that only recovered by ring
         // eviction would still be frozen here. Nothing is typed from now on.
         for i in 0..40 {
-            host.term
+            host.term_mut()
                 .write_input(format!("printf 'line-{i}\\r\\n'\n").as_bytes())
                 .expect("write");
         }
@@ -3869,7 +3211,7 @@ mod tests {
         let mut client = ClientSession::new(big, caps(), client_link, None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.
-        host.term
+        host.term_mut()
             .write_input(b"i=0; while [ $i -lt 60 ]; do printf '\\033[3%dm%s-%d\\r\\n' $((i%8)) $(head -c 60 /dev/urandom | od -An -tx1 | tr -d ' \\n') $i; i=$((i+1)); done\n")
             .unwrap();
 
@@ -4112,7 +3454,7 @@ mod tests {
         // landing exactly on the reattach turn's own poll would set `moved`
         // there too, and the mutation this test guards against would go
         // undetected for the wrong reason.
-        host.term.write_input(b"echo moved\n").unwrap();
+        host.term_mut().write_input(b"echo moved\n").unwrap();
         let poll_budget = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut elapsed = Duration::ZERO;
         loop {
@@ -4125,7 +3467,7 @@ mod tests {
             elapsed += Duration::from_millis(20);
             host.turn_at(late + elapsed, None)
                 .expect("a turn while still detached");
-            if text(&host.term.snapshot(1)).contains("moved") {
+            if text(&host.term_mut().snapshot(1)).contains("moved") {
                 break;
             }
         }
@@ -4262,7 +3604,9 @@ mod tests {
         assert!(text(client.screen()).contains("before-roam"));
 
         // And new output crosses the new path.
-        host.term.write_input(b"printf 'after-roam\r\n'\n").unwrap();
+        host.term_mut()
+            .write_input(b"printf 'after-roam\r\n'\n")
+            .unwrap();
         assert!(
             drive(
                 &mut host,
@@ -6973,7 +6317,7 @@ mod tests {
             "nothing in flight can displace the landed link"
         );
 
-        host.term
+        host.term_mut()
             .write_input(b"printf 'after-%s\\r\\n' landing\n")
             .expect("write");
         assert!(
@@ -8570,7 +7914,7 @@ mod tests {
         // socket-address assertion cannot reach: QUIC migration is what makes
         // the swap survivable, so output produced after it has to arrive.
         let mut out = Vec::new();
-        host.term
+        host.term_mut()
             .write_input(b"printf 'after-the-rebind\\r\\n'\n")
             .expect("write");
         assert!(

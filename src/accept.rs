@@ -279,8 +279,8 @@ mod tests {
     use oxutrm_proto::{ClientSpki, HostSpki, TermSize};
     use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+    use crate::host_session::HostSession;
     use crate::link::Link;
-    use crate::session::HostSession;
 
     fn size() -> TermSize {
         TermSize { cols: 80, rows: 24 }

@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use oxutrm_host::registry::{RegistryRoot, SessionMeta};
 use oxutrm_net::NetConfig;
 
-use crate::session::HostSession;
+use crate::host_session::HostSession;
 
 /// How much scrollback the host keeps. The same number `loopback` uses.
 const SCROLLBACK: usize = 10_000;

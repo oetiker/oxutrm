@@ -29,6 +29,7 @@ mod config;
 mod connect;
 mod control;
 mod egress;
+mod host_session;
 mod ladder;
 mod link;
 mod linkstate;
