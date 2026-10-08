@@ -138,18 +138,21 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
         return "no live oxutrm sessions on this host\n".to_string();
     }
     // The name column is as wide as the longest name, so the ids and the
-    // rest stay aligned whatever the names are.
+    // rest stay aligned whatever the names are. Measured in terminal cells,
+    // not characters: `構築` is two characters and four cells.
+    let cells = unicode_width::UnicodeWidthStr::width;
     let width = sessions
         .iter()
-        .map(|m| m.name.as_deref().map_or(1, |n| n.chars().count()))
+        .map(|m| m.name.as_deref().map_or(1, cells))
         .max()
         .unwrap_or(1);
     let mut out = String::new();
     for m in sessions {
+        let name = m.name.as_deref().unwrap_or("-");
         out.push_str(&format!(
-            "{}  {:<width$}  {:>7}  {:>3}x{:<3}  attach {}  {}  {}\n",
+            "{}  {name}{}  {:>7}  {:>3}x{:<3}  attach {}  {}  {}\n",
             m.session_id,
-            m.name.as_deref().unwrap_or("-"),
+            " ".repeat(width.saturating_sub(cells(name))),
             m.pid,
             m.size.cols,
             m.size.rows,
@@ -160,7 +163,6 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
             } else {
                 "NOT detachable (dies with its ssh)"
             },
-            width = width,
         ));
     }
     out

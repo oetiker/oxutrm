@@ -397,3 +397,25 @@ fn the_listing_has_a_name_column_that_keeps_the_rest_aligned() {
     // The pid column starts at the same place on both lines.
     assert_eq!(lines[0].find("4242"), lines[1].find("4243"), "{text}");
 }
+
+/// A name in wide characters takes two cells per character, and the column
+/// is padded in cells: what follows it starts in the same terminal column on
+/// every line.
+#[test]
+fn a_wide_name_keeps_the_listing_aligned() {
+    let mut wide = meta("3ff1218f5e0c4b7d9a1c2e3f40516273", 4242);
+    wide.name = Some("構築ログ".to_string());
+    let mut logs = meta("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", 4243);
+    logs.name = Some("logs".to_string());
+    let text = format_session_list(&[wide, logs]);
+    let lines: Vec<&str> = text.lines().collect();
+    let cells_before = |line: &str, pid: &str| {
+        let at = line.find(pid).unwrap();
+        unicode_width::UnicodeWidthStr::width(&line[..at])
+    };
+    assert_eq!(
+        cells_before(lines[0], "4242"),
+        cells_before(lines[1], "4243"),
+        "{text}"
+    );
+}
