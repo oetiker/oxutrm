@@ -53,11 +53,12 @@ pub use daemon::{Detached, FD_DIRS, daemonize, daemonize_session, detach_process
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
 pub use ladder::LadderPlan;
 pub use registry::{
-    DirVerdict, META_FILE, PID_REUSE_SLACK_SECS, PrepareError, REGISTRY_SUBDIR, Registry,
-    RegistryGuard, RegistryRoot, RegistryRootKind, RootEnv, SOCK_FILE, SessionMeta, boot_token,
-    check_socket_path_length, detachable_for_rung, dir_verdict, entry_is_stale, linger_enabled,
-    new_session_id, now_unix, pid_alive, prepare_root, process_start_unix, read_root_env,
-    registry_root_candidates, resolve_registry_root, walk_candidates,
+    DirVerdict, META_FILE, NAMES_LOCK, NamesLock, PID_REUSE_SLACK_SECS, PrepareError,
+    REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot, RegistryRootKind, RootEnv, SOCK_FILE,
+    SessionMeta, boot_token, check_socket_path_length, detachable_for_rung, dir_verdict,
+    entry_is_stale, linger_enabled, name_refusal, new_session_id, now_unix, pid_alive,
+    prepare_root, process_start_unix, read_root_env, registry_root_candidates,
+    resolve_registry_root, walk_candidates,
 };
 
 // There is deliberately no `transport::Path` here any more. It existed to hold

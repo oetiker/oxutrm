@@ -91,6 +91,7 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         // than one that under-promises it for a few hundred milliseconds.
         detachable: false,
         boot: oxutrm_host::boot_token(),
+        name: None,
     };
 
     let attached = crate::attach_exchange::run_attach_exchange(

@@ -137,11 +137,19 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
     if sessions.is_empty() {
         return "no live oxutrm sessions on this host\n".to_string();
     }
+    // The name column is as wide as the longest name, so the ids and the
+    // rest stay aligned whatever the names are.
+    let width = sessions
+        .iter()
+        .map(|m| m.name.as_deref().map_or(1, |n| n.chars().count()))
+        .max()
+        .unwrap_or(1);
     let mut out = String::new();
     for m in sessions {
         out.push_str(&format!(
-            "{}  {:>7}  {:>3}x{:<3}  attach {}  {}  {}\n",
+            "{}  {:<width$}  {:>7}  {:>3}x{:<3}  attach {}  {}  {}\n",
             m.session_id,
+            m.name.as_deref().unwrap_or("-"),
             m.pid,
             m.size.cols,
             m.size.rows,
@@ -152,6 +160,7 @@ pub fn format_session_list(sessions: &[SessionMeta]) -> String {
             } else {
                 "NOT detachable (dies with its ssh)"
             },
+            width = width,
         ));
     }
     out
@@ -196,6 +205,7 @@ mod tests {
             },
             detachable: true,
             boot: Some("boot-token".to_owned()),
+            name: None,
         };
         let summaries = summarize(std::slice::from_ref(&meta));
         assert_eq!(summaries.len(), 1);

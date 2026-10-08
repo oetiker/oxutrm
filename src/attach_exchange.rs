@@ -400,6 +400,7 @@ pub(crate) mod fixtures {
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
             boot: None,
+            name: None,
         }
     }
 
@@ -708,6 +709,7 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
             boot: None,
+            name: None,
         };
         let attach = oxutrm_host::begin_attach(&mut meta, HostSpki::new([7u8; 32]))
             .expect("fresh key material");

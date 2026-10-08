@@ -38,6 +38,7 @@ fn meta(id: &str, pid: u32) -> SessionMeta {
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
         boot: None,
+        name: None,
     }
 }
 
@@ -382,4 +383,17 @@ fn the_listing_shows_detachability_rather_than_implying_it() {
 #[test]
 fn an_empty_listing_is_a_sentence_not_a_blank() {
     assert!(format_session_list(&[]).contains("no live oxutrm sessions"));
+}
+
+#[test]
+fn the_listing_has_a_name_column_that_keeps_the_rest_aligned() {
+    let mut build = meta("3ff1218f5e0c4b7d9a1c2e3f40516273", 4242);
+    build.name = Some("build".to_string());
+    let unnamed = meta("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", 4243);
+    let text = format_session_list(&[build, unnamed]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].contains("  build  "), "{}", lines[0]);
+    assert!(lines[1].contains("  -      "), "{}", lines[1]);
+    // The pid column starts at the same place on both lines.
+    assert_eq!(lines[0].find("4242"), lines[1].find("4243"), "{text}");
 }

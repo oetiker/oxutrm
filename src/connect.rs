@@ -806,6 +806,7 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
             detachable: true,
             boot: oxutrm_host::boot_token(),
+            name: None,
         };
 
         let cfg = test_config();

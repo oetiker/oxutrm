@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 pub const REGISTRY_SUBDIR: &str = "oxutrm";
 pub const META_FILE: &str = "meta.json";
 pub const SOCK_FILE: &str = "sock";
+/// The lock every name change is made under (switcher spec §2.3). A plain
+/// file beside the session directories, so `list_in` passes it by.
+pub const NAMES_LOCK: &str = "names.lock";
 
 /// What `--list` shows, and what `--attach` needs to find a session again.
 ///
@@ -58,6 +61,15 @@ pub struct SessionMeta {
     /// upgrade would strand every running session behind a parse error.
     #[serde(default)]
     pub boot: Option<String>,
+    /// The session's name, if it has one.
+    ///
+    /// A plain string on disk, and checked as an `oxutrm_proto::Name` only
+    /// where it is shown or sent ([`SessionMeta::name`]): an entry whose name
+    /// some later rule refuses must still parse, or the session would vanish
+    /// from `--list` while it runs. `serde(default)` because a running host
+    /// keeps its old binary, and its entries have no name at all.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl SessionMeta {
@@ -72,6 +84,67 @@ impl SessionMeta {
         self.detachable = detachable_for_rung(rung);
         self.detachable
     }
+
+    /// The name, if it has one that is still a valid name.
+    #[must_use]
+    pub fn name(&self) -> Option<oxutrm_proto::Name> {
+        self.name
+            .as_deref()
+            .and_then(|n| oxutrm_proto::Name::parse(n).ok())
+    }
+
+    /// What the ssh offer says about this session; `None` for an entry
+    /// whose id is not an id, which no session of ours writes.
+    #[must_use]
+    pub fn offer(&self) -> Option<oxutrm_proto::OfferEntry> {
+        Some(oxutrm_proto::OfferEntry {
+            id: self.session_id.parse().ok()?,
+            name: self.name(),
+            shell: self.shell.clone(),
+            created_unix: self.created_unix,
+            size: self.size,
+            detachable: self.detachable,
+        })
+    }
+}
+
+/// An exclusive lock on the registry's [`NAMES_LOCK`], held until dropped.
+///
+/// Every name is taken under it: a fresh read of the registry, the check,
+/// and the `meta.json` that records the name, in that order, so two sessions
+/// cannot both take one. `flock`, so a process that dies holding it lets go.
+pub struct NamesLock {
+    _file: std::fs::File,
+}
+
+impl NamesLock {
+    /// Wait for the lock on `dir`'s names. Blocks: it is held only for one
+    /// registry read and one small write, by whichever session is naming.
+    pub fn take(dir: &Path) -> anyhow::Result<NamesLock> {
+        use std::os::unix::fs::OpenOptionsExt;
+        create_private_dir(dir)?;
+        let path = dir.join(NAMES_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(NamesLock { _file: file })
+    }
+}
+
+/// Why `name` cannot be taken by session `id` in `dir`, if it cannot: a live
+/// session other than `id` has it. Call it holding the [`NamesLock`].
+pub fn name_refusal(dir: &Path, name: &str, id: &str) -> anyhow::Result<Option<String>> {
+    let taken = Registry::list_in(dir)?
+        .iter()
+        .any(|m| m.session_id != id && m.name.as_deref() == Some(name));
+    Ok(taken.then(|| format!("the name {name} is taken by another session")))
 }
 
 /// A fresh session identifier: 32 lowercase hex characters.
@@ -446,8 +519,20 @@ impl RegistryGuard {
         Self::register_in(&Registry::dir()?, meta)
     }
 
+    /// A meta with a name is registered under the [`NamesLock`], and refused
+    /// when a live session already has that name.
     pub fn register_in(root: &Path, meta: &SessionMeta) -> anyhow::Result<RegistryGuard> {
         create_private_dir(root)?;
+        let _lock = match &meta.name {
+            Some(name) => {
+                let lock = NamesLock::take(root)?;
+                if let Some(why) = name_refusal(root, name, &meta.session_id)? {
+                    anyhow::bail!("{why}");
+                }
+                Some(lock)
+            }
+            None => None,
+        };
         let dir = root.join(&meta.session_id);
         // `create_dir` and not `create_dir_all`: an existing directory means
         // another live session already owns this id, and taking it over would
@@ -478,9 +563,37 @@ impl RegistryGuard {
     /// Rewrite `meta.json`. Called after `daemonize()`, because forking twice
     /// changes the pid that `--list` prunes on, and after every attach, because
     /// `attach_id` moves.
+    ///
+    /// Atomically: a temporary file beside it, then a rename. A reader --
+    /// `list_in`, under a name check -- sees the old file or the new one,
+    /// never a torn one it would skip as unparsable (spec §2.3).
     pub fn update(&self, meta: &SessionMeta) -> anyhow::Result<()> {
         let text = serde_json::to_vec_pretty(meta).context("encoding meta.json")?;
-        write_private_file(&self.meta_path(), &text)
+        let tmp = self.dir.join(format!("{META_FILE}.tmp"));
+        write_private_file(&tmp, &text)?;
+        std::fs::rename(&tmp, self.meta_path())
+            .with_context(|| format!("replacing {}", self.meta_path().display()))
+    }
+
+    /// Give this session `name`, or none, under the [`NamesLock`]: refused
+    /// when another live session has it. `meta` is this session's record,
+    /// and is changed only when the name is taken.
+    pub fn rename(&self, meta: &mut SessionMeta, name: Option<String>) -> anyhow::Result<()> {
+        let root = self
+            .dir
+            .parent()
+            .context("a session directory has a registry around it")?;
+        let _lock = NamesLock::take(root)?;
+        if let Some(n) = &name
+            && let Some(why) = name_refusal(root, n, &meta.session_id)?
+        {
+            anyhow::bail!("{why}");
+        }
+        let mut renamed = meta.clone();
+        renamed.name = name;
+        self.update(&renamed)?;
+        *meta = renamed;
+        Ok(())
     }
 }
 
@@ -1077,6 +1190,7 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
             detachable: true,
             boot: boot.map(str::to_owned),
+            name: None,
         }
     }
 

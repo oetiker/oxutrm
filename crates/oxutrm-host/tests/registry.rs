@@ -20,6 +20,7 @@ fn meta(id: &str, pid: u32) -> SessionMeta {
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
         boot: None,
+        name: None,
     }
 }
 
@@ -60,6 +61,7 @@ fn plant(root: &Path, id: &str, pid: u32, created: u64) -> std::path::PathBuf {
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
         boot: None,
+        name: None,
     };
     std::fs::write(dir.join(META_FILE), serde_json::to_vec(&m).unwrap()).expect("write meta");
     std::fs::write(dir.join("sock"), b"").expect("write sock");
@@ -401,4 +403,100 @@ fn two_session_identifiers_are_not_the_same() {
     let a = oxutrm_host::registry::new_session_id().expect("the system CSPRNG");
     let b = oxutrm_host::registry::new_session_id().expect("the system CSPRNG");
     assert_ne!(a, b, "session identifiers are not being drawn at random");
+}
+
+// ---------------------------------------------------------------------------
+// Names (switcher spec §2.3)
+// ---------------------------------------------------------------------------
+
+fn named(id: &str, name: Option<&str>) -> SessionMeta {
+    let mut m = meta(id, std::process::id());
+    m.name = name.map(str::to_string);
+    m
+}
+
+#[test]
+fn a_name_is_registered_and_a_second_session_cannot_take_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _build = RegistryGuard::register_in(
+        dir.path(),
+        &named("3ff1218f5e0c4b7d9a1c2e3f40516273", Some("build")),
+    )
+    .expect("the first build");
+    let err = RegistryGuard::register_in(
+        dir.path(),
+        &named("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", Some("build")),
+    )
+    .err()
+    .expect("a second build is refused");
+    assert!(err.to_string().contains("taken"), "{err}");
+    // And it left no directory behind.
+    assert!(!dir.path().join("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60").exists());
+}
+
+#[test]
+fn a_rename_is_written_refused_when_taken_and_cleared_by_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let _logs = RegistryGuard::register_in(
+        dir.path(),
+        &named("3ff1218f5e0c4b7d9a1c2e3f40516273", Some("logs")),
+    )
+    .unwrap();
+    let mut me = named("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", None);
+    let guard = RegistryGuard::register_in(dir.path(), &me).unwrap();
+
+    guard.rename(&mut me, Some("build".into())).expect("free");
+    assert_eq!(me.name.as_deref(), Some("build"));
+    let on_disk: SessionMeta =
+        serde_json::from_slice(&std::fs::read(guard.meta_path()).unwrap()).unwrap();
+    assert_eq!(on_disk.name.as_deref(), Some("build"));
+
+    // Its own name again is no conflict.
+    guard
+        .rename(&mut me, Some("build".into()))
+        .expect("its own");
+
+    let err = guard
+        .rename(&mut me, Some("logs".into()))
+        .expect_err("taken by the other");
+    assert!(err.to_string().contains("taken"), "{err}");
+    assert_eq!(
+        me.name.as_deref(),
+        Some("build"),
+        "a refusal changes nothing"
+    );
+
+    guard.rename(&mut me, None).expect("cleared");
+    let on_disk: SessionMeta =
+        serde_json::from_slice(&std::fs::read(guard.meta_path()).unwrap()).unwrap();
+    assert_eq!(on_disk.name, None);
+}
+
+#[test]
+fn an_update_leaves_no_temporary_file_and_the_lock_is_not_an_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = named("3ff1218f5e0c4b7d9a1c2e3f40516273", Some("build"));
+    let guard = RegistryGuard::register_in(dir.path(), &m).unwrap();
+    guard.update(&m).unwrap();
+    let names: Vec<_> = std::fs::read_dir(guard.dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec![META_FILE.to_string()], "{names:?}");
+    assert!(dir.path().join(oxutrm_host::NAMES_LOCK).exists());
+    assert_eq!(Registry::list_in(dir.path()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_entry_written_without_a_name_parses_and_a_bad_name_is_not_shown() {
+    let text = r#"{"session_id":"3ff1218f5e0c4b7d9a1c2e3f40516273","attach_id":1,"pid":1,
+        "created_unix":1,"shell":"/bin/bash","size":{"cols":120,"rows":40},"detachable":true}"#;
+    let m: SessionMeta = serde_json::from_str(text).expect("an old entry parses");
+    assert_eq!(m.name, None);
+    let mut m = m;
+    m.name = Some("cafe".to_string());
+    assert_eq!(m.name(), None, "an all-hex name is not a name");
+    let offer = m.offer().expect("an offer");
+    assert_eq!(offer.name, None);
+    assert_eq!(offer.id.to_string(), m.session_id);
 }
