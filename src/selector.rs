@@ -166,6 +166,11 @@ impl Selector {
         self.rename.as_ref().map(|(_, f)| f.as_str())
     }
 
+    /// The session being renamed, while `r` is open.
+    pub(crate) fn renaming(&self) -> Option<SessionId> {
+        self.rename.as_ref().map(|(id, _)| *id)
+    }
+
     pub(crate) fn note(&self) -> Option<&str> {
         self.note.as_deref()
     }

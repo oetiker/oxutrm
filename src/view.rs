@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use jiff::tz::TimeZone;
 use oxutrm_client::{
-    ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, PopupView, Row, legible, rung_label,
-    summarised,
+    ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, PopupView, Row, SessionRow,
+    SessionsView, legible, rung_label, summarised,
 };
 use oxutrm_proto::PathDescription;
 
@@ -478,9 +478,129 @@ fn keys(phase: Phase) -> Vec<KeyHint> {
             hint("Esc", "close", true),
             hint("q", "quit", true),
             hint("c", "config", true),
-            hint("s", "sessions", false),
+            // `s` only on a live link (switcher spec §3.2): dimmed through
+            // an outage or a rebuild, when nothing it asks could be
+            // answered. The reason is the outage the header already shows.
+            hint("s", "sessions", phase == Phase::Live),
         ],
     }
+}
+
+/// What the session selector is built from (switcher spec §3.2).
+pub(crate) struct SessionsFacts<'a> {
+    pub(crate) identity: Option<&'a Identity>,
+    pub(crate) selector: &'a crate::selector::Selector,
+    /// In a lobby: `q quit` rather than `q back`.
+    pub(crate) lobby: bool,
+    pub(crate) phase: Phase,
+    pub(crate) last_heard: Instant,
+    pub(crate) now: Instant,
+    /// `now` on the wall clock, which decides what "today" is.
+    pub(crate) wall: SystemTime,
+    pub(crate) zone: &'a TimeZone,
+}
+
+/// The session selector: a row per session -- name, shell, start, size,
+/// mark -- `+ new session`, and under the list the question, the reason
+/// something was refused, or that the list is on its way.
+pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
+    let sel = f.selector;
+    let rows: Vec<SessionRow> = sel
+        .rows()
+        .iter()
+        .map(|e| {
+            // The field is on the session being renamed, found by its id:
+            // a refetch can move the rows under it.
+            let (name, field) = match sel.rename() {
+                Some(text) if sel.renaming() == Some(e.id) => (field_text(&legible(text)), true),
+                _ => (crate::selector::label(e), false),
+            };
+            SessionRow {
+                name,
+                shell: legible(
+                    std::path::Path::new(&e.shell)
+                        .file_name()
+                        .and_then(|b| b.to_str())
+                        .unwrap_or(&e.shell),
+                ),
+                started: started(e.created_unix, f.wall, f.zone),
+                size: format!("{}\u{d7}{}", e.size.cols, e.size.rows),
+                mark: match e.attached {
+                    oxutrm_proto::Attached::Here => "this",
+                    oxutrm_proto::Attached::Elsewhere => "in use",
+                    oxutrm_proto::Attached::No => "",
+                    oxutrm_proto::Attached::Unknown => "?",
+                    oxutrm_proto::Attached::OtherVersion => "old version",
+                }
+                .to_string(),
+                dimmed: !e.detachable,
+                field,
+            }
+        })
+        .collect();
+    let line = match (sel.question(), sel.note()) {
+        (Some(q), _) => legible(&q.text()),
+        (None, Some(note)) => summarised(note),
+        (None, None) if sel.loading() => "asking the host for its sessions\u{2026}".to_string(),
+        (None, None) => String::new(),
+    };
+    let selected = sel
+        .rows()
+        .get(sel.cursor())
+        .map_or_else(|| "+ new session".to_string(), crate::selector::label);
+    SessionsView {
+        title: match f.identity {
+            Some(id) => format!("sessions on {}", legible(&id.target)),
+            None => "sessions".to_string(),
+        },
+        header: outage_note(f.phase, f.last_heard, f.now).unwrap_or_default(),
+        rows,
+        new_row: "+ new session".to_string(),
+        cursor: sel.cursor(),
+        line,
+        keys: sessions_keys(sel, f.lobby, f.phase == Phase::Live),
+        small: format!("oxutrm sessions \u{b7} {selected}"),
+    }
+}
+
+/// When a session started: `HH:MM` today, else `Mon DD`, in `zone`.
+fn started(created_unix: u64, wall: SystemTime, zone: &TimeZone) -> String {
+    let at = i64::try_from(created_unix)
+        .ok()
+        .and_then(|s| jiff::Timestamp::from_second(s).ok());
+    let now = jiff::Timestamp::try_from(wall).ok();
+    let (Some(at), Some(now)) = (at, now) else {
+        return "?".to_string();
+    };
+    let (at, now) = (zone.to_datetime(at), zone.to_datetime(now));
+    if at.date() == now.date() {
+        format!("{:02}:{:02}", at.hour(), at.minute())
+    } else {
+        at.strftime("%b %d").to_string()
+    }
+}
+
+/// The selector's keys: the question's, the name field's, or its own --
+/// the ones that ask the host dimmed while the link is down.
+fn sessions_keys(sel: &crate::selector::Selector, lobby: bool, live: bool) -> Vec<KeyHint> {
+    let hint = |key: &str, label: &str, enabled: bool| KeyHint {
+        key: key.to_string(),
+        label: label.to_string(),
+        enabled,
+    };
+    if sel.question().is_some() {
+        return vec![hint("y", "yes", live), hint("n", "no", true)];
+    }
+    if sel.rename().is_some() {
+        return vec![hint("\u{23ce}", "save", live), hint("Esc", "cancel", true)];
+    }
+    vec![
+        hint("\u{23ce}", "switch", live),
+        hint("n", "new", live),
+        hint("r", "rename", live),
+        hint("x", "kill", live),
+        hint("q", if lobby { "quit" } else { "back" }, true),
+    ]
 }
 
 /// What the config screen is built from.
@@ -527,18 +647,24 @@ fn config_header(f: &ConfigFacts<'_>) -> String {
         1 => parts.push("config: 1 warning".to_string()),
         n => parts.push(format!("config: {n} warnings")),
     }
-    let silent_since = match f.phase {
-        Phase::Silent { since } => Some(since),
-        Phase::Recovering { .. } => Some(f.last_heard),
-        _ => None,
-    };
-    if let Some(since) = silent_since {
-        parts.push(format!(
-            "no reply {}",
-            clock(f.now.saturating_duration_since(since))
-        ));
+    if let Some(outage) = outage_note(f.phase, f.last_heard, f.now) {
+        parts.push(outage);
     }
     parts.join(" \u{b7} ")
+}
+
+/// `no reply 5 s` while the link is down: the outage, in a screen's
+/// header.
+fn outage_note(phase: Phase, last_heard: Instant, now: Instant) -> Option<String> {
+    let since = match phase {
+        Phase::Silent { since } => since,
+        Phase::Recovering { .. } => last_heard,
+        _ => return None,
+    };
+    Some(format!(
+        "no reply {}",
+        clock(now.saturating_duration_since(since))
+    ))
 }
 
 /// The field's text with a cursor after it.
@@ -959,21 +1085,23 @@ mod tests {
                 .collect()
         };
         let own = |s: &str, on: bool| (s.to_string(), on);
-        let shown = [
-            own("Esc close", true),
-            own("q quit", true),
-            own("c config", true),
-            own("s sessions", false),
-        ];
+        let shown = |live: bool| {
+            [
+                own("Esc close", true),
+                own("q quit", true),
+                own("c config", true),
+                own("s sessions", live),
+            ]
+        };
+        assert_eq!(bar(Phase::Live), shown(true));
         for phase in [
-            Phase::Live,
             Phase::Silent { since: t },
             Phase::Recovering {
                 attempt: 0,
                 next_try: t,
             },
         ] {
-            assert_eq!(bar(phase), shown, "{phase:?}");
+            assert_eq!(bar(phase), shown(false), "{phase:?}");
         }
         assert_eq!(
             bar(Phase::Confirming),
@@ -2117,5 +2245,236 @@ mod tests {
             })
             .collect();
         insta::assert_snapshot!(text.join("\n"));
+    }
+
+    // ---- the session selector -------------------------------------------
+
+    /// 2026-10-07 12:00:00 UTC: the wall clock the selector's tests run at.
+    const NOON: u64 = 1_791_374_400;
+
+    fn wall() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(NOON)
+    }
+
+    /// `build` (this, started 09:14 today), an unnamed fish session in use
+    /// elsewhere since two days ago, `logs` detached since 11:02.
+    fn listed() -> Vec<oxutrm_proto::SessionEntry> {
+        use crate::selector::fixtures::{BUILD, FISH, LOGS, entry};
+        use oxutrm_proto::Attached;
+        let mut fish = entry(
+            FISH,
+            None,
+            "/usr/bin/fish",
+            NOON - 2 * 86_400,
+            Attached::Elsewhere,
+        );
+        fish.size = oxutrm_proto::TermSize { cols: 80, rows: 24 };
+        vec![
+            entry(
+                BUILD,
+                Some("build"),
+                "/bin/bash",
+                NOON - 2 * 3600 - 46 * 60,
+                Attached::Here,
+            ),
+            fish,
+            entry(LOGS, Some("logs"), "/bin/zsh", NOON - 58 * 60, Attached::No),
+        ]
+    }
+
+    fn sessions_text(f: &SessionsFacts<'_>, size: oxutrm_proto::TermSize) -> String {
+        let o = oxutrm_client::layout_sessions(&sessions(f), size);
+        (0..o.rows)
+            .map(|r| {
+                (0..o.cols)
+                    .map(|c| {
+                        o.cells[usize::from(r) * usize::from(o.cols) + usize::from(c)]
+                            .text
+                            .to_string()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sessions_facts<'a>(
+        id: &'a Identity,
+        selector: &'a crate::selector::Selector,
+        lobby: bool,
+        t: Instant,
+    ) -> SessionsFacts<'a> {
+        SessionsFacts {
+            identity: Some(id),
+            selector,
+            lobby,
+            phase: Phase::Live,
+            last_heard: t,
+            now: t,
+            wall: wall(),
+            zone: &UTC,
+        }
+    }
+
+    fn thinlinc() -> Identity {
+        Identity {
+            target: "thinlinc".to_string(),
+            session_id: crate::selector::fixtures::BUILD.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_start_time_is_the_clock_today_and_the_date_before() {
+        let z = TimeZone::UTC;
+        assert_eq!(started(NOON - 2 * 3600 - 46 * 60, wall(), &z), "09:14");
+        assert_eq!(started(NOON - 2 * 86_400, wall(), &z), "Oct 05");
+        // Midnight is the line, in the zone shown.
+        assert_eq!(started(NOON - 12 * 3600, wall(), &z), "00:00");
+        assert_eq!(started(NOON - 12 * 3600 - 60, wall(), &z), "Oct 06");
+    }
+
+    #[test]
+    fn every_row_says_name_shell_start_size_and_mark() {
+        let t = Instant::now();
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(listed());
+        let id = thinlinc();
+        let v = sessions(&sessions_facts(&id, &sel, false, t));
+        assert_eq!(v.title, "sessions on thinlinc");
+        let shown: Vec<(&str, &str, &str, &str, &str)> = v
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.shell.as_str(),
+                    r.started.as_str(),
+                    r.size.as_str(),
+                    r.mark.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("a3f9c01e", "fish", "Oct 05", "80\u{d7}24", "in use"),
+                ("build", "bash", "09:14", "120\u{d7}40", "this"),
+                ("logs", "zsh", "11:02", "120\u{d7}40", ""),
+            ]
+        );
+        assert_eq!(v.cursor, 1, "on this");
+        assert_eq!(v.keys.last().unwrap().label, "back");
+        let lobby = sessions(&sessions_facts(&id, &sel, true, t));
+        assert_eq!(lobby.keys.last().unwrap().label, "quit");
+    }
+
+    #[test]
+    fn while_the_link_is_down_the_header_says_so_and_the_actions_are_dimmed() {
+        let t = Instant::now();
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(listed());
+        let id = thinlinc();
+        let v = sessions(&SessionsFacts {
+            phase: Phase::Silent { since: t },
+            now: t + Duration::from_secs(4),
+            ..sessions_facts(&id, &sel, false, t)
+        });
+        assert_eq!(v.header, "no reply 4 s");
+        assert!(v.keys.iter().filter(|k| k.key != "q").all(|k| !k.enabled));
+        assert!(v.keys.last().unwrap().enabled, "q always works");
+    }
+
+    #[test]
+    fn the_name_being_typed_is_shown_on_the_session_it_renames() {
+        let t = Instant::now();
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(listed());
+        let ctx = crate::selector::Ctx {
+            live: true,
+            lobby: false,
+            busy: false,
+        };
+        sel.keys(b"r-ci", ctx, t);
+        let id = thinlinc();
+        let v = sessions(&sessions_facts(&id, &sel, false, t));
+        let fields: Vec<(&str, bool)> = v.rows.iter().map(|r| (r.name.as_str(), r.field)).collect();
+        assert_eq!(
+            fields,
+            [
+                ("a3f9c01e", false),
+                ("build-ci\u{258f}", true),
+                ("logs", false)
+            ]
+        );
+        let keys: Vec<&str> = v.keys.iter().map(|k| k.label.as_str()).collect();
+        assert_eq!(keys, ["save", "cancel"]);
+    }
+
+    #[test]
+    fn the_status_views_s_is_offered_only_on_a_live_link() {
+        let s_of = |p: Phase| keys(p).into_iter().find(|k| k.key == "s").unwrap();
+        assert!(s_of(Phase::Live).enabled);
+        assert!(
+            !s_of(Phase::Silent {
+                since: Instant::now()
+            })
+            .enabled
+        );
+    }
+
+    #[test]
+    fn snapshot_sessions_from_the_popup_80x24() {
+        let t = Instant::now();
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(listed());
+        let id = thinlinc();
+        insta::assert_snapshot!(sessions_text(
+            &sessions_facts(&id, &sel, false, t),
+            oxutrm_proto::TermSize { cols: 80, rows: 24 }
+        ));
+    }
+
+    #[test]
+    fn snapshot_sessions_at_connect_72x24() {
+        let t = Instant::now();
+        let mut rows = listed();
+        rows.retain(|e| !e.this);
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(rows);
+        let id = thinlinc();
+        insta::assert_snapshot!(sessions_text(
+            &sessions_facts(&id, &sel, true, t),
+            oxutrm_proto::TermSize { cols: 72, rows: 24 }
+        ));
+    }
+
+    #[test]
+    fn snapshot_sessions_with_an_error_line_and_a_question_narrow() {
+        let t = Instant::now();
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(listed());
+        sel.fail("session a3f9c01e did not answer in time".to_string());
+        let id = thinlinc();
+        let failed = sessions_text(
+            &sessions_facts(&id, &sel, false, t),
+            oxutrm_proto::TermSize { cols: 50, rows: 14 },
+        );
+        let ctx = crate::selector::Ctx {
+            live: true,
+            lobby: false,
+            busy: false,
+        };
+        sel.keys(b"kx", ctx, t);
+        let asked = sessions_text(
+            &sessions_facts(&id, &sel, false, t),
+            oxutrm_proto::TermSize { cols: 50, rows: 14 },
+        );
+        insta::assert_snapshot!(format!("{failed}\n\n{asked}"));
     }
 }

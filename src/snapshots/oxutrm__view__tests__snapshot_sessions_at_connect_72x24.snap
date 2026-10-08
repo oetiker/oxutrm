@@ -1,0 +1,11 @@
+---
+source: src/view.rs
+expression: "sessions_text(&sessions_facts(&id, &sel, true, t), oxutrm_proto::TermSize\n{ cols: 72, rows: 24 })"
+---
+╭ sessions on thinlinc ─────────────────────╮
+│ ▸ a3f9c01e  fish  Oct 05  80×24   in use  │
+│   logs      zsh   11:02   120×40          │
+│   + new session                           │
+├───────────────────────────────────────────┤
+│ ⏎ switch  n new  r rename  x kill  q quit │
+╰───────────────────────────────────────────╯

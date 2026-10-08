@@ -1,0 +1,12 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_sessions(&v, TermSize { cols: 40, rows: 12 }))"
+---
+╭ sessions on thinlinc ────────────╮
+│ no reply 4 s                     │
+│ ▸ logs      zsh  11:02  120×40   │
+│   + new session                  │
+│ the link is down; try again onc… │
+├──────────────────────────────────┤
+│ ⏎ n r x q quit                   │
+╰──────────────────────────────────╯

@@ -175,28 +175,8 @@ pub fn layout_popup(v: &PopupView, size: TermSize) -> Overlay {
 /// The box drawn `cols` by `rows`, and how many rows inside its border the
 /// content needs: everything drawn, the plain rule and the key bar.
 fn draw(v: &PopupView, cols: u16, rows: u16) -> (Buffer, u16) {
-    let area = Rect::new(0, 0, cols, rows);
-    let mut buf = Buffer::empty(area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
-        .title(format!(" {} ", v.title));
-    let inner = block.inner(area);
-    block.render(area, &mut buf);
-
-    let bar = Rect {
-        y: inner.bottom() - 1,
-        height: 1,
-        ..inner
-    };
-    Paragraph::new(key_line(&v.keys)).render(bar, &mut buf);
-
-    let mut body = Rect {
-        height: inner.height - 1,
-        ..inner
-    };
+    let (mut buf, above_bar) = framed(&v.title, key_line(&v.keys), cols, rows);
+    let mut body = above_bar;
     body = if v.held.is_empty() {
         place(&[header_line(v)], body, &mut buf)
     } else {
@@ -222,7 +202,7 @@ fn draw(v: &PopupView, cols: u16, rows: u16) -> (Buffer, u16) {
     body = place(&plain(&v.quality), body, &mut buf);
 
     if body.height == 0 {
-        return (buf, inner.height);
+        return (buf, above_bar.height + 1);
     }
     rule(&mut buf, body.bottom() - 1, cols, None);
     body.height -= 1;
@@ -242,7 +222,44 @@ fn draw(v: &PopupView, cols: u16, rows: u16) -> (Buffer, u16) {
     }
 
     // The content, the plain rule, the key bar.
-    (buf, end - inner.y + 2)
+    (buf, end - above_bar.y + 2)
+}
+
+/// What the box's frame takes of its width: the border and a cell of
+/// padding either side.
+const FRAME_COLS: u16 = 4;
+
+/// The box every popup screen is drawn in, `cols` by `rows`: a rounded
+/// border with `title` drawn into its top, a cell of padding either side,
+/// and `keys` on the last row inside -- how the screen is left, so the
+/// last row to give way. Returns the area inside the border above the key
+/// bar. At least `FRAME_COLS` by 3.
+fn framed(title: &str, keys: Line<'static>, cols: u16, rows: u16) -> (Buffer, Rect) {
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    block.render(area, &mut buf);
+    let bar = inner.bottom() - 1;
+    Paragraph::new(keys).render(
+        Rect {
+            y: bar,
+            height: 1,
+            ..inner
+        },
+        &mut buf,
+    );
+    (
+        buf,
+        Rect {
+            height: inner.height - 1,
+            ..inner
+        },
+    )
 }
 
 /// `line` on the top row of `area`, cut at its width; return the part of
@@ -467,10 +484,32 @@ fn place_log(log: &[Row], area: Rect, buf: &mut Buffer) -> u16 {
 }
 
 fn key_line(keys: &[KeyHint]) -> Line<'static> {
+    hint_line(keys, "  ", |_| true)
+}
+
+/// The key bar in `width` cells: whole when it fits, else every key but
+/// the last without its label -- the last is how the screen is left, `q
+/// back` or `q quit`, and says which.
+fn fitted_key_line(keys: &[KeyHint], width: u16) -> Line<'static> {
+    let whole = key_line(keys);
+    if whole.width() <= usize::from(width) {
+        return whole;
+    }
+    let last = keys.len().saturating_sub(1);
+    hint_line(keys, " ", |i| i == last)
+}
+
+/// `keys` with `gap` between them, the labels of those `labelled` says.
+/// A key in bold, a disabled one and its label dimmed.
+fn hint_line(
+    keys: &[KeyHint],
+    gap: &'static str,
+    labelled: impl Fn(usize) -> bool,
+) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(gap));
         }
         let (key, label) = if k.enabled {
             (
@@ -482,7 +521,9 @@ fn key_line(keys: &[KeyHint]) -> Line<'static> {
             (dim, dim)
         };
         spans.push(Span::styled(k.key.clone(), key));
-        spans.push(Span::styled(format!(" {}", k.label), label));
+        if labelled(i) {
+            spans.push(Span::styled(format!(" {}", k.label), label));
+        }
     }
     Line::from(spans)
 }
@@ -572,11 +613,13 @@ impl ConfigView {
     }
 }
 
-/// What layer 1's popup shows: the status view or the config screen.
+/// What layer 1's popup shows: the status view, the config screen or the
+/// session selector.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Popup {
     Status(PopupView),
     Config(ConfigView),
+    Sessions(SessionsView),
 }
 
 /// Lay out whichever view the popup shows.
@@ -584,7 +627,198 @@ pub fn layout(p: &Popup, size: TermSize) -> Overlay {
     match p {
         Popup::Status(v) => layout_popup(v, size),
         Popup::Config(v) => layout_config(v, size),
+        Popup::Sessions(v) => layout_sessions(v, size),
     }
+}
+
+/// One row of the session selector, its columns as text.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SessionRow {
+    /// The name, else the start of the id; or the name being typed.
+    pub name: String,
+    /// The shell's basename.
+    pub shell: String,
+    /// `HH:MM` today, else `Mon DD`.
+    pub started: String,
+    /// `120×40`.
+    pub size: String,
+    /// `this`, `in use`, `?`, `old version`, or nothing.
+    pub mark: String,
+    /// A session that cannot be switched to: drawn dimmed.
+    pub dimmed: bool,
+    /// The name is an open text field: cut at its start, not its end.
+    pub field: bool,
+}
+
+/// What the session selector says, as content rather than as cells.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SessionsView {
+    /// Drawn into the top border.
+    pub title: String,
+    /// The first line inside the box -- an outage -- or empty.
+    pub header: String,
+    pub rows: Vec<SessionRow>,
+    /// The last row, after the sessions: `+ new session`.
+    pub new_row: String,
+    /// A row of `rows`, or `rows.len()` for the new row.
+    pub cursor: usize,
+    /// The line under the list: a question, why something was refused, or
+    /// that the list is on its way. Empty for none.
+    pub line: String,
+    pub keys: Vec<KeyHint>,
+    /// What a screen below [`MIN_BOX`] shows on its one line.
+    pub small: String,
+}
+
+/// The widest the selector's name column grows: a name's own limit.
+const SESSION_NAME_COLS: usize = 24;
+/// The narrowest: the start of an id.
+const SESSION_NAME_MIN: usize = 8;
+/// The gap between the selector's columns.
+const SESSION_GAP: &str = "  ";
+
+/// The selector's column widths in cells, from what its rows say.
+struct SessionCols {
+    name: usize,
+    shell: usize,
+    started: usize,
+    size: usize,
+}
+
+impl SessionCols {
+    fn of(rows: &[SessionRow]) -> SessionCols {
+        let widest =
+            |f: fn(&SessionRow) -> &str| rows.iter().map(|r| cells(f(r))).max().unwrap_or(0);
+        SessionCols {
+            name: widest(|r| &r.name).clamp(SESSION_NAME_MIN, SESSION_NAME_COLS),
+            shell: widest(|r| &r.shell),
+            started: widest(|r| &r.started),
+            size: widest(|r| &r.size),
+        }
+    }
+
+    /// One row as text: the marker, then the columns, each padded to its
+    /// width in cells.
+    fn line(&self, r: &SessionRow, selected: bool) -> String {
+        let marker = if selected { '\u{25b8}' } else { ' ' };
+        let name = cut(&r.name, self.name, r.field);
+        format!(
+            "{marker} {}{SESSION_GAP}{}{SESSION_GAP}{}{SESSION_GAP}{}{SESSION_GAP}{}",
+            padded(&name, self.name),
+            padded(&r.shell, self.shell),
+            padded(&r.started, self.started),
+            padded(&r.size, self.size),
+            r.mark,
+        )
+        .trim_end()
+        .to_string()
+    }
+}
+
+/// Lay the session selector out for this screen (switcher spec §3.2): the
+/// popup's box rules -- as wide and as tall as what it says, capped at
+/// `min(cols - 4, 72)` by `min(rows - 2, 24)`, centred. The header, the
+/// rows, `+ new session`, the line under the list, then a plain rule and
+/// the key bar. When the rows do not fit, the list scrolls so the cursor's
+/// row is in view. Below [`MIN_BOX`], one reverse-video line.
+pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
+    if size.cols < MIN_BOX.cols || size.rows < MIN_BOX.rows {
+        return reversed_line(v.small.clone(), size);
+    }
+    let cols = SessionCols::of(&v.rows);
+    let mut lines: Vec<String> = v
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| cols.line(r, i == v.cursor))
+        .collect();
+    let new_marker = if v.cursor >= v.rows.len() {
+        '\u{25b8}'
+    } else {
+        ' '
+    };
+    lines.push(format!("{new_marker} {}", v.new_row));
+    let width = lines
+        .iter()
+        .chain([&v.header, &v.line])
+        .map(|l| cells(l))
+        // The title, a space either side, fits the top border as the
+        // content fits between the padding.
+        .chain([cells(&v.title), key_line(&v.keys).width()])
+        .max()
+        .unwrap_or(0);
+    let wanted = u16::try_from(width)
+        .unwrap_or(u16::MAX)
+        .saturating_add(FRAME_COLS);
+    let box_cols = wanted.min((size.cols - 4).min(MAX_BOX.cols));
+    let cap = (size.rows - 2).min(MAX_BOX.rows);
+    let inside = lines.len()
+        + usize::from(!v.header.is_empty())
+        + usize::from(!v.line.is_empty())
+        // The rule and the key bar.
+        + 2;
+    let box_rows = u16::try_from(inside)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(cap);
+    let buf = draw_sessions(v, &lines, box_cols, box_rows);
+    overlay_from_buffer(&buf, (size.rows - box_rows) / 2, (size.cols - box_cols) / 2)
+}
+
+/// The selector in a box `cols` by `rows`, at least 4 rows: the key bar
+/// and a plain rule from the bottom, the header from the top, the line
+/// under the list above the rule, and the list in what is left.
+fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Buffer {
+    let keys = fitted_key_line(&v.keys, cols.saturating_sub(FRAME_COLS));
+    let (mut buf, above_bar) = framed(&v.title, keys, cols, rows);
+    if above_bar.height >= 1 {
+        rule(&mut buf, above_bar.bottom() - 1, cols, None);
+    }
+    let mut body = Rect {
+        height: above_bar.height.saturating_sub(1),
+        ..above_bar
+    };
+    if !v.header.is_empty() {
+        body = place_one(Line::from(v.header.clone()), body, &mut buf);
+    }
+    // The line under the list keeps its row: a question there is what the
+    // next key answers. Cut visibly, never silently.
+    if !v.line.is_empty() && body.height >= 2 {
+        let y = body.bottom() - 1;
+        let line = cut(&v.line, usize::from(body.width), false);
+        Paragraph::new(Line::from(line)).render(
+            Rect {
+                y,
+                height: 1,
+                ..body
+            },
+            &mut buf,
+        );
+        body.height -= 1;
+    }
+    let height = usize::from(body.height);
+    let at = v.cursor.min(lines.len().saturating_sub(1));
+    // Scrolled just enough for the cursor's row to be the last one shown.
+    let start = (at + 1).saturating_sub(height);
+    for (i, text) in lines.iter().enumerate().skip(start).take(height) {
+        let y = body.y + u16::try_from(i - start).unwrap_or(u16::MAX);
+        let mut style = Style::default();
+        if i == at {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if v.rows.get(i).is_some_and(|r| r.dimmed) {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        Paragraph::new(Line::from(Span::styled(text.clone(), style))).render(
+            Rect {
+                y,
+                height: 1,
+                ..body
+            },
+            &mut buf,
+        );
+    }
+    buf
 }
 
 /// The config screen's column widths: the name, then the value.
@@ -641,31 +875,66 @@ fn config_lines(v: &ConfigView) -> Vec<ConfigLine<'_>> {
     lines
 }
 
-/// `text` in at most `cols` characters. A cut is marked with `…`: at the
-/// end, or -- for an open text field, whose cursor is at the end and must
-/// stay in view while typing -- at the start.
+/// How many cells `text` takes on the screen: a CJK character takes two,
+/// so every column here is measured in cells, never in characters.
+fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// `text` padded with spaces to `cols` cells.
+fn padded(text: &str, cols: usize) -> String {
+    format!("{text}{}", " ".repeat(cols.saturating_sub(cells(text))))
+}
+
+/// `text` in at most `cols` cells. A cut is marked with `…`: at the end,
+/// or -- for an open text field, whose cursor is at the end and must stay
+/// in view while typing -- at the start. A wide character that would
+/// straddle the cut goes with it, so the result can be a cell short.
 fn cut(text: &str, cols: usize, keep_end: bool) -> String {
-    let n = text.chars().count();
-    if n <= cols {
-        text.to_string()
-    } else if cols == 0 {
-        String::new()
-    } else if keep_end {
-        let tail: String = text.chars().skip(n - (cols - 1)).collect();
-        format!("\u{2026}{tail}")
+    if cells(text) <= cols {
+        return text.to_string();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    let room = cols - 1;
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 0;
+    let mut take = |c: char| {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > room {
+            return false;
+        }
+        used += w;
+        kept.push(c);
+        true
+    };
+    if keep_end {
+        for c in text.chars().rev() {
+            if !take(c) {
+                break;
+            }
+        }
+        kept.reverse();
+        format!("\u{2026}{}", kept.into_iter().collect::<String>())
     } else {
-        let head: String = text.chars().take(cols - 1).collect();
-        format!("{head}\u{2026}")
+        for c in text.chars() {
+            if !take(c) {
+                break;
+            }
+        }
+        format!("{}\u{2026}", kept.into_iter().collect::<String>())
     }
 }
 
-/// `text` padded or cut to `cols` characters, with a space after a cut so
-/// the next column stays apart.
+/// `text` padded or cut to `cols` cells, with a space after a cut so the
+/// next column stays apart.
 fn column(text: &str, cols: usize, keep_end: bool) -> String {
-    if text.chars().count() <= cols {
-        format!("{text:<cols$}")
+    if cells(text) <= cols {
+        padded(text, cols)
     } else {
-        format!("{} ", cut(text, cols.saturating_sub(1), keep_end))
+        let room = cols.saturating_sub(1);
+        format!("{} ", padded(&cut(text, room, keep_end), room))
     }
 }
 
@@ -699,44 +968,26 @@ fn row_line(r: &ConfigRow, selected: bool, list: bool, width: usize) -> Line<'st
 }
 
 fn draw_config(v: &ConfigView, cols: u16, rows: u16) -> Buffer {
-    let area = Rect::new(0, 0, cols, rows);
-    let mut buf = Buffer::empty(area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
-        .title(format!(" {} ", v.title));
-    let inner = block.inner(area);
-    block.render(area, &mut buf);
-
     // From the bottom: the key bar, which is how the screen is left, then
     // the help line and a plain rule while there is room for them. At
     // least two rows inside the border here.
-    let bar = inner.bottom() - 1;
-    Paragraph::new(key_line(&v.keys)).render(
-        Rect {
-            y: bar,
-            height: 1,
-            ..inner
-        },
-        &mut buf,
-    );
-    if inner.height >= 2 {
+    let (mut buf, above_bar) = framed(&v.title, key_line(&v.keys), cols, rows);
+    if above_bar.height >= 1 {
         Paragraph::new(v.help.clone()).render(
             Rect {
-                y: bar - 1,
+                y: above_bar.bottom() - 1,
                 height: 1,
-                ..inner
+                ..above_bar
             },
             &mut buf,
         );
     }
-    if inner.height >= 3 {
-        rule(&mut buf, bar - 2, cols, None);
+    if above_bar.height >= 2 {
+        rule(&mut buf, above_bar.bottom() - 2, cols, None);
     }
     let mut body = Rect {
-        height: inner.height.saturating_sub(3),
-        ..inner
+        height: above_bar.height.saturating_sub(2),
+        ..above_bar
     };
     if !v.header.is_empty() {
         body = place_one(Line::from(v.header.clone()), body, &mut buf);
@@ -1780,5 +2031,217 @@ mod tests {
             &config_view(),
             TermSize { cols: 40, rows: 12 }
         )));
+    }
+
+    // ---- the session selector -------------------------------------------
+
+    fn session_keys(back: &str) -> Vec<KeyHint> {
+        [
+            ("\u{23ce}", "switch"),
+            ("n", "new"),
+            ("r", "rename"),
+            ("x", "kill"),
+            ("q", back),
+        ]
+        .into_iter()
+        .map(|(key, label)| KeyHint {
+            key: key.to_string(),
+            label: label.to_string(),
+            enabled: true,
+        })
+        .collect()
+    }
+
+    fn session(name: &str, shell: &str, started: &str, size: &str, mark: &str) -> SessionRow {
+        SessionRow {
+            name: name.to_string(),
+            shell: shell.to_string(),
+            started: started.to_string(),
+            size: size.to_string(),
+            mark: mark.to_string(),
+            ..SessionRow::default()
+        }
+    }
+
+    /// The spec's picture: three sessions on thinlinc, `build` the one the
+    /// client is in, an unnamed fish session in use by another client.
+    fn sessions_view() -> SessionsView {
+        SessionsView {
+            title: "sessions on thinlinc".to_string(),
+            header: String::new(),
+            rows: vec![
+                session("a3f9c01e", "fish", "Oct 05", "80\u{d7}24", "in use"),
+                session("build", "bash", "09:14", "120\u{d7}40", "this"),
+                session("logs", "zsh", "11:02", "120\u{d7}40", ""),
+            ],
+            new_row: "+ new session".to_string(),
+            cursor: 1,
+            line: String::new(),
+            keys: session_keys("back"),
+            small: "oxutrm sessions \u{b7} build".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_selector_lines_up_its_columns_and_marks_the_cursor() {
+        let o = layout_sessions(&sessions_view(), TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        let build = row(&o, find(&o, "build").unwrap());
+        let fish = row(&o, find(&o, "fish").unwrap());
+        assert!(build.contains("\u{25b8} build"), "{text}");
+        for col in ["bash", "09:14", "120\u{d7}40", "this"] {
+            assert!(build.contains(col), "{col} missing: {text}");
+        }
+        // In characters: the marker is three bytes.
+        let at = |line: &str, what: &str| line[..line.find(what).unwrap()].chars().count();
+        assert_eq!(at(&build, "bash"), at(&fish, "fish"), "{text}");
+        assert_eq!(at(&build, "09:14"), at(&fish, "Oct 05"), "{text}");
+        assert!(find(&o, "+ new session").is_some(), "{text}");
+        assert!(row(&o, o.rows - 2).contains("q back"), "{text}");
+        assert!(is_rule(&row(&o, o.rows - 3), None), "{text}");
+        // As wide as it needs and no wider, centred.
+        assert!(o.cols < 72, "{text}");
+        assert_eq!(o.col, (80 - o.cols) / 2);
+    }
+
+    #[test]
+    fn a_session_that_cannot_be_switched_to_is_dimmed() {
+        let mut v = sessions_view();
+        v.rows[2].dimmed = true;
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let r = find(&o, "logs").unwrap();
+        assert!(cell_of(&o, r, "l").attrs.contains(Attrs::DIM));
+        let b = find(&o, "build").unwrap();
+        assert!(!cell_of(&o, b, "b").attrs.contains(Attrs::DIM));
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_cursor_in_view() {
+        let mut v = sessions_view();
+        v.rows = (0..30)
+            .map(|i| session(&format!("job-{i:02}"), "bash", "09:14", "120\u{d7}40", ""))
+            .collect();
+        v.cursor = 27;
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 12 });
+        let text = text_of(&o);
+        assert!(find(&o, "\u{25b8} job-27").is_some(), "{text}");
+        assert!(row(&o, o.rows - 2).contains("q back"), "{text}");
+    }
+
+    #[test]
+    fn a_name_being_typed_keeps_its_end_in_view() {
+        let mut v = sessions_view();
+        v.rows[1].name = format!("{}\u{258f}", "n".repeat(40));
+        v.rows[1].field = true;
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let line = row(&o, find(&o, "\u{258f}").expect("no cursor shown"));
+        assert!(line.contains('\u{2026}'), "the cut is not marked: {line}");
+        assert!(line.contains("bash"), "the columns after it moved: {line}");
+    }
+
+    #[test]
+    fn snapshot_sessions_80x24() {
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &sessions_view(),
+            TermSize { cols: 80, rows: 24 }
+        )));
+    }
+
+    #[test]
+    fn snapshot_sessions_question_72x24() {
+        let mut v = sessions_view();
+        v.cursor = 0;
+        v.line = "take over a3f9c01e from its other client? y/n".to_string();
+        v.keys = vec![
+            KeyHint {
+                key: "y".to_string(),
+                label: "yes".to_string(),
+                enabled: true,
+            },
+            KeyHint {
+                key: "n".to_string(),
+                label: "no".to_string(),
+                enabled: true,
+            },
+        ];
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &v,
+            TermSize { cols: 72, rows: 24 }
+        )));
+    }
+
+    #[test]
+    fn snapshot_sessions_at_connect_40x12() {
+        let v = SessionsView {
+            title: "sessions on thinlinc".to_string(),
+            header: "no reply 4 s".to_string(),
+            rows: vec![session("logs", "zsh", "11:02", "120\u{d7}40", "")],
+            cursor: 0,
+            line: "the link is down; try again once it is back".to_string(),
+            keys: session_keys("quit"),
+            ..sessions_view()
+        };
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &v,
+            TermSize { cols: 40, rows: 12 }
+        )));
+    }
+
+    #[test]
+    fn snapshot_sessions_19x5() {
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &sessions_view(),
+            TermSize { cols: 19, rows: 5 }
+        )));
+    }
+
+    #[test]
+    fn no_size_panics() {
+        for cols in 0..=90 {
+            for rows in 0..=30 {
+                let _ = layout_sessions(&sessions_view(), TermSize { cols, rows });
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_selector_keeps_the_key_that_leaves_it() {
+        let o = layout_sessions(&sessions_view(), TermSize { cols: 30, rows: 12 });
+        let bar = row(&o, o.rows - 2);
+        assert!(bar.contains("q back"), "{}", text_of(&o));
+    }
+
+    /// The short key bar dims a key that does nothing, as the whole one
+    /// does.
+    #[test]
+    fn a_narrow_selectors_key_bar_still_dims_what_is_off() {
+        let mut v = sessions_view();
+        v.keys[3].enabled = false;
+        let o = layout_sessions(&v, TermSize { cols: 30, rows: 12 });
+        let bar = o.rows - 2;
+        assert!(!row(&o, bar).contains("kill"), "{}", text_of(&o));
+        assert!(cell_of(&o, bar, "x").attrs.contains(Attrs::DIM));
+        assert!(!cell_of(&o, bar, "n").attrs.contains(Attrs::DIM));
+    }
+
+    /// A name of wide characters takes two cells a character: the columns
+    /// after it stay aligned with every other row's.
+    #[test]
+    fn a_name_of_wide_characters_keeps_the_columns_aligned() {
+        let mut v = sessions_view();
+        v.rows[2].name = "\u{69cb}\u{7bc9}\u{30ed}\u{30b0}".to_string();
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        let column_of = |r: u16, first: &str| {
+            let start = r as usize * o.cols as usize;
+            o.cells[start..start + o.cols as usize]
+                .iter()
+                .position(|c| c.text == first)
+                .unwrap_or_else(|| panic!("no {first} on row {r}: {text}"))
+        };
+        let wide = find(&o, "zsh").unwrap();
+        let narrow = find(&o, "bash").unwrap();
+        // The start time's colon is the first on either row.
+        assert_eq!(column_of(wide, ":"), column_of(narrow, ":"), "{text}");
     }
 }

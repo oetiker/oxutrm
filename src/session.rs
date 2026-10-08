@@ -1374,6 +1374,9 @@ impl ClientSession {
         if !self.ui.visible(phase) {
             return None;
         }
+        if self.ui.mode() == Mode::Sessions {
+            return Some(Popup::Sessions(self.sessions_view(phase, now)));
+        }
         Some(match self.ui.config_screen() {
             Some(screen) => Popup::Config(self.config_view(screen, phase, now)),
             None => Popup::Status(self.view(phase, now)),
@@ -1381,13 +1384,31 @@ impl ClientSession {
     }
 
     /// The status view [`ClientSession::layer_at`] shows, for the tests that
-    /// read it: `None` while the popup is closed or shows the config screen.
+    /// read it: `None` while the popup is closed or shows the config screen
+    /// or the session selector.
     #[cfg(test)]
     fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
         match self.layer_at(now)? {
             Popup::Status(v) => Some(v),
-            Popup::Config(_) => None,
+            Popup::Config(_) | Popup::Sessions(_) => None,
         }
+    }
+
+    /// What the session selector says at `now`.
+    ///
+    /// The wall clock is read here, for "today": a start time turns from
+    /// `HH:MM` into `Mon DD` at midnight, which a repaint then shows.
+    fn sessions_view(&self, phase: Phase, now: Instant) -> oxutrm_client::SessionsView {
+        crate::view::sessions(&crate::view::SessionsFacts {
+            identity: self.identity.as_ref(),
+            selector: self.ui.selector(),
+            lobby: self.in_lobby,
+            phase,
+            last_heard: self.link_state.last_heard(),
+            now,
+            wall: std::time::SystemTime::now(),
+            zone: &self.zone,
+        })
     }
 
     /// What the config screen says at `now`.
@@ -9626,6 +9647,22 @@ mod tests {
                 .is_empty(),
             "a standby switched off still has a popup section"
         );
+    }
+
+    /// `s` on the popup puts the session selector up as layer 1, saying
+    /// the list is on its way until it comes back.
+    #[tokio::test]
+    async fn the_selector_is_what_the_popup_shows_while_it_is_up() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        session.route_keys(&[crate::ui::PREFIX], &mut out).unwrap();
+        session.route_keys(b"s", &mut out).unwrap();
+        let Some(Popup::Sessions(v)) = session.layer_at(Instant::now()) else {
+            panic!("the selector is not on the screen");
+        };
+        assert_eq!(v.line, "asking the host for its sessions\u{2026}");
+        assert_eq!(v.keys.last().map(|k| k.label.as_str()), Some("back"));
+        assert_eq!(session.popup_at(Instant::now()), None);
     }
 
     /// A client with its popup open on the config screen, cursor on `row`.

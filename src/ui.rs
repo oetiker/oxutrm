@@ -316,10 +316,6 @@ impl Ui {
     }
 
     /// The selector, for the view and for the session to fill in.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the session uses it from Task 12 on")
-    )]
     pub(crate) fn selector(&self) -> &crate::selector::Selector {
         &self.selector
     }
