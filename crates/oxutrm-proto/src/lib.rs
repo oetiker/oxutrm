@@ -94,6 +94,8 @@ pub mod error;
 pub mod frame;
 pub mod ids;
 pub mod keymat;
+pub mod name;
+pub mod open;
 pub mod screen;
 pub mod signal;
 pub mod stream;
@@ -105,6 +107,11 @@ pub use error::ApplyError;
 pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
 pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
+pub use name::{MAX_NAME, Name};
+pub use open::{
+    Answer, Attached, OfferEntry, Open, Reply, Request, Role, SessionEntry, encode_line,
+    parse_answer, parse_line,
+};
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
 pub use signal::{Choice, MAX_SIGNAL_LINE, SessionSummary, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};

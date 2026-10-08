@@ -1,5 +1,7 @@
 //! The session identifier.
 
+use serde::{Deserialize, Serialize};
+
 use crate::ProtoError;
 
 /// 128-bit session identifier.
@@ -8,8 +10,31 @@ use crate::ProtoError;
 /// travels in `Signal::HostHello.session_id`, what names the registry
 /// directory, and what a user types after `--attach`, so it is deliberately
 /// one representation and not three.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SessionId(pub [u8; 16]);
+///
+/// The field is private: parsing is the only way to make one, so a value of
+/// this type is always a well-formed id. On the wire it is that same string
+/// (`serde(try_from, into)`), and a malformed one fails the whole message.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SessionId([u8; 16]);
+
+impl SessionId {
+    /// The first eight characters, which is how the selector and the popup's
+    /// title name a session that has no name.
+    #[must_use]
+    pub fn short(&self) -> String {
+        self.to_string().chars().take(8).collect()
+    }
+
+    /// Whether `prefix` begins this id, compared as `Display` spells it:
+    /// lowercase, and case-sensitively. An uppercase prefix never matches, so
+    /// a name such as `CAFE` (which `Name` allows) can never also be read as
+    /// an id prefix: `--attach` takes a name or an id with no precedence.
+    #[must_use]
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.to_string().starts_with(prefix)
+    }
+}
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,7 +58,11 @@ impl std::str::FromStr for SessionId {
         }
         let mut bytes = [0u8; 16];
         for (i, byte) in bytes.iter_mut().enumerate() {
-            let pair = &s[i * 2..i * 2 + 2];
+            // `get`, not indexing: a multi-byte character can make the
+            // length 32 while a pair boundary falls inside it.
+            let pair = s.get(i * 2..i * 2 + 2).ok_or_else(|| {
+                ProtoError::Malformed("session id must be 32 hex characters".to_string())
+            })?;
             *byte = u8::from_str_radix(pair, 16).map_err(|_| {
                 ProtoError::Malformed(format!(
                     "session id must be 32 hex characters, {pair:?} is not hex"
@@ -41,6 +70,19 @@ impl std::str::FromStr for SessionId {
             })?;
         }
         Ok(SessionId(bytes))
+    }
+}
+
+impl TryFrom<String> for SessionId {
+    type Error = ProtoError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<SessionId> for String {
+    fn from(id: SessionId) -> String {
+        id.to_string()
     }
 }
 
@@ -112,5 +154,35 @@ mod tests {
         assert!(seen.insert(SessionId([1; 16])));
         assert!(!seen.insert(SessionId([1; 16])));
         assert!(seen.insert(SessionId([2; 16])));
+    }
+
+    #[test]
+    fn on_the_wire_it_is_the_hex_string_and_a_bad_one_fails_the_message() {
+        let id: SessionId = "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().expect("parse");
+        let json = serde_json::to_string(&id).expect("encode");
+        assert_eq!(json, "\"3ff1218f5e0c4b7d9a1c2e3f40516273\"");
+        let back: SessionId = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, id);
+        assert!(serde_json::from_str::<SessionId>("\"3ff1218f\"").is_err());
+    }
+
+    #[test]
+    fn short_is_the_first_eight_and_a_prefix_matches_in_lowercase_only() {
+        let id: SessionId = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".parse().expect("parse");
+        assert_eq!(id.short(), "a3f9c01e");
+        assert!(id.starts_with("a3f9"));
+        // Ids are lowercase hex; `CAFE` is a legal name, so an uppercase
+        // prefix must never match an id.
+        assert!(!id.starts_with("A3F9C0"));
+        assert!(!id.starts_with("a3f8"));
+    }
+
+    #[test]
+    fn a_multibyte_character_at_a_pair_boundary_is_an_error_not_a_panic() {
+        // 30 ASCII bytes and one two-byte character: 32 bytes, and the
+        // character straddles the last pair.
+        let s = format!("{}\u{e9}", "0".repeat(30));
+        assert_eq!(s.len(), 32);
+        assert!(SessionId::from_str(&s).is_err());
     }
 }

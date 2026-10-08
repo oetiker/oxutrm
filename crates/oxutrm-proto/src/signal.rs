@@ -203,7 +203,7 @@ fn looks_like_signal(line: &str) -> bool {
 
 /// Hard version check (spec §4.2): a mismatch is a loud failure, never a
 /// downgrade and never a warning. Messages that carry no version pass.
-fn check_version(s: &Signal) -> Result<(), ProtoError> {
+pub(crate) fn check_version(s: &Signal) -> Result<(), ProtoError> {
     match s.proto() {
         Some(peer) if peer != PROTO_VERSION => Err(ProtoError::VersionMismatch {
             peer,

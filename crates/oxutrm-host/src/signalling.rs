@@ -20,7 +20,9 @@
 //! reading" become the same branch, and every other error — malformed JSON,
 //! version skew — propagates exactly as `oxutrm-proto` decided it should.
 
-use oxutrm_proto::{MAX_SIGNAL_LINE, ProtoError, Signal};
+use oxutrm_proto::{Answer, MAX_SIGNAL_LINE, ProtoError, Signal};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Read one `Signal`, discarding whatever the remote login printed first.
@@ -96,4 +98,110 @@ where
     w.write_all(&buf).await.map_err(ProtoError::Io)?;
     w.flush().await.map_err(ProtoError::Io)?;
     Ok(())
+}
+
+/// One line, up to and including its newline, never more than
+/// [`MAX_SIGNAL_LINE`] bytes of it. End of stream before any byte is
+/// `UnexpectedEof`, as for [`read_signal_async`].
+async fn read_bounded_line<R>(r: &mut R) -> Result<Vec<u8>, ProtoError>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut raw = Vec::new();
+    let taken = AsyncReadExt::take(&mut *r, MAX_SIGNAL_LINE as u64)
+        .read_until(b'\n', &mut raw)
+        .await?;
+    if taken == 0 {
+        return Err(ProtoError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the stream closed before a line arrived",
+        )));
+    }
+    if taken == MAX_SIGNAL_LINE && raw.last() != Some(&b'\n') {
+        return Err(ProtoError::SignalLineTooLong {
+            limit: MAX_SIGNAL_LINE,
+        });
+    }
+    Ok(raw)
+}
+
+/// Read one door line -- an `Open`, a `Reply` -- strictly: the peer speaks
+/// the protocol from its first byte, so nothing is skipped (switcher spec
+/// §4.1). Bounded like a signal.
+pub async fn read_line_async<R, T>(r: &mut R) -> Result<T, ProtoError>
+where
+    R: AsyncBufReadExt + Unpin,
+    T: DeserializeOwned,
+{
+    let raw = read_bounded_line(r).await?;
+    oxutrm_proto::parse_line(&raw)
+}
+
+/// Read what answers an `Open` that may run an attach exchange: its first
+/// `Signal`, or a `Reply`.
+pub async fn read_answer_async<R>(r: &mut R) -> Result<Answer, ProtoError>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let raw = read_bounded_line(r).await?;
+    oxutrm_proto::parse_answer(&raw)
+}
+
+/// Write one door line and flush it.
+pub async fn write_line_async<W, T>(w: &mut W, value: &T) -> Result<(), ProtoError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let line = oxutrm_proto::encode_line(value)?;
+    w.write_all(&line).await.map_err(ProtoError::Io)?;
+    w.flush().await.map_err(ProtoError::Io)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxutrm_proto::{Open, Reply, Request};
+
+    #[tokio::test]
+    async fn a_door_line_round_trips_and_a_banner_is_not_skipped() {
+        let mut buf = Vec::new();
+        write_line_async(&mut buf, &Open::new(Request::Sessions))
+            .await
+            .unwrap();
+        let mut r = tokio::io::BufReader::new(buf.as_slice());
+        let back: Open = read_line_async(&mut r).await.unwrap();
+        assert_eq!(back.req, Request::Sessions);
+
+        // A door has no preamble: a banner line is malformed, not noise.
+        let mut r = tokio::io::BufReader::new(&b"Welcome to Ubuntu\n"[..]);
+        assert!(matches!(
+            read_line_async::<_, Open>(&mut r).await,
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_a_reply_or_a_signal() {
+        let mut buf = Vec::new();
+        write_line_async(&mut buf, &Reply::Refused("gone".into()))
+            .await
+            .unwrap();
+        let mut r = tokio::io::BufReader::new(buf.as_slice());
+        assert!(matches!(
+            read_answer_async(&mut r).await.unwrap(),
+            Answer::Reply(Reply::Refused(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_endless_door_line_is_refused_at_the_limit() {
+        let endless = vec![b'x'; MAX_SIGNAL_LINE + 10];
+        let mut r = tokio::io::BufReader::new(endless.as_slice());
+        assert!(matches!(
+            read_line_async::<_, Open>(&mut r).await,
+            Err(ProtoError::SignalLineTooLong { .. })
+        ));
+    }
 }
