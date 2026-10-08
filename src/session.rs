@@ -6706,6 +6706,7 @@ mod tests {
                 cmds: cmds_tx,
                 attached: attached_tx,
             },
+            None,
         );
         door.register().expect("register");
         crate::control::serve_control(host.link.sink.connection().clone(), Arc::clone(&door));

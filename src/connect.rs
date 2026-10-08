@@ -402,20 +402,71 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send,
 {
     let mut reader = reader;
+    // L5. Banner and motd are skipped inside `read_signal_async`; version skew
+    // fails loudly.
+    let first = read_signal_async(&mut reader)
+        .await
+        .context("reading the host's offer")?;
+    establish_from(first, reader, writer, size, cfg, admit_remote).await
+}
+
+/// [`establish`] on a control stream after an `Open` that runs an attach
+/// exchange -- a `Switch`, a `New` in a session (switcher spec §4.1): the
+/// one answer is the exchange's `HostHello`, or a refusal, which is the
+/// host's words for the user ([`HostRefused`]).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the switcher's requests use it from Task 9 on")
+)]
+pub(crate) async fn establish_answering<R, W>(
+    reader: R,
+    writer: W,
+    size: TermSize,
+    cfg: &NetConfig,
+) -> Result<Established>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut reader = reader;
+    match oxutrm_host::signalling::read_answer_async(&mut reader)
+        .await
+        .context("reading the host's answer")?
+    {
+        oxutrm_proto::Answer::Signal(first) => {
+            establish_from(first, reader, writer, size, cfg, None).await
+        }
+        oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Refused(why)) => {
+            Err(anyhow::Error::new(HostRefused(why)))
+        }
+        oxutrm_proto::Answer::Reply(other) => Err(anyhow::anyhow!(
+            "the host answered with {other:?} where an attach should have begun"
+        )),
+    }
+}
+
+/// L4 and L6 to L10, once the host's first line -- its hello, or why not --
+/// is in hand.
+async fn establish_from<R, W>(
+    first: Signal,
+    reader: R,
+    writer: W,
+    size: TermSize,
+    cfg: &NetConfig,
+    admit_remote: Option<oxutrm_net::RemoteFilter>,
+) -> Result<Established>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut reader = reader;
     let mut writer = writer;
+    let host = host_facts(first)?;
 
     // L4. One socket for STUN, ICE and QUIC.
     let bound = oxutrm_net::bind_socket(cfg).context("binding a UDP socket")?;
     let mut candidates = oxutrm_net::local_candidates(&bound);
     let socket = crate::ladder::adopt(bound).context("handing the socket to the runtime")?;
-
-    // L5. Banner and motd are skipped inside `read_signal_async`; version skew
-    // fails loudly.
-    let host = host_facts(
-        read_signal_async(&mut reader)
-            .await
-            .context("reading the host's offer")?,
-    )?;
 
     // L6.
     let (reflexive, nat) = oxutrm_net::stun_discover(&socket, cfg).await;

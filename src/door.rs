@@ -119,6 +119,9 @@ pub(crate) struct Door {
     presence: Presence,
     /// `None` for a door with no loop behind it: the tests' doors.
     to_loop: Option<LoopLink>,
+    /// The binary a sibling runs: this session's own (switcher spec §3.4),
+    /// resolved once at startup. `None` where none could be.
+    exe: Option<PathBuf>,
 }
 
 impl Door {
@@ -129,6 +132,7 @@ impl Door {
         presence: Presence,
         cfg: NetConfig,
         to_loop: LoopLink,
+        exe: Option<PathBuf>,
     ) -> Arc<Door> {
         Arc::new(Door {
             registry,
@@ -142,6 +146,7 @@ impl Door {
             }),
             presence,
             to_loop: Some(to_loop),
+            exe,
         })
     }
 
@@ -167,6 +172,7 @@ impl Door {
             }),
             presence,
             to_loop: None,
+            exe: None,
         })
     }
 
@@ -386,6 +392,191 @@ impl Door {
     }
 }
 
+/// `Switch` (switcher spec §3.3): open the target's socket, ask it for a
+/// primary attach, and relay. The target runs its ordinary attach exchange
+/// with this session's client, which keeps its link here until the new one
+/// is up; nothing here changes this session.
+async fn switch<R, W>(door: &Door, to: SessionId, reader: R, mut writer: W)
+where
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let refuse = |why: String| Reply::Refused(why);
+    let reply = if to.to_string() == door.id() {
+        refuse("this is the session you are in".to_string())
+    } else {
+        let live = Registry::list_in(&door.registry).unwrap_or_default();
+        match live.iter().find(|m| m.session_id == to.to_string()) {
+            None => refuse(format!("no session {} on this host", to.short())),
+            Some(m) if !m.detachable => refuse(format!(
+                "session {} is not detachable: it dies with its ssh",
+                to.short()
+            )),
+            Some(m) => {
+                let path = Registry::socket_path_in(&door.registry, &m.session_id);
+                match tokio::net::UnixStream::connect(&path).await {
+                    Err(e) => refuse(format!("session {} did not answer: {e}", to.short())),
+                    Ok(stream) => {
+                        let (r, mut w) = stream.into_split();
+                        let asked = write_line_async(
+                            &mut w,
+                            &Open::new(Request::Attach {
+                                role: Role::Primary,
+                            }),
+                        )
+                        .await;
+                        if let Err(e) = asked {
+                            refuse(format!("session {} did not answer: {e}", to.short()))
+                        } else {
+                            let what = format!("session {}", to.short());
+                            relay_attach(&what, reader, writer, tokio::io::BufReader::new(r), w)
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let _ = write_line_async(&mut writer, &reply).await;
+}
+
+/// `New` in a session (switcher spec §3.4): start a sibling as the ordinary
+/// `oxutrm host --serve`, its stdin and stdout on a socket pair held here,
+/// and relay the client's stream into that pair exactly as ssh carries a
+/// first connect. One startup path makes every session process.
+async fn new_sibling<R, W>(door: &Door, name: Option<Name>, reader: R, mut writer: W)
+where
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let refused = |why: String| Reply::Refused(why);
+    let reply = match &door.exe {
+        None => refused("this session does not know its own binary".to_string()),
+        Some(exe) => match name_taken(&door.registry, name.as_ref()) {
+            Some(why) => refused(why),
+            None => match spawn_sibling(exe, &door.registry, name.as_ref()) {
+                Err(e) => refused(format!("starting a new session: {e}")),
+                Ok(pair) => {
+                    let (r, w) = pair.into_split();
+                    relay_attach(
+                        "the new session",
+                        reader,
+                        writer,
+                        tokio::io::BufReader::new(r),
+                        w,
+                    )
+                    .await;
+                    return;
+                }
+            },
+        },
+    };
+    let _ = write_line_async(&mut writer, &reply).await;
+}
+
+/// Why `name` cannot be a new session's, checked under the name lock: a
+/// refusal the client can read now, rather than a sibling that fails to
+/// register after its exchange. The sibling checks again as it registers.
+fn name_taken(registry: &std::path::Path, name: Option<&Name>) -> Option<String> {
+    let name = name?;
+    let checked = oxutrm_host::NamesLock::take(registry)
+        .and_then(|_lock| oxutrm_host::name_refusal(registry, name.as_str(), ""));
+    match checked {
+        Ok(refusal) => refusal,
+        Err(e) => Some(format!("checking the name: {e:#}")),
+    }
+}
+
+/// `exe host --serve [--name <name>]` with its stdin and stdout on one end
+/// of a socket pair, the other end returned. Its registry is this one,
+/// passed as `OXUTRM_STATE_DIR` -- the directory `registry` is in -- so the
+/// sibling registers beside its parent whatever its environment says.
+///
+/// The child is `host --serve`'s first process, which forks the session and
+/// exits at once (`detach_process`); it is waited for on a task of its own.
+fn spawn_sibling(
+    exe: &std::path::Path,
+    registry: &std::path::Path,
+    name: Option<&Name>,
+) -> std::io::Result<tokio::net::UnixStream> {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let theirs = std::os::fd::OwnedFd::from(theirs);
+    let base = registry.parent().unwrap_or(registry);
+    let mut command = tokio::process::Command::new(exe);
+    command.args(["host", "--serve"]);
+    if let Some(n) = name {
+        command.args(["--name", n.as_str()]);
+    }
+    command
+        .env("OXUTRM_STATE_DIR", base)
+        .stdin(std::process::Stdio::from(theirs.try_clone()?))
+        .stdout(std::process::Stdio::from(theirs))
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    // `command` held the child's ends; they go with it, so only the child
+    // has them now.
+    drop(command);
+    // Only a reaper: the child exits at once, after forking the session, and
+    // waiting for it keeps it from lingering as a zombie. The session itself
+    // is the grandchild, which nothing here waits for.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    ours.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(ours)
+}
+
+/// Relay an attach exchange between this session's client and another
+/// session process (`what`, for the reasons): its first line is read here,
+/// so a refusal or another protocol version reaches the client as a reason,
+/// then everything is relayed both ways -- decoded and re-encoded, so
+/// garbage cannot pass -- until either side ends. Bounded by
+/// [`crate::listener::ATTACH_TIMEOUT`], as the exchange itself is.
+async fn relay_attach<CR, CW, TR, TW>(
+    what: &str,
+    client_r: CR,
+    client_w: CW,
+    target_r: TR,
+    target_w: TW,
+) where
+    CR: AsyncBufRead + Unpin + Send,
+    CW: AsyncWrite + Unpin + Send,
+    TR: AsyncBufRead + Unpin + Send,
+    TW: AsyncWrite + Unpin + Send,
+{
+    let (mut client_r, mut client_w, mut target_r, mut target_w) =
+        (client_r, client_w, target_r, target_w);
+    let first = tokio::time::timeout(OPEN_TIMEOUT, read_answer_async(&mut target_r)).await;
+    let refusal = match first {
+        Ok(Ok(Answer::Signal(hello @ oxutrm_proto::Signal::HostHello { .. }))) => {
+            if oxutrm_host::signalling::write_signal_async(&mut client_w, &hello)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let both = async {
+                tokio::select! {
+                    _ = oxutrm_host::attach::relay_signals(&mut client_r, &mut target_w) => {}
+                    _ = oxutrm_host::attach::relay_signals(&mut target_r, &mut client_w) => {}
+                }
+            };
+            let _ = tokio::time::timeout(crate::listener::ATTACH_TIMEOUT, both).await;
+            return;
+        }
+        Ok(Ok(Answer::Signal(oxutrm_proto::Signal::Failed { reason }))) => reason,
+        Ok(Ok(Answer::Reply(Reply::Refused(why)))) => why,
+        Ok(Ok(other)) => format!("{what} answered with {other:?}"),
+        Ok(Err(ProtoError::Malformed(_) | ProtoError::VersionMismatch { .. })) => {
+            format!("{what} runs another version of oxutrm")
+        }
+        Ok(Err(e)) => format!("{what} did not start: {e}"),
+        Err(_) => format!("{what} did not answer in time"),
+    };
+    let _ = write_line_async(&mut client_w, &Reply::Refused(refusal)).await;
+}
+
 /// How long a request forwarded to a sibling may take: a kill waits out
 /// the shell's grace and its reaping.
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -482,13 +673,17 @@ where
             let reply = forward(&door.registry, id, Request::Rename { id, name }).await;
             let _ = write_line_async(&mut writer, &reply).await;
         }
-        Request::Switch { .. } | Request::New { .. } => {
+        // Only a session's own client switches or starts a sibling: a
+        // socket is a sibling's or `--attach`'s, and neither does.
+        Request::Switch { .. } | Request::New { .. } if via == Via::Socket => {
             let _ = write_line_async(
                 &mut writer,
-                &Reply::Refused("this host does not do that yet".to_string()),
+                &Reply::Refused("asked through the wrong door".to_string()),
             )
             .await;
         }
+        Request::Switch { to } => switch(&door, to, reader, writer).await,
+        Request::New { name } => new_sibling(&door, name, reader, writer).await,
     }
 }
 

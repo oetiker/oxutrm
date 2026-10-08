@@ -22,6 +22,9 @@ pub fn run_host_serve(begin: Begin) -> anyhow::Result<()> {
     // the command finished; the channel stays open because the grandchild
     // still holds 0, 1 and 2.
     let detached = oxutrm_host::detach_process().context("detaching from ssh")?;
+    // The binary a sibling runs (switcher spec §3.4), resolved once here and
+    // passed in: never looked up inside the code that spawns one.
+    let exe = own_binary();
 
     // R2. This reaches the user, because stderr is still the ssh pipe — and a
     // user wondering why a session vanished at logout needs this sentence
@@ -37,7 +40,7 @@ pub fn run_host_serve(begin: Begin) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building the runtime")?;
-    let outcome = runtime.block_on(serve(detached, &root, begin));
+    let outcome = runtime.block_on(serve(detached, &root, begin, exe));
 
     // Do not WAIT for the read that is parked on ssh's pipe.
     //
@@ -78,6 +81,7 @@ async fn serve(
     detached: oxutrm_host::Detached,
     root: &RegistryRoot,
     begin: Begin,
+    exe: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let cfg = NetConfig::default();
     let mut meta = SessionMeta {
@@ -137,6 +141,7 @@ async fn serve(
     let shell = Shell {
         program: meta.shell.clone(),
         start: oxutrm_term::Start::login_in(home_dir(std::env::var_os("HOME"))),
+        sibling: exe,
     };
     run_process(
         attached.link,
@@ -151,6 +156,17 @@ async fn serve(
     .map(|_| ())
 }
 
+/// This session's own binary, for a sibling to run: on Linux
+/// `/proc/self/exe`, which still opens after the file was replaced by a
+/// rebuild; elsewhere the path this process was started from.
+fn own_binary() -> Option<std::path::PathBuf> {
+    if cfg!(target_os = "linux") {
+        Some(std::path::PathBuf::from("/proc/self/exe"))
+    } else {
+        std::env::current_exe().ok()
+    }
+}
+
 /// What a session process starts as: a session with its shell, or a lobby
 /// (switcher spec §2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,10 +178,13 @@ pub(crate) enum Begin {
     Lobby,
 }
 
-/// The shell a session runs, and how it starts it.
+/// What a session process runs: its shell, how the shell starts, and the
+/// binary a sibling runs (switcher spec §3.4) -- this process's own,
+/// resolved once at startup; `None` where none could be.
 pub(crate) struct Shell {
     pub(crate) program: String,
     pub(crate) start: oxutrm_term::Start,
+    pub(crate) sibling: Option<std::path::PathBuf>,
 }
 
 /// R13 to R16: one session process, from its first link to its end.
@@ -207,6 +226,7 @@ pub(crate) async fn run_process(
             cmds: cmds_tx,
             attached: attached_tx,
         },
+        shell.sibling.clone(),
     );
     let mut session =
         HostSession::lobby(&shell.program, &shell.start, client_size, SCROLLBACK, link)?
@@ -289,15 +309,32 @@ pub(crate) mod fixtures {
             registry.to_path_buf(),
             crate::attach_exchange::fixtures::stun_free(),
             begin,
-            shell,
+            Shell {
+                sibling: Some(built_binary()),
+                ..shell
+            },
         ));
         Process { client, task }
+    }
+
+    /// The `oxutrm` binary `cargo test` built, for a sibling to run.
+    ///
+    /// `CARGO_BIN_EXE_oxutrm` is set for integration tests only, so it is
+    /// found where cargo puts it: `$CARGO_TARGET_DIR`, else `target/` in
+    /// the workspace, then `debug/`. `make test` builds it (the integration
+    /// tests need it); a lone `cargo test --bin oxutrm` may not.
+    pub(crate) fn built_binary() -> std::path::PathBuf {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+        target.join("debug").join("oxutrm")
     }
 
     pub(crate) fn sh() -> Shell {
         Shell {
             program: "/bin/sh".to_string(),
             start: oxutrm_term::Start::default(),
+            sibling: None,
         }
     }
 
@@ -567,6 +604,7 @@ mod tests {
             Shell {
                 program: script.to_str().unwrap().to_string(),
                 start: oxutrm_term::Start::default(),
+                sibling: None,
             },
         )
         .await;
@@ -718,6 +756,7 @@ mod tests {
             Shell {
                 program: script.to_str().unwrap().to_string(),
                 start: oxutrm_term::Start::login_in(home_dir(Some(home.clone().into_os_string()))),
+                sibling: None,
             },
         )
         .await;
@@ -736,5 +775,260 @@ mod tests {
         // a `#!` script's `$0` is its path, whatever `argv[0]` was.
         assert!(text.ends_with(&format!(":{}", home.display())), "{text}");
         done(ask_over(p.client.sink.connection(), Request::Kill { id: id(BUILD) }).await);
+    }
+
+    /// Open a control stream on `conn`, send `req`, and run the client's side
+    /// of the attach exchange that follows, as a switch or a new sibling
+    /// does.
+    async fn attach_by(
+        conn: &quinn::Connection,
+        req: Request,
+    ) -> anyhow::Result<crate::connect::Established> {
+        use oxutrm_host::signalling::write_line_async;
+        let (mut send, recv) = conn.open_bi().await?;
+        write_line_async(&mut send, &oxutrm_proto::Open::new(req)).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::connect::establish_answering(
+                tokio::io::BufReader::new(recv),
+                send,
+                SIZE,
+                &crate::attach_exchange::fixtures::stun_free(),
+            ),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_runs_the_targets_ordinary_attach_and_leaves_this_session_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = process(
+            dir.path(),
+            BUILD,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let logs = process(
+            dir.path(),
+            LOGS,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD, LOGS]).await;
+
+        let landed = attach_by(
+            me.client.sink.connection(),
+            Request::Switch { to: id(LOGS) },
+        )
+        .await
+        .expect("the switch lands");
+        assert_eq!(landed.session_id, LOGS);
+
+        // The target's other client was displaced, as by any primary attach.
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            logs.client.sink.connection().closed(),
+        )
+        .await
+        .expect("the target's old client was not displaced");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == crate::session::TAKEN_OVER),
+            "{reason:?}"
+        );
+        // This session is untouched: its link is up and it is still listed.
+        assert!(me.client.sink.connection().close_reason().is_none());
+        assert!(!me.task.is_finished());
+        registry_holds(dir.path(), &[BUILD, LOGS]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_to_a_session_that_is_gone_is_refused_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
+        registry_holds(dir.path(), &[BUILD]).await;
+        let err = attach_by(
+            me.client.sink.connection(),
+            Request::Switch { to: id(LOGS) },
+        )
+        .await
+        .err()
+        .expect("there is nothing to switch to");
+        assert!(format!("{err:#}").contains("a3f9c01e"), "{err:#}");
+        let err = attach_by(
+            me.client.sink.connection(),
+            Request::Switch { to: id(BUILD) },
+        )
+        .await
+        .err()
+        .expect("a switch to here");
+        assert!(format!("{err:#}").contains("you are in"), "{err:#}");
+        assert!(me.client.sink.connection().close_reason().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_to_another_version_is_refused_with_that_reason() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
+        let _old = oxutrm_host::RegistryGuard::register_in(
+            dir.path(),
+            &crate::door::fixtures::meta(LOGS, None),
+        )
+        .unwrap();
+        let old =
+            tokio::net::UnixListener::bind(oxutrm_host::Registry::socket_path_in(dir.path(), LOGS))
+                .unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = old.accept().await {
+                // It reads what it was asked first, as any peer does: one
+                // that hung up before the request was written would fail
+                // the write, not answer it.
+                let mut s = tokio::io::BufReader::new(s);
+                let _ = s.read_line(&mut String::new()).await;
+                let hello = format!(
+                    concat!(
+                        r#"{{"t":"HostHello","proto":2,"session_id":"{}","attach_id":1,"#,
+                        r#""cert_spki_sha256":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","#,
+                        r#""psk":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","#,
+                        r#""candidates":[],"nat_type":"Unknown","bound_port":443,"#,
+                        r#""detachable":true}}"#,
+                        "\n"
+                    ),
+                    LOGS
+                );
+                let _ = s.write_all(hello.as_bytes()).await;
+            }
+        });
+        registry_holds(dir.path(), &[BUILD, LOGS]).await;
+        let err = attach_by(
+            me.client.sink.connection(),
+            Request::Switch { to: id(LOGS) },
+        )
+        .await
+        .err()
+        .expect("an old session cannot be switched to");
+        assert!(format!("{err:#}").contains("another version"), "{err:#}");
+    }
+
+    /// Kills whatever sessions are left in `registry` when a test ends, by
+    /// pid: a sibling is a real detached process, and one a failed test
+    /// leaves behind would run for ever.
+    struct Reaper(std::path::PathBuf);
+
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            for m in oxutrm_host::Registry::list_in(&self.0).unwrap_or_default() {
+                if m.pid != std::process::id()
+                    && let Some(pid) = rustix::process::Pid::from_raw(m.pid as i32)
+                {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+        }
+    }
+
+    /// The whole of `New` from a session: a real sibling, started as
+    /// `oxutrm host --serve --name logs` from the binary cargo built, runs
+    /// the ordinary attach exchange over the relayed stream and registers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn new_in_a_session_starts_a_named_sibling_through_the_one_startup_path() {
+        // Under /tmp: a socket path under macOS's per-user temp directory
+        // is too long once `oxutrm/<id>/sock` is added.
+        let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let registry = base.path().join("oxutrm");
+        let _reaper = Reaper(registry.clone());
+        assert!(
+            built_binary().exists(),
+            "{} is not built; run the tests through `make test`",
+            built_binary().display()
+        );
+        let me = process(
+            &registry,
+            BUILD,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(&registry, &[BUILD]).await;
+
+        let landed = attach_by(
+            me.client.sink.connection(),
+            Request::New { name: name("logs") },
+        )
+        .await
+        .expect("the sibling's exchange completes");
+        assert_ne!(
+            landed.session_id, BUILD,
+            "the client landed in a new session"
+        );
+
+        let sibling = landed.session_id.clone();
+        registry_holds(&registry, &[BUILD, &sibling]).await;
+        let live = oxutrm_host::Registry::list_in(&registry).unwrap();
+        let entry = live.iter().find(|m| m.session_id == sibling).unwrap();
+        assert_eq!(entry.name.as_deref(), Some("logs"));
+        assert_ne!(entry.pid, std::process::id(), "a process of its own");
+
+        // A taken name is refused before anything starts.
+        let err = attach_by(
+            me.client.sink.connection(),
+            Request::New { name: name("logs") },
+        )
+        .await
+        .err()
+        .expect("logs is taken");
+        assert!(format!("{err:#}").contains("taken"), "{err:#}");
+
+        // And it is a session like any other: killed through this one.
+        done(
+            ask_over(
+                me.client.sink.connection(),
+                Request::Kill { id: id(&sibling) },
+            )
+            .await,
+        );
+        registry_holds(&registry, &[BUILD]).await;
+        drop(landed);
+    }
+
+    /// The binary a sibling would run is gone -- an upgrade removed it, a
+    /// path that no longer resolves: `New` is refused with the reason, and
+    /// the session it was asked of carries on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn new_with_no_binary_to_run_is_refused_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, client) = crate::link::fixtures::link_pair().await;
+        let mut meta = crate::door::fixtures::meta(BUILD, None);
+        meta.size = SIZE;
+        let task = tokio::spawn(run_process(
+            host,
+            SIZE,
+            meta,
+            dir.path().to_path_buf(),
+            crate::attach_exchange::fixtures::stun_free(),
+            Begin::Session { name: None },
+            Shell {
+                sibling: Some(std::path::PathBuf::from("/nonexistent/oxutrm")),
+                ..sh()
+            },
+        ));
+        registry_holds(dir.path(), &[BUILD]).await;
+        let err = attach_by(client.sink.connection(), Request::New { name: None })
+            .await
+            .err()
+            .expect("there is no binary to start");
+        assert!(
+            format!("{err:#}").contains("starting a new session"),
+            "{err:#}"
+        );
+        assert!(client.sink.connection().close_reason().is_none());
+        assert!(!task.is_finished());
+        registry_holds(dir.path(), &[BUILD]).await;
     }
 }
