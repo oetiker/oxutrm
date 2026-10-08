@@ -24,6 +24,7 @@ fn meta(id: &str) -> SessionMeta {
         // optimistic, which is why it must not be trusted.
         detachable: true,
         boot: None,
+        name: None,
     }
 }
 

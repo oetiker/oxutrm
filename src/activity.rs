@@ -40,6 +40,9 @@ pub(crate) enum Kind {
     Outage,
     /// The config file: a warning about it, a save, a save that failed.
     Config,
+    /// The session switcher: a switch, a new, killed or renamed session, and
+    /// what was refused.
+    Session,
 }
 
 impl Kind {
@@ -53,6 +56,7 @@ impl Kind {
             Kind::Log => "log",
             Kind::Outage => "outage",
             Kind::Config => "config",
+            Kind::Session => "session",
         }
     }
 }

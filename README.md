@@ -74,19 +74,22 @@ and no macOS package is built, so treat it as unproven rather than supported.
 ## Using it
 
 ```
-oxutrm <ssh-target>          # resume your session there, or start one
-oxutrm --attach <id> <tgt>   # resume that one in particular
-oxutrm --new <ssh-target>    # start a fresh one regardless
-oxutrm host --list           # sessions on this machine
+oxutrm <ssh-target>                    # pick a session there, or start one
+oxutrm --attach <name|id> <ssh-target> # go straight to that one
+oxutrm --new [--name <name>] <tgt>     # start a fresh one regardless
+oxutrm host --list                     # sessions on this machine
 oxutrm loopback              # both halves in one process, no network
 ```
 
 `oxutrm <ssh-target>` works: it drives ssh, races the connection ladder, brings
 up QUIC on whichever rung wins, and hands you the shell. The session survives
 the client going away, and you get it back by connecting again: the far end
-offers what is already running, a single session of yours is resumed without
-asking, and with several oxutrm asks which. `--attach` names one directly and
-`--new` always starts a fresh one.
+offers what is already running, and with any session there the **session
+selector** opens -- to switch to one, start a new one, rename or kill one.
+Nothing is resumed silently. `--attach` goes straight to a session by its name
+or the start of its id (lowercase hex), and `--new` always starts a fresh one,
+named with `--name`. The same selector is `s` in the status popup, and
+switching there uses the live link, not ssh. See `docs/sessions.md`.
 
 A client whose network dies reconnects by itself. After twenty seconds of
 silence it rebuilds the link — a new ssh, back into the same session. The first

@@ -1,0 +1,5 @@
+---
+source: crates/oxutrm-client/src/popup.rs
+expression: "text_of(&layout_sessions(&sessions_view(), TermSize { cols: 19, rows: 5 }))"
+---
+oxutrm sessions · b

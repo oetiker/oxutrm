@@ -34,6 +34,36 @@ use crate::exit_wake::ExitWake;
 /// having no bound at all is a host that never returns from a drop.
 const REAP_BUDGET: Duration = Duration::from_secs(2);
 
+/// How the child is started, beyond its program and arguments.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Start {
+    /// The directory it starts in; `None` inherits ours.
+    pub cwd: Option<std::path::PathBuf>,
+    /// A login shell: `argv[0]` is `-<basename>`, the convention `login(1)`
+    /// and `sshd` use to tell a shell to read its profile.
+    pub login: bool,
+}
+
+impl Start {
+    /// A login shell in `home`, as ssh would give you (switcher spec §3.4);
+    /// in the inherited directory when there is no usable home.
+    #[must_use]
+    pub fn login_in(home: Option<std::path::PathBuf>) -> Start {
+        Start {
+            cwd: home,
+            login: true,
+        }
+    }
+}
+
+/// `-<basename of shell>`, the `argv[0]` of a login shell.
+fn login_name(shell: &str) -> String {
+    let base = std::path::Path::new(shell)
+        .file_name()
+        .map_or_else(|| shell.to_string(), |b| b.to_string_lossy().into_owned());
+    format!("-{base}")
+}
+
 /// A PTY with a child attached to its user side.
 pub struct Pty {
     /// Our end: reads what the child wrote, writes what the user typed.
@@ -44,11 +74,23 @@ pub struct Pty {
 
 impl Pty {
     /// Open a PTY and start `shell` on the far side of it.
+    #[cfg(test)]
     pub fn spawn(
         shell: &str,
         args: &[String],
         env: &[(String, String)],
         size: TermSize,
+    ) -> anyhow::Result<Pty> {
+        Pty::spawn_with(shell, args, env, size, &Start::default())
+    }
+
+    /// [`Pty::spawn`], started as `start` says.
+    pub fn spawn_with(
+        shell: &str,
+        args: &[String],
+        env: &[(String, String)],
+        size: TermSize,
+        start: &Start,
     ) -> anyhow::Result<Pty> {
         let winsize = winsize_of(size);
         // `openpty` (rather than `openpty_nocloexec`) marks both descriptors
@@ -66,6 +108,12 @@ impl Pty {
 
         let mut command = Command::new(shell);
         command.args(args);
+        if start.login {
+            command.arg0(login_name(shell));
+        }
+        if let Some(dir) = &start.cwd {
+            command.current_dir(dir);
+        }
         for (k, v) in env {
             command.env(k, v);
         }
@@ -163,6 +211,31 @@ impl Pty {
             // Gone and unwaitable. Reporting "exited" beats claiming a session
             // is alive forever when nothing is on the other end.
             Err(_) => Some(-1),
+        }
+    }
+
+    /// Hang the child up the way the kernel does when a terminal goes away:
+    /// SIGHUP to the terminal's foreground process group and to the child.
+    /// Best effort -- either may already be gone. Callers must not call this
+    /// once the child has been reaped (its pid may be recycled).
+    pub fn hang_up(&self) {
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        if let Ok(fg) = rustix::termios::tcgetpgrp(self.controller.as_fd()) {
+            let _ = kill_process_group(fg, Signal::HUP);
+        }
+        if let Some(pid) = Pid::from_raw(self.child.id() as i32) {
+            let _ = kill_process(pid, Signal::HUP);
+        }
+    }
+
+    /// SIGKILL to the child's process group. The child is a session leader
+    /// (`login_tty`), so its group is its own pid. Best effort; same caveat
+    /// as [`Pty::hang_up`].
+    pub fn kill_group(&self) {
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        if let Some(pid) = Pid::from_raw(self.child.id() as i32) {
+            let _ = kill_process_group(pid, Signal::KILL);
+            let _ = kill_process(pid, Signal::KILL);
         }
     }
 
@@ -547,5 +620,60 @@ mod tests {
     fn spawning_something_that_does_not_exist_is_an_error_not_a_panic() {
         let e = Pty::spawn("/nonexistent/oxutrm-test-shell", &[], &[], size());
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn a_login_shell_starts_in_its_directory_with_a_dash_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().canonicalize().expect("canonical");
+        let mut pty = Pty::spawn_with(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "printf '%s:%s\\n' \"$0\" \"$(pwd -P)\"".to_owned(),
+            ],
+            &[],
+            size(),
+            &Start::login_in(Some(home.clone())),
+        )
+        .expect("spawn");
+        let want = format!("-sh:{}", home.display());
+        let out = read_until(&mut pty, want.as_bytes(), Duration::from_secs(5));
+        assert!(
+            String::from_utf8_lossy(&out).contains(&want),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    fn wait_exit(pty: &mut Pty, budget: Duration) -> Option<i32> {
+        let deadline = Instant::now() + budget;
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            let _ = pty.read_ready(&mut buf);
+            if let Some(code) = pty.child_exited() {
+                return Some(code);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn a_hang_up_ends_a_shell_that_does_not_ignore_it() {
+        let mut pty = sh("echo up; sleep 30");
+        read_until(&mut pty, b"up", Duration::from_secs(5));
+        pty.hang_up();
+        assert_eq!(wait_exit(&mut pty, Duration::from_secs(5)), Some(128 + 1));
+    }
+
+    #[test]
+    fn a_shell_that_ignores_the_hang_up_needs_the_kill() {
+        let mut pty = sh("trap '' HUP; echo up; while :; do sleep 1; done");
+        read_until(&mut pty, b"up", Duration::from_secs(5));
+        pty.hang_up();
+        assert_eq!(wait_exit(&mut pty, Duration::from_millis(400)), None);
+        pty.kill_group();
+        assert_eq!(wait_exit(&mut pty, Duration::from_secs(5)), Some(128 + 9));
     }
 }

@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Candidate, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, ProtoError, Psk,
-    TermSize, TerminalCaps,
+    Candidate, ClientSpki, HostSpki, Name, NatType, OfferEntry, PROTO_VERSION, PathDescription,
+    ProtoError, Psk, SessionId, TermSize, TerminalCaps,
 };
 
 /// The most bytes one signalling line may occupy, newline included.
@@ -36,37 +36,17 @@ use crate::{
 /// bytes is the largest one that is still accepted.
 pub const MAX_SIGNAL_LINE: usize = 1024 * 1024;
 
-/// One live session, as offered to a client.
-///
-/// Deliberately NOT `SessionMeta`. That struct also carries `pid` and `boot`,
-/// which are this host's own bookkeeping: a pid means nothing on the client's
-/// machine, and a boot token even less. What a client needs is enough to
-/// choose between sessions and to be told when a choice cannot work.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSummary {
-    /// 32 lowercase hex characters, the same id `--list` and `--attach` use.
-    pub session_id: String,
-    pub created_unix: u64,
-    pub shell: String,
-    /// The size the session was last driven at, which is what a returning
-    /// client sees redrawn before its own size takes effect.
-    pub size: TermSize,
-    /// A rung-4 session tunnels QUIC through its ssh connection and dies with
-    /// it. It is offered anyway, and refused with a reason: a list that
-    /// silently omits a session the host's own `--list` shows is a list that
-    /// makes a user doubt the tool.
-    pub detachable: bool,
-    pub attach_id: u64,
-}
-
 /// What the client wants done, in answer to [`Signal::Sessions`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "c")]
 pub enum Choice {
     /// Relay me into this session.
-    Attach { id: String },
-    /// Start a fresh one.
-    New,
+    Attach { id: SessionId },
+    /// Start a fresh one, named `name` if given.
+    New { name: Option<Name> },
+    /// Start a lobby: no shell, no registry entry, the selector over a blank
+    /// screen (switcher spec §2.1).
+    Lobby,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,7 +105,7 @@ pub enum Signal {
     /// the client learns what is already running and says which of it it
     /// wants. Empty is the ordinary first-connect case and is not an error.
     Sessions {
-        sessions: Vec<SessionSummary>,
+        list: Vec<OfferEntry>,
     },
     /// client -> host, the only answer to `Sessions`.
     ///
@@ -173,17 +153,6 @@ pub enum Signal {
     Failed {
         reason: String,
     },
-    /// client -> host, first line on a control stream: run an attach exchange
-    /// over this stream and park the result as a standby (spec §3.2).
-    StandbyRequest,
-    /// client -> host on a standby's control stream. Answered without
-    /// adopting anything: a sync frame is what adopts (spec §3.4).
-    Probe {
-        nonce: u64,
-    },
-    ProbeAck {
-        nonce: u64,
-    },
 }
 
 impl Signal {
@@ -203,7 +172,7 @@ fn looks_like_signal(line: &str) -> bool {
 
 /// Hard version check (spec §4.2): a mismatch is a loud failure, never a
 /// downgrade and never a warning. Messages that carry no version pass.
-fn check_version(s: &Signal) -> Result<(), ProtoError> {
+pub(crate) fn check_version(s: &Signal) -> Result<(), ProtoError> {
     match s.proto() {
         Some(peer) if peer != PROTO_VERSION => Err(ProtoError::VersionMismatch {
             peer,
@@ -1022,59 +991,56 @@ mod tests {
 
     // ---- the session offer, before the hellos ----
 
+    fn offer_entry() -> OfferEntry {
+        OfferEntry {
+            id: "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().unwrap(),
+            name: Some(Name::parse("build").unwrap()),
+            shell: "/bin/bash".to_owned(),
+            created_unix: 1_757_200_000,
+            size: TermSize {
+                cols: 120,
+                rows: 40,
+            },
+            detachable: true,
+        }
+    }
+
     #[test]
     fn an_offer_round_trips_through_json() {
-        // The offer travels on the same newline-delimited JSON channel as the
-        // hellos, so it must survive the same encode/decode. Asserting on the
-        // decoded value and not on the string: the tag names are an internal
-        // detail, the round trip is the contract.
         let offer = Signal::Sessions {
-            sessions: vec![SessionSummary {
-                session_id: "f00d".repeat(8),
-                created_unix: 1_757_200_000,
-                shell: "/bin/bash".to_owned(),
-                size: TermSize {
-                    cols: 120,
-                    rows: 40,
-                },
-                detachable: true,
-                attach_id: 3,
-            }],
+            list: vec![offer_entry()],
         };
         let line = serde_json::to_string(&offer).expect("an offer encodes");
         let back: Signal = serde_json::from_str(&line).expect("an offer decodes");
         match back {
-            Signal::Sessions { sessions } => {
-                assert_eq!(sessions.len(), 1);
-                assert_eq!(sessions[0].session_id, "f00d".repeat(8));
-                assert_eq!(sessions[0].size.cols, 120);
-                assert!(sessions[0].detachable);
-                assert_eq!(sessions[0].attach_id, 3);
-            }
+            Signal::Sessions { list } => assert_eq!(list, vec![offer_entry()]),
             other => panic!("expected Sessions, got {other:?}"),
         }
     }
 
     #[test]
     fn an_empty_offer_is_a_legitimate_offer() {
-        // The ordinary first connect. It must not be expressed as an absent
-        // message: the client blocks on reading exactly one line here, and
-        // "nothing to offer" has to be sayable.
-        let line = serde_json::to_string(&Signal::Sessions { sessions: vec![] })
+        // The ordinary first connect. The client blocks on reading exactly one
+        // line here, and "nothing to offer" has to be sayable.
+        let line = serde_json::to_string(&Signal::Sessions { list: vec![] })
             .expect("an empty offer encodes");
         match serde_json::from_str::<Signal>(&line).expect("an empty offer decodes") {
-            Signal::Sessions { sessions } => assert!(sessions.is_empty()),
+            Signal::Sessions { list } => assert!(list.is_empty()),
             other => panic!("expected Sessions, got {other:?}"),
         }
     }
 
     #[test]
-    fn both_choices_round_trip() {
+    fn every_choice_round_trips() {
         for choice in [
-            Choice::New,
-            Choice::Attach {
-                id: "abcd1234".to_owned(),
+            Choice::New { name: None },
+            Choice::New {
+                name: Some(Name::parse("build").unwrap()),
             },
+            Choice::Attach {
+                id: "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().unwrap(),
+            },
+            Choice::Lobby,
         ] {
             let line = serde_json::to_string(&Signal::Choose {
                 choice: choice.clone(),
@@ -1089,26 +1055,17 @@ mod tests {
 
     #[test]
     fn an_offer_carries_no_process_identity() {
-        // SessionMeta also holds `pid` and `boot`. Both are local bookkeeping and
-        // mean nothing on the client's machine; a pid on the wire invites a
-        // client to reason about a process it cannot see. Asserting on the
-        // serialized text on purpose -- this one IS about what goes on the wire.
+        // SessionMeta also holds `pid` and `boot`: local bookkeeping that means
+        // nothing on the client's machine. About the wire, so on the text.
         let line = serde_json::to_string(&Signal::Sessions {
-            sessions: vec![SessionSummary {
-                session_id: "f00d".repeat(8),
-                created_unix: 1,
-                shell: "/bin/sh".to_owned(),
-                size: TermSize { cols: 80, rows: 24 },
-                detachable: false,
-                attach_id: 0,
-            }],
+            list: vec![offer_entry()],
         })
         .expect("an offer encodes");
         assert!(!line.contains("\"pid\""), "pid must not travel: {line}");
         assert!(!line.contains("\"boot\""), "boot must not travel: {line}");
     }
 
-    // ---- features, and the three signals for a standby ----
+    // ---- features ----
 
     #[test]
     fn a_hello_without_features_parses_as_none() {
@@ -1137,20 +1094,6 @@ mod tests {
         match old {
             Signal::HostHello { features, .. } => assert!(features.is_empty()),
             other => panic!("parsed as {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_standby_signals_round_trip() {
-        for s in [
-            Signal::StandbyRequest,
-            Signal::Probe { nonce: 42 },
-            Signal::ProbeAck { nonce: 42 },
-        ] {
-            let mut line = Vec::new();
-            write_signal(&mut line, &s).unwrap();
-            let back = read_signal(&mut &line[..]).unwrap();
-            assert_eq!(format!("{back:?}"), format!("{s:?}"));
         }
     }
 }

@@ -38,8 +38,8 @@ pub use color::down_convert;
 pub use guard::{RawGuard, TERMINAL_RESTORE};
 pub use overlay::{Overlay, overlay_from_buffer};
 pub use popup::{
-    ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, Popup, PopupView, Row, layout,
-    layout_config, layout_popup, legible, summarised,
+    ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, Popup, PopupView, Row, SessionRow,
+    SessionsView, cells, layout, layout_config, layout_popup, layout_sessions, legible, summarised,
 };
 pub use renderer::Renderer;
 pub use status::{rung_label, status_line};

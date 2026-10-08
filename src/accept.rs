@@ -279,8 +279,8 @@ mod tests {
     use oxutrm_proto::{ClientSpki, HostSpki, TermSize};
     use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+    use crate::host_session::HostSession;
     use crate::link::Link;
-    use crate::session::HostSession;
 
     fn size() -> TermSize {
         TermSize { cols: 80, rows: 24 }
@@ -358,6 +358,7 @@ mod tests {
                     Ok(conn) => {
                         let session = HostSession::spawn(
                             "/bin/sh",
+                            &oxutrm_term::Start::default(),
                             size(),
                             200,
                             Link::new(conn, endpoint.clone(), Arc::clone(&socket)),
@@ -680,8 +681,14 @@ mod tests {
             let conn = accept_one(permit, nominated)
                 .await
                 .expect("the first client");
-            let session =
-                HostSession::spawn("/bin/sh", size(), 200, Link::new(conn, ep, sock)).unwrap();
+            let session = HostSession::spawn(
+                "/bin/sh",
+                &oxutrm_term::Start::default(),
+                size(),
+                200,
+                Link::new(conn, ep, sock),
+            )
+            .unwrap();
             counter.0.fetch_add(1, Ordering::SeqCst);
             // Keep it alive so the test is not measuring a dropped session.
             std::future::pending::<()>().await;

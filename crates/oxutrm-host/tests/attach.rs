@@ -38,6 +38,7 @@ fn meta(id: &str, pid: u32) -> SessionMeta {
         size: TermSize { cols: 80, rows: 24 },
         detachable: true,
         boot: None,
+        name: None,
     }
 }
 
@@ -367,7 +368,7 @@ fn the_listing_shows_detachability_rather_than_implying_it() {
     let mut tunnelled = meta("2222222222222222bbbbbbbbbbbbbbbb", 4243);
     tunnelled.set_detachable(Rung::SshTunnel);
 
-    let text = format_session_list(&[ok, tunnelled]);
+    let text = format_session_list(&[ok, tunnelled], cells);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("detachable"));
@@ -381,5 +382,45 @@ fn the_listing_shows_detachability_rather_than_implying_it() {
 
 #[test]
 fn an_empty_listing_is_a_sentence_not_a_blank() {
-    assert!(format_session_list(&[]).contains("no live oxutrm sessions"));
+    assert!(format_session_list(&[], cells).contains("no live oxutrm sessions"));
+}
+
+#[test]
+fn the_listing_has_a_name_column_that_keeps_the_rest_aligned() {
+    let mut build = meta("3ff1218f5e0c4b7d9a1c2e3f40516273", 4242);
+    build.name = Some("build".to_string());
+    let unnamed = meta("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", 4243);
+    let text = format_session_list(&[build, unnamed], cells);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].contains("  build  "), "{}", lines[0]);
+    assert!(lines[1].contains("  -      "), "{}", lines[1]);
+    // The pid column starts at the same place on both lines.
+    assert_eq!(lines[0].find("4242"), lines[1].find("4243"), "{text}");
+}
+
+/// A name in wide characters takes two cells per character, and the column
+/// is padded in cells: what follows it starts in the same terminal column on
+/// every line.
+#[test]
+fn a_wide_name_keeps_the_listing_aligned() {
+    let mut wide = meta("3ff1218f5e0c4b7d9a1c2e3f40516273", 4242);
+    wide.name = Some("構築ログ".to_string());
+    let mut logs = meta("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", 4243);
+    logs.name = Some("logs".to_string());
+    let text = format_session_list(&[wide, logs], cells);
+    let lines: Vec<&str> = text.lines().collect();
+    let cells_before = |line: &str, pid: &str| {
+        let at = line.find(pid).unwrap();
+        cells(&line[..at])
+    };
+    assert_eq!(
+        cells_before(lines[0], "4242"),
+        cells_before(lines[1], "4243"),
+        "{text}"
+    );
+}
+
+/// The measure the binary passes `format_session_list`: terminal cells.
+fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
 }

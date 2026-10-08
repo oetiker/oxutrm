@@ -1,4 +1,5 @@
-//! The two loops that make a remote terminal.
+//! The two loops that make a remote terminal. The host's lives in
+//! `host_session.rs`; this module keeps the client's and what both share.
 //!
 //! ```text
 //!   host:    PTY -> HostTerm -> Sender<ScreenState> -> QUIC
@@ -58,7 +59,6 @@ use oxutrm_client::{
 };
 use oxutrm_proto::{Frame, PathDescription, ScreenState, TermSize, TerminalCaps};
 use oxutrm_sync::{InputState, Receiver, Sender, SyncState as _};
-use oxutrm_term::HostTerm;
 
 use crate::activity::{Activity, Kind};
 use crate::config::{ConfigState, Settings, Value};
@@ -73,7 +73,7 @@ use crate::view::{ConfigFacts, Facts, Identity, RebuildFacts, StandbyFacts};
 ///
 /// Short enough that a keystroke is never sitting in a buffer, long enough
 /// that an idle session costs nothing.
-const IDLE_POLL: Duration = Duration::from_millis(4);
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(4);
 
 /// How long [`ClientSession::drain`] will keep taking frames off a closed
 /// link before handing the user their prompt back.
@@ -82,31 +82,6 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// reached in practice. It exists so that a reader task which somehow outlives
 /// its connection cannot hold a person's terminal hostage.
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
-
-/// How long the host keeps building frames for a client it has not heard from.
-///
-/// **This is the guarantee quinn used to provide and no longer does.** Until
-/// phase 2 the host asked `close_reason()`, which answered once the transport's
-/// 30 s idle timeout had fired. `max_idle_timeout` is `None` now, so
-/// `close_reason()` stays `None` for ever on a silent peer and the question has
-/// to be answered from a clock of our own.
-///
-/// Thirty seconds, so the behaviour is unchanged by construction: it is
-/// exactly what quinn enforced before -- with one difference. Quinn's idle
-/// timer was reset by *any* transport activity, including the 10 s
-/// keep-alive, so a client whose quinn stack kept answering keep-alives while
-/// its application loop was wedged used to stay attached for ever. `last_heard`
-/// moves only on an application frame, so that peer now detaches at 30 s
-/// instead -- a stricter and more honest reading of "still there". Six times
-/// `HEARTBEAT_IDLE`, so an attached client that is merely quiet is nowhere
-/// near it -- it heartbeats at 0.2 Hz and every heartbeat is a frame.
-///
-/// Detaching closes nothing. It stops snapshotting and stops offering frames;
-/// the pty is still drained and the emulator still fed, because the screen being
-/// current on reattach is the whole reason a detached session keeps emulating.
-/// A peer that comes back is heard on its first frame and `screen_stale` forces
-/// the snapshot.
-pub const DETACH_AFTER: Duration = Duration::from_secs(30);
 
 /// What one turn did. Returned so tests can watch the loop rather than infer
 /// it from the screen.
@@ -138,620 +113,6 @@ pub struct Turn {
     pub detached: bool,
 }
 
-/// The remote half: owns the PTY and the authoritative screen.
-pub struct HostSession {
-    term: HostTerm,
-    screen_tx: oxutrm_sync::Sender<ScreenState>,
-    input_rx: Receiver<InputState>,
-    link: Link,
-    size: TermSize,
-    last_send: Option<Instant>,
-    /// How much of the receiver's pending input has already gone to the PTY.
-    /// See [`HostSession::drain_input`].
-    written: usize,
-    /// The emulator moved while nobody was attached, so the snapshot the
-    /// sender holds is older than the screen. Forces one snapshot on the
-    /// turn a peer comes back, whether or not the pty moved on that turn.
-    screen_stale: bool,
-    /// The last time anything arrived from the client. The host's own liveness
-    /// clock, because `close_reason()` stopped being one when the transport's
-    /// idle timeout went. See [`DETACH_AFTER`].
-    last_heard: Instant,
-}
-
-impl HostSession {
-    /// Start a shell and serve it over `link`.
-    ///
-    /// `TERM` and `COLORTERM` come from [`oxutrm_term::negotiate_term`], which
-    /// takes no arguments on purpose.
-    pub fn spawn(
-        shell: &str,
-        size: TermSize,
-        scrollback: usize,
-        link: Link,
-    ) -> Result<HostSession> {
-        let (term_name, colorterm) = oxutrm_term::negotiate_term();
-        let mut env = vec![("TERM".to_owned(), term_name)];
-        if let Some(ct) = colorterm {
-            env.push(("COLORTERM".to_owned(), ct));
-        }
-
-        let term = HostTerm::spawn(shell, &[], &env, size, scrollback)
-            .context("starting the shell on a pty")?;
-        let blank = ScreenState::blank(size.rows, size.cols)?;
-        let empty = InputState {
-            seq: 1,
-            pending: Vec::new(),
-            size,
-        };
-
-        Ok(HostSession {
-            term,
-            screen_tx: oxutrm_sync::Sender::new(blank),
-            input_rx: Receiver::new(empty),
-            link,
-            size,
-            last_send: None,
-            written: 0,
-            screen_stale: false,
-            // An attach has just completed and R5 obliges the client to send
-            // immediately, so "now" is true rather than optimistic.
-            last_heard: Instant::now(),
-        })
-    }
-
-    /// One turn: apply whatever arrived, drain the PTY, offer a frame.
-    pub fn turn(&mut self) -> Result<Turn> {
-        self.turn_at(Instant::now(), None)
-    }
-
-    /// [`HostSession::turn`], plus a frame the caller has already taken off
-    /// the source.
-    ///
-    /// `run`'s select has to *receive* a frame to know one arrived, so it
-    /// arrives holding one; `try_recv` below would never see it and the
-    /// keystrokes in it would be silently dropped.
-    pub fn turn_with(&mut self, first: Option<Frame>) -> Result<Turn> {
-        self.turn_at(Instant::now(), first)
-    }
-
-    /// [`HostSession::turn_with`], with the clock injected.
-    ///
-    /// The clock is a parameter for the same reason it is one throughout
-    /// `LinkState` and `ClientSession::note_heard`: [`DETACH_AFTER`] is thirty
-    /// seconds, and a threshold that can only be tested by sleeping thirty
-    /// seconds is a threshold nobody tests.
-    pub fn turn_at(&mut self, now: Instant, mut first: Option<Frame>) -> Result<Turn> {
-        let mut turn = Turn::default();
-
-        // ---- inbound: the client's keystrokes ------------------------------
-        // (the size the client wants rides on the same diff, and is applied
-        // below once the frames have been taken in)
-        while let Some(frame) = first.take().or_else(|| self.link.source.try_recv()) {
-            // Any frame at all is evidence of a peer, including one `on_frame`
-            // rejects: a stale sequence number says the client is behind, not
-            // that it is gone.
-            self.last_heard = now;
-            // A rejected frame is not a disconnection: the state and the ack
-            // are both untouched, and the peer's next diff will apply.
-            match self.input_rx.on_frame(&frame) {
-                Ok(true) => {
-                    turn.applied += 1;
-                    self.drain_input()?;
-                }
-                Ok(false) => {}
-                // Not a disconnection, but not nothing either: a BaseMismatch
-                // is the peer diffing from a base we do not hold, and silence
-                // here once hid a deadlock for a whole day.
-                Err(e) => {
-                    turn.rejected += 1;
-                    #[cfg_attr(
-                        not(test),
-                        expect(
-                            clippy::print_stderr,
-                            reason = "the host daemon's own stderr, from turn_at on \
-                                      HostSession; never a client's screen"
-                        )
-                    )]
-                    {
-                        eprintln!("oxutrm: host dropped an unapplicable input frame: {e}");
-                    }
-                }
-            }
-        }
-
-        // The client's requested size arrives on the input diff. This has to
-        // live in `turn` rather than in `run`, or a caller driving the loop
-        // itself - which is every test, and will be M3's reattach path -
-        // silently never resizes.
-        let wanted = self.input_rx.state().size;
-        if wanted != self.size && wanted.cols > 0 && wanted.rows > 0 {
-            self.resize(wanted)?;
-        }
-
-        // ---- is anyone listening? -------------------------------------------
-        // A detached session must keep DRAINING the pty below - a child whose
-        // output nobody reads fills the buffer and blocks forever - and must
-        // keep feeding the emulator, because the whole point of a detachable
-        // session is that the screen is current when you come back. But
-        // everything after that exists only to build a frame for a peer, and
-        // there is no peer.
-        //
-        // Measured: a detached session whose child was writing five lines a
-        // second burned 17-20% of a core doing exactly that, for a screen
-        // nobody would ever see. Quiet ones cost 1.2%, which is why this hid.
-        //
-        // Two questions, and since phase 2 they have different answers.
-        // `close_reason` still catches a peer that closed properly or a
-        // transport error -- both are immediate and certain. What it no longer
-        // catches is silence: `max_idle_timeout` is `None`, so quinn will hold
-        // a connection to a peer that vanished for ever, and this used to read
-        // "turns off only once quinn has given the connection up".
-        //
-        // So the recency window is what answers it now. Generous on purpose:
-        // during a blip the connection is open and we WANT the work to
-        // continue, so the session resumes instantly when the peer comes back.
-        // `DETACH_AFTER` is six times the client's heartbeat interval.
-        let closed = self.link.sink.connection().close_reason().is_some();
-        let quiet_too_long = now.duration_since(self.last_heard) >= DETACH_AFTER;
-        let attached = !closed && !quiet_too_long;
-        turn.detached = !attached;
-
-        // ---- the terminal --------------------------------------------------
-        let moved = self.term.poll().context("draining the pty")?;
-        if attached {
-            if moved || self.screen_stale {
-                // The sequence number is a placeholder; `update` mints the real
-                // one, keeping numbering in exactly one place.
-                let snapshot = self.term.snapshot(1);
-                self.screen_tx.update(snapshot);
-                self.screen_stale = false;
-            }
-        } else if moved {
-            self.screen_stale = true;
-        }
-
-        // ---- outbound: the screen ------------------------------------------
-        if attached {
-            turn.sent = self.offer_frame();
-        }
-        turn.exited = self.term.child_exited();
-        Ok(turn)
-    }
-
-    /// Write newly acknowledged input to the PTY, exactly once.
-    ///
-    /// The receiver's `pending` holds bytes until the client's next diff trims
-    /// them, so a loop that wrote all of `pending` on every turn would send
-    /// the same keystrokes to the shell repeatedly. `written` tracks how much
-    /// of the current `pending` has already gone out, and the client's
-    /// `consumed` count is what shrinks it back.
-    fn drain_input(&mut self) -> Result<()> {
-        let pending = self.input_rx.state().pending.clone();
-        // A diff that consumed from the front makes `pending` shorter; the
-        // offset has to shrink with it or we would skip real input.
-        if self.written > pending.len() {
-            self.written = pending.len();
-        }
-        if self.written < pending.len() {
-            let fresh = pending[self.written..].to_vec();
-            self.term
-                .write_input(&fresh)
-                .context("writing to the pty")?;
-            self.written = pending.len();
-        }
-        Ok(())
-    }
-
-    /// The frame the current state owes the peer, if any, and the bookkeeping
-    /// that says it has been offered.
-    ///
-    /// Split out from [`HostSession::offer_frame`] so the two ways of putting
-    /// it on the wire — paced and unreliable, or final and reliable — differ
-    /// only in the sending, never in what is sent.
-    fn next_frame(&mut self) -> Option<Frame> {
-        self.screen_tx.on_ack(self.input_rx.peer_ack());
-        match self.screen_tx.make_frame(self.input_rx.ack()) {
-            Ok(Some(f)) => {
-                self.last_send = Some(Instant::now());
-                Some(f)
-            }
-            // Nothing to send, or a diff that could not be built. Neither ends
-            // the session.
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    fn offer_frame(&mut self) -> Option<SendOutcome> {
-        if !self.due() {
-            return None;
-        }
-        let frame = self.next_frame()?;
-        Some(self.link.sink.send(&frame))
-    }
-
-    /// [`HostSession::offer_frame`], on a stream that is finished and
-    /// acknowledged before this returns.
-    ///
-    /// For the last frame of a session only. See [`crate::link::FrameSink::send_final`].
-    async fn offer_frame_reliably(&mut self) -> Option<SendOutcome> {
-        if !self.due() {
-            return None;
-        }
-        let frame = self.next_frame()?;
-        Some(self.link.sink.send_final(&frame).await)
-    }
-
-    fn due(&self) -> bool {
-        match self.last_send {
-            // Idle: go now rather than waiting out an interval.
-            None => true,
-            Some(t) => t.elapsed() >= self.link.sink.pacing_interval(),
-        }
-    }
-
-    /// Resize the PTY and the emulator. The next diff carries it.
-    pub fn resize(&mut self, size: TermSize) -> Result<()> {
-        if size == self.size {
-            return Ok(());
-        }
-        self.term.resize(size).context("resizing the pty")?;
-        self.size = size;
-        Ok(())
-    }
-
-    /// Run until the child exits, waiting on descriptors rather than polling.
-    ///
-    /// A thin wrapper over [`HostSession::run_with_attaches`], with a receiver
-    /// whose sender has already been dropped. `Some(a) = attaches.recv()`
-    /// makes a closed receiver disable that arm rather than make it hot — see
-    /// `run_with_attaches`' own note — so this costs nothing and every
-    /// existing caller and test is unchanged.
-    pub async fn run(&mut self) -> Result<i32> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        // Dropped, not merely unnamed. `let (_tx, ...)` binds the sender for
-        // the whole `await`, which leaves an open-and-empty channel whose
-        // `recv()` pends for ever — the behaviour is the same, but it is not
-        // the mechanism the sentence above describes, and it means the arm
-        // that `Some(a) = ...` is there to disable is never actually
-        // disabled by anything `run` does.
-        drop(tx);
-        self.run_with_attaches(&mut rx).await
-    }
-
-    /// [`HostSession::run`], plus a second inbound connection completing an
-    /// attach exchange elsewhere in the process. Carries the whole
-    /// [`crate::attach_exchange::Attached`] rather than just the [`Link`],
-    /// because [`HostSession::adopt`] needs the size and
-    /// [`HostSession::on_attached`] the role: a primary is adopted at once, a
-    /// standby is parked until the client's first frame arrives on it.
-    ///
-    /// The descriptors are duplicated out of the terminal before the loop so
-    /// the arms borrow locals rather than `self`, which is what lets the body
-    /// call `&mut self` methods afterwards (C1). A `dup` shares the file
-    /// description, harmless here in a way it is NOT for the client's
-    /// keyboard: this description is ours and we set its `O_NONBLOCK`
-    /// ourselves in `Pty::spawn`.
-    pub async fn run_with_attaches(
-        &mut self,
-        attaches: &mut tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
-    ) -> Result<i32> {
-        let output = self.term.output_fd().try_clone_to_owned()?;
-        let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
-            .context("waiting on the pty")?;
-        let exit = match self.term.exit_wake().as_fd() {
-            Some(fd) => Some(
-                tokio::io::unix::AsyncFd::with_interest(
-                    fd.try_clone_to_owned()?,
-                    tokio::io::Interest::READABLE,
-                )
-                .context("waiting on the child")?,
-            ),
-            // Already gone when it was watched. The first turn below reports
-            // the exit before anything waits, so there is nothing to miss.
-            None => None,
-        };
-
-        // A frame taken off the source by the select, owed to the next turn.
-        let mut pending: Option<Frame> = None;
-        // The client's parked standby (spec §3.5): a link held, not used,
-        // until the client's first frame arrives on it. A local rather than a
-        // field so the arm watching it borrows the loop, not `self` (C1).
-        let mut standby: Option<Link> = None;
-        // A standby whose first frame has arrived, owed to the next turn with
-        // that frame. `promote_standby` does the reset and the feed together,
-        // in that order.
-        let mut promote: Option<(Link, Frame)> = None;
-        // The exit wake fired but `child_exited` disagreed. It is edge
-        // triggered and will not fire twice, so re-check on a timer instead of
-        // trusting the hint — the same rule that keeps PTY EOF out of this.
-        let mut recheck_child = false;
-
-        loop {
-            let turn = match (promote.take(), pending.take()) {
-                // `pending` is always empty here: a lap sets one or the other.
-                (Some((link, first)), _) => self
-                    .promote_standby(link, first)
-                    .context("switching to the standby")?,
-                (None, None) => self.turn()?,
-                (None, Some(frame)) => self.turn_with(Some(frame))?,
-            };
-            if let Some(code) = turn.exited {
-                // Closed, not dropped: its control server holds the
-                // connection open for as long as it is not.
-                if let Some(parked) = standby.take() {
-                    close_as_exited(parked.sink.connection(), code);
-                }
-                self.finish(code).await;
-                return Ok(code);
-            }
-
-            // Bytes are still in the PTY buffer, and readiness for them has
-            // already been delivered. Go round again rather than sleeping on
-            // an edge that will not come.
-            //
-            // Honest about its status: NO test currently fails without this.
-            // Removing it leaves the suite green, because a child that has
-            // more to write supplies another edge when it writes, and the exit
-            // wake supplies the last one. What it removes is a staleness
-            // window - a detached session whose child bursts and then falls
-            // quiet would hold an emulator behind the child until something
-            // else happened, and the screen being current on reattach is the
-            // whole reason a detached session keeps emulating at all. It is
-            // kept as the cheap half of a guarantee whose expensive half
-            // (`READ_BUDGET` versus the kernel's PTY buffer) is not ours.
-            if self.term.more_output_waiting() {
-                continue;
-            }
-
-            // Armed only when a frame is owed but paced out, so a session with
-            // nothing to say holds no timer at all. `due()` goes true on the
-            // lap after it fires, which is what stops it re-arming for ever.
-            let mut deadline = if self.due() {
-                None
-            } else {
-                Some(tokio::time::Instant::now() + self.link.sink.pacing_interval())
-            };
-            if std::mem::take(&mut recheck_child) {
-                let at = tokio::time::Instant::now() + IDLE_POLL;
-                deadline = Some(deadline.map_or(at, |d| d.min(at)));
-            }
-
-            // Nothing here touches `self`; every borrow starts after the
-            // select expression has ended and dropped these futures (C1).
-            //
-            // There is deliberately NO `conn.closed()` arm. A closed
-            // connection is permanently ready, so an arm watching one would
-            // spin — and the host must not end the session anyway, since
-            // outliving a vanished client is the entire point. `turn` re-reads
-            // `close_reason` whenever something else wakes it, which is
-            // exactly when the answer can matter.
-            let wake: HostWake = tokio::select! {
-                r = output.readable() => match r {
-                    // Cleared HERE, having just established above that the PTY
-                    // came up empty. Read-then-clear is the ordering `try_io`
-                    // uses, and clearing while bytes remain would stall the
-                    // screen until the child happened to write again.
-                    Ok(mut g) => { g.clear_ready(); HostWake::Pty }
-                    Err(e) => return Err(e).context("waiting on the pty"),
-                },
-                r = async { exit.as_ref().expect("armed").readable().await }, if exit.is_some() => match r {
-                    Ok(mut g) => { g.clear_ready(); HostWake::Exit }
-                    Err(e) => return Err(e).context("waiting on the child"),
-                },
-                Some(frame) = self.link.source.recv() => HostWake::Frame(frame),
-                () = async { tokio::time::sleep_until(deadline.expect("armed")).await },
-                    if deadline.is_some() => HostWake::Due,
-                // A closed mpsc receiver (the `run()` wrapper's, forever)
-                // yields `None` immediately, and `Some(a) = ...` disables the
-                // arm rather than making it hot — the same reason there is no
-                // `conn.closed()` arm above.
-                Some(a) = attaches.recv() => HostWake::Attached(a),
-                // A parked standby carries nothing until the client fails
-                // over onto it, so this arm is quiet until it matters. A
-                // closed one yields `None` once, and is then un-parked.
-                f = async { standby.as_mut().expect("armed").source.recv().await },
-                    if standby.is_some() => match f {
-                        Some(frame) => HostWake::StandbyFrame(frame),
-                        None => HostWake::StandbyGone,
-                    },
-            };
-
-            match wake {
-                HostWake::Frame(frame) => pending = Some(frame),
-                HostWake::Exit => recheck_child = true,
-                HostWake::Pty | HostWake::Due => {}
-                HostWake::Attached(a) => self.on_attached(a, &mut standby)?,
-                HostWake::StandbyFrame(frame) => {
-                    let link = standby.take().expect("the arm was armed");
-                    promote = Some((link, frame));
-                }
-                // Its connection is already closed, which is what ended the
-                // source; there is nothing left to close.
-                HostWake::StandbyGone => standby = None,
-            }
-        }
-    }
-
-    /// The last screen, and only then the close. `ls; exit` lives or dies here.
-    ///
-    /// Three separate things were losing it, and all three had to go:
-    ///
-    /// **The shell's last write and its exit are two events.** `turn` polls
-    /// the pty and *then* reaps the child, so a shell that printed and exited
-    /// in the same breath leaves its output in the pty buffer, unread, on the
-    /// very turn that reports the exit. One more poll collects it.
-    ///
-    /// **Pacing has nothing left to defer to.** `offer_frame` is gated by
-    /// `due()`, which at an 8 ms interval against a 4 ms poll is false on
-    /// roughly half the turns. Normally that costs one interval; here it costs
-    /// the screen, because there is no next interval. Clearing `last_send` is
-    /// what makes the final offer unconditional.
-    ///
-    /// **`close` discards whatever is still in flight.** A datagram, or a
-    /// stream whose writer task has not yet reached `open_uni`. So the final
-    /// frame goes on a stream that is finished and *acknowledged* before the
-    /// close is sent.
-    ///
-    /// Infallible on purpose: nothing here is worth reporting instead of the
-    /// status of a shell that has already exited.
-    pub async fn finish(&mut self, code: i32) {
-        if self.term.poll().unwrap_or(false) {
-            let snapshot = self.term.snapshot(1);
-            self.screen_tx.update(snapshot);
-        }
-        self.last_send = None;
-        self.offer_frame_reliably().await;
-        self.close(code);
-    }
-
-    /// Tell the client the shell is gone, and with what status.
-    ///
-    /// The exit code has no field in the protocol and needs none. QUIC's own
-    /// close carries an application error code, so the status travels on the
-    /// mechanism that *is* the end of the session rather than in a frame that
-    /// would have to arrive first — and a frame is exactly what cannot be
-    /// relied on here, since the close discards whatever is still in flight.
-    ///
-    /// A code outside `u32` cannot come from a shell; `child_exited` invents
-    /// `-1` for a child it can no longer wait on, and that becomes 255, the
-    /// same thing every shell reports for "something went wrong out here".
-    ///
-    /// The reason phrase is [`SHELL_EXITED`] and is load-bearing, not
-    /// decoration. See its own note.
-    pub fn close(&self, code: i32) {
-        close_as_exited(self.link.sink.connection(), code);
-    }
-
-    /// The authoritative screen, for tests. Nothing in the session loop reads
-    /// it: the loop ships diffs and never inspects what it shipped.
-    #[allow(dead_code)]
-    pub fn screen(&self) -> &ScreenState {
-        self.screen_tx.current()
-    }
-
-    /// Swap a freshly attached link in for the current one.
-    ///
-    /// Design spec §8.5: both sync channels restart at sequence 1 and the
-    /// first datagram of the new attach is a full state. `screen_stale` is
-    /// what forces that snapshot on the next turn.
-    pub fn adopt(&mut self, link: Link, size: TermSize) -> Result<()> {
-        self.adopt_as(link, size, TAKEN_OVER)
-    }
-
-    /// [`HostSession::adopt`], closing the displaced link with `reason`:
-    /// [`TAKEN_OVER`] for a newer attach, [`SWITCHED`] for the client's own
-    /// standby.
-    pub fn adopt_as(&mut self, link: Link, size: TermSize, reason: &'static [u8]) -> Result<()> {
-        // Close the displaced connection FIRST, and say why. A displaced
-        // client that is merely dropped reports silence, which is the one
-        // thing that did not happen.
-        self.link
-            .sink
-            .connection()
-            .close(quinn::VarInt::from_u32(0), reason);
-
-        self.link = link;
-        // `resize`, not `self.size = size`. The field means "the size the
-        // terminal currently IS", and writing it directly left the emulator
-        // and the pty at the FIRST client's geometry while every frame
-        // announced the newcomer's. Nothing downstream healed it either: the
-        // `input_rx` seeded below carries this same size, so `turn_at`'s
-        // `wanted != self.size` self-heal is false on every subsequent turn
-        // and the client only re-sends a size on a window change. A newcomer
-        // on a differently-sized terminal is the common case for reattach.
-        self.resize(size)
-            .context("resizing for the second attach")?;
-
-        // §8.5. New generation, so both channels restart at 1. The screen
-        // itself is NOT reset — the emulator kept running — so the base state
-        // is blank and `screen_stale` forces the snapshot that fills it.
-        // Built from `self.size`, which the resize above has just made current
-        // (and which `resize` leaves untouched when the size did not change).
-        let blank = ScreenState::blank(self.size.rows, self.size.cols)?;
-        self.screen_tx = oxutrm_sync::Sender::new(blank);
-        self.input_rx = Receiver::new(InputState {
-            seq: 1,
-            pending: Vec::new(),
-            size,
-        });
-        self.written = 0;
-        self.last_send = None;
-        self.screen_stale = true;
-        // An attach has just completed and the client sends immediately, so
-        // "now" is true rather than optimistic — the same reasoning as `spawn`.
-        self.last_heard = Instant::now();
-        Ok(())
-    }
-
-    /// One completed attach, by role. `standby` is the loop's local slot.
-    ///
-    /// Every link this lets go of is closed, and with a reason: a dropped
-    /// link is not closed at all, because its control server holds a handle
-    /// to the connection for as long as the connection is open.
-    pub(crate) fn on_attached(
-        &mut self,
-        a: crate::attach_exchange::Attached,
-        standby: &mut Option<Link>,
-    ) -> Result<()> {
-        match a.role {
-            crate::control::Role::Primary => {
-                // A takeover. The standby belongs to the displaced client, and
-                // leaving it parked would let that client take the session back
-                // by failing over onto it, without going through ssh.
-                if let Some(old) = standby.take() {
-                    old.sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), TAKEN_OVER);
-                }
-                self.adopt(a.link, a.client_size)
-                    .context("adopting a second attach")
-            }
-            crate::control::Role::Standby => {
-                // One slot. A newer standby supersedes the older one.
-                //
-                // Nothing checks that the client which asked for this one is
-                // still the primary's. The listener can finish a standby's
-                // exchange just after a takeover, so the displaced client's
-                // standby may land here. It does no harm: that client exits on
-                // its `TAKEN_OVER` and never sends on it. It stays parked
-                // until a standby the new client finds supersedes it, or the
-                // next primary attach drops it.
-                if let Some(old) = standby.replace(a.link) {
-                    old.sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), SUPERSEDED);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// The client has failed over: its first frame arrived on the parked
-    /// standby. Adopt the standby, then take that frame in, in one turn.
-    ///
-    /// Reset first, THEN feed. `adopt_as` restarts the input receiver at a
-    /// fresh generation, and the client's first frame after its own reset
-    /// belongs to that generation. Fed first, it would meet the old
-    /// generation's receiver, be taken for a stale frame and thrown away.
-    ///
-    /// The size is the session's current one. The client's frame carries its
-    /// real size in `InputState`, and `turn_at` reconciles it.
-    pub(crate) fn promote_standby(&mut self, link: Link, first: Frame) -> Result<Turn> {
-        let size = self.size;
-        self.adopt_as(link, size, SWITCHED)?;
-        self.turn_with(Some(first))
-    }
-}
-
-/// Close `conn` saying the shell exited, with `code` as its status.
-///
-/// A code outside `u32` cannot come from a shell; see [`HostSession::close`].
-fn close_as_exited(conn: &quinn::Connection, code: i32) {
-    let code = u32::try_from(code).unwrap_or(255);
-    conn.close(quinn::VarInt::from_u32(code), SHELL_EXITED);
-}
-
 /// What woke [`ClientSession::run_on`].
 ///
 /// Waking and acting are separate steps, and that is structural rather than
@@ -776,6 +137,8 @@ enum Wake {
     Standby(crate::standby::StandbyEvent),
     /// The standby's connection closed, with this reason.
     StandbyClosed(quinn::ConnectionError),
+    /// A switcher request was answered.
+    Answered(crate::switcher::Answered),
     Closed(quinn::ConnectionError),
     /// A readiness that turned out to be nothing. Costs one lap.
     Nothing,
@@ -791,26 +154,6 @@ fn is_takeover(reason: &quinn::ConnectionError) -> bool {
         reason,
         quinn::ConnectionError::ApplicationClosed(closed) if closed.reason.as_ref() == TAKEN_OVER
     )
-}
-
-/// The host's half of the same idea. Separate from [`Wake`] because the two
-/// loops wake for entirely different reasons and a shared enum would give each
-/// of them variants it can never produce.
-enum HostWake {
-    /// The child wrote something.
-    Pty,
-    /// The child exited — a hint; `child_exited` is the authority.
-    Exit,
-    Frame(Frame),
-    /// A frame was owed but paced out, and the pace has come round.
-    Due,
-    /// A second attach completed. Carries the whole thing, because the
-    /// session needs the size as well as the link.
-    Attached(crate::attach_exchange::Attached),
-    /// A frame arrived on the parked standby: the client has failed over.
-    StandbyFrame(Frame),
-    /// The parked standby's connection is gone.
-    StandbyGone,
 }
 
 /// Readiness on the keyboard, or never again once it has reached end of file.
@@ -895,6 +238,15 @@ pub const SUPERSEDED: &[u8] = b"superseded by a newer standby";
 /// is already carrying the session. It exists so that a `close` here is as
 /// legible in a packet trace as [`TAKEN_OVER`] is.
 pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
+
+/// Why the client closed a link of its own: it moved to another session
+/// (switcher spec §4.3). The session it left detaches quietly, as after any
+/// client loss; a lobby ends.
+pub const MOVED_AWAY: &[u8] = b"the client moved to another session";
+
+/// Why a client in a lobby closed its link: the user quit. The lobby ends
+/// with its link rather than after `DETACH_AFTER`.
+pub const QUIT: &[u8] = b"the client quit";
 
 /// What `conn` reports right now, as plain values for [`Quality`].
 fn reading_of(conn: &quinn::Connection) -> Reading {
@@ -1024,6 +376,23 @@ pub struct ClientSession {
     /// `network.standby` as last applied. The standby itself is switched by
     /// the loop, which owns the tasks it stops (`standby_switch`).
     standby_wanted: bool,
+    /// In a lobby: the far end has no shell (switcher spec §2.1). No standby
+    /// is searched for, and a rebuild aims at a fresh lobby.
+    in_lobby: bool,
+    /// A request for the host, waiting for the loop to send it.
+    asking: Option<crate::switcher::Ask>,
+    /// The request in flight, which its answer is read against.
+    asked: Option<crate::switcher::Ask>,
+    /// The host's sessions, as last fetched.
+    sessions: Vec<oxutrm_proto::SessionEntry>,
+    /// What an attach exchange of the switcher's runs with: `apply`'s.
+    net: oxutrm_net::NetConfig,
+    /// A connect-time lobby's selector is still to open: once the splash
+    /// is down (switcher spec §3.1).
+    open_selector: bool,
+    /// The selector wants the list, but another request was out when it
+    /// asked: fetched once that one is answered.
+    list_owed: bool,
 }
 
 /// The startup splash while it shows; the picture is
@@ -1171,6 +540,13 @@ impl ClientSession {
             config: ConfigState::defaults(),
             config_warned: std::collections::HashSet::new(),
             standby_wanted: true,
+            in_lobby: false,
+            asking: None,
+            asked: None,
+            sessions: Vec::new(),
+            net: oxutrm_net::NetConfig::default(),
+            open_selector: false,
+            list_owed: false,
         })
     }
 
@@ -1286,6 +662,231 @@ impl ClientSession {
         self
     }
 
+    /// Start in a lobby: the connect chose `Lobby` (switcher spec §3.1).
+    ///
+    /// The selector opens over the blank screen once the splash is down.
+    pub(crate) fn with_lobby(mut self) -> ClientSession {
+        self.in_lobby = true;
+        self.open_selector = true;
+        self
+    }
+
+    /// Whether the far end is a lobby.
+    #[cfg(test)]
+    pub(crate) fn in_lobby(&self) -> bool {
+        self.in_lobby
+    }
+
+    /// Ask the host `a` on the loop's next lap. One at a time: `false`, and
+    /// nothing asked, while another is waiting or in flight.
+    pub(crate) fn ask(&mut self, a: crate::switcher::Ask) -> bool {
+        if self.asking.is_some() || self.asked.is_some() {
+            return false;
+        }
+        self.asking = Some(a);
+        true
+    }
+
+    /// Whether a request is waiting or in flight.
+    pub(crate) fn asking(&self) -> bool {
+        self.asking.is_some() || self.asked.is_some()
+    }
+
+    /// The request to send now, if one is waiting; from here it is in
+    /// flight.
+    fn take_ask(&mut self) -> Option<crate::switcher::Ask> {
+        let a = self.asking.take()?;
+        self.asked = Some(a.clone());
+        Some(a)
+    }
+
+    /// The host's sessions, as last fetched.
+    #[cfg(test)]
+    pub(crate) fn sessions(&self) -> &[oxutrm_proto::SessionEntry] {
+        &self.sessions
+    }
+
+    /// How the activity log names session `id`: its name from the last
+    /// fetched list, else the start of its id.
+    fn label_of(&self, id: &oxutrm_proto::SessionId) -> String {
+        self.sessions
+            .iter()
+            .find(|e| e.id == *id)
+            .and_then(|e| e.name.as_ref())
+            .map_or_else(|| id.short(), |n| oxutrm_client::legible(n.as_str()))
+    }
+
+    /// The session this client is in, as an id.
+    fn here(&self) -> Option<oxutrm_proto::SessionId> {
+        self.identity.as_ref()?.session_id.parse().ok()
+    }
+
+    /// Point a rebuild at where the client now is.
+    fn aim_rebuild(&mut self) {
+        let aim = match (self.in_lobby, &self.identity) {
+            (true, _) => crate::rebuild::Aim::Lobby,
+            (false, Some(id)) => crate::rebuild::Aim::Session(id.session_id.clone()),
+            (false, None) => return,
+        };
+        if let Some(r) = self.rebuild.as_mut() {
+            r.retarget(aim);
+        }
+    }
+
+    /// What came of the request in flight. True when the link the session
+    /// runs on, or its standby, changed under the loop -- a switch, a new
+    /// sibling, a kill into a lobby -- and the loop must follow.
+    pub(crate) fn answered(&mut self, a: crate::switcher::Answered, now: Instant) -> Result<bool> {
+        let moved = self.take_answer(a, now)?;
+        // A list the selector asked for while this request was out: its
+        // turn now. Whatever this answer was -- even one from a link a
+        // rebuild has since replaced -- the list then shows what is there.
+        if std::mem::take(&mut self.list_owed) && self.ui.mode() == Mode::Sessions {
+            self.ask(crate::switcher::Ask::Sessions);
+        }
+        Ok(moved)
+    }
+
+    /// The selector wants the list: asked now, or once the request out is
+    /// answered.
+    fn fetch_list(&mut self) {
+        if !self.ask(crate::switcher::Ask::Sessions) {
+            self.list_owed = true;
+        }
+    }
+
+    /// What `answered` does with each answer.
+    fn take_answer(&mut self, a: crate::switcher::Answered, now: Instant) -> Result<bool> {
+        use crate::switcher::{Answered, Ask};
+        let asked = self.asked.take();
+        match a {
+            Answered::Sessions(list) => {
+                self.ui.selector_mut().set_rows(list.clone());
+                self.sessions = list;
+                Ok(false)
+            }
+            Answered::Landed(e) => {
+                let label = match &asked {
+                    Some(Ask::Switch { to }) => format!("switched to {}", self.label_of(to)),
+                    Some(Ask::New { name: Some(n) }) => {
+                        format!("new session {}", oxutrm_client::legible(n.as_str()))
+                    }
+                    _ => match e.session_id.parse::<oxutrm_proto::SessionId>() {
+                        Ok(id) => format!("new session {}", id.short()),
+                        Err(_) => "new session".to_string(),
+                    },
+                };
+                self.moved(*e, now)?;
+                self.activity.record_shown(Kind::Session, &label, &label);
+                // The selector closes: the user is in the new shell.
+                self.ui.close_popup();
+                Ok(true)
+            }
+            Answered::Started(entry) => {
+                self.in_lobby = false;
+                if let Some(id) = self.identity.as_mut() {
+                    id.session_id = entry.id.to_string();
+                }
+                self.aim_rebuild();
+                // The screen starts over as after a switch (switcher spec
+                // §3.4), but on the same link: the host's screen and input
+                // streams run on through the change, so only what is painted
+                // is forgotten -- resetting the sync state here would put the
+                // client out of step with them.
+                self.renderer.invalidate();
+                let label = match &entry.name {
+                    Some(n) => format!("new session {}", oxutrm_client::legible(n.as_str())),
+                    None => format!("new session {}", entry.id.short()),
+                };
+                self.activity.record_shown(Kind::Session, &label, &label);
+                self.ui.close_popup();
+                Ok(false)
+            }
+            Answered::Killed(id) => {
+                let label = format!("killed {}", self.label_of(&id));
+                self.activity.record_shown(Kind::Session, &label, &label);
+                // The list changed: fetched again, the selector staying
+                // open -- without the `this` row if that was this session.
+                self.fetch_list();
+                if Some(id) != self.here() {
+                    return Ok(false);
+                }
+                // This session's shell is gone, and the process is a lobby
+                // now (switcher spec §3.4): no standby there, and a rebuild
+                // goes to a fresh lobby. A lobby always shows the selector,
+                // even when the popup was closed before the answer came.
+                self.in_lobby = true;
+                if self.ui.mode() != Mode::Sessions {
+                    self.ui.open_sessions();
+                }
+                self.aim_rebuild();
+                if let Some(s) = self.standby.as_mut() {
+                    s.forget(now);
+                }
+                Ok(true)
+            }
+            Answered::Renamed(entry) => {
+                let label = match &entry.name {
+                    Some(n) => format!(
+                        "renamed {} to {}",
+                        entry.id.short(),
+                        oxutrm_client::legible(n.as_str())
+                    ),
+                    None => format!("{} has no name now", entry.id.short()),
+                };
+                self.activity.record_shown(Kind::Session, &label, &label);
+                self.fetch_list();
+                Ok(false)
+            }
+            Answered::Failed(why) => {
+                let what = match &asked {
+                    Some(Ask::Sessions) => "listing the sessions".to_string(),
+                    Some(Ask::Switch { to }) => format!("switching to {}", self.label_of(to)),
+                    Some(Ask::New { .. }) => "starting a new session".to_string(),
+                    Some(Ask::Kill { id }) => format!("killing {}", self.label_of(id)),
+                    Some(Ask::Rename { id, .. }) => format!("renaming {}", self.label_of(id)),
+                    None => "a request".to_string(),
+                };
+                self.activity.record_shown(
+                    Kind::Session,
+                    &format!("{what} failed: {why}"),
+                    &format!("{what} failed"),
+                );
+                // Under the list, as one line; the detail is in client.log.
+                // A list that failed is not on its way any more: the
+                // selector says so until one arrives.
+                let line = format!("{what} failed: {}", oxutrm_client::summarised(&why));
+                match asked {
+                    Some(Ask::Sessions) => self.ui.selector_mut().fail_list(line),
+                    _ => self.ui.selector_mut().fail(line),
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Move to the session `e` reached, make-before-break (switcher spec
+    /// §3.3): the new link is up, so it is adopted, the old one closed as
+    /// [`MOVED_AWAY`], the old link's parked standby dropped, the screen
+    /// started over, and the rebuild pointed at the new session. A rebuild
+    /// attempt still running was for the old one and is stood down.
+    fn moved(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        if let Some(r) = self.rebuild.as_mut() {
+            r.stood_down();
+        }
+        self.swap_in_as(e.link, now, MOVED_AWAY)?;
+        if let Some(s) = self.standby.as_mut() {
+            s.forget(now);
+        }
+        self.in_lobby = false;
+        if let Some(id) = self.identity.as_mut() {
+            id.session_id = e.session_id.clone();
+        }
+        self.aim_rebuild();
+        self.path = Some(e.path);
+        Ok(())
+    }
+
     /// Keep the activity log in `activity` -- the one with the file, which
     /// `connect` opens -- instead of the ring-only log `new` starts with.
     pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
@@ -1327,6 +928,7 @@ impl ClientSession {
         self.link_state
             .retune(s.silent_after, s.effective_rebuild_after());
         let cfg = s.net_config();
+        self.net = cfg.clone();
         if let Some(r) = self.rebuild.as_mut() {
             r.retune(cfg.clone(), s.connect_timeout);
         }
@@ -1729,6 +1331,7 @@ impl ClientSession {
             self.paint(out, "painting the screen after the splash")?;
         }
         let phase = self.link_state.phase_now();
+        self.ui.set_switcher(self.in_lobby, self.asking());
         let routed = self.ui.keys(keys, phase, now);
         if !routed.to_host.is_empty() {
             self.turn(&routed.to_host, out)?;
@@ -1737,7 +1340,17 @@ impl ClientSession {
             self.link_state.hold_keys(&routed.to_hold);
         }
         match routed.command {
-            Some(Command::Quit) => return Ok(Some(0)),
+            Some(Command::Quit) => {
+                // A lobby ends with its link: closed here, it does not wait
+                // out `DETACH_AFTER`. A session detaches, as it always did.
+                if self.in_lobby {
+                    self.link
+                        .sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), QUIT);
+                }
+                return Ok(Some(0));
+            }
             Some(Command::SendHeld) => {
                 let held = self.link_state.take_held();
                 self.activity.record(
@@ -1753,6 +1366,18 @@ impl ClientSession {
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
             Some(Command::Config(c)) => self.config_command(c),
+            // `s` while a request is out: the list follows its answer. The
+            // selector makes no other request while one is out (`busy`);
+            // should one come anyway, the line under the list says why
+            // nothing happens rather than dropping it unsaid.
+            Some(Command::Ask(crate::switcher::Ask::Sessions)) => self.fetch_list(),
+            Some(Command::Ask(a)) => {
+                if !self.ask(a) {
+                    self.ui
+                        .selector_mut()
+                        .fail(crate::selector::BUSY.to_string());
+                }
+            }
             None => {}
         }
         Ok(None)
@@ -1787,6 +1412,12 @@ impl ClientSession {
     /// rarely and costs one comparison otherwise; a change of phase is
     /// reported the lap it happens.
     fn layer_at(&mut self, now: Instant) -> Option<Popup> {
+        // A connect-time lobby: the selector, once the splash is down.
+        if self.open_selector && self.splash.is_none() {
+            self.open_selector = false;
+            self.ui.open_sessions();
+            self.fetch_list();
+        }
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
         match self.ui.tick(phase, now) {
@@ -1803,11 +1434,18 @@ impl ClientSession {
                 self.activity.record_detail(Kind::Link, &text);
                 let (text, shown) = std::mem::take(&mut self.outage).summary(outage);
                 self.activity.record_shown(Kind::Outage, &text, &shown);
+                // A list that failed in the outage is fetched again now.
+                if self.ui.mode() == Mode::Sessions && self.ui.selector().list_failed().is_some() {
+                    self.fetch_list();
+                }
             }
             None => {}
         }
         if !self.ui.visible(phase) {
             return None;
+        }
+        if self.ui.mode() == Mode::Sessions {
+            return Some(Popup::Sessions(self.sessions_view(phase, now)));
         }
         Some(match self.ui.config_screen() {
             Some(screen) => Popup::Config(self.config_view(screen, phase, now)),
@@ -1816,13 +1454,31 @@ impl ClientSession {
     }
 
     /// The status view [`ClientSession::layer_at`] shows, for the tests that
-    /// read it: `None` while the popup is closed or shows the config screen.
+    /// read it: `None` while the popup is closed or shows the config screen
+    /// or the session selector.
     #[cfg(test)]
     fn popup_at(&mut self, now: Instant) -> Option<PopupView> {
         match self.layer_at(now)? {
             Popup::Status(v) => Some(v),
-            Popup::Config(_) => None,
+            Popup::Config(_) | Popup::Sessions(_) => None,
         }
+    }
+
+    /// What the session selector says at `now`.
+    ///
+    /// The wall clock is read here, for "today": a start time turns from
+    /// `HH:MM` into `Mon DD` at midnight, which a repaint then shows.
+    fn sessions_view(&self, phase: Phase, now: Instant) -> oxutrm_client::SessionsView {
+        crate::view::sessions(&crate::view::SessionsFacts {
+            identity: self.identity.as_ref(),
+            selector: self.ui.selector(),
+            lobby: self.in_lobby,
+            phase,
+            last_heard: self.link_state.last_heard(),
+            now,
+            wall: std::time::SystemTime::now(),
+            zone: &self.zone,
+        })
     }
 
     /// What the config screen says at `now`.
@@ -2045,6 +1701,16 @@ impl ClientSession {
                 &format!("landed via {label} after the old link came back"),
             );
         }
+        // From a lobby a rebuild lands in a fresh one, with an id of its
+        // own; the selector, still open, lists what is there now.
+        if self.in_lobby {
+            if let Some(id) = self.identity.as_mut() {
+                id.session_id = e.session_id.clone();
+            }
+            if self.ui.mode() == Mode::Sessions {
+                self.fetch_list();
+            }
+        }
         self.path = Some(e.path);
         Ok(())
     }
@@ -2163,7 +1829,9 @@ impl ClientSession {
         now: Instant,
         rebuild: RebuildStage,
     ) -> crate::standby::StandbyAction {
-        let Some(s) = self.standby.as_mut() else {
+        // Searched for only in a session, never in a lobby (switcher spec
+        // §2.1): a lobby has nothing a second path would keep alive.
+        let Some(s) = self.standby.as_mut().filter(|_| !self.in_lobby) else {
             return crate::standby::StandbyAction::Nothing;
         };
         let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
@@ -2547,6 +2215,12 @@ impl ClientSession {
         let mut _search_task: Option<crate::attach_exchange::AbortOnDrop> = None;
         let mut _probe_task: Option<crate::attach_exchange::AbortOnDrop> = None;
 
+        // Where a switcher request reports back, and the request in flight:
+        // locals for the reason `outcomes` is one (C1). One deep: one
+        // request at a time.
+        let (answers_tx, mut answers) = tokio::sync::mpsc::channel::<crate::switcher::Answered>(1);
+        let mut _ask_task: Option<crate::attach_exchange::AbortOnDrop> = None;
+
         let mut winch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
@@ -2598,6 +2272,7 @@ impl ClientSession {
                 () = splash_due(splash_at) => Wake::SplashFrame,
                 Some(report) = outcomes.recv() => Wake::Rebuilt(report),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
+                Some(a) = answers.recv() => Wake::Answered(a),
                 // Quiet until the standby goes away; a closed connection is
                 // ready for ever, which is why the handler disarms it.
                 reason = async { standby_conn.as_ref().expect("armed").closed().await },
@@ -2687,6 +2362,19 @@ impl ClientSession {
                     standby_conn = None;
                     self.on_standby_closed(&reason, Instant::now());
                 }
+                Wake::Answered(a) => {
+                    _ask_task = None;
+                    if self.answered(a, Instant::now())? {
+                        // As after a landed rebuild: the arm watches the new
+                        // connection, the old one was closed on purpose, and
+                        // the standby -- the old session's -- is gone.
+                        conn = self.link.sink.connection().clone();
+                        takeover_expected = false;
+                        standby_conn = None;
+                        _search_task = None;
+                        _probe_task = None;
+                    }
+                }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
                 // nothing at all.
@@ -2760,6 +2448,18 @@ impl ClientSession {
                 && let Some(s) = self.standby.as_mut()
             {
                 s.route_moved(now);
+            }
+
+            // A switcher request, on its own stream of the live link.
+            if let Some(ask) = self.take_ask() {
+                let primary = self.link.sink.connection().clone();
+                let (size, cfg) = (self.size, self.net.clone());
+                let tx = answers_tx.clone();
+                let task = tokio::spawn(async move {
+                    let a = crate::switcher::ask(primary, ask, size, &cfg).await;
+                    let _ = tx.send(a).await;
+                });
+                _ask_task = Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
             }
 
             // The `bool` is for the tests, which hold the clock still and ask
@@ -3039,6 +2739,7 @@ mod tests {
     use super::*;
     // `use super::*` reaches the session module's own imports, not `crate`'s
     // other modules, so the route pace has to be named explicitly.
+    use crate::host_session::{DETACH_AFTER, HostSession};
     use crate::roam::ROUTE_PROBE_EVERY;
     use crate::view::words;
     use oxutrm_client::Marker;
@@ -3163,9 +2864,16 @@ mod tests {
         // The client's peer is the RELAY, which is the whole point.
         let (host_link, client_link) = listening.dial("127.0.0.1:0", relay.addr).await;
 
-        let mut host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size,
+            200,
+            host_link,
+        )
+        .unwrap();
         let client = ClientSession::new(size, caps(), client_link, None).unwrap();
-        host.term.write_input(shell.as_bytes()).unwrap();
+        host.term_mut().write_input(shell.as_bytes()).unwrap();
         (host, client, relay)
     }
 
@@ -3198,14 +2906,21 @@ mod tests {
         let addr = listening.addr;
         let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size,
+            200,
+            host_link,
+        )
+        .unwrap();
         let client = ClientSession::new(size, caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
         // the script is fed as input instead, which is also how a real session
         // works.
         let mut host = host;
-        host.term.write_input(shell.as_bytes()).unwrap();
+        host.term_mut().write_input(shell.as_bytes()).unwrap();
         (host, client)
     }
 
@@ -3322,7 +3037,7 @@ mod tests {
         let mut quiet = 0;
         let settled_by = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < settled_by && quiet < 2 {
-            if host.term.poll().expect("polling the pty") {
+            if host.term_mut().poll().expect("polling the pty") {
                 quiet = 0;
             } else {
                 quiet += 1;
@@ -3553,7 +3268,7 @@ mod tests {
         let mut out = Vec::new();
 
         // One burst of typing, then the client goes quiet for good.
-        host.term
+        host.term_mut()
             .write_input(b"printf 'first\r\n'\n")
             .expect("write");
         assert!(
@@ -3571,7 +3286,7 @@ mod tests {
         // Well past STATE_RING updates, so a run that only recovered by ring
         // eviction would still be frozen here. Nothing is typed from now on.
         for i in 0..40 {
-            host.term
+            host.term_mut()
                 .write_input(format!("printf 'line-{i}\\r\\n'\n").as_bytes())
                 .expect("write");
         }
@@ -3865,11 +3580,18 @@ mod tests {
         };
         let (host_link, client_link) = crate::link::fixtures::link_pair().await;
 
-        let mut host = HostSession::spawn("/bin/sh", big, 200, host_link).unwrap();
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            big,
+            200,
+            host_link,
+        )
+        .unwrap();
         let mut client = ClientSession::new(big, caps(), client_link, None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.
-        host.term
+        host.term_mut()
             .write_input(b"i=0; while [ $i -lt 60 ]; do printf '\\033[3%dm%s-%d\\r\\n' $((i%8)) $(head -c 60 /dev/urandom | od -An -tx1 | tr -d ' \\n') $i; i=$((i+1)); done\n")
             .unwrap();
 
@@ -4112,7 +3834,7 @@ mod tests {
         // landing exactly on the reattach turn's own poll would set `moved`
         // there too, and the mutation this test guards against would go
         // undetected for the wrong reason.
-        host.term.write_input(b"echo moved\n").unwrap();
+        host.term_mut().write_input(b"echo moved\n").unwrap();
         let poll_budget = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut elapsed = Duration::ZERO;
         loop {
@@ -4125,7 +3847,7 @@ mod tests {
             elapsed += Duration::from_millis(20);
             host.turn_at(late + elapsed, None)
                 .expect("a turn while still detached");
-            if text(&host.term.snapshot(1)).contains("moved") {
+            if text(&host.term_mut().snapshot(1)).contains("moved") {
                 break;
             }
         }
@@ -4262,7 +3984,9 @@ mod tests {
         assert!(text(client.screen()).contains("before-roam"));
 
         // And new output crosses the new path.
-        host.term.write_input(b"printf 'after-roam\r\n'\n").unwrap();
+        host.term_mut()
+            .write_input(b"printf 'after-roam\r\n'\n")
+            .unwrap();
         assert!(
             drive(
                 &mut host,
@@ -6973,7 +6697,7 @@ mod tests {
             "nothing in flight can displace the landed link"
         );
 
-        host.term
+        host.term_mut()
             .write_input(b"printf 'after-%s\\r\\n' landing\n")
             .expect("write");
         assert!(
@@ -7004,7 +6728,7 @@ mod tests {
             &script,
             format!(
                 "#!/bin/sh\n{ASKED_SSH_G}\
-                 printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+                 printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
                  read -r choice\n\
                  exec sleep 300\n"
             ),
@@ -7240,10 +6964,14 @@ mod tests {
         let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
-        // The probe is answered by the standby's own control server. Its door
-        // is never knocked on.
-        let (door_tx, _door_rx) = tokio::sync::mpsc::channel(1);
-        crate::control::serve_control(standby_host.sink.connection().clone(), door_tx);
+        // The probe is answered by the standby's own control server. Its
+        // attach loop is never asked for anything.
+        let door_dir = tempfile::tempdir().expect("a scratch directory");
+        let (door, _inbox, _) = crate::door::fixtures::registered(
+            door_dir.path(),
+            crate::door::fixtures::meta("00112233445566778899aabbccddeeff", None),
+        );
+        crate::control::serve_control(standby_host.sink.connection().clone(), door);
         let standby_id = standby_client.sink.connection().stable_id();
         assert_ne!(standby_id, primary_id);
 
@@ -7318,22 +7046,31 @@ mod tests {
         let (mut host, mut client) = pair_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let listener =
-            tokio::net::UnixListener::bind(dir.path().join("sock")).expect("binding the socket");
-        let start =
+        let mut start =
             crate::attach_exchange::fixtures::fresh_meta("00112233445566778899aabbccddeeff");
-        let guard = Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = Arc::new(tokio::sync::Mutex::new(start));
-        let (door_task, mut attach_rx) = crate::serve::open_doors(
-            listener,
-            guard,
-            Arc::clone(&meta),
+        // Severed, so the door binds a socket and runs an attach loop.
+        start.detachable = true;
+        let meta_path = dir
+            .path()
+            .join("00112233445566778899aabbccddeeff")
+            .join(oxutrm_host::META_FILE);
+        let (cmds_tx, mut cmds) = tokio::sync::mpsc::channel(1);
+        let (attached_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let door = crate::door::Door::process(
+            dir.path().to_path_buf(),
+            start,
+            crate::host_session::Presence::default(),
             crate::attach_exchange::fixtures::stun_free(),
-            host.link.sink.connection().clone(),
+            crate::door::LoopLink {
+                cmds: cmds_tx,
+                attached: attached_tx,
+            },
+            None,
         );
-        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+        door.register().expect("register");
+        crate::control::serve_control(host.link.sink.connection().clone(), Arc::clone(&door));
+        let host_loop =
+            tokio::spawn(async move { host.run_with_doors(&mut attach_rx, &mut cmds).await });
 
         // Due at once rather than after the settling delay. Loopback is the
         // primary's own path, so the real filter would rightly refuse every
@@ -7362,11 +7099,22 @@ mod tests {
         typing.write_all(&[CTRL_BACKSLASH]).expect("type");
         wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
         wait_for_screen(&out, BIG, "found ", Duration::from_secs(20)).await;
-        assert_eq!(
-            meta.lock().await.attach_id,
-            1,
-            "the host did not run an exchange for the standby"
-        );
+        // The host records the generation just after its `Established`
+        // went out, so the client may see the standby a moment first.
+        let recorded = async {
+            loop {
+                let on_disk: oxutrm_host::SessionMeta =
+                    serde_json::from_slice(&std::fs::read(&meta_path).expect("meta.json"))
+                        .expect("meta.json parses");
+                if on_disk.attach_id == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), recorded)
+            .await
+            .expect("the host did not run an exchange for the standby");
 
         // The open popup takes every key: close it, then talk to the shell.
         close_the_popup(&mut typing, &out, BIG).await;
@@ -7389,7 +7137,7 @@ mod tests {
             "the standby was shown but not recorded"
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
-        crate::listener::close_the_door(door_task).await;
+        door.close().await;
     }
 
     /// What the popup may not say while `Silent` or `Confirming`, wherever
@@ -8570,7 +8318,7 @@ mod tests {
         // socket-address assertion cannot reach: QUIC migration is what makes
         // the swap survivable, so output produced after it has to arrive.
         let mut out = Vec::new();
-        host.term
+        host.term_mut()
             .write_input(b"printf 'after-the-rebind\\r\\n'\n")
             .expect("write");
         assert!(
@@ -9981,6 +9729,22 @@ mod tests {
         );
     }
 
+    /// `s` on the popup puts the session selector up as layer 1, saying
+    /// the list is on its way until it comes back.
+    #[tokio::test]
+    async fn the_selector_is_what_the_popup_shows_while_it_is_up() {
+        let (_host, mut session) = pair("/bin/sh").await;
+        let mut out = Vec::new();
+        session.route_keys(&[crate::ui::PREFIX], &mut out).unwrap();
+        session.route_keys(b"s", &mut out).unwrap();
+        let Some(Popup::Sessions(v)) = session.layer_at(Instant::now()) else {
+            panic!("the selector is not on the screen");
+        };
+        assert_eq!(v.line, "asking the host for its sessions\u{2026}");
+        assert_eq!(v.keys.last().map(|k| k.label.as_str()), Some("back"));
+        assert_eq!(session.popup_at(Instant::now()), None);
+    }
+
     /// A client with its popup open on the config screen, cursor on `row`.
     async fn on_the_config_screen(row: usize) -> (HostSession, ClientSession) {
         let (host, mut session) = pair("/bin/sh").await;
@@ -10306,5 +10070,773 @@ mod tests {
             let shown = format!("config: {w}");
             assert_eq!(times(&shown), 1, "{shown}: {:#?}", shown_log(&session));
         }
+    }
+
+    // ---- the switcher, on the client (switcher spec §3.3 to §3.5) ----------
+
+    const BUILD_ID: &str = "3ff1218f5e0c4b7d9a1c2e3f40516273";
+    const LOGS_ID: &str = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60";
+
+    /// A client on `link`, in session `id` on `thinlinc`, whose switcher
+    /// exchanges reach no STUN server.
+    fn client_on(link: Link, id: &str) -> ClientSession {
+        let mut c = ClientSession::new(crate::serve::fixtures::SIZE, caps(), link, None)
+            .unwrap()
+            .with_identity(Identity {
+                target: "thinlinc".to_owned(),
+                session_id: id.to_owned(),
+            });
+        c.net = crate::attach_exchange::fixtures::stun_free();
+        c
+    }
+
+    /// Send the request the client has waiting, as the loop does, and hand
+    /// the answer back to it. Returns what `answered` returned.
+    ///
+    /// A list the answer asks for in turn -- after a kill or a rename -- is
+    /// fetched too, as the loop would.
+    async fn ask_now(c: &mut ClientSession, a: crate::switcher::Ask) -> bool {
+        assert!(c.ask(a), "another request was in flight");
+        let mut first = None;
+        while let Some(a) = c.take_ask() {
+            let answered =
+                crate::switcher::ask(c.link.sink.connection().clone(), a, c.size, &c.net.clone())
+                    .await;
+            let moved = c.answered(answered, Instant::now()).expect("answered");
+            first.get_or_insert(moved);
+        }
+        first.expect("the request just asked")
+    }
+
+    fn id_of(s: &str) -> oxutrm_proto::SessionId {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_moves_the_client_and_the_old_session_stays_listed() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        assert!(!ask_now(&mut client, crate::switcher::Ask::Sessions).await);
+        assert_eq!(client.sessions().len(), 2);
+
+        let old = client.link.sink.connection().clone();
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Switch { to: id_of(LOGS_ID) }
+            )
+            .await,
+            "a switch moves the loop to a new link"
+        );
+        assert_ne!(client.link.sink.connection().stable_id(), old.stable_id());
+        assert!(
+            matches!(
+                old.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the old link was not closed: {:?}",
+            old.close_reason()
+        );
+        assert_eq!(client.identity.as_ref().unwrap().session_id, LOGS_ID);
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Session(LOGS_ID.to_owned())
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "switched to logs".to_owned()))
+        );
+        // The old session detached and is still there.
+        assert!(!build.task.is_finished());
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        // And the client is in `logs` now: its shell's exit is the client's.
+        let (keys, mut typing) = keyboard();
+        let mut out = SharedOut::default();
+        let looping = tokio::spawn(async move { client.run_on(keys, &mut out).await });
+        typing.write_all(b"exit 7\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(logs.task.await.unwrap().unwrap(), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_that_fails_leaves_the_client_where_it_was_and_says_why() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            None,
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        let before = client.link.sink.connection().stable_id();
+        assert!(
+            !ask_now(
+                &mut client,
+                crate::switcher::Ask::Switch { to: id_of(LOGS_ID) }
+            )
+            .await
+        );
+        assert_eq!(client.link.sink.connection().stable_id(), before);
+        assert!(client.link.sink.connection().close_reason().is_none());
+        let (kind, text) = last_entry(&client).unwrap();
+        assert_eq!(kind, Kind::Session);
+        assert!(
+            text.starts_with("switching to a3f9c01e failed: ") && text.contains("no session"),
+            "{text}"
+        );
+        assert!(!client.asking(), "the failed request is still in flight");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn killing_this_session_puts_the_client_in_the_lobby_and_new_takes_it_out() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        assert!(!ask_now(&mut client, crate::switcher::Ask::Sessions).await);
+
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Kill {
+                    id: id_of(BUILD_ID)
+                }
+            )
+            .await
+        );
+        assert!(client.in_lobby());
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Lobby
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "killed build".to_owned()))
+        );
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the link stays"
+        );
+        registry_holds(dir.path(), &[]).await;
+
+        // What is painted now is the model: painting again writes nothing.
+        let mut painted = Vec::new();
+        client.paint(&mut painted, "painting").unwrap();
+        painted.clear();
+        client.paint(&mut painted, "painting").unwrap();
+        assert!(painted.is_empty(), "the control: nothing to repaint");
+
+        let again = oxutrm_proto::Name::parse("again").unwrap();
+        assert!(!ask_now(&mut client, crate::switcher::Ask::New { name: Some(again) }).await);
+        assert!(!client.in_lobby());
+        client.paint(&mut painted, "painting").unwrap();
+        assert!(
+            !painted.is_empty(),
+            "the screen did not start over when the lobby became a session"
+        );
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Session(BUILD_ID.to_owned()),
+            "a lobby keeps its id when it becomes the session"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "new session again".to_owned()))
+        );
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quitting_in_a_lobby_ends_the_lobby_with_the_link() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let lobby = process(dir.path(), BUILD_ID, None, Begin::Lobby, sh()).await;
+        let mut client = client_on(lobby.client, BUILD_ID).with_lobby();
+        let mut out = Vec::new();
+        let at = Instant::now();
+        assert_eq!(
+            client
+                .route_keys_at(&[CTRL_BACKSLASH, b'q'], at, &mut out)
+                .unwrap(),
+            Some(0)
+        );
+        let code = tokio::time::timeout(Duration::from_secs(5), lobby.task)
+            .await
+            .expect("the lobby outlived its client's quit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn no_standby_is_searched_for_in_a_lobby() {
+        let (_host, client) = crate::link::fixtures::link_pair().await;
+        let due = crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now()
+                .checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        );
+        let mut c = client_on(client, BUILD_ID).with_lobby().with_standby(due);
+        let action = c.standby_step(Phase::Live, Instant::now(), RebuildStage::Idle);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Nothing),
+            "a lobby searched for a standby"
+        );
+        c.in_lobby = false;
+        let action = c.standby_step(Phase::Live, Instant::now(), RebuildStage::Idle);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Search { .. }),
+            "the control: in a session the search is due"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rename_is_recorded_and_a_refused_one_says_why() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            None,
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+
+        let name = |n: &str| Some(oxutrm_proto::Name::parse(n).unwrap());
+        let rename = |n| crate::switcher::Ask::Rename {
+            id: id_of(BUILD_ID),
+            name: n,
+        };
+        assert!(!ask_now(&mut client, rename(name("build"))).await);
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "renamed 3ff1218f to build".to_owned()))
+        );
+        assert!(!ask_now(&mut client, rename(name("logs"))).await);
+        let (_, text) = last_entry(&client).unwrap();
+        assert!(
+            text.starts_with("renaming build failed: ") && text.contains("taken"),
+            "{text}"
+        );
+    }
+
+    /// The spec's success line, from a connect: a bare connect to a host
+    /// with a session lands in a lobby, the selector opens over its blank
+    /// screen, and `⏎` switches to the session listed. That session has a
+    /// client of its own, so it is `in use`: the switch asks first, and the
+    /// other client is taken over (switcher spec §3.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_opens_the_selector_and_enter_switches_into_the_session() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let lobby = process(dir.path(), BUILD_ID, None, Begin::Lobby, sh()).await;
+        registry_holds(dir.path(), &[LOGS_ID]).await;
+
+        let client = client_on(lobby.client, BUILD_ID).with_lobby();
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move { client.run_on(keys, &mut out).await }
+        });
+
+        wait_for_screen(&out, SIZE, "sessions on thinlinc", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "\u{25b8} logs", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "q quit", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "in use", Duration::from_secs(10)).await;
+        typing.write_all(b"\r").expect("type");
+        wait_for_screen(
+            &out,
+            SIZE,
+            "take over logs from its other client? y/n",
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(crate::ui::ANSWER_GUARD + Duration::from_millis(100)).await;
+        typing.write_all(b"y").expect("type");
+        wait_off_screen(&out, SIZE, "sessions on thinlinc", Duration::from_secs(20)).await;
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            logs.client.sink.connection().closed(),
+        )
+        .await
+        .expect("the other client was not taken over");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == TAKEN_OVER),
+            "{reason:?}"
+        );
+        typing.write_all(b"exit 7\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 7, "the shell that exited was logs'");
+        assert_eq!(logs.task.await.unwrap().unwrap(), 7);
+        // The lobby the client left ended with its link.
+        let ended = tokio::time::timeout(Duration::from_secs(10), lobby.task)
+            .await
+            .expect("the lobby outlived the client's move");
+        assert_eq!(ended.unwrap().unwrap(), 0);
+    }
+
+    /// Killing the session you are in: the selector stays, without `this`,
+    /// and `q` there ends the client -- and the lobby with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn killing_this_session_from_the_selector_keeps_it_open_as_a_lobby() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        let client = client_on(build.client, BUILD_ID);
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, SIZE, "s sessions", Duration::from_secs(10)).await;
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, SIZE, "\u{25b8} build", Duration::from_secs(10)).await;
+        // There to begin with, so its absence below is the kill's doing.
+        wait_for_screen(&out, SIZE, "this", Duration::from_secs(10)).await;
+        typing.write_all(b"x").expect("type");
+        wait_for_screen(&out, SIZE, "kill build? y/n", Duration::from_secs(10)).await;
+        tokio::time::sleep(crate::ui::ANSWER_GUARD + Duration::from_millis(100)).await;
+        typing.write_all(b"y").expect("type");
+        wait_for_screen(&out, SIZE, "q quit", Duration::from_secs(15)).await;
+        wait_off_screen(&out, SIZE, "this", Duration::from_secs(10)).await;
+        registry_holds(dir.path(), &[LOGS_ID]).await;
+
+        typing.write_all(b"q").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(10), looping)
+            .await
+            .expect("q in the lobby did not end the client")
+            .unwrap();
+        assert_eq!(code.unwrap(), 0);
+        assert!(client.in_lobby());
+        let ended = tokio::time::timeout(Duration::from_secs(10), build.task)
+            .await
+            .expect("the lobby outlived its client's quit");
+        assert_eq!(ended.unwrap().unwrap(), 0);
+    }
+
+    /// The shell exiting on its own while the selector is open ends the
+    /// client with its status, exactly as without the selector: only a kill
+    /// from the selector leads to a lobby (switcher spec §1.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_that_exits_while_the_selector_is_open_ends_the_client() {
+        use crate::serve::fixtures::{SIZE, process, registry_holds};
+        use crate::serve::{Begin, Shell};
+        use std::os::unix::fs::PermissionsExt as _;
+        let scripts = tempfile::tempdir().unwrap();
+        let go = scripts.path().join("go");
+        let script = scripts.path().join("quits");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.1; done\nexit 3\n",
+                go.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            Shell {
+                program: script.to_str().unwrap().to_string(),
+                start: oxutrm_term::Start::default(),
+                sibling: None,
+            },
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+
+        let client = client_on(build.client, BUILD_ID);
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move { client.run_on(keys, &mut out).await }
+        });
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, SIZE, "s sessions", Duration::from_secs(10)).await;
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, SIZE, "\u{25b8} build", Duration::from_secs(10)).await;
+        std::fs::write(&go, b"").unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client outlived its shell")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 3);
+    }
+
+    /// `s` while another request is still out: the selector opens, and the
+    /// list it waits for is fetched as soon as that request is answered --
+    /// not dropped, which left an empty list under `+ new session`.
+    #[tokio::test]
+    async fn s_while_a_request_is_out_fetches_the_list_once_it_is_answered() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = pair("/bin/sh").await;
+        assert!(session.ask(Ask::Kill { id: id_of(LOGS_ID) }));
+        assert_eq!(session.take_ask(), Some(Ask::Kill { id: id_of(LOGS_ID) }));
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert!(session.ui.selector().loading());
+        assert_eq!(session.take_ask(), None, "nothing can go out yet");
+
+        session
+            .answered(
+                Answered::Failed("no such session".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            session.take_ask(),
+            Some(Ask::Sessions),
+            "the list the selector waits for was never fetched"
+        );
+    }
+
+    /// While the list is on its way the cursor sits on `+ new session`; a
+    /// quick `⏎` there asks nothing, and the line under the list says why.
+    #[tokio::test]
+    async fn enter_while_the_list_is_on_its_way_asks_nothing() {
+        use crate::switcher::Ask;
+        let (_host, mut session) = pair("/bin/sh").await;
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+        type_in(&mut session, b"\r");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), None, "a new session was asked for");
+        assert_eq!(session.ui.selector().note(), Some(crate::selector::BUSY));
+    }
+
+    /// The selector open on a client in session `BUILD_ID` on `thinlinc`,
+    /// its list fetch sent and in flight.
+    async fn on_the_selector() -> (HostSession, ClientSession) {
+        let (host, mut session) = pair("/bin/sh").await;
+        session.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), Some(crate::switcher::Ask::Sessions));
+        (host, session)
+    }
+
+    /// The line under the list, as the selector shows it now.
+    fn selector_line(session: &ClientSession) -> String {
+        session
+            .sessions_view(session.link_state.phase_now(), Instant::now())
+            .line
+    }
+
+    /// A list that could not be fetched is not on its way any more: the
+    /// selector stops saying it is asking, says why under the list through
+    /// the reads that follow, and `⏎` on `+ new session` -- all there is
+    /// without a list -- asks for one.
+    #[tokio::test]
+    async fn a_failed_list_ends_the_wait_and_says_why_until_a_list_arrives() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session
+            .answered(
+                Answered::Failed("the host did not answer in time".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        type_in(&mut session, b"j");
+        type_in(&mut session, b"k");
+        assert!(!session.ui.selector().loading());
+        assert_eq!(
+            selector_line(&session),
+            "listing the sessions failed: the host did not answer in time"
+        );
+        type_in(&mut session, b"\r");
+        assert_eq!(session.take_ask(), Some(Ask::New { name: None }));
+    }
+
+    /// A list that failed in an outage is fetched again once the link is
+    /// back.
+    #[tokio::test]
+    async fn a_failed_list_is_fetched_again_when_the_link_is_back() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        let t = Instant::now();
+        session.note_heard(t);
+        session.note_sent(t);
+        let _ = session.layer_at(t);
+        let _ = session.layer_at(t + Duration::from_secs(3));
+        assert!(session.link_state.phase_now().is_outage());
+        session
+            .answered(
+                Answered::Failed("the host did not answer in time".to_string()),
+                t + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(session.take_ask(), None, "fetched again inside the outage");
+        session.note_heard(t + Duration::from_millis(4_500));
+        let _ = session.layer_at(t + Duration::from_millis(4_500));
+        assert_eq!(session.link_state.phase_now(), Phase::Live);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+    }
+
+    /// A failed request says what failed and why, in one line under the
+    /// list: the reason's first line only, the rest is in client.log.
+    #[tokio::test]
+    async fn a_failed_request_is_one_line_under_the_list() {
+        use crate::selector::fixtures::entry;
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        let logs = entry(
+            LOGS_ID,
+            Some("logs"),
+            "/bin/bash",
+            1_700_000_000,
+            oxutrm_proto::Attached::No,
+        );
+        session
+            .answered(Answered::Sessions(vec![logs]), Instant::now())
+            .unwrap();
+        assert!(session.ask(Ask::Kill { id: id_of(LOGS_ID) }));
+        session.take_ask();
+        session
+            .answered(
+                Answered::Failed("no such session\nsee the host's log".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            selector_line(&session),
+            "killing logs failed: no such session"
+        );
+    }
+
+    /// The kill of this session answered after the popup was closed: the
+    /// client is in a lobby, and a lobby always shows the selector -- never
+    /// a closed popup over a blank screen.
+    #[tokio::test]
+    async fn a_kill_of_this_session_answered_after_esc_opens_the_selector() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session
+            .answered(Answered::Sessions(Vec::new()), Instant::now())
+            .unwrap();
+        assert!(session.ask(Ask::Kill {
+            id: id_of(BUILD_ID)
+        }));
+        session.take_ask();
+        session.ui.close_popup();
+        assert!(
+            session
+                .answered(Answered::Killed(id_of(BUILD_ID)), Instant::now())
+                .unwrap()
+        );
+        assert!(session.in_lobby());
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+    }
+
+    /// A client in session `BUILD_ID` whose link is `Recovering`, with a
+    /// rebuild attempt in flight against an ssh that never answers.
+    async fn rebuilding_in_session(dir: &std::path::Path) -> (HostSession, ClientSession) {
+        let pidfile = dir.join("ssh.pid");
+        let rebuild = Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned())
+            .via(hanging_ssh(dir, &pidfile), stunless());
+        let (host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert!(
+            session.rebuild.as_ref().unwrap().is_running(),
+            "no attempt in flight, so there is nothing for the test to see"
+        );
+        wait_for_pid(&pidfile).await;
+        (host, session)
+    }
+
+    /// The kill of this session answered while a rebuild attempt is in
+    /// flight: that attempt was for the session just killed, and would end
+    /// the client on "no such session". It is cancelled, and the next one
+    /// goes to a fresh lobby.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_of_this_session_cancels_the_rebuild_aimed_at_it() {
+        use crate::switcher::{Answered, Ask};
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, mut session) = rebuilding_in_session(dir.path()).await;
+        session.asked = Some(Ask::Kill {
+            id: id_of(BUILD_ID),
+        });
+        session
+            .answered(Answered::Killed(id_of(BUILD_ID)), Instant::now())
+            .unwrap();
+        let rebuild = session.rebuild.as_ref().unwrap();
+        assert!(
+            !rebuild.is_running(),
+            "the attempt for the killed session runs on"
+        );
+        assert_eq!(rebuild.aim(), &crate::rebuild::Aim::Lobby);
+    }
+
+    /// A lobby's `New` answered while a rebuild attempt is in flight: that
+    /// attempt was for a fresh lobby, which the client is no longer in. It is
+    /// cancelled, and the next one goes to the session just started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_session_cancels_the_rebuild_aimed_at_a_lobby() {
+        use crate::selector::fixtures::entry;
+        use crate::switcher::{Answered, Ask};
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, mut session) = rebuilding_in_session(dir.path()).await;
+        // Into a lobby first, so the attempt below is aimed at one.
+        session.in_lobby = true;
+        session.aim_rebuild();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(Instant::now() + Duration::from_secs(600), &tx);
+        assert!(session.rebuild.as_ref().unwrap().is_running());
+        assert_eq!(
+            session.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Lobby
+        );
+
+        session.asked = Some(Ask::New { name: None });
+        let logs = entry(
+            LOGS_ID,
+            Some("logs"),
+            "/bin/bash",
+            1_700_000_000,
+            oxutrm_proto::Attached::Here,
+        );
+        session
+            .answered(Answered::Started(logs), Instant::now())
+            .unwrap();
+        let rebuild = session.rebuild.as_ref().unwrap();
+        assert!(!rebuild.is_running(), "the attempt for a lobby runs on");
+        assert_eq!(
+            rebuild.aim(),
+            &crate::rebuild::Aim::Session(LOGS_ID.to_owned())
+        );
+    }
+
+    /// A rebuild from a lobby lands in a fresh lobby: the client takes its
+    /// id, and the selector open on it lists what is there now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_into_a_lobby_takes_its_id_and_fetches_the_list() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session.in_lobby = true;
+        session
+            .answered(Answered::Sessions(Vec::new()), Instant::now())
+            .unwrap();
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        let mut landed = standby_established(rebuilt);
+        landed.session_id = LOGS_ID.to_owned();
+        session.rebuild_landed(landed, Instant::now()).unwrap();
+        assert_eq!(session.identity.as_ref().unwrap().session_id, LOGS_ID);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
     }
 }

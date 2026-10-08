@@ -1557,6 +1557,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1622,6 +1623,7 @@ dependencies = [
  "rustix",
  "rustix-openpty",
  "serde",
+ "tempfile",
  "unicode-width",
 ]
 

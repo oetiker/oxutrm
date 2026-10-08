@@ -333,7 +333,29 @@ impl Default for Ties {
     }
 }
 
-/// One attempt at getting back into `session_id` on `target`.
+/// Where a rebuild goes (switcher spec §3.5): the session the client is in,
+/// or -- while it is in a lobby -- a fresh lobby. A lobby is never
+/// reattached: it ended after `DETACH_AFTER` of silence, or will.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Aim {
+    Session(String),
+    Lobby,
+}
+
+impl Aim {
+    /// What the attempt answers the offer with.
+    fn choice(&self) -> Result<Choice, String> {
+        match self {
+            Aim::Session(id) => id
+                .parse()
+                .map(|id| Choice::Attach { id })
+                .map_err(|_| format!("{id:?} is not a session id")),
+            Aim::Lobby => Ok(Choice::Lobby),
+        }
+    }
+}
+
+/// One attempt at getting back to `aim` on `target`.
 ///
 /// `launcher` is the injection point, exactly as it is for
 /// [`SshChannel::open`]: production passes [`SshLauncher::ssh`] and the tests
@@ -362,21 +384,12 @@ impl Default for Ties {
 pub(crate) async fn attempt(
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
 ) -> AttemptOutcome {
-    attempt_within(
-        ATTEMPT_DEADLINE,
-        launcher,
-        target,
-        session_id,
-        size,
-        cfg,
-        ties,
-    )
-    .await
+    attempt_within(ATTEMPT_DEADLINE, launcher, target, aim, size, cfg, ties).await
 }
 
 /// [`attempt`], with its outer bound as a parameter.
@@ -394,12 +407,12 @@ async fn attempt_within(
     deadline: std::time::Duration,
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
 ) -> AttemptOutcome {
-    let body = one_attempt(launcher, target, session_id, size, cfg, ties);
+    let body = one_attempt(launcher, target, aim, size, cfg, ties);
     match tokio::time::timeout(deadline, body).await {
         Ok(outcome) => outcome,
         Err(_) => AttemptOutcome::Retry(format!(
@@ -415,7 +428,7 @@ async fn attempt_within(
 async fn one_attempt(
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
@@ -446,8 +459,9 @@ async fn one_attempt(
     if !ties.commitment.commit() {
         return AttemptOutcome::Retry("abandoned for the standby".to_owned());
     }
-    let choice = Choice::Attach {
-        id: session_id.to_owned(),
+    let choice = match aim.choice() {
+        Ok(choice) => choice,
+        Err(why) => return AttemptOutcome::Definite(why),
     };
     if let Err(e) = channel.send(&Signal::Choose { choice }).await {
         return classify(target, &anyhow::Error::new(e));
@@ -472,7 +486,7 @@ async fn one_attempt(
 /// this is only ever touched between laps.
 pub(crate) struct Rebuild {
     target: String,
-    session_id: String,
+    aim: Aim,
     /// How to start ssh. The injection point, as in [`attempt`].
     launcher: SshLauncher,
     cfg: NetConfig,
@@ -505,9 +519,14 @@ pub(crate) struct Rebuild {
 
 impl Rebuild {
     pub(crate) fn new(target: String, session_id: String) -> Rebuild {
+        Rebuild::aimed(target, Aim::Session(session_id))
+    }
+
+    /// A rebuild that goes to `aim`.
+    pub(crate) fn aimed(target: String, aim: Aim) -> Rebuild {
         Rebuild {
             target,
-            session_id,
+            aim,
             launcher: SshLauncher::ssh(),
             cfg: NetConfig::default(),
             in_flight: None,
@@ -518,6 +537,29 @@ impl Rebuild {
             started: None,
             displacing: false,
         }
+    }
+
+    /// Where the next attempt goes, after a switch, a new session or a kill
+    /// moved the client (switcher spec §3.5).
+    ///
+    /// An attempt already running for another aim is cancelled: it would
+    /// reach a session that is gone (`Killed` of this one, which ends the
+    /// client as a definite failure) or a fresh lobby the client is no longer
+    /// in (`Started`). The next one goes where the client now is, after the
+    /// backoff the cancelled one began. The displacing latch is left as it
+    /// is: the outage is not over, and an attempt that had already sent its
+    /// `Attach` may still be adopted ([`Rebuild::may_have_displaced_us`]).
+    pub(crate) fn retarget(&mut self, aim: Aim) {
+        if aim != self.aim {
+            self.cancel();
+        }
+        self.aim = aim;
+    }
+
+    /// Where the next attempt goes.
+    #[cfg(test)]
+    pub(crate) fn aim(&self) -> &Aim {
+        &self.aim
     }
 
     /// The network settings and the connect timeout the next attempt runs
@@ -641,7 +683,7 @@ impl Rebuild {
         let generation = self.generation;
         let launcher = self.launcher.clone();
         let target = self.target.clone();
-        let session_id = self.session_id.clone();
+        let aim = self.aim.clone();
         let cfg = self.cfg.clone();
         let ties = Ties {
             commitment: Commitment::default(),
@@ -651,7 +693,7 @@ impl Rebuild {
         self.commitment = ties.commitment.clone();
         self.displacing = true;
         self.in_flight = Some(tokio::spawn(async move {
-            let outcome = attempt(&launcher, &target, &session_id, size, &cfg, &ties).await;
+            let outcome = attempt(&launcher, &target, &aim, size, &cfg, &ties).await;
             // A closed receiver means the session this was for has ended.
             // There is nobody to tell, and that is not a failure.
             let _ = outcomes
@@ -869,7 +911,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s\\n' '{{\"t\":\"Failed\",\"reason\":\"{reason}\"}}'\n"
         );
@@ -919,7 +961,7 @@ mod tests {
         let record = dir.path().join("choice.json");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s' \"$choice\" > '{}'\n",
             record.display()
@@ -928,10 +970,14 @@ mod tests {
     }
 
     async fn run_attempt(fake: &FakeHost, session_id: &str) -> AttemptOutcome {
+        run_attempt_to(fake, &Aim::Session(session_id.to_owned())).await
+    }
+
+    async fn run_attempt_to(fake: &FakeHost, aim: &Aim) -> AttemptOutcome {
         attempt(
             &fake.launcher,
             "bastion.example.net",
-            session_id,
+            aim,
             a_size(),
             &test_config(),
             &Ties::default(),
@@ -968,7 +1014,7 @@ mod tests {
         // Failed would spawn ssh every eight seconds until the user noticed.
         let outcome = attempt_against(
             fake_host_replying_failed("no such session on this host"),
-            "abc123",
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
         )
         .await;
         match outcome {
@@ -981,7 +1027,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ssh_that_dies_is_retried() {
-        match attempt_against(fake_host_that_exits_immediately(), "abc123").await {
+        match attempt_against(
+            fake_host_that_exits_immediately(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await
+        {
             // The reason, and not merely the variant: `Retry` is what
             // `classify` returns for everything that is not one of the two
             // definite cases, so a `classify` that had stopped reading its
@@ -1000,7 +1051,12 @@ mod tests {
     /// saying so beats an ssh every eight seconds for ever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_remote_that_rejects_the_option_is_definite() {
-        match attempt_against(fake_host_rejecting_the_option(), "abc123").await {
+        match attempt_against(
+            fake_host_rejecting_the_option(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await
+        {
             AttemptOutcome::Definite(reason) => {
                 assert!(
                     reason.contains("bastion.example.net"),
@@ -1035,7 +1091,7 @@ mod tests {
                 std::time::Duration::from_millis(200),
                 &fake.launcher,
                 "bastion.example.net",
-                "abc123",
+                &Aim::Session("3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned()),
                 a_size(),
                 &test_config(),
                 &Ties::default(),
@@ -1076,7 +1132,7 @@ mod tests {
         let record = dir.path().join("choice.json");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s' \"$choice\" > '{}'\n\
              exec sleep 300\n",
@@ -1087,8 +1143,11 @@ mod tests {
 
     /// A `Rebuild` that runs its attempts against `fake`, with one begun.
     fn rebuilding_against(fake: &FakeHost) -> Rebuild {
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         rebuild.begin(a_size(), tx, Instant::now());
         rebuild
@@ -1165,7 +1224,7 @@ mod tests {
                 rtt_ms: 38,
                 mtu: 1400,
             },
-            session_id: "abc123".to_owned(),
+            session_id: "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
             attach_id: 2,
             host_features: vec![],
         };
@@ -1261,7 +1320,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let body = "#!/bin/sh\n\
                     exec 0<&-\n\
-                    printf '%s\\n' '{\"t\":\"Sessions\",\"sessions\":[]}'\n\
+                    printf '%s\\n' '{\"t\":\"Sessions\",\"list\":[]}'\n\
                     exec sleep 300\n";
         FakeHost::new(dir, body)
     }
@@ -1279,8 +1338,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_attempt_commits_before_it_writes_its_attach() {
         let fake = fake_host_that_will_not_read_the_choice();
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         rebuild.begin(a_size(), tx, Instant::now());
 
@@ -1320,7 +1382,7 @@ mod tests {
     /// said about its configuration.
     async fn rebuild_arguments(config: &str) -> Vec<String> {
         let fake = fake_ssh_recording_its_arguments(config);
-        let _ = run_attempt(&fake, "abc123").await;
+        let _ = run_attempt(&fake, "3ff1218f5e0c4b7d9a1c2e3f40516273").await;
         std::fs::read_to_string(fake.path("args"))
             .expect("the fake ssh recorded no arguments")
             .lines()
@@ -1354,8 +1416,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_retuned_rebuild_runs_its_next_attempt_with_the_new_settings() {
         let fake = fake_ssh_recording_its_arguments("connecttimeout none");
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let cfg = oxutrm_net::NetConfig {
             enable_birthday: false,
             ..test_config()
@@ -1408,8 +1473,11 @@ mod tests {
     /// often each was asked `ssh -G`, and whether each carried the
     /// connect timeout.
     async fn two_attempts(fake: &FakeHost) -> (usize, [bool; 2]) {
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut bounded = [false; 2];
         for b in &mut bounded {
@@ -1497,7 +1565,61 @@ mod tests {
     async fn an_attempt_asks_for_the_session_it_came_from() {
         // The side effect, not the return value: a rebuild that answered `New`
         // would silently start a second shell and look like it had worked.
-        let recorded = attempt_against_recording(fake_host_recording_the_choice(), "abc123").await;
-        assert_eq!(recorded, serde_json::json!({"c": "Attach", "id": "abc123"}));
+        let recorded = attempt_against_recording(
+            fake_host_recording_the_choice(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await;
+        assert_eq!(
+            recorded,
+            serde_json::json!({"c": "Attach", "id": "3ff1218f5e0c4b7d9a1c2e3f40516273"})
+        );
+    }
+
+    /// A client in a lobby is rebuilt into a fresh lobby, never into the old
+    /// one, which has ended or will (switcher spec §3.5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attempt_from_a_lobby_asks_for_a_fresh_lobby() {
+        let fake = fake_host_recording_the_choice();
+        let record = fake.path("choice.json");
+        let _ = run_attempt_to(&fake, &Aim::Lobby).await;
+        let line = std::fs::read_to_string(&record).expect("the fake host recorded no choice");
+        let signal: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON");
+        assert_eq!(signal["choice"], serde_json::json!({"c": "Lobby"}));
+    }
+
+    #[test]
+    fn a_rebuild_is_retargeted_by_a_move() {
+        let mut r = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        );
+        r.retarget(Aim::Lobby);
+        assert_eq!(r.aim(), &Aim::Lobby);
+        r.retarget(Aim::Session("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_owned()));
+        assert_eq!(
+            r.aim(),
+            &Aim::Session("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_owned())
+        );
+    }
+
+    /// An attempt in flight for the old aim is cancelled by a retarget, so
+    /// it never reaches a session that is gone; one for the same aim runs on.
+    /// The displacing latch stays: the outage is not over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retarget_cancels_an_attempt_for_the_old_aim() {
+        let fake = fake_host_that_never_answers();
+        let mut rebuild = rebuilding_against(&fake);
+        let here = rebuild.aim().clone();
+        rebuild.retarget(here);
+        assert!(rebuild.is_running(), "the same aim cancelled the attempt");
+
+        rebuild.retarget(Aim::Lobby);
+        assert!(!rebuild.is_running(), "the attempt for the old aim runs on");
+        assert_eq!(rebuild.aim(), &Aim::Lobby);
+        assert!(
+            rebuild.may_have_displaced_us(),
+            "a retarget ended the outage's claim on a TAKEN_OVER"
+        );
     }
 }

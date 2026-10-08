@@ -39,6 +39,9 @@ rand.workspace = true
 # Declared here rather than in [workspace.dependencies] so that adding it does
 # not touch the root manifest, which other crates are being written against.
 tempfile = "3"
+# The measure `oxutrm host --list` is given in the product (the client UI's
+# `cells`), for the tests that check its columns line up.
+unicode-width.workspace = true
 
 # A test fixture, not part of the product: it daemonizes and then reports what
 # survived, so tests/daemonize.rs can assert against a real detached process

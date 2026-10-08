@@ -67,6 +67,9 @@ pub(crate) enum Mode {
         cursor: usize,
         editing: Editing,
     },
+    /// The session selector (switcher spec §3.2). Its state lives in `Ui`
+    /// beside the config screen's field, because `Mode` is `Copy`.
+    Sessions,
 }
 
 /// What the config screen is doing with the keys.
@@ -103,6 +106,8 @@ pub(crate) enum Command {
     /// Something the config screen needs the session to check or do. The
     /// session answers with [`Ui::accepted`] or [`Ui::say`].
     Config(ConfigCmd),
+    /// Something the selector asks of the host.
+    Ask(crate::switcher::Ask),
 }
 
 /// What the config screen asks of the session. Rows are rows of
@@ -135,9 +140,61 @@ pub(crate) struct ConfigScreen<'a> {
     pub(crate) note: Option<&'a str>,
 }
 
-/// A key the config screen reads out of an escape sequence or a byte.
+/// One line of text being typed: the config screen's fields and the
+/// selector's rename. Input is UTF-8, so a character is added once all of
+/// its bytes have arrived; control characters never are; at most
+/// [`FIELD_MAX`] characters, so a pasted file stops there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Field {
+    text: String,
+    /// The bytes of a character that has not arrived whole yet.
+    partial: Vec<u8>,
+}
+
+impl Field {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Start over holding `text`.
+    pub(crate) fn set(&mut self, text: String) {
+        self.text = text;
+        self.partial.clear();
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    /// Backspace: the last character.
+    pub(crate) fn erase(&mut self) {
+        self.partial.clear();
+        self.text.pop();
+    }
+
+    /// A byte typed into the field.
+    pub(crate) fn type_byte(&mut self, b: u8) {
+        self.partial.push(b);
+        match std::str::from_utf8(&self.partial) {
+            Ok(s) => {
+                for c in s.chars().filter(|c| !c.is_control()) {
+                    if self.text.chars().count() < FIELD_MAX {
+                        self.text.push(c);
+                    }
+                }
+                self.partial.clear();
+            }
+            // The rest of the character is still to come.
+            Err(e) if e.error_len().is_none() => {}
+            Err(_) => self.partial.clear(),
+        }
+    }
+}
+
+/// A key the config screen and the selector read out of an escape sequence
+/// or a byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Key {
+pub(crate) enum Key {
     Up,
     Down,
     Byte(u8),
@@ -190,10 +247,7 @@ pub(crate) struct Ui {
     /// `dismissed` is (spec §4.2).
     config_decided: bool,
     /// The config screen's text field.
-    field: String,
-    /// The bytes of a character typed into the field that has not arrived
-    /// whole yet.
-    partial: Vec<u8>,
+    field: Field,
     /// The `stun_servers` sub-list as the screen shows it.
     servers: Vec<String>,
     /// The sub-list as the last command proposed it, until the session
@@ -202,6 +256,13 @@ pub(crate) struct Ui {
     /// What the help line says instead of the help: why a change was
     /// refused, or what a save did. Gone with the next read.
     note: Option<String>,
+    /// The session selector's state, while it is up and between openings.
+    selector: crate::selector::Selector,
+    /// The client is in a lobby: the selector's `q` ends the client, and
+    /// the popup key does not close it (there is nothing behind it).
+    lobby: bool,
+    /// A switcher request is in flight.
+    busy: bool,
     /// Inside a bracketed paste on the config screen whose end has not
     /// arrived yet, and how many bytes of that end the last read finished
     /// on: a large paste is cut into reads wherever the buffer ends, its end
@@ -224,13 +285,46 @@ impl Ui {
             // below `silent_after` and so changes nothing a lap could see.
             auto_open_after: Some(Duration::ZERO),
             config_decided: false,
-            field: String::new(),
-            partial: Vec::new(),
+            field: Field::default(),
             servers: Vec::new(),
             proposed: None,
             note: None,
+            selector: crate::selector::Selector::default(),
+            lobby: false,
+            busy: false,
             pasting: None,
         }
+    }
+
+    /// What the selector needs to know about the session: whether it is in
+    /// a lobby, and whether a request is in flight. Set before every read.
+    pub(crate) fn set_switcher(&mut self, lobby: bool, busy: bool) {
+        self.lobby = lobby;
+        self.busy = busy;
+    }
+
+    /// Open the selector, as `s` does: from a connect-time lobby, or after
+    /// the session it was showing ended. The session fetches the list.
+    pub(crate) fn open_sessions(&mut self) {
+        self.leave_config();
+        self.selector.open();
+        self.mode = Mode::Sessions;
+    }
+
+    /// The selector, for the view and for the session to fill in.
+    pub(crate) fn selector(&self) -> &crate::selector::Selector {
+        &self.selector
+    }
+
+    pub(crate) fn selector_mut(&mut self) -> &mut crate::selector::Selector {
+        &mut self.selector
+    }
+
+    /// Close the popup, wherever it was: a switch landed, or a lobby
+    /// became a session.
+    pub(crate) fn close_popup(&mut self) {
+        self.leave_config();
+        self.mode = Mode::Closed;
     }
 
     /// The popup's three settings, from `apply`. They act from the next
@@ -270,8 +364,10 @@ impl Ui {
         self.note_question(phase, now);
         if phase == Phase::Confirming {
             // The question takes over the config screen, field and all, so
-            // its `s` and `d` can never land in a field.
+            // its `s` and `d` can never land in a field -- and the
+            // selector, whose `s`-less keys would leave it unanswerable.
             self.leave_config();
+            self.leave_sessions();
         }
         if phase.is_outage() {
             let change = if self.outage_since.is_none() {
@@ -338,6 +434,11 @@ impl Ui {
         self.note_question(phase, now);
         if phase == Phase::Confirming {
             self.leave_config();
+            self.leave_sessions();
+        }
+        if self.mode == Mode::Sessions {
+            self.pasting = None;
+            return self.sessions_keys(bytes, phase, now);
         }
         if matches!(self.mode, Mode::Config { .. }) {
             // The rest of a paste that began in an earlier read is the
@@ -412,6 +513,17 @@ impl Ui {
             r.command = command;
             return true;
         }
+        if b == b's' && !confirming {
+            // Only on a live link (switcher spec §3.2): the key bar shows it
+            // dimmed otherwise, and it does nothing but touch the popup.
+            if phase == Phase::Live {
+                self.open_sessions();
+                r.command = Some(Command::Ask(crate::switcher::Ask::Sessions));
+                return true;
+            }
+            self.touch();
+            return false;
+        }
         if b == b'c' && !confirming {
             self.mode = Mode::Config {
                 cursor: 0,
@@ -428,8 +540,7 @@ impl Ui {
             // The question about held input has to be answered before the
             // popup can go.
             _ if (b == ESC || Some(b) == self.key) && !confirming => self.close(b, phase, now, r),
-            // `s` is offered by a later version (the session switcher); it,
-            // and every other key, only count as touching the popup.
+            // Every other key only counts as touching the popup.
             _ => self.touch(),
         }
         false
@@ -457,7 +568,7 @@ impl Ui {
         Some(ConfigScreen {
             cursor,
             editing,
-            field: &self.field,
+            field: self.field.as_str(),
             servers: &self.servers,
             note: self.note.as_deref(),
         })
@@ -466,7 +577,7 @@ impl Ui {
     /// Open a text field on the cursor's row, holding `text`.
     pub(crate) fn open_text(&mut self, text: String) {
         if let Mode::Config { cursor, .. } = self.mode {
-            self.field = text;
+            self.field.set(text);
             self.mode = Mode::Config {
                 cursor,
                 editing: Editing::Text,
@@ -505,7 +616,6 @@ impl Ui {
             return;
         };
         self.field.clear();
-        self.partial.clear();
         let editing = match editing {
             Editing::Servers { cursor: at, .. } => {
                 if let Some(list) = self.proposed.take() {
@@ -529,13 +639,52 @@ impl Ui {
         self.note = Some(note);
     }
 
+    /// Back from the selector to the status view.
+    fn leave_sessions(&mut self) {
+        if self.mode == Mode::Sessions {
+            self.mode = Mode::Open { pressed: None };
+        }
+    }
+
+    /// One read on the selector. The popup key closes the popup as it does
+    /// everywhere -- except in a lobby, where there is nothing behind it.
+    fn sessions_keys(&mut self, bytes: &[u8], phase: Phase, now: Instant) -> Routed {
+        use crate::selector::{Ctx, Out};
+        let mut r = Routed::default();
+        if let Some(key) = self.key
+            && bytes.first() == Some(&key)
+            && self.selector.rename().is_none()
+            && !self.selector.pasting()
+        {
+            if !self.lobby {
+                self.mode = Mode::Closed;
+                if phase.is_outage() {
+                    self.dismissed = true;
+                }
+            }
+            return r;
+        }
+        let ctx = Ctx {
+            live: phase == Phase::Live,
+            lobby: self.lobby,
+            busy: self.busy,
+        };
+        match self.selector.keys(bytes, ctx, now) {
+            None => {}
+            Some(Out::Ask(a)) => r.command = Some(Command::Ask(a)),
+            Some(Out::Back) => self.mode = Mode::Open { pressed: None },
+            Some(Out::Close) => self.mode = Mode::Closed,
+            Some(Out::Quit) => r.command = Some(Command::Quit),
+        }
+        r
+    }
+
     /// Back from the config screen to the status view, dropping whatever
     /// field was open. The pending edits are the session's and stay.
     fn leave_config(&mut self) {
         if matches!(self.mode, Mode::Config { .. }) {
             self.mode = Mode::Open { pressed: None };
             self.field.clear();
-            self.partial.clear();
             self.proposed = None;
             self.note = None;
             self.pasting = None;
@@ -577,34 +726,12 @@ impl Ui {
     }
 
     /// A paste's text up to its end, if the end is in `bytes`: into an open
-    /// field, or nowhere. Returns what follows the end. The start of an end
-    /// marker that the read stops in is kept in `pasting` until the next read
-    /// says whether it was one.
+    /// field, or nowhere. Returns what follows the end.
     fn paste<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
-        for (i, &b) in bytes.iter().enumerate() {
-            let matched = self.pasting.unwrap_or(0);
-            if b == PASTE_END[matched] {
-                if matched + 1 == PASTE_END.len() {
-                    self.pasting = None;
-                    return &bytes[i + 1..];
-                }
-                self.pasting = Some(matched + 1);
-                continue;
-            }
-            // What looked like the end's beginning was text after all. Only
-            // its ESC can begin the end again: the marker has no other
-            // overlap with itself.
-            for &h in &PASTE_END[..matched] {
-                self.paste_byte(h);
-            }
-            if b == PASTE_END[0] {
-                self.pasting = Some(1);
-            } else {
-                self.pasting = Some(0);
-                self.paste_byte(b);
-            }
-        }
-        &bytes[bytes.len()..]
+        let mut pasting = self.pasting;
+        let rest = paste_through(&mut pasting, bytes, |b| self.paste_byte(b));
+        self.pasting = pasting;
+        rest
     }
 
     /// One byte of a paste: into the field, if one is open. `type_byte`
@@ -617,26 +744,7 @@ impl Ui {
                 ..
             }
         ) {
-            self.type_byte(b);
-        }
-    }
-
-    /// A byte typed into the field: input is UTF-8, so a character is added
-    /// once all of its bytes have arrived. Control characters never are.
-    fn type_byte(&mut self, b: u8) {
-        self.partial.push(b);
-        match std::str::from_utf8(&self.partial) {
-            Ok(s) => {
-                for c in s.chars().filter(|c| !c.is_control()) {
-                    if self.field.chars().count() < FIELD_MAX {
-                        self.field.push(c);
-                    }
-                }
-                self.partial.clear();
-            }
-            // The rest of the character is still to come.
-            Err(e) if e.error_len().is_none() => {}
-            Err(_) => self.partial.clear(),
+            self.field.type_byte(b);
         }
     }
 
@@ -655,7 +763,6 @@ impl Ui {
             Editing::Text | Editing::Servers { field: true, .. } => match key {
                 Key::Byte(ESC) => {
                     self.field.clear();
-                    self.partial.clear();
                     self.mode = to(match editing {
                         Editing::Servers { cursor: at, .. } => Editing::Servers {
                             cursor: at.min(self.servers.len().saturating_sub(1)),
@@ -665,7 +772,7 @@ impl Ui {
                     });
                 }
                 k if enter(k) => {
-                    let text = self.field.trim().to_string();
+                    let text = self.field.as_str().trim().to_string();
                     r.command = match editing {
                         Editing::Servers { cursor: at, .. } => {
                             let mut list = self.servers.clone();
@@ -691,10 +798,9 @@ impl Ui {
                     return true;
                 }
                 k if erase(k) => {
-                    self.partial.clear();
-                    self.field.pop();
+                    self.field.erase();
                 }
-                Key::Byte(b) if b >= 0x20 => self.type_byte(b),
+                Key::Byte(b) if b >= 0x20 => self.field.type_byte(b),
                 _ => {}
             },
             Editing::Capture => match key {
@@ -734,7 +840,7 @@ impl Ui {
                         });
                     }
                     k if enter(k) && at < self.servers.len() => {
-                        self.field = self.servers[at].clone();
+                        self.field.set(self.servers[at].clone());
                         self.mode = to(Editing::Servers {
                             cursor: at,
                             field: true,
@@ -826,11 +932,49 @@ impl Ui {
     }
 }
 
-/// The key an escape sequence stands for on the config screen, and how many
-/// bytes after the ESC the sequence took. Only the arrows mean anything; any
-/// other sequence is skipped whole. A bracketed paste's start is `None` too,
-/// with its five bytes used: the caller tells it from the rest by looking.
-fn escape(tail: &[u8]) -> (Option<Key>, usize) {
+/// A bracketed paste's text, read up to its end if the end is in `bytes`:
+/// each byte goes to `sink`, and what follows the end is returned.
+/// `pasting` is how many bytes of the end marker the last read finished on:
+/// `Some` while a paste is open, `None` once its end has arrived. A read
+/// that stops inside the end marker leaves it to the next read to say
+/// whether it was one.
+pub(crate) fn paste_through<'a>(
+    pasting: &mut Option<usize>,
+    bytes: &'a [u8],
+    mut sink: impl FnMut(u8),
+) -> &'a [u8] {
+    for (i, &b) in bytes.iter().enumerate() {
+        let matched = pasting.unwrap_or(0);
+        if b == PASTE_END[matched] {
+            if matched + 1 == PASTE_END.len() {
+                *pasting = None;
+                return &bytes[i + 1..];
+            }
+            *pasting = Some(matched + 1);
+            continue;
+        }
+        // What looked like the end's beginning was text after all. Only its
+        // ESC can begin the end again: the marker has no other overlap with
+        // itself.
+        for &h in &PASTE_END[..matched] {
+            sink(h);
+        }
+        if b == PASTE_END[0] {
+            *pasting = Some(1);
+        } else {
+            *pasting = Some(0);
+            sink(b);
+        }
+    }
+    &bytes[bytes.len()..]
+}
+
+/// The key an escape sequence stands for on the config screen and the
+/// selector, and how many bytes after the ESC the sequence took. Only the
+/// arrows mean anything; any other sequence is skipped whole. A bracketed
+/// paste's start is `None` too, with its five bytes used: the caller tells
+/// it from the rest by looking, and reads the paste with [`paste_through`].
+pub(crate) fn escape(tail: &[u8]) -> (Option<Key>, usize) {
     match tail {
         [b'[' | b'O', b'A', ..] => (Some(Key::Up), 2),
         [b'[' | b'O', b'B', ..] => (Some(Key::Down), 2),
@@ -1016,8 +1160,10 @@ mod tests {
     fn every_key_belongs_to_the_open_popup() {
         let t = Instant::now();
         let mut ui = open_at(t);
+        // No `s` and no `c` in it: those open the selector and the config
+        // screen.
         assert_eq!(
-            ui.keys(b"ls -l\r", Phase::Live, ms(t, 10)),
+            ui.keys(b"pwd -P\r", Phase::Live, ms(t, 10)),
             Routed::default()
         );
         assert_eq!(
@@ -1088,15 +1234,27 @@ mod tests {
     }
 
     #[test]
-    fn s_is_offered_later_and_does_nothing_now() {
+    fn s_opens_the_selector_on_a_live_link_and_asks_for_the_list() {
         let t = Instant::now();
         let mut ui = open_at(t);
-        assert_eq!(ui.keys(b"s", Phase::Live, t), Routed::default());
-        assert!(matches!(ui.mode(), Mode::Open { .. }));
-        let mut ui = auto_at(t);
-        assert_eq!(ui.keys(b"s", silent(t), t), Routed::default());
+        assert_eq!(
+            ui.keys(b"s", Phase::Live, t),
+            command(Command::Ask(crate::switcher::Ask::Sessions))
+        );
+        assert_eq!(ui.mode(), Mode::Sessions);
+        assert!(ui.selector().loading(), "a fresh list is on its way");
     }
 
+    #[test]
+    fn s_does_nothing_while_the_link_is_down() {
+        let t = Instant::now();
+        let mut ui = auto_at(t);
+        assert_eq!(ui.keys(b"s", silent(t), t), Routed::default());
+        assert!(
+            matches!(ui.mode(), Mode::Open { .. }),
+            "touched, not opened"
+        );
+    }
     #[test]
     fn send_and_drop_are_commands_only_under_confirming() {
         let t = Instant::now();
@@ -1111,8 +1269,14 @@ mod tests {
                 "{} was honoured under an outage",
                 key as char
             );
-            assert_eq!(open_at(t).keys(&[key], Phase::Live, t), Routed::default());
         }
+        // On a live link `s` opens the selector and `d` only touches the
+        // popup: neither is ever an answer to a question that is not up.
+        assert_eq!(
+            open_at(t).keys(b"s", Phase::Live, t),
+            command(Command::Ask(crate::switcher::Ask::Sessions))
+        );
+        assert_eq!(open_at(t).keys(b"d", Phase::Live, t), Routed::default());
     }
 
     #[test]
@@ -1358,7 +1522,7 @@ mod tests {
         let t = Instant::now();
         let mut ui = lingering_at(t);
         assert_eq!(
-            ui.keys(b"ls", Phase::Live, ms(t, 200)),
+            ui.keys(b"pw", Phase::Live, ms(t, 200)),
             Routed::default(),
             "typing reached the host"
         );
@@ -2161,5 +2325,116 @@ mod tests {
             ui.keys(b"s", Phase::Confirming, t + ANSWER_GUARD),
             command(Command::SendHeld)
         );
+    }
+
+    // ---- the session selector -------------------------------------------
+
+    fn sessions_at(t: Instant) -> Ui {
+        let mut ui = open_at(t);
+        ui.keys(b"s", Phase::Live, t);
+        ui.selector_mut()
+            .set_rows(crate::selector::fixtures::three());
+        ui
+    }
+
+    #[test]
+    fn the_selectors_keys_are_its_own_and_q_goes_back_to_the_popup() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        assert_eq!(
+            ui.keys(b"j\r", Phase::Live, t),
+            command(Command::Ask(crate::switcher::Ask::Switch {
+                to: crate::selector::fixtures::LOGS.parse().unwrap()
+            }))
+        );
+        assert_eq!(ui.keys(b"q", Phase::Live, t), Routed::default());
+        assert!(matches!(ui.mode(), Mode::Open { .. }));
+    }
+
+    #[test]
+    fn in_a_lobby_q_quits_and_the_popup_key_does_not_close_it() {
+        let t = Instant::now();
+        let mut ui = Ui::new();
+        ui.set_switcher(true, false);
+        ui.open_sessions();
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(
+            ui.mode(),
+            Mode::Sessions,
+            "nothing behind a lobby's selector"
+        );
+        assert_eq!(ui.keys(b"q", Phase::Live, t), command(Command::Quit));
+    }
+
+    #[test]
+    fn the_popup_key_closes_the_selector_in_a_session() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    #[test]
+    fn the_selector_stays_through_an_outage_and_refuses_its_actions() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        ui.tick(silent(t), t);
+        ui.tick(silent(t), ms(t, 5_000));
+        assert_eq!(ui.mode(), Mode::Sessions, "an outage does not take it down");
+        assert_eq!(ui.keys(b"n", silent(t), ms(t, 5_000)), Routed::default());
+        assert_eq!(ui.selector().note(), Some(crate::selector::NOT_LIVE));
+    }
+
+    #[test]
+    fn a_request_in_flight_refuses_the_next() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        ui.set_switcher(false, true);
+        assert_eq!(ui.keys(b"n", Phase::Live, t), Routed::default());
+        assert_eq!(ui.selector().note(), Some(crate::selector::BUSY));
+    }
+
+    #[test]
+    fn the_held_input_question_takes_the_selector_down() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        ui.tick(Phase::Confirming, t);
+        assert!(matches!(ui.mode(), Mode::Open { .. }));
+    }
+
+    #[test]
+    fn closing_the_popup_from_the_session_closes_whatever_it_shows() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        ui.close_popup();
+        assert_eq!(ui.mode(), Mode::Closed);
+    }
+
+    /// The popup key while a name is being typed: it neither closes the
+    /// selector under the field nor ends up in the name.
+    #[test]
+    fn the_popup_key_while_renaming_is_neither_a_close_nor_a_character() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        ui.keys(b"r", Phase::Live, t);
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Sessions);
+        assert_eq!(ui.selector().rename(), Some("build"));
+    }
+
+    /// A paste on the selector is text, never keys: an `n` in it asks for
+    /// nothing, and the popup key in it, at the start of a later read of
+    /// the same paste, does not close the selector.
+    #[test]
+    fn a_paste_on_the_selector_is_neither_a_command_nor_a_close() {
+        let t = Instant::now();
+        let mut ui = sessions_at(t);
+        assert_eq!(ui.keys(b"\x1b[200~n\r", Phase::Live, t), Routed::default());
+        assert_eq!(ui.keys(&[PREFIX, b'j'], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Sessions);
+        assert_eq!(ui.keys(b"\x1b[201~", Phase::Live, t), Routed::default());
+        assert_eq!(ui.selector().cursor(), 1, "nothing in the paste moved it");
+        assert_eq!(ui.keys(&[PREFIX], Phase::Live, t), Routed::default());
+        assert_eq!(ui.mode(), Mode::Closed, "after the paste, the key closes");
     }
 }

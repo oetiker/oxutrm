@@ -1,0 +1,23 @@
+---
+source: src/view.rs
+expression: "format!(\"{failed}\\n\\n{asked}\")"
+---
+╭ sessions on thinlinc ─────────────────────╮
+│   a3f9c01e  fish  Oct 05  80×24   in use  │
+│ ▸ build     bash  09:14   120×40  this    │
+│   logs      zsh   11:02   120×40          │
+│   + new session                           │
+│ session a3f9c01e did not answer in time   │
+├───────────────────────────────────────────┤
+│ ⏎ switch  n new  r rename  x kill  q back │
+╰───────────────────────────────────────────╯
+
+╭ sessions on thinlinc ────────────────────╮
+│ ▸ a3f9c01e  fish  Oct 05  80×24   in use │
+│   build     bash  09:14   120×40  this   │
+│   logs      zsh   11:02   120×40         │
+│   + new session                          │
+│ kill a3f9c01e (in use elsewhere)? y/n    │
+├──────────────────────────────────────────┤
+│ y yes  n no                              │
+╰──────────────────────────────────────────╯

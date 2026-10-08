@@ -94,6 +94,8 @@ pub mod error;
 pub mod frame;
 pub mod ids;
 pub mod keymat;
+pub mod name;
+pub mod open;
 pub mod screen;
 pub mod signal;
 pub mod stream;
@@ -105,8 +107,13 @@ pub use error::ApplyError;
 pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
 pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
+pub use name::{MAX_NAME, Name};
+pub use open::{
+    Answer, Attached, OfferEntry, Open, Reply, Request, Role, SessionEntry, encode_line,
+    parse_answer, parse_line,
+};
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
-pub use signal::{Choice, MAX_SIGNAL_LINE, SessionSummary, Signal, read_signal, write_signal};
+pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
@@ -123,7 +130,13 @@ pub use types::{
 /// with one missing field, it is a client that can never be let in. A hard
 /// version failure with both numbers in it is the only useful outcome, and it
 /// is what `check_version` already does.
-pub const PROTO_VERSION: u32 = 2;
+///
+/// **3**: the session switcher. Every door of a session process -- the
+/// control stream and the Unix socket -- reads an [`Open`] first, the ssh
+/// offer lists [`OfferEntry`]s, and `Choice` gained `Lobby` and a name. No
+/// compatibility with 2: a host session started by an older binary must be
+/// ended before a new client can reach that host.
+pub const PROTO_VERSION: u32 = 3;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";

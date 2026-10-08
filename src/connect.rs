@@ -9,14 +9,14 @@ use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_host::ssh::{SshChannel, SshLauncher};
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, Choice, ClientSpki, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk,
-    SessionSummary, Signal, TermSize,
+    Candidate, Choice, ClientSpki, HostSpki, Name, NatType, OfferEntry, PROTO_VERSION,
+    PathDescription, Psk, Signal, TermSize,
 };
 use oxutrm_term::detect_caps;
 
 use crate::activity::{Activity, LogFile};
 use crate::candidates::{inbound_candidates, outbound_candidates};
-use crate::choose::{Decision, decide, pick};
+use crate::choose::{Decision, decide};
 use crate::ladder::nominate;
 use crate::link::Link;
 use crate::rebuild::Rebuild;
@@ -32,7 +32,8 @@ use crate::view::Identity;
 /// prompt it asks with; [`RawGuard`] goes on at L11, after every prompt ssh
 /// could possibly have shown.
 pub fn run_connect(args: &[String]) -> Result<()> {
-    // `--attach <id>` and `--new` come before the target, in either order.
+    // `--attach <name|id>`, `--new` and `--name <name>` come before the
+    // target, in any order.
     //
     // Every usage mistake here exits 2, the same convention `dispatch`'s own
     // "unknown option" and `run_host`'s missing-subcommand cases use: a typo
@@ -40,6 +41,7 @@ pub fn run_connect(args: &[String]) -> Result<()> {
     // exited before anything -- ssh included -- has been started.
     let mut attach: Option<String> = None;
     let mut new = false;
+    let mut name: Option<Name> = None;
     let mut rest = args;
     loop {
         match rest.first().map(String::as_str) {
@@ -53,7 +55,9 @@ pub fn run_connect(args: &[String]) -> Result<()> {
                 // is reported like every other one here, before anything at all
                 // has been started.
                 let Some(id) = rest.get(1).filter(|id| !id.starts_with('-')) else {
-                    eprintln!("oxutrm: --attach needs a session id. Try `oxutrm --help`.");
+                    eprintln!(
+                        "oxutrm: --attach needs a session's name or id. Try `oxutrm --help`."
+                    );
                     std::process::exit(2);
                 };
                 attach = Some(id.clone());
@@ -63,12 +67,32 @@ pub fn run_connect(args: &[String]) -> Result<()> {
                 new = true;
                 rest = &rest[1..];
             }
+            // Checked here, before ssh: a name that breaks a rule (switcher
+            // spec §2.3) is a usage mistake like any other.
+            Some("--name") => {
+                let Some(text) = rest.get(1).filter(|t| !t.starts_with('-')) else {
+                    eprintln!("oxutrm: --name needs a name. Try `oxutrm --help`.");
+                    std::process::exit(2);
+                };
+                match Name::parse(text) {
+                    Ok(n) => name = Some(n),
+                    Err(why) => {
+                        eprintln!("oxutrm: --name {text:?}: {why}.");
+                        std::process::exit(2);
+                    }
+                }
+                rest = &rest[2..];
+            }
             _ => break,
         }
     }
 
     if attach.is_some() && new {
         eprintln!("oxutrm: --attach and --new cannot both be given. Try `oxutrm --help`.");
+        std::process::exit(2);
+    }
+    if name.is_some() && !new {
+        eprintln!("oxutrm: --name names a new session, so it needs --new. Try `oxutrm --help`.");
         std::process::exit(2);
     }
 
@@ -83,7 +107,7 @@ pub fn run_connect(args: &[String]) -> Result<()> {
         .enable_all()
         .build()
         .context("building the runtime")?;
-    let outcome = runtime.block_on(connect(target, attach.as_deref(), new));
+    let outcome = runtime.block_on(connect(target, attach.as_deref(), new, name));
 
     // Same reasoning as `host --serve`: the ssh channel's reader may be parked
     // on a pipe the far end is in no hurry to close, and waiting for a read we
@@ -98,7 +122,7 @@ pub fn run_connect(args: &[String]) -> Result<()> {
 }
 
 /// L3 to L13.
-async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
+async fn connect(target: &str, attach: Option<&str>, new: bool, name: Option<Name>) -> Result<i32> {
     // The config file, for this target. Nothing is printed about it: a
     // line written here would be painted over within milliseconds. Its
     // warnings go to the activity log once the session has one.
@@ -124,42 +148,13 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // `NoSignal`. `establish` reads a plain stream and cannot do that, which
     // is exactly why the offer is read here and not inside it.
     let offered = read_offer(&mut channel).await?;
-    let choice = match decide(&offered, attach, new) {
+    let choice = match decide(&offered, attach, new, name) {
         Decision::Chosen(choice) => choice,
         // Before raw mode: this is an ordinary line on an ordinary terminal,
         // the same as any other reason `connect` cannot go on.
         Decision::Refused(why) => {
             eprintln!("oxutrm: {why}");
             std::process::exit(2);
-        }
-        // More than one session is live and nothing else settled it. The
-        // terminal is still ordinary here -- raw mode is L11, well below --
-        // so the picker is plain line I/O on stdin and stdout.
-        //
-        // Run on tokio's blocking pool, not on this async task: `pick` waits
-        // on a human with no bound on how long that takes, and `SshChannel`'s
-        // own stderr drainer (`oxutrm_host::ssh::SshChannel::open`) is a
-        // `tokio::spawn` task on this same multi-threaded runtime. On a
-        // single-worker or cgroup-limited host, a human sitting at the `>`
-        // prompt would monopolise the only worker, starving that drainer;
-        // once its pipe buffer fills, `ssh` itself blocks on the write.
-        // `spawn_blocking` keeps the wait off the async workers entirely.
-        Decision::Ask => {
-            let offered = offered.clone();
-            let picked = tokio::task::spawn_blocking(move || {
-                pick(
-                    &offered,
-                    &mut std::io::stdin().lock(),
-                    &mut std::io::stdout(),
-                )
-            })
-            .await
-            .context("running the picker")??;
-            match picked {
-                Some(choice) => choice,
-                // The user quit. Not an error: they were asked, and declined.
-                None => std::process::exit(0),
-            }
         }
     };
     // Kept past the send, because the line printed below has to say which of
@@ -195,7 +190,10 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // The attach generation used to be here too and is not any more. It is
     // internal bookkeeping -- which generation of the sync counters this is --
     // and unlike the id there is nothing a user can do with it.
-    println!("{}", opening_line(&chosen, &established.session_id));
+    println!(
+        "{}",
+        opening_line(&chosen, &established.session_id, offered.len())
+    );
 
     // L11. Late, deliberately: after every prompt ssh could have shown, and
     // after the last thing that could have failed with a message worth
@@ -205,7 +203,15 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
     // The two identities a rebuild needs: the target the user typed, and
     // whichever session actually resulted -- which for `Choice::New` is an id
     // the client had no way to guess in advance.
-    let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
+    //
+    // A lobby is never reattached: a rebuild from one asks for a fresh one
+    // (switcher spec §3.5).
+    let lobby = chosen == Choice::Lobby;
+    let rebuild = if lobby {
+        Rebuild::aimed(target.to_owned(), crate::rebuild::Aim::Lobby)
+    } else {
+        Rebuild::new(target.to_owned(), established.session_id.clone())
+    };
     let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
         .context("preparing the client session")?
@@ -221,6 +227,9 @@ async fn connect(target: &str, attach: Option<&str>, new: bool) -> Result<i32> {
             target,
             &established.session_id,
         ));
+    if lobby {
+        session = session.with_lobby();
+    }
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     // Created whatever `network.standby` says: the setting only switches it
@@ -295,12 +304,17 @@ fn splash_seed() -> u64 {
 /// real terminal -- and this line said the same words for both outcomes until
 /// somebody read it. The text is the whole behaviour, so the text is what is
 /// pinned.
-fn opening_line(chosen: &Choice, session_id: &str) -> String {
+fn opening_line(chosen: &Choice, session_id: &str, offered: usize) -> String {
     match chosen {
-        // Spec §4.2: the "exactly one, detachable" row resumes without asking,
-        // "with one line saying so". This is that line.
         Choice::Attach { .. } => format!("oxutrm: resumed session {session_id}."),
-        Choice::New => format!("oxutrm: new session {session_id}."),
+        Choice::New { name: Some(n) } => format!("oxutrm: new session {n} ({session_id})."),
+        Choice::New { name: None } => format!("oxutrm: new session {session_id}."),
+        // Nothing is resumed silently (switcher spec §1.1): the selector
+        // opens instead, and this says why it is there.
+        Choice::Lobby => match offered {
+            1 => "oxutrm: 1 session is running here; choose it or start another.".to_string(),
+            n => format!("oxutrm: {n} sessions are running here; choose one or start another."),
+        },
     }
 }
 
@@ -324,10 +338,12 @@ fn splash_caption(
 ) -> String {
     let id: String = session_id.chars().take(8).collect();
     let news = match chosen {
-        Choice::Attach { .. } => "resumed session",
-        Choice::New => "new session",
+        Choice::Attach { .. } => format!("resumed session {id}"),
+        Choice::New { name: Some(n) } => format!("new session {n}"),
+        Choice::New { name: None } => format!("new session {id}"),
+        Choice::Lobby => "choose a session".to_string(),
     };
-    let mut caption = format!("{news} {id} \u{b7} {}", oxutrm_client::rung_label(path));
+    let mut caption = format!("{news} \u{b7} {}", oxutrm_client::rung_label(path));
     match warnings {
         0 => {}
         1 => caption.push_str(" \u{b7} config: 1 warning"),
@@ -397,20 +413,37 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send,
 {
     let mut reader = reader;
+    // L5. Banner and motd are skipped inside `read_signal_async`; version skew
+    // fails loudly.
+    let first = read_signal_async(&mut reader)
+        .await
+        .context("reading the host's offer")?;
+    establish_from(first, reader, writer, size, cfg, admit_remote).await
+}
+
+/// L4 and L6 to L10, once the host's first line -- its hello, or why not --
+/// is in hand: from [`establish`], and from the switcher's `Switch` and
+/// `New`, whose first answer may be a refusal instead (`switcher::ask`).
+pub(crate) async fn establish_from<R, W>(
+    first: Signal,
+    reader: R,
+    writer: W,
+    size: TermSize,
+    cfg: &NetConfig,
+    admit_remote: Option<oxutrm_net::RemoteFilter>,
+) -> Result<Established>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut reader = reader;
     let mut writer = writer;
+    let host = host_facts(first)?;
 
     // L4. One socket for STUN, ICE and QUIC.
     let bound = oxutrm_net::bind_socket(cfg).context("binding a UDP socket")?;
     let mut candidates = oxutrm_net::local_candidates(&bound);
     let socket = crate::ladder::adopt(bound).context("handing the socket to the runtime")?;
-
-    // L5. Banner and motd are skipped inside `read_signal_async`; version skew
-    // fails loudly.
-    let host = host_facts(
-        read_signal_async(&mut reader)
-            .await
-            .context("reading the host's offer")?,
-    )?;
 
     // L6.
     let (reflexive, nat) = oxutrm_net::stun_discover(&socket, cfg).await;
@@ -552,7 +585,7 @@ impl std::error::Error for HostRefused {}
 /// without ssh in the test below. [`crate::rebuild::attempt`] reads its own
 /// fresh channel's offer through this same function, and for the same reason:
 /// the first read is where a missing binary or a dead ssh is diagnosed.
-pub(crate) async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSummary>> {
+pub(crate) async fn read_offer(channel: &mut SshChannel) -> Result<Vec<OfferEntry>> {
     sessions_offered(
         channel
             .recv()
@@ -562,9 +595,9 @@ pub(crate) async fn read_offer(channel: &mut SshChannel) -> Result<Vec<SessionSu
 }
 
 /// What a `Signal` means as the host's offer, once it has been read.
-fn sessions_offered(signal: Signal) -> Result<Vec<SessionSummary>> {
+fn sessions_offered(signal: Signal) -> Result<Vec<OfferEntry>> {
     match signal {
-        Signal::Sessions { sessions } => Ok(sessions),
+        Signal::Sessions { list } => Ok(list),
         // The host's own words, exactly as at L5: it is the only explanation
         // there is for why this connection is not going to happen.
         Signal::Failed { reason } => Err(anyhow::Error::new(HostRefused(reason))),
@@ -712,13 +745,16 @@ mod tests {
         let (client_read, mut client_write) = tokio::io::split(client_side);
         let mut client_read = tokio::io::BufReader::new(client_read);
 
-        let offered = vec![SessionSummary {
-            session_id: "a".repeat(32),
+        let offered = vec![OfferEntry {
+            id: "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().unwrap(),
+            name: Some(Name::parse("build").unwrap()),
+            shell: "/bin/bash".to_owned(),
             created_unix: 1_757_200_000,
-            shell: "/bin/sh".to_owned(),
-            size: TermSize { cols: 80, rows: 24 },
+            size: TermSize {
+                cols: 120,
+                rows: 40,
+            },
             detachable: true,
-            attach_id: 1,
         }];
 
         // Stands in for `oxutrm host --connect`: sends the offer first, then
@@ -726,7 +762,7 @@ mod tests {
         let host = tokio::spawn({
             let offered = offered.clone();
             async move {
-                write_signal_async(&mut host_write, &Signal::Sessions { sessions: offered })
+                write_signal_async(&mut host_write, &Signal::Sessions { list: offered })
                     .await
                     .expect("writing the offer");
                 match read_signal_async(&mut tokio::io::BufReader::new(host_read))
@@ -751,11 +787,9 @@ mod tests {
                 .await
                 .expect("reading the offer");
             let sessions = sessions_offered(signal).expect("the offer parses");
-            let decision = decide(&sessions, None, false);
+            let decision = decide(&sessions, Some("build"), false, None);
             let Decision::Chosen(choice) = decision else {
-                panic!(
-                    "with exactly one detachable session and no flags, decide must choose: {decision:?}"
-                );
+                panic!("--attach build must choose the session named build: {decision:?}");
             };
             write_signal_async(
                 &mut client_write,
@@ -777,8 +811,10 @@ mod tests {
         );
         assert_eq!(
             choice,
-            Choice::Attach { id: "a".repeat(32) },
-            "the one live, detachable session must be resumed without asking"
+            Choice::Attach {
+                id: "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().unwrap()
+            },
+            "--attach build must reach the session named build"
         );
     }
 
@@ -806,6 +842,7 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
             detachable: true,
             boot: oxutrm_host::boot_token(),
+            name: None,
         };
 
         let cfg = test_config();
@@ -896,29 +933,58 @@ mod tests {
             rtt_ms: 38,
             mtu: 1400,
         };
+        let new = Choice::New { name: None };
         assert_eq!(
-            splash_caption(&Choice::Attach { id: id.clone() }, &id, &path, 0),
+            splash_caption(
+                &Choice::Attach {
+                    id: id.parse().unwrap()
+                },
+                &id,
+                &path,
+                0
+            ),
             "resumed session 3ff1218f \u{b7} IPv4 punched"
         );
         assert_eq!(
-            splash_caption(&Choice::New, &id, &path, 0),
+            splash_caption(&new, &id, &path, 0),
             "new session 3ff1218f \u{b7} IPv4 punched"
         );
         assert_eq!(
-            splash_caption(&Choice::New, &id, &path, 1),
+            splash_caption(
+                &Choice::New {
+                    name: Some(Name::parse("build").unwrap())
+                },
+                &id,
+                &path,
+                0
+            ),
+            "new session build \u{b7} IPv4 punched"
+        );
+        assert_eq!(
+            splash_caption(&Choice::Lobby, &id, &path, 0),
+            "choose a session \u{b7} IPv4 punched"
+        );
+        assert_eq!(
+            splash_caption(&new, &id, &path, 1),
             "new session 3ff1218f \u{b7} IPv4 punched \u{b7} config: 1 warning"
         );
         assert_eq!(
-            splash_caption(&Choice::New, &id, &path, 3),
+            splash_caption(&new, &id, &path, 3),
             "new session 3ff1218f \u{b7} IPv4 punched \u{b7} config: 3 warnings"
         );
     }
 
     #[test]
     fn the_opening_line_says_whether_the_session_was_already_running() {
-        let id = "a".repeat(32);
-        let resumed = opening_line(&Choice::Attach { id: id.clone() }, &id);
-        let fresh = opening_line(&Choice::New, &id);
+        let id = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_string();
+        let resumed = opening_line(
+            &Choice::Attach {
+                id: id.parse().unwrap(),
+            },
+            &id,
+            1,
+        );
+        let fresh = opening_line(&Choice::New { name: None }, &id, 1);
 
         // The one assertion the pre-fix line cannot satisfy: it produced
         // exactly the same string for both.
@@ -937,6 +1003,23 @@ mod tests {
             resumed.contains(&id) && fresh.contains(&id),
             "the session id must survive in both: {resumed:?} / {fresh:?}"
         );
+    }
+
+    #[test]
+    fn a_named_new_session_and_the_lobby_say_so() {
+        let id = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60";
+        let named = opening_line(
+            &Choice::New {
+                name: Some(Name::parse("build").unwrap()),
+            },
+            id,
+            0,
+        );
+        assert!(named.contains("build") && named.contains(id), "{named}");
+        let one = opening_line(&Choice::Lobby, id, 1);
+        assert!(one.contains("1 session is"), "{one}");
+        let three = opening_line(&Choice::Lobby, id, 3);
+        assert!(three.contains("3 sessions are"), "{three}");
     }
 
     fn a_host_hello() -> Signal {

@@ -400,6 +400,7 @@ pub(crate) mod fixtures {
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
             boot: None,
+            name: None,
         }
     }
 
@@ -558,7 +559,7 @@ mod tests {
     /// A size no screen can be built at must fail the ATTACH, not the session.
     ///
     /// `ScreenState::blank` refuses anything past I7's bounds, and the caller
-    /// that builds one on a REATTACH is [`crate::session::HostSession::adopt`]
+    /// that builds one on a REATTACH is [`crate::host_session::HostSession::adopt`]
     /// — which runs after the old link has been closed and replaced, and whose
     /// `?` propagates out of `run_with_attaches` and takes a running shell with
     /// it. The exchange is where that has to be caught: it is the last point
@@ -708,6 +709,7 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
             detachable: false,
             boot: None,
+            name: None,
         };
         let attach = oxutrm_host::begin_attach(&mut meta, HostSpki::new([7u8; 32]))
             .expect("fresh key material");
