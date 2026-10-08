@@ -11,26 +11,36 @@
   with the screen it has right now, and tells the terminal that had it that it
   was taken over rather than leaving it to report silence.
 
-- **Connecting to a host resumes your session there instead of replacing it.**
-  `oxutrm <ssh-target>` now asks the far end what is already running before
-  either side commits to anything. One session of yours, and it is resumed —
-  same shell, same scrollback, same screen — without asking. Several, and
-  oxutrm lists them and asks which; `q` leaves without touching any of them.
-  None, and you get a new one, exactly as before. `--attach <id>` names one
-  directly, by as few as four characters of its id, and `--new` starts a fresh
-  session however many are already there. Killing a client and reconnecting
-  used to strand the old session: it stayed live, holding your shell, and the
-  reconnect started a second one beside it.
+- **A session selector, at connect and in the status popup.** A host may run
+  several oxutrm sessions; `s` in the status popup now lists them -- name,
+  shell, when each started, its size, and whether it is the one you are in,
+  attached to another client (`in use`), or did not answer (`?`) -- and from
+  the list `⏎` switches to one, `n` starts a new one, `r` names or renames one
+  in place and `x` kills one after asking. A switch travels over the live
+  link and never touches ssh: the new session's link is built while you stay
+  in the old one, and only once it is up does the client move, so a switch
+  that fails leaves you where you were with the reason under the list. A
+  session another client is attached to is taken over after asking, as
+  `--attach` does. Killing the session you are in leaves the selector open
+  over a blank screen until you pick another, start one, or quit with `q`;
+  killing never ends the client by itself. Every switch, kill and rename is in
+  the popup's log and in `client.log`. `docs/sessions.md` has the whole of it.
 
-  Connecting prints one line saying which of the two happened — `oxutrm:
-  resumed session <id>.` or `oxutrm: new session <id>.` — before the terminal
-  goes into raw mode. The id is the one thing worth writing down to `--attach`
-  back into later, and the first word is there because landing in a two-day-old
-  session with a half-typed command already at the prompt should not be
-  something you have to work out from the screen. A session that cannot be
-  resumed because it tunnels its data through the ssh connection that created
-  it is still offered, and refused with that reason rather than quietly
-  omitted.
+- **Connecting to a host shows its sessions instead of resuming one.**
+  `oxutrm <ssh-target>` asks the far end what is running before either side
+  commits to anything. With nothing of yours there you get a new session,
+  exactly as before. With any session running -- even exactly one -- the
+  selector opens over a blank screen, after the splash: nothing is resumed
+  silently any more. `--attach <name>` or `--attach <id-prefix>` (four
+  lowercase hex characters or more, as ids are written) goes straight to one
+  session, and `--new` starts a fresh one however many are running, named with
+  `--name <name>`. A name is up to 24 characters and needs at least one
+  outside `0-9a-f`, so it can never be read as an id; names are unique on a
+  host. Connecting prints one line before the terminal goes into raw mode:
+  `oxutrm: resumed session <id>.`, `oxutrm: new session <name> (<id>).`, or
+  how many sessions are running when the selector is about to open. A session
+  that cannot be resumed because it tunnels its data through the ssh
+  connection that created it is listed dimmed and refused with that reason.
 
 - **A client whose network dies reconnects by itself.** After twenty seconds of
   silence — long enough that a blip is not raced against an outage about to end
@@ -161,6 +171,14 @@
 
 ### Compatibility
 
+- **The client and every host session must be the same version: end your old
+  sessions before upgrading.** The session switcher changed the wire between
+  the client and a session process, and between sessions, and
+  `PROTO_VERSION` is now 3. A client of this version refuses a host session
+  started by an older binary with both version numbers in the message, and the
+  selector lists such a session as `old version`, which can be ended only by
+  ending its shell. There is no compatibility mode.
+
 - **`network.birthday = false` stops the birthday punch at both ends only
   against an upgraded host.** The client asks with a new `no-birthday` hello
   feature, which an older host ignores: there only the client's half of the
@@ -178,6 +196,15 @@
   field lives in the hellos and this exchange happens before them.
 
 ### Changed
+
+- **New shells are login shells in your home directory**, as ssh would start
+  them: `argv[0]` is `-bash` (or whatever your shell is), so your profile is
+  read, and the shell starts in `$HOME` rather than in `/`. This holds for a
+  first connect and for sessions started from the selector alike.
+
+- **`oxutrm host --list` shows each session's name**, in a column after its
+  id, and `meta.json` is now replaced atomically, so a listing never reads a
+  half-written one.
 
 - **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
   carry a `features` list — empty today except for the host, which advertises

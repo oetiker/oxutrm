@@ -230,7 +230,7 @@ Fixed on the way: `SessionId::from_str` sliced the string by bytes and panicked 
 **Interfaces:**
 - Consumes: `oxutrm_proto::{Signal, ProtoError, TermSize, PROTO_VERSION, MAX_SIGNAL_LINE}` (existing).
 - Produces:
-  - `oxutrm_proto::SessionId` -- private field; `FromStr`/`Display` as 32 lowercase hex; serde as that string (`try_from = "String", into = "String"`); `short(&self) -> String` (first 8); `starts_with(&self, prefix: &str) -> bool` (case-insensitive).
+  - `oxutrm_proto::SessionId` -- private field; `FromStr`/`Display` as 32 lowercase hex; serde as that string (`try_from = "String", into = "String"`); `short(&self) -> String` (first 8); `starts_with(&self, prefix: &str) -> bool` (case-sensitive: ids are lowercase hex, as on the wire).
   - `oxutrm_proto::Name` -- `parse(&str) -> Result<Name, String>` (1-24 characters, no control character, no space at either end, at least one character outside `[0-9a-f]`), `as_str()`, `Display`, serde through `parse`; `MAX_NAME: usize = 24`.
   - `oxutrm_proto::{Open { proto: u32, req: Request }, Open::new(Request) -> Open}`; `Request` (tag `"q"`): `Attach { role: Role }`, `Probe { nonce: u64 }`, `Sessions`, `Myself`, `Switch { to: SessionId }`, `New { name: Option<Name> }`, `Kill { id: SessionId }`, `Rename { id: SessionId, name: Option<Name> }`.
   - `Reply` (tag `"r"`, content `"v"`): `Sessions(Vec<SessionEntry>)`, `Entry(SessionEntry)`, `Done`, `Refused(String)`, `ProbeAck { nonce: u64 }`.
@@ -7164,7 +7164,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 7: The offer and the choice: `OfferEntry`, `--name`, `--attach <name>`, a lobby instead of the line picker
 
-Spec §3.1, §4.2. `Signal::Sessions { list: Vec<OfferEntry> }` (built from `meta.json` only, before the fork); `Choice` is `Attach { id: SessionId } | New { name: Option<Name> } | Lobby`; `SessionSummary` and `attach::summarize` go. `choose::decide` is the §3.1 table: `--new` -> `New { name }`; `--attach x` -> the session named exactly `x`, else the one whose id `x` prefixes (four characters or more, case-insensitive); nothing running -> `New`; anything running -> `Lobby`. The line picker (`choose::pick`, `Decision::Ask`) is gone.
+Spec §3.1, §4.2. `Signal::Sessions { list: Vec<OfferEntry> }` (built from `meta.json` only, before the fork); `Choice` is `Attach { id: SessionId } | New { name: Option<Name> } | Lobby`; `SessionSummary` and `attach::summarize` go. `choose::decide` is the §3.1 table: `--new` -> `New { name }`; `--attach x` -> the session named exactly `x`, else the one whose id `x` prefixes (four characters or more, case-sensitive: ids are lowercase hex); nothing running -> `New`; anything running -> `Lobby`. The line picker (`choose::pick`, `Decision::Ask`) is gone.
 
 `connect` parses `--name <name>` (validated with `Name::parse` before ssh; without `--new` it is refused, exit 2); `dispatch` routes `--name` to it. `run_host_connect` refuses a taken name with a `Failed` before it forks -- still runtime-free: a blocking `flock` and a directory read -- and `Door::register` checks again under the same lock for the race this leaves. `oxutrm host --serve [--name <name>]`. The opening line and the splash caption say `new session <name> (<id>)`, or how many sessions are running when the lobby is about to open.
 
@@ -15008,6 +15008,7 @@ The §6 loopback list, test by test: switch between two sessions -- `a_switch_mo
 5. **A new close reason, `QUIT`**, for a client leaving a lobby with `q` (Task 9), so the lobby ends with its link instead of after `DETACH_AFTER`.
 6. **`Myself` answered with anything but an `Entry` is `OtherVersion`** (Task 5); there is no dedicated version refusal in `Reply`, and a version refusal is a `Refused` like any other.
 7. **`s` is dimmed without a reason text of its own** (Task 11); the popup's header already says why the link is not live.
+8. **The rebuild into a fresh lobby is not tested end to end** (Task 9): it is covered by unit tests and hand-test step 9 only, because an end-to-end rebuild needs ssh.
 
 ## Judgement calls to scrutinise
 
