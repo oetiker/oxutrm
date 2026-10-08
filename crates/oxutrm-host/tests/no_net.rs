@@ -56,6 +56,9 @@ const ALLOWED: &[&str] = &[
     // HostHello.
     "rand",
     "base64",
+    // `--list` pads its name column in terminal cells. A table of character
+    // widths and nothing else: no I/O at all.
+    "unicode-width",
 ];
 
 /// Dependency names that would each be a specific, named regression.
