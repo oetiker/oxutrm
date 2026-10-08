@@ -540,9 +540,19 @@ impl Rebuild {
     }
 
     /// Where the next attempt goes, after a switch, a new session or a kill
-    /// moved the client (switcher spec §3.5). An attempt already running
-    /// keeps its own.
+    /// moved the client (switcher spec §3.5).
+    ///
+    /// An attempt already running for another aim is cancelled: it would
+    /// reach a session that is gone (`Killed` of this one, which ends the
+    /// client as a definite failure) or a fresh lobby the client is no longer
+    /// in (`Started`). The next one goes where the client now is, after the
+    /// backoff the cancelled one began. The displacing latch is left as it
+    /// is: the outage is not over, and an attempt that had already sent its
+    /// `Attach` may still be adopted ([`Rebuild::may_have_displaced_us`]).
     pub(crate) fn retarget(&mut self, aim: Aim) {
+        if aim != self.aim {
+            self.cancel();
+        }
         self.aim = aim;
     }
 
@@ -1590,6 +1600,26 @@ mod tests {
         assert_eq!(
             r.aim(),
             &Aim::Session("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_owned())
+        );
+    }
+
+    /// An attempt in flight for the old aim is cancelled by a retarget, so
+    /// it never reaches a session that is gone; one for the same aim runs on.
+    /// The displacing latch stays: the outage is not over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retarget_cancels_an_attempt_for_the_old_aim() {
+        let fake = fake_host_that_never_answers();
+        let mut rebuild = rebuilding_against(&fake);
+        let here = rebuild.aim().clone();
+        rebuild.retarget(here);
+        assert!(rebuild.is_running(), "the same aim cancelled the attempt");
+
+        rebuild.retarget(Aim::Lobby);
+        assert!(!rebuild.is_running(), "the attempt for the old aim runs on");
+        assert_eq!(rebuild.aim(), &Aim::Lobby);
+        assert!(
+            rebuild.may_have_displaced_us(),
+            "a retarget ended the outage's claim on a TAKEN_OVER"
         );
     }
 }

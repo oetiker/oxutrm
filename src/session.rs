@@ -771,7 +771,10 @@ impl ClientSession {
                     Some(Ask::New { name: Some(n) }) => {
                         format!("new session {}", oxutrm_client::legible(n.as_str()))
                     }
-                    _ => format!("new session {}", &e.session_id[..8.min(e.session_id.len())]),
+                    _ => match e.session_id.parse::<oxutrm_proto::SessionId>() {
+                        Ok(id) => format!("new session {}", id.short()),
+                        Err(_) => "new session".to_string(),
+                    },
                 };
                 self.moved(*e, now)?;
                 self.activity.record_shown(Kind::Session, &label, &label);
@@ -10733,6 +10736,90 @@ mod tests {
         assert!(session.in_lobby());
         assert_eq!(session.ui.mode(), Mode::Sessions);
         assert_eq!(session.take_ask(), Some(Ask::Sessions));
+    }
+
+    /// A client in session `BUILD_ID` whose link is `Recovering`, with a
+    /// rebuild attempt in flight against an ssh that never answers.
+    async fn rebuilding_in_session(dir: &std::path::Path) -> (HostSession, ClientSession) {
+        let pidfile = dir.join("ssh.pid");
+        let rebuild = Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned())
+            .via(hanging_ssh(dir, &pidfile), stunless());
+        let (host, mut session) = pair_on("127.0.0.1:0", "/bin/sh", Some(rebuild)).await;
+        session.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        let entered = drive_to_recovering(&mut session);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(entered, &tx);
+        assert!(
+            session.rebuild.as_ref().unwrap().is_running(),
+            "no attempt in flight, so there is nothing for the test to see"
+        );
+        wait_for_pid(&pidfile).await;
+        (host, session)
+    }
+
+    /// The kill of this session answered while a rebuild attempt is in
+    /// flight: that attempt was for the session just killed, and would end
+    /// the client on "no such session". It is cancelled, and the next one
+    /// goes to a fresh lobby.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_of_this_session_cancels_the_rebuild_aimed_at_it() {
+        use crate::switcher::{Answered, Ask};
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, mut session) = rebuilding_in_session(dir.path()).await;
+        session.asked = Some(Ask::Kill {
+            id: id_of(BUILD_ID),
+        });
+        session
+            .answered(Answered::Killed(id_of(BUILD_ID)), Instant::now())
+            .unwrap();
+        let rebuild = session.rebuild.as_ref().unwrap();
+        assert!(
+            !rebuild.is_running(),
+            "the attempt for the killed session runs on"
+        );
+        assert_eq!(rebuild.aim(), &crate::rebuild::Aim::Lobby);
+    }
+
+    /// A lobby's `New` answered while a rebuild attempt is in flight: that
+    /// attempt was for a fresh lobby, which the client is no longer in. It is
+    /// cancelled, and the next one goes to the session just started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_session_cancels_the_rebuild_aimed_at_a_lobby() {
+        use crate::selector::fixtures::entry;
+        use crate::switcher::{Answered, Ask};
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, mut session) = rebuilding_in_session(dir.path()).await;
+        // Into a lobby first, so the attempt below is aimed at one.
+        session.in_lobby = true;
+        session.aim_rebuild();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        session.rebuild_step(Instant::now() + Duration::from_secs(600), &tx);
+        assert!(session.rebuild.as_ref().unwrap().is_running());
+        assert_eq!(
+            session.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Lobby
+        );
+
+        session.asked = Some(Ask::New { name: None });
+        let logs = entry(
+            LOGS_ID,
+            Some("logs"),
+            "/bin/bash",
+            1_700_000_000,
+            oxutrm_proto::Attached::Here,
+        );
+        session
+            .answered(Answered::Started(logs), Instant::now())
+            .unwrap();
+        let rebuild = session.rebuild.as_ref().unwrap();
+        assert!(!rebuild.is_running(), "the attempt for a lobby runs on");
+        assert_eq!(
+            rebuild.aim(),
+            &crate::rebuild::Aim::Session(LOGS_ID.to_owned())
+        );
     }
 
     /// A rebuild from a lobby lands in a fresh lobby: the client takes its
