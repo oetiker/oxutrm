@@ -132,18 +132,20 @@ where
 /// Detachability is shown rather than implied. A session that cannot be
 /// reattached looks identical to one that can until you try, and finding out by
 /// trying is the worst moment to find out.
+///
+/// `cells` measures a name in terminal cells (`構築` is two characters and
+/// four cells). It is the caller's, so this crate does not grow a width
+/// table: the binary passes the one its UI measures with.
 #[must_use]
-pub fn format_session_list(sessions: &[SessionMeta]) -> String {
+pub fn format_session_list(sessions: &[SessionMeta], cells: impl Fn(&str) -> usize) -> String {
     if sessions.is_empty() {
         return "no live oxutrm sessions on this host\n".to_string();
     }
     // The name column is as wide as the longest name, so the ids and the
-    // rest stay aligned whatever the names are. Measured in terminal cells,
-    // not characters: `構築` is two characters and four cells.
-    let cells = unicode_width::UnicodeWidthStr::width;
+    // rest stay aligned whatever the names are.
     let width = sessions
         .iter()
-        .map(|m| m.name.as_deref().map_or(1, cells))
+        .map(|m| m.name.as_deref().map_or(1, &cells))
         .max()
         .unwrap_or(1);
     let mut out = String::new();

@@ -39,7 +39,7 @@ pub use guard::{RawGuard, TERMINAL_RESTORE};
 pub use overlay::{Overlay, overlay_from_buffer};
 pub use popup::{
     ConfigRow, ConfigSection, ConfigView, KeyHint, Marker, Popup, PopupView, Row, SessionRow,
-    SessionsView, layout, layout_config, layout_popup, layout_sessions, legible, summarised,
+    SessionsView, cells, layout, layout_config, layout_popup, layout_sessions, legible, summarised,
 };
 pub use renderer::Renderer;
 pub use status::{rung_label, status_line};

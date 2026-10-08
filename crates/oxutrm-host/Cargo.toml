@@ -34,14 +34,14 @@ tokio.workspace = true
 # decoder. Hence no `base64` here — a second encode site is what let the mint
 # and the consume ends drift apart in the first place.
 rand.workspace = true
-# `--list` pads its name column in terminal cells, as the client's UI does,
-# so a name in wide characters keeps the columns after it aligned.
-unicode-width.workspace = true
 
 [dev-dependencies]
 # Declared here rather than in [workspace.dependencies] so that adding it does
 # not touch the root manifest, which other crates are being written against.
 tempfile = "3"
+# The measure `oxutrm host --list` is given in the product (the client UI's
+# `cells`), for the tests that check its columns line up.
+unicode-width.workspace = true
 
 # A test fixture, not part of the product: it daemonizes and then reports what
 # survived, so tests/daemonize.rs can assert against a real detached process

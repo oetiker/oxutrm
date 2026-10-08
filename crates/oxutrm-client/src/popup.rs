@@ -945,8 +945,9 @@ fn config_lines(v: &ConfigView) -> Vec<ConfigLine<'_>> {
 }
 
 /// How many cells `text` takes on the screen: a CJK character takes two,
-/// so every column here is measured in cells, never in characters.
-fn cells(text: &str) -> usize {
+/// so every column here is measured in cells, never in characters. Public
+/// for `oxutrm host --list`, which pads its columns the same way.
+pub fn cells(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 

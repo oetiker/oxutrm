@@ -141,7 +141,10 @@ fn run_host_list() -> Result<()> {
 
     let sessions = oxutrm_host::Registry::list_in(&oxutrm_host::Registry::dir_at(&root.base))
         .context("reading the session registry")?;
-    print!("{}", oxutrm_host::attach::format_session_list(&sessions));
+    print!(
+        "{}",
+        oxutrm_host::attach::format_session_list(&sessions, oxutrm_client::cells,)
+    );
     Ok(())
 }
 
