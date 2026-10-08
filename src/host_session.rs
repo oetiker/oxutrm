@@ -91,13 +91,18 @@ pub(crate) enum LoopCmd {
     StartShell {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Kill the shell ([`HostSession::hang_up_shell`]) and reply with its
-    /// status. Then, for its own client's request, become a lobby; for a
-    /// sibling's (`end`), wait for `written` -- the door's `Done`, written
-    /// after it removed the registry entry -- and end as a shell that exited.
+    /// Kill the shell ([`ShellKill`]) and reply with its status, or with why
+    /// there was none to kill. Then, for its own client's request, become a
+    /// lobby; for a sibling's (`end`), wait for `written` -- the door's
+    /// `Done`, written after it removed the registry entry -- and end as a
+    /// shell that exited.
+    ///
+    /// The loop keeps serving its link while the shell takes its time:
+    /// heartbeats are answered and the screen goes out, so a slow kill is
+    /// never an outage.
     Kill {
         end: bool,
-        reply: tokio::sync::oneshot::Sender<i32>,
+        reply: tokio::sync::oneshot::Sender<Result<i32, String>>,
         written: tokio::sync::oneshot::Receiver<()>,
     },
 }
@@ -540,6 +545,9 @@ impl HostSession {
         // triggered and will not fire twice, so re-check on a timer instead of
         // trusting the hint — the same rule that keeps PTY EOF out of this.
         let mut recheck_child = false;
+        // A kill the door asked for, waiting for the shell to go. The loop
+        // goes on turning meanwhile; no new command is taken until it is over.
+        let mut killing: Option<Killing> = None;
 
         loop {
             let turn = match (promote.take(), pending.take()) {
@@ -550,6 +558,47 @@ impl HostSession {
                 (None, None) => self.turn()?,
                 (None, Some(frame)) => self.turn_with(Some(frame))?,
             };
+            if let Some(k) = killing.as_mut() {
+                let over = match self.term.as_mut() {
+                    Some(term) => turn.exited.or_else(|| k.kill.step(term)),
+                    None => Some(-1),
+                };
+                if let Some(code) = over {
+                    let Killing {
+                        end,
+                        reply,
+                        written,
+                        ..
+                    } = killing.take().expect("checked above");
+                    if end {
+                        // A sibling asked: end as a shell that exited, once
+                        // the door has told the sibling it is done. The
+                        // parked standby goes as it goes when a shell exits.
+                        if let Some(parked) = standby.take() {
+                            close_as_exited(parked.sink.connection(), code);
+                        }
+                        let _ = reply.send(Ok(code));
+                        let _ = tokio::time::timeout(DONE_WRITTEN_WITHIN, written).await;
+                        self.finish(code).await;
+                        return Ok(code);
+                    }
+                    // Our own client asked: a lobby from here, and the
+                    // client stays (spec §1.1). Its parked standby is not
+                    // told the shell exited -- were the client to have
+                    // failed over onto it, that would end it -- only that
+                    // it is no longer wanted.
+                    if let Some(parked) = standby.take() {
+                        parked
+                            .sink
+                            .connection()
+                            .close(quinn::VarInt::from_u32(0), SUPERSEDED);
+                    }
+                    self.become_lobby()?;
+                    watch = None;
+                    let _ = reply.send(Ok(code));
+                    continue;
+                }
+            }
             if let Some(code) = turn.exited {
                 // Closed, not dropped: its control server holds the
                 // connection open for as long as it is not.
@@ -590,7 +639,9 @@ impl HostSession {
             } else {
                 Some(tokio::time::Instant::now() + self.link.sink.pacing_interval())
             };
-            if std::mem::take(&mut recheck_child) {
+            // A kill in progress is a clock of its own: the grace, then the
+            // reap. Checked at the idle pace, for at most a few seconds.
+            if std::mem::take(&mut recheck_child) || killing.is_some() {
                 let at = tokio::time::Instant::now() + IDLE_POLL;
                 deadline = Some(deadline.map_or(at, |d| d.min(at)));
             }
@@ -643,7 +694,7 @@ impl HostSession {
                         Some(frame) => HostWake::StandbyFrame(frame),
                         None => HostWake::StandbyGone,
                     },
-                Some(c) = cmds.recv() => HostWake::Cmd(c),
+                Some(c) = cmds.recv(), if killing.is_none() => HostWake::Cmd(c),
                 _ = conn.closed(), if lobby => HostWake::LobbyOver,
                 () = tokio::time::sleep_until(silent_until), if lobby => HostWake::LobbyOver,
             };
@@ -674,45 +725,42 @@ impl HostSession {
                     }
                 }
                 HostWake::Cmd(LoopCmd::StartShell { reply }) => {
-                    let started = if self.is_lobby() {
-                        self.start_shell().map_err(|e| format!("{e:#}"))
-                    } else {
-                        Err("this session already has a shell".to_string())
-                    };
-                    let ok = started.is_ok();
-                    let _ = reply.send(started);
-                    if ok {
-                        watch = self.watch()?;
+                    if !self.is_lobby() {
+                        let _ = reply.send(Err("this session already has a shell".to_string()));
+                        continue;
+                    }
+                    // Watched before the client is told: a shell the loop
+                    // cannot wait on is not a started one.
+                    match self.start_shell().and_then(|()| self.watch()) {
+                        Ok(w) => {
+                            watch = w;
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => {
+                            // Still a lobby, whichever half failed.
+                            self.become_lobby()?;
+                            let _ = reply.send(Err(format!("{e:#}")));
+                        }
                     }
                 }
                 HostWake::Cmd(LoopCmd::Kill {
                     end,
                     reply,
                     written,
-                }) => {
-                    if self.is_lobby() {
-                        let _ = reply.send(-1);
-                        continue;
+                }) => match self.term.as_mut() {
+                    None => {
+                        let _ =
+                            reply.send(Err("this session has no shell left to kill".to_string()));
                     }
-                    let code = self.hang_up_shell(KILL_GRACE).await;
-                    // The parked standby belonged to this shell's client;
-                    // it goes as a standby goes when the shell exits.
-                    if let Some(parked) = standby.take() {
-                        close_as_exited(parked.sink.connection(), code);
+                    Some(term) => {
+                        killing = Some(Killing {
+                            end,
+                            reply,
+                            written,
+                            kill: ShellKill::begin(term, KILL_GRACE),
+                        });
                     }
-                    if end {
-                        // A sibling asked: end as a shell that exited, once
-                        // the door has told the sibling it is done.
-                        let _ = reply.send(code);
-                        let _ = tokio::time::timeout(DONE_WRITTEN_WITHIN, written).await;
-                        self.finish(code).await;
-                        return Ok(code);
-                    }
-                    // Our own client asked: a lobby from here.
-                    self.become_lobby()?;
-                    watch = None;
-                    let _ = reply.send(code);
-                }
+                },
             }
         }
     }
@@ -747,38 +795,18 @@ impl HostSession {
         Ok(Some(Watch { output, exit }))
     }
 
-    /// End the shell on request: hang it up as a closing terminal would, and
-    /// SIGKILL its process group if it is still there after `grace`
-    /// ([`KILL_GRACE`] in the session). Returns its exit status once it is
-    /// reaped -- or `-1` for one that could not be reaped even after the
-    /// kill, which a session ends on all the same.
-    ///
-    /// Drains the pty while it waits: on macOS a child killed while writing
-    /// to a pty is not reaped until its output is read (`Pty::reap`).
+    /// [`ShellKill`], without the loop around it: hang the shell up and wait
+    /// for it, draining the pty meanwhile.
+    #[cfg(test)]
     pub(crate) async fn hang_up_shell(&mut self, grace: Duration) -> i32 {
         let Some(term) = self.term.as_mut() else {
             return -1;
         };
-        // A shell that is already gone is not signalled: its pid may be
-        // someone else's by now.
-        if let Some(code) = term.child_exited() {
-            return code;
-        }
-        term.hang_up();
-        let start = tokio::time::Instant::now();
-        let mut killed = false;
+        let mut kill = ShellKill::begin(term, grace);
         loop {
             let _ = term.poll();
-            if let Some(code) = term.child_exited() {
+            if let Some(code) = kill.step(term) {
                 return code;
-            }
-            let waited = start.elapsed();
-            if !killed && waited >= grace {
-                term.kill_group();
-                killed = true;
-            }
-            if killed && waited >= grace + REAP_AFTER_KILL {
-                return -1;
             }
             tokio::time::sleep(IDLE_POLL).await;
         }
@@ -998,6 +1026,59 @@ enum HostWake {
     LobbyOver,
 }
 
+/// Ending the shell on request: hang it up as a closing terminal would, and
+/// SIGKILL its process group if it is still there after `grace`
+/// ([`KILL_GRACE`] in the session). Over once the shell is reaped -- or at
+/// `-1` for one that could not be reaped even after the kill, which a session
+/// ends on all the same.
+///
+/// A clock, not a wait: the loop steps it after every turn and keeps serving
+/// its link in between. The turn drains the pty, which matters here: on macOS
+/// a child killed while writing to a pty is not reaped until its output is
+/// read (`Pty::reap`).
+struct ShellKill {
+    since: tokio::time::Instant,
+    grace: Duration,
+    killed: bool,
+}
+
+impl ShellKill {
+    /// Hang `term` up and start the clock. A shell that is already gone is
+    /// not signalled: its pid may be someone else's by now.
+    fn begin(term: &mut HostTerm, grace: Duration) -> ShellKill {
+        if term.child_exited().is_none() {
+            term.hang_up();
+        }
+        ShellKill {
+            since: tokio::time::Instant::now(),
+            grace,
+            killed: false,
+        }
+    }
+
+    /// The shell's status once the kill is over, SIGKILLing its group once
+    /// the grace has run out.
+    fn step(&mut self, term: &mut HostTerm) -> Option<i32> {
+        if let Some(code) = term.child_exited() {
+            return Some(code);
+        }
+        let waited = self.since.elapsed();
+        if !self.killed && waited >= self.grace {
+            term.kill_group();
+            self.killed = true;
+        }
+        (self.killed && waited >= self.grace + REAP_AFTER_KILL).then_some(-1)
+    }
+}
+
+/// A kill the door asked for, in progress: what to answer once it is over.
+struct Killing {
+    end: bool,
+    reply: tokio::sync::oneshot::Sender<Result<i32, String>>,
+    written: tokio::sync::oneshot::Receiver<()>,
+    kill: ShellKill,
+}
+
 /// The shell's two descriptors, as the loop waits on them.
 struct Watch {
     output: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
@@ -1017,13 +1098,15 @@ mod tests {
     }
 
     /// A "shell" that ignores SIGHUP, as a script file the session runs. It
-    /// creates `ready` once its trap is set, so a test never races the trap.
+    /// creates `ready` once its trap is set, so a test never races the trap,
+    /// and then `exec`s a `sleep` that inherits the ignored HUP: no shell is
+    /// left to hang in a signal handler of its own.
     fn stubborn_shell(dir: &std::path::Path) -> String {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("stubborn");
         let ready = dir.join("ready");
         let script = format!(
-            "#!/bin/sh\ntrap '' HUP\n: > '{}'\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\ntrap '' HUP\n: > '{}'\nexec sleep 300\n",
             ready.display()
         );
         std::fs::write(&path, script).unwrap();
@@ -1061,18 +1144,140 @@ mod tests {
             host_link,
         )
         .unwrap();
-        // The script has set its trap once it has made `ready`.
-        let ready = dir.path().join("ready");
-        let waiting = Instant::now();
-        while !ready.exists() {
-            assert!(waiting.elapsed() < Duration::from_secs(10), "no trap set");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        trap_set(dir.path()).await;
         let grace = Duration::from_millis(400);
         let begun = Instant::now();
         let code = host.hang_up_shell(grace).await;
         assert_eq!(code, 128 + 9, "ended by the SIGKILL");
         assert!(begun.elapsed() >= grace, "{:?}", begun.elapsed());
+    }
+
+    /// Wait for the stubborn shell in `dir` to have set its trap.
+    async fn trap_set(dir: &std::path::Path) {
+        let ready = dir.join("ready");
+        let waiting = Instant::now();
+        while !ready.exists() {
+            assert!(waiting.elapsed() < Duration::from_secs(10), "no trap set");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A kill its own client asked for, of a shell that ignores the hang-up:
+    /// the loop keeps serving the link through the whole grace -- typing is
+    /// echoed while the kill still waits -- and the client's parked standby
+    /// is closed as superseded, not as a shell that exited, because the
+    /// client stays (switcher spec §1.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_kill_keeps_serving_the_link_and_spares_the_standby() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = stubborn_shell(dir.path());
+        let (host_link, client_link) = link_pair().await;
+        let (standby_host, standby_client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            &shell,
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        trap_set(dir.path()).await;
+
+        let (attach_tx, mut attaches) = tokio::sync::mpsc::channel(1);
+        let (cmd_tx, mut cmds) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move { host.run_with_doors(&mut attaches, &mut cmds).await });
+        attach_tx
+            .send(crate::attach_exchange::Attached {
+                link: standby_host,
+                path: oxutrm_proto::PathDescription {
+                    rung: oxutrm_proto::Rung::StunPunch,
+                    local: "127.0.0.1:1".parse().unwrap(),
+                    remote: "203.0.113.7:443".parse().unwrap(),
+                    probes_sent: 4,
+                    nat_type: oxutrm_proto::NatType::Unknown,
+                    rtt_ms: 30,
+                    mtu: 1400,
+                },
+                client_size: size(),
+                role: crate::control::Role::Standby,
+            })
+            .await
+            .unwrap();
+
+        let (reply, mut code) = tokio::sync::oneshot::channel();
+        let (_written, written_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(LoopCmd::Kill {
+                end: false,
+                reply,
+                written: written_rx,
+            })
+            .await
+            .unwrap();
+        let asked = Instant::now();
+
+        let mut client = crate::session::ClientSession::new(
+            size(),
+            oxutrm_proto::TerminalCaps {
+                truecolor: true,
+                colors: 16_777_216,
+                bracketed_paste: true,
+                mouse_sgr: true,
+                osc52: true,
+                term_name: "xterm-256color".to_owned(),
+            },
+            client_link,
+            None,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut typed = false;
+        let echoed = |c: &crate::session::ClientSession| {
+            let text: String = c.screen().cells.iter().map(|c| c.text.as_str()).collect();
+            text.contains("kept")
+        };
+        while !echoed(&client) {
+            assert!(
+                asked.elapsed() < KILL_GRACE,
+                "nothing came back while the kill waited out its grace"
+            );
+            client
+                .turn(if typed { b"" } else { b"kept" }, &mut out)
+                .unwrap();
+            typed = true;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(
+                code.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the echo came only after the kill was over"
+        );
+
+        let code = tokio::time::timeout(KILL_GRACE + Duration::from_secs(5), code)
+            .await
+            .expect("the kill never answered")
+            .unwrap();
+        assert_eq!(code, Ok(128 + 9), "ended by the SIGKILL");
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            standby_client.sink.connection().closed(),
+        )
+        .await
+        .expect("the parked standby was never closed");
+        assert!(
+            matches!(
+                &reason,
+                quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == SUPERSEDED
+            ),
+            "the standby was closed as {reason:?}"
+        );
+        assert!(
+            !task.is_finished(),
+            "a kill from its own client ended the session"
+        );
+        task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

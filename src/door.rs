@@ -356,12 +356,13 @@ impl Door {
                 })
                 .await;
             match (asked, code.await) {
-                (Ok(()), Ok(_code)) => {
+                (Ok(()), Ok(Ok(_code))) => {
                     self.unregister();
                     let _ = write_line_async(writer, &Reply::Done).await;
                     let _ = written.send(());
                     return;
                 }
+                (Ok(()), Ok(Err(why))) => refused(&why),
                 _ => refused("the session ended before its shell could be killed"),
             }
         } else {
