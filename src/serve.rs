@@ -172,8 +172,17 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     // the emulator, never from the client, or a client narrower than the
     // emulator would bake degraded output into the authoritative screen for
     // the life of the session.
-    let mut session = HostSession::spawn(&shell, attached.client_size, SCROLLBACK, attached.link)
-        .context("starting the shell")?;
+    //
+    // A login shell in `$HOME`, as ssh would give you (switcher spec §3.4).
+    let start = oxutrm_term::Start::login_in(home_dir(std::env::var_os("HOME")));
+    let mut session = HostSession::spawn(
+        &shell,
+        &start,
+        attached.client_size,
+        SCROLLBACK,
+        attached.link,
+    )
+    .context("starting the shell")?;
 
     // R15, then R16: dropping the guard takes the session directory with it,
     // so a session that exits cleanly leaves nothing for `--list` to prune.
@@ -188,6 +197,13 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
     };
     drop(guard);
     code.map(|_| ())
+}
+
+/// The directory a new shell starts in: `$HOME` when it names a directory,
+/// else none -- the inherited one -- rather than a shell that fails to start.
+pub(crate) fn home_dir(home: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    home.map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
 }
 
 /// The two ways into a severed session after its first attach: the Unix
@@ -223,4 +239,24 @@ pub(crate) fn open_doors(
         attach_tx,
     ));
     (task, attach_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_is_used_only_when_it_is_an_absolute_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            home_dir(Some(dir.path().as_os_str().to_owned())),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(home_dir(None), None);
+        assert_eq!(home_dir(Some("relative/home".into())), None);
+        assert_eq!(
+            home_dir(Some(dir.path().join("missing").into_os_string())),
+            None
+        );
+    }
 }

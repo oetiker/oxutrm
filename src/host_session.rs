@@ -47,6 +47,18 @@ use crate::session::{IDLE_POLL, SHELL_EXITED, SUPERSEDED, SWITCHED, TAKEN_OVER, 
 /// the snapshot.
 pub const DETACH_AFTER: Duration = Duration::from_secs(30);
 
+/// How long a hung-up shell has to exit before its process group is killed
+/// (switcher spec §3.4).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the door's Kill passes it from Task 6 on")
+)]
+pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a killed shell is waited for. A SIGKILLed process is reaped at
+/// once in practice; this bounds the wait for one that cannot be.
+const REAP_AFTER_KILL: Duration = Duration::from_secs(2);
+
 /// The remote half: owns the PTY and the authoritative screen.
 pub struct HostSession {
     term: HostTerm,
@@ -76,8 +88,12 @@ impl HostSession {
     ///
     /// `TERM` and `COLORTERM` come from [`oxutrm_term::negotiate_term`], which
     /// takes no arguments on purpose.
+    ///
+    /// `start` says where and how: a session's is a login shell in `$HOME`
+    /// (switcher spec §3.4); the tests' is a plain `/bin/sh`.
     pub fn spawn(
         shell: &str,
+        start: &oxutrm_term::Start,
         size: TermSize,
         scrollback: usize,
         link: Link,
@@ -88,7 +104,7 @@ impl HostSession {
             env.push(("COLORTERM".to_owned(), ct));
         }
 
-        let term = HostTerm::spawn(shell, &[], &env, size, scrollback)
+        let term = HostTerm::spawn_with(shell, &[], &env, size, scrollback, start)
             .context("starting the shell on a pty")?;
         let blank = ScreenState::blank(size.rows, size.cols)?;
         let empty = InputState {
@@ -485,6 +501,44 @@ impl HostSession {
         }
     }
 
+    /// End the shell on request: hang it up as a closing terminal would, and
+    /// SIGKILL its process group if it is still there after `grace`
+    /// ([`KILL_GRACE`] in the session). Returns its exit status once it is
+    /// reaped -- or `-1` for one that could not be reaped even after the
+    /// kill, which a session ends on all the same.
+    ///
+    /// Drains the pty while it waits: on macOS a child killed while writing
+    /// to a pty is not reaped until its output is read (`Pty::reap`).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the door's Kill calls it from Task 6 on")
+    )]
+    pub(crate) async fn hang_up_shell(&mut self, grace: Duration) -> i32 {
+        // A shell that is already gone is not signalled: its pid may be
+        // someone else's by now.
+        if let Some(code) = self.term.child_exited() {
+            return code;
+        }
+        self.term.hang_up();
+        let start = tokio::time::Instant::now();
+        let mut killed = false;
+        loop {
+            let _ = self.term.poll();
+            if let Some(code) = self.term.child_exited() {
+                return code;
+            }
+            let waited = start.elapsed();
+            if !killed && waited >= grace {
+                self.term.kill_group();
+                killed = true;
+            }
+            if killed && waited >= grace + REAP_AFTER_KILL {
+                return -1;
+            }
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+    }
+
     /// The last screen, and only then the close. `ls; exit` lives or dies here.
     ///
     /// Three separate things were losing it, and all three had to go:
@@ -689,4 +743,76 @@ enum HostWake {
     StandbyFrame(Frame),
     /// The parked standby's connection is gone.
     StandbyGone,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::fixtures::link_pair;
+
+    fn size() -> TermSize {
+        TermSize {
+            cols: 120,
+            rows: 40,
+        }
+    }
+
+    /// A "shell" that ignores SIGHUP, as a script file the session runs. It
+    /// creates `ready` once its trap is set, so a test never races the trap.
+    fn stubborn_shell(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("stubborn");
+        let ready = dir.join("ready");
+        let script = format!(
+            "#!/bin/sh\ntrap '' HUP\n: > '{}'\nwhile :; do sleep 1; done\n",
+            ready.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_hung_up_shell_ends_at_once() {
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        let begun = Instant::now();
+        let code = host.hang_up_shell(KILL_GRACE).await;
+        assert_eq!(code, 128 + 1, "ended by the SIGHUP");
+        assert!(begun.elapsed() < KILL_GRACE, "{:?}", begun.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_shell_that_ignores_the_hang_up_is_killed_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = stubborn_shell(dir.path());
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            &shell,
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        // The script has set its trap once it has made `ready`.
+        let ready = dir.path().join("ready");
+        let waiting = Instant::now();
+        while !ready.exists() {
+            assert!(waiting.elapsed() < Duration::from_secs(10), "no trap set");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let grace = Duration::from_millis(400);
+        let begun = Instant::now();
+        let code = host.hang_up_shell(grace).await;
+        assert_eq!(code, 128 + 9, "ended by the SIGKILL");
+        assert!(begun.elapsed() >= grace, "{:?}", begun.elapsed());
+    }
 }

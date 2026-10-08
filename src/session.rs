@@ -2505,7 +2505,14 @@ mod tests {
         // The client's peer is the RELAY, which is the whole point.
         let (host_link, client_link) = listening.dial("127.0.0.1:0", relay.addr).await;
 
-        let mut host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size,
+            200,
+            host_link,
+        )
+        .unwrap();
         let client = ClientSession::new(size, caps(), client_link, None).unwrap();
         host.term_mut().write_input(shell.as_bytes()).unwrap();
         (host, client, relay)
@@ -2540,7 +2547,14 @@ mod tests {
         let addr = listening.addr;
         let (host_link, client_link) = listening.dial(client_bind, addr).await;
 
-        let host = HostSession::spawn("/bin/sh", size, 200, host_link).unwrap();
+        let host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size,
+            200,
+            host_link,
+        )
+        .unwrap();
         let client = ClientSession::new(size, caps(), client_link, rebuild).unwrap();
 
         // The caller decides what the shell runs; `spawn` above starts one, so
@@ -3207,7 +3221,14 @@ mod tests {
         };
         let (host_link, client_link) = crate::link::fixtures::link_pair().await;
 
-        let mut host = HostSession::spawn("/bin/sh", big, 200, host_link).unwrap();
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            big,
+            200,
+            host_link,
+        )
+        .unwrap();
         let mut client = ClientSession::new(big, caps(), client_link, None).unwrap();
 
         // Fill the screen with varied, poorly compressible content.

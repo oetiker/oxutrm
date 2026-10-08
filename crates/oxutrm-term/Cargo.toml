@@ -21,3 +21,5 @@ oxutrm-proto.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# A directory for the login-shell test to start in.
+tempfile = "3"

@@ -71,11 +71,24 @@ impl HostTerm {
         size: TermSize,
         scrollback: usize,
     ) -> anyhow::Result<HostTerm> {
+        HostTerm::spawn_with(shell, args, env, size, scrollback, &crate::Start::default())
+    }
+
+    /// [`HostTerm::spawn`], with the child started as `start` says: a
+    /// session's shell is a login shell in `$HOME` (switcher spec §3.4).
+    pub fn spawn_with(
+        shell: &str,
+        args: &[String],
+        env: &[(String, String)],
+        size: TermSize,
+        scrollback: usize,
+        start: &crate::Start,
+    ) -> anyhow::Result<HostTerm> {
         // Before the PTY, not after: `size` came from the client and this is
         // the host. Spawning a shell and then discovering the geometry was
         // hostile means a process to clean up as well as an error to report.
         let dims = GridSize::new(size, scrollback)?;
-        let pty = Pty::spawn(shell, args, env, size)?;
+        let pty = Pty::spawn_with(shell, args, env, size, start)?;
         let events = EventSink::new();
         let config = Config {
             scrolling_history: scrollback,
@@ -284,6 +297,23 @@ impl HostTerm {
             self.exited = self.pty.child_exited();
         }
         self.exited
+    }
+
+    /// SIGHUP to the shell and its terminal's foreground job: what a closed
+    /// terminal does. See `Pty::hang_up`. Does nothing once the shell has been
+    /// reaped, so a recycled pid is never signalled.
+    pub fn hang_up(&self) {
+        if self.exited.is_none() {
+            self.pty.hang_up();
+        }
+    }
+
+    /// SIGKILL to the shell's process group, for a shell that outlived its
+    /// hang-up. Does nothing once the shell has been reaped.
+    pub fn kill_group(&self) {
+        if self.exited.is_none() {
+            self.pty.kill_group();
+        }
     }
 
     /// The size the emulator is currently at.

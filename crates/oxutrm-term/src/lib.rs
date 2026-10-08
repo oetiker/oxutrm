@@ -64,3 +64,4 @@ pub use grid::GridSize;
 pub use host::HostTerm;
 pub use listener::{EventSink, Signals};
 pub use palette::{PALETTE_LEN, palette};
+pub use pty::Start;
