@@ -533,7 +533,8 @@ pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
                     oxutrm_proto::Attached::OtherVersion => "old version",
                 }
                 .to_string(),
-                dimmed: !e.detachable,
+                // Neither can be switched to (spec §3.2).
+                dimmed: !e.detachable || e.attached == oxutrm_proto::Attached::OtherVersion,
                 field,
             }
         })
@@ -558,6 +559,7 @@ pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
         new_row: "+ new session".to_string(),
         cursor: sel.cursor(),
         line,
+        question: sel.question().is_some(),
         keys: sessions_keys(sel, f.lobby, f.phase == Phase::Live),
         small: format!("oxutrm sessions \u{b7} {selected}"),
     }
@@ -2411,6 +2413,26 @@ mod tests {
         );
         let keys: Vec<&str> = v.keys.iter().map(|k| k.label.as_str()).collect();
         assert_eq!(keys, ["save", "cancel"]);
+    }
+
+    #[test]
+    fn a_session_of_another_version_is_dimmed_even_if_detachable() {
+        let t = Instant::now();
+        let mut rows = listed();
+        rows[2].attached = oxutrm_proto::Attached::OtherVersion;
+        assert!(rows[2].detachable);
+        let mut sel = crate::selector::Selector::default();
+        sel.open();
+        sel.set_rows(rows);
+        let id = thinlinc();
+        let v = sessions(&sessions_facts(&id, &sel, false, t));
+        let dimmed: Vec<(&str, bool)> =
+            v.rows.iter().map(|r| (r.name.as_str(), r.dimmed)).collect();
+        assert_eq!(
+            dimmed,
+            [("a3f9c01e", false), ("build", false), ("logs", true)]
+        );
+        assert_eq!(v.rows[2].mark, "old version");
     }
 
     #[test]
