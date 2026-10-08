@@ -232,14 +232,12 @@ mod tests {
     fn doors(meta: SessionMeta, attach_timeout: Duration) -> Doors {
         let dir = tempfile::tempdir().expect("a temp dir");
         let registry = dir.path().to_path_buf();
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(&registry, &meta).expect("register"),
-        );
+        let guard = oxutrm_host::RegistryGuard::register_in(&registry, &meta).expect("register");
         let sock = guard.socket_path();
         let guard_dir = guard.dir().to_path_buf();
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
         let (queue, inbox) = attach_queue();
-        let door = Door::new(
+        let door = Door::assembled(
             registry.clone(),
             meta,
             Some(guard),

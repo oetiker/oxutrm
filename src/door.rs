@@ -27,13 +27,15 @@ use std::time::{Duration, Instant};
 
 use oxutrm_host::registry::{Registry, RegistryGuard, SessionMeta};
 use oxutrm_host::signalling::{read_answer_async, read_line_async, write_line_async};
+use oxutrm_net::NetConfig;
 use oxutrm_proto::{
-    Answer, Attached, Open, PROTO_VERSION, ProtoError, Reply, Request, Role, SessionEntry,
+    Answer, Attached, Name, Open, PROTO_VERSION, ProtoError, Reply, Request, Role, SessionEntry,
+    SessionId,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::control::DoorRequest;
-use crate::host_session::Presence;
+use crate::host_session::{LoopCmd, Presence};
 
 /// How long a connection may take to say what it wants. Generous for a
 /// peer on the same machine or a live link, short enough that a silent one
@@ -87,33 +89,84 @@ struct Own {
     /// renames. Not the loop's working copy: that one is held across an
     /// exchange, and this must answer while one runs.
     meta: SessionMeta,
-    /// The registry entry, while there is one: a lobby has none.
-    guard: Option<Arc<RegistryGuard>>,
+    /// The registry entry, while there is one: a lobby has none. Dropping it
+    /// removes the session's directory, its socket with it.
+    guard: Option<RegistryGuard>,
+    /// Where `Attach` goes, while the session is registered and severed:
+    /// `None` in a lobby, and on rung 4, which has no socket.
+    attaches: Option<AttachQueue>,
+    /// The socket's accept loop and the serial attach loop, while they run.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// No shell: a connect-time lobby, or a session killed by its client.
+    lobby: bool,
+}
+
+/// How the door reaches the session's loop: what only the loop can do, and
+/// where completed attaches go.
+pub(crate) struct LoopLink {
+    pub(crate) cmds: tokio::sync::mpsc::Sender<LoopCmd>,
+    pub(crate) attached: tokio::sync::mpsc::Sender<crate::attach_exchange::Attached>,
 }
 
 /// What one session process's doors share.
 pub(crate) struct Door {
-    /// The registry directory: where siblings are found.
+    /// The registry directory: where siblings are found and this session
+    /// registers.
     registry: PathBuf,
+    /// What the attach loop runs exchanges with.
+    cfg: NetConfig,
     own: std::sync::Mutex<Own>,
     presence: Presence,
-    /// `None` where nothing can run an attach: rung 4, which has no socket.
-    attaches: Option<AttachQueue>,
+    /// `None` for a door with no loop behind it: the tests' doors.
+    to_loop: Option<LoopLink>,
 }
 
 impl Door {
-    pub(crate) fn new(
+    /// The door of a session process: a lobby until [`Door::register`].
+    pub(crate) fn process(
         registry: PathBuf,
         meta: SessionMeta,
-        guard: Option<Arc<RegistryGuard>>,
+        presence: Presence,
+        cfg: NetConfig,
+        to_loop: LoopLink,
+    ) -> Arc<Door> {
+        Arc::new(Door {
+            registry,
+            cfg,
+            own: std::sync::Mutex::new(Own {
+                meta,
+                guard: None,
+                attaches: None,
+                tasks: Vec::new(),
+                lobby: true,
+            }),
+            presence,
+            to_loop: Some(to_loop),
+        })
+    }
+
+    /// A door assembled from its parts, with no loop behind it: a session
+    /// registered as `guard`, whose `Attach` requests go to `attaches`.
+    #[cfg(test)]
+    pub(crate) fn assembled(
+        registry: PathBuf,
+        meta: SessionMeta,
+        guard: Option<RegistryGuard>,
         presence: Presence,
         attaches: Option<AttachQueue>,
     ) -> Arc<Door> {
         Arc::new(Door {
             registry,
-            own: std::sync::Mutex::new(Own { meta, guard }),
+            cfg: NetConfig::default(),
+            own: std::sync::Mutex::new(Own {
+                meta,
+                guard,
+                attaches,
+                tasks: Vec::new(),
+                lobby: false,
+            }),
             presence,
-            attaches,
+            to_loop: None,
         })
     }
 
@@ -128,6 +181,93 @@ impl Door {
     /// The session's record as it stands.
     pub(crate) fn meta(&self) -> SessionMeta {
         self.own().meta.clone()
+    }
+
+    /// The session's id.
+    fn id(&self) -> String {
+        self.own().meta.session_id.clone()
+    }
+
+    /// R13 and the doors after it: record the session in the registry --
+    /// under its name, refused if a live session has it -- and, where it
+    /// severed from ssh, bind its socket and start the accept and attach
+    /// loops. The one way a session process becomes a registered session,
+    /// on a first connect and when a lobby is asked for `New` alike.
+    pub(crate) fn register(self: &Arc<Self>) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let mut own = self.own();
+        let guard = RegistryGuard::register_in(&self.registry, &own.meta)?;
+        if !own.meta.detachable {
+            // Rung 4: its QUIC runs inside ssh, so a socket bound anyway
+            // would offer an attach that cannot outlive it.
+            own.guard = Some(guard);
+            own.lobby = false;
+            return Ok(());
+        }
+        // A failure from here drops `guard`, and the entry with it: the door
+        // is still the lobby it was.
+        let path = guard.socket_path();
+        oxutrm_host::check_socket_path_length(&path)?;
+        let listener = tokio::net::UnixListener::bind(&path)
+            .with_context(|| format!("binding the session socket at {}", path.display()))?;
+        own.guard = Some(guard);
+        own.lobby = false;
+        if let Some(to_loop) = &self.to_loop {
+            let (queue, inbox) = attach_queue();
+            own.attaches = Some(queue);
+            own.tasks.push(tokio::spawn(crate::listener::serve_attaches(
+                Arc::clone(self),
+                self.cfg.clone(),
+                crate::listener::ATTACH_TIMEOUT,
+                inbox,
+                to_loop.attached.clone(),
+            )));
+        }
+        own.tasks.push(tokio::spawn(crate::listener::accept_doors(
+            listener,
+            Arc::clone(self),
+        )));
+        Ok(())
+    }
+
+    /// The other way round: the registry entry and the socket go, and the
+    /// loops behind them stop. A lobby from here.
+    ///
+    /// Not awaited: this runs on a door task, and the loops it stops hold
+    /// clones of the door. [`Door::close`] is the awaited end of a process.
+    fn unregister(&self) {
+        let (guard, tasks) = {
+            let mut own = self.own();
+            own.lobby = true;
+            own.attaches = None;
+            (own.guard.take(), std::mem::take(&mut own.tasks))
+        };
+        for t in &tasks {
+            t.abort();
+        }
+        drop(guard);
+    }
+
+    /// The end of the process: stop the loops, wait until they are gone --
+    /// they hold clones of this door, and through it nothing else -- and
+    /// remove the registry entry.
+    ///
+    /// Abort AND await, and why both, is `listener::close_the_door`'s own
+    /// note. The guard is dropped here explicitly, not by the last clone of
+    /// the door, because a control server can hold one for as long as its
+    /// link stays open.
+    pub(crate) async fn close(&self) {
+        let tasks = std::mem::take(&mut self.own().tasks);
+        for t in tasks {
+            crate::listener::close_the_door(t).await;
+        }
+        let guard = {
+            let mut own = self.own();
+            own.lobby = true;
+            own.attaches = None;
+            own.guard.take()
+        };
+        drop(guard);
     }
 
     /// An attach completed with `m` as its working record: what it moved --
@@ -160,6 +300,126 @@ impl Door {
                 offer.entry(attached, false)
             }
         })
+    }
+
+    /// `New` in a lobby: register under `name`, then have the loop start the
+    /// shell. The lobby becomes the session, with the id it already has.
+    async fn start(self: &Arc<Self>, name: Option<Name>) -> Reply {
+        let Some(to_loop) = &self.to_loop else {
+            return Reply::Refused("this session cannot start a shell".to_string());
+        };
+        self.own().meta.name = name.map(String::from);
+        if let Err(e) = self.register() {
+            self.own().meta.name = None;
+            return Reply::Refused(format!("{e:#}"));
+        }
+        let (reply, started) = tokio::sync::oneshot::channel();
+        let asked = to_loop.cmds.send(LoopCmd::StartShell { reply }).await;
+        match (asked, started.await) {
+            (Ok(()), Ok(Ok(()))) => match self.own_entry(Via::Client) {
+                Some(e) => Reply::Entry(e),
+                None => Reply::Refused("the new session has no entry".to_string()),
+            },
+            (_, Ok(Err(why))) => {
+                self.unregister();
+                Reply::Refused(why)
+            }
+            _ => {
+                self.unregister();
+                Reply::Refused("the session ended".to_string())
+            }
+        }
+    }
+
+    /// `Kill` of this session: the loop hangs the shell up, then the entry
+    /// goes, then -- and only then -- `Done` (switcher spec §3.4). From its
+    /// own client the session stays as a lobby; from a sibling it ends.
+    async fn kill_self<W: AsyncWrite + Unpin>(&self, via: Via, writer: &mut W) {
+        let refused = |why: &str| Reply::Refused(why.to_string());
+        let reply = if self.own().lobby {
+            refused("this session has no shell left to kill")
+        } else if let Some(to_loop) = &self.to_loop {
+            let (reply, code) = tokio::sync::oneshot::channel();
+            let (written, written_rx) = tokio::sync::oneshot::channel();
+            let asked = to_loop
+                .cmds
+                .send(LoopCmd::Kill {
+                    end: via == Via::Socket,
+                    reply,
+                    written: written_rx,
+                })
+                .await;
+            match (asked, code.await) {
+                (Ok(()), Ok(_code)) => {
+                    self.unregister();
+                    let _ = write_line_async(writer, &Reply::Done).await;
+                    let _ = written.send(());
+                    return;
+                }
+                _ => refused("the session ended before its shell could be killed"),
+            }
+        } else {
+            refused("this session cannot kill its shell")
+        };
+        let _ = write_line_async(writer, &reply).await;
+    }
+
+    /// `Rename` of this session, under the registry's name lock.
+    fn rename_self(&self, via: Via, name: Option<Name>) -> Reply {
+        let renamed = {
+            let mut own = self.own();
+            let own = &mut *own;
+            match &own.guard {
+                None => Err("this session has no entry to name".to_string()),
+                Some(guard) => guard
+                    .rename(&mut own.meta, name.map(String::from))
+                    .map_err(|e| format!("{e:#}")),
+            }
+        };
+        match renamed.and_then(|()| {
+            self.own_entry(via)
+                .ok_or_else(|| "this session has no entry".to_string())
+        }) {
+            Ok(e) => Reply::Entry(e),
+            Err(why) => Reply::Refused(why),
+        }
+    }
+}
+
+/// How long a request forwarded to a sibling may take: a kill waits out
+/// the shell's grace and its reaping.
+pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ask sibling `id` to do `req` -- a `Kill` or a `Rename` -- and bring back
+/// its one reply. Every failure is a refusal with a reason for the user.
+async fn forward(registry: &std::path::Path, id: SessionId, req: Request) -> Reply {
+    let live = Registry::list_in(registry).unwrap_or_default();
+    let Some(m) = live.iter().find(|m| m.session_id == id.to_string()) else {
+        return Reply::Refused(format!("no session {} on this host", id.short()));
+    };
+    if !m.detachable {
+        return Reply::Refused(format!(
+            "session {} has no socket to ask: it dies with its ssh",
+            id.short()
+        ));
+    }
+    let path = Registry::socket_path_in(registry, &m.session_id);
+    let asked = async {
+        let stream = tokio::net::UnixStream::connect(&path).await?;
+        let (r, mut w) = stream.into_split();
+        write_line_async(&mut w, &Open::new(req)).await?;
+        read_line_async::<_, Reply>(&mut tokio::io::BufReader::new(r)).await
+    };
+    match tokio::time::timeout(FORWARD_TIMEOUT, asked).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(ProtoError::Malformed(_) | ProtoError::VersionMismatch { .. })) => {
+            Reply::Refused(format!(
+                "session {} runs another version of oxutrm; end its shell to end it",
+                id.short()
+            ))
+        }
+        Ok(Err(e)) => Reply::Refused(format!("session {} did not answer: {e}", id.short())),
+        Err(_) => Reply::Refused(format!("session {} did not answer in time", id.short())),
     }
 }
 
@@ -203,10 +463,26 @@ where
             let reply = Reply::Sessions(sessions(&door, via).await);
             let _ = write_line_async(&mut writer, &reply).await;
         }
-        Request::Switch { .. }
-        | Request::New { .. }
-        | Request::Kill { .. }
-        | Request::Rename { .. } => {
+        Request::New { name } if door.own().lobby => {
+            let reply = door.start(name).await;
+            let _ = write_line_async(&mut writer, &reply).await;
+        }
+        Request::Kill { id } if id.to_string() == door.id() => {
+            door.kill_self(via, &mut writer).await;
+        }
+        Request::Kill { id } => {
+            let reply = forward(&door.registry, id, Request::Kill { id }).await;
+            let _ = write_line_async(&mut writer, &reply).await;
+        }
+        Request::Rename { id, name } if id.to_string() == door.id() => {
+            let reply = door.rename_self(via, name);
+            let _ = write_line_async(&mut writer, &reply).await;
+        }
+        Request::Rename { id, name } => {
+            let reply = forward(&door.registry, id, Request::Rename { id, name }).await;
+            let _ = write_line_async(&mut writer, &reply).await;
+        }
+        Request::Switch { .. } | Request::New { .. } => {
             let _ = write_line_async(
                 &mut writer,
                 &Reply::Refused("this host does not do that yet".to_string()),
@@ -224,7 +500,7 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let Some(queue) = &door.attaches else {
+    let Some(queue) = door.own().attaches.clone() else {
         return;
     };
     let to = match role {
@@ -328,10 +604,10 @@ pub(crate) mod fixtures {
         registry: &std::path::Path,
         meta: SessionMeta,
     ) -> (Arc<Door>, AttachInbox, Presence) {
-        let guard = Arc::new(RegistryGuard::register_in(registry, &meta).expect("register"));
+        let guard = RegistryGuard::register_in(registry, &meta).expect("register");
         let (queue, inbox) = attach_queue();
         let presence = Presence::default();
-        let door = Door::new(
+        let door = Door::assembled(
             registry.to_path_buf(),
             meta,
             Some(guard),

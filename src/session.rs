@@ -6687,22 +6687,30 @@ mod tests {
         let (mut host, mut client) = pair_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let start =
+        let mut start =
             crate::attach_exchange::fixtures::fresh_meta("00112233445566778899aabbccddeeff");
-        let guard = Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let listener = tokio::net::UnixListener::bind(guard.socket_path()).expect("binding");
-        let (door_tasks, mut attach_rx) = crate::serve::open_doors(
-            listener,
+        // Severed, so the door binds a socket and runs an attach loop.
+        start.detachable = true;
+        let meta_path = dir
+            .path()
+            .join("00112233445566778899aabbccddeeff")
+            .join(oxutrm_host::META_FILE);
+        let (cmds_tx, mut cmds) = tokio::sync::mpsc::channel(1);
+        let (attached_tx, mut attach_rx) = tokio::sync::mpsc::channel(1);
+        let door = crate::door::Door::process(
             dir.path().to_path_buf(),
             start,
-            Arc::clone(&guard),
             crate::host_session::Presence::default(),
             crate::attach_exchange::fixtures::stun_free(),
-            host.link.sink.connection().clone(),
+            crate::door::LoopLink {
+                cmds: cmds_tx,
+                attached: attached_tx,
+            },
         );
-        let host_loop = tokio::spawn(async move { host.run_with_attaches(&mut attach_rx).await });
+        door.register().expect("register");
+        crate::control::serve_control(host.link.sink.connection().clone(), Arc::clone(&door));
+        let host_loop =
+            tokio::spawn(async move { host.run_with_doors(&mut attach_rx, &mut cmds).await });
 
         // Due at once rather than after the settling delay. Loopback is the
         // primary's own path, so the real filter would rightly refuse every
@@ -6736,7 +6744,7 @@ mod tests {
         let recorded = async {
             loop {
                 let on_disk: oxutrm_host::SessionMeta =
-                    serde_json::from_slice(&std::fs::read(guard.meta_path()).expect("meta.json"))
+                    serde_json::from_slice(&std::fs::read(&meta_path).expect("meta.json"))
                         .expect("meta.json parses");
                 if on_disk.attach_id == 1 {
                     return;
@@ -6769,9 +6777,7 @@ mod tests {
             "the standby was shown but not recorded"
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
-        for task in door_tasks {
-            crate::listener::close_the_door(task).await;
-        }
+        door.close().await;
     }
 
     /// What the popup may not say while `Silent` or `Confirming`, wherever

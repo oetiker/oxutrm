@@ -94,7 +94,7 @@ fn run_host(args: &[String]) -> Result<()> {
         // Works today: it needs the registry and nothing else.
         Some("--list") => run_host_list(),
         Some("--connect") => run_host_connect(),
-        Some("--serve") => serve::run_host_serve(),
+        Some("--serve") => serve::run_host_serve(serve::Begin::Session),
         Some("--attach") => match args.get(1) {
             Some(id) => run_host_attach(id),
             None => Err(anyhow::anyhow!(
@@ -211,7 +211,7 @@ fn run_host_connect() -> Result<()> {
         };
 
     match choice {
-        Choice::New => serve::run_host_serve(),
+        Choice::New => serve::run_host_serve(serve::Begin::Session),
         Choice::Attach { id } => {
             // Refused HERE rather than inside the relay, because the client is
             // still listening on this channel: a `Failed` it can read is worth

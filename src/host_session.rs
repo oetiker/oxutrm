@@ -49,10 +49,6 @@ pub const DETACH_AFTER: Duration = Duration::from_secs(30);
 
 /// How long a hung-up shell has to exit before its process group is killed
 /// (switcher spec §3.4).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the door's Kill passes it from Task 6 on")
-)]
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// How long a killed shell is waited for. A SIGKILLed process is reaped at
@@ -87,9 +83,44 @@ impl Presence {
     }
 }
 
+/// What the door asks of the loop: the two things only the owner of the
+/// shell can do (switcher spec §2.2, §3.4).
+pub(crate) enum LoopCmd {
+    /// A lobby was asked for `New` and is registered: start the shell. The
+    /// reply says whether it started.
+    StartShell {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Kill the shell ([`HostSession::hang_up_shell`]) and reply with its
+    /// status. Then, for its own client's request, become a lobby; for a
+    /// sibling's (`end`), wait for `written` -- the door's `Done`, written
+    /// after it removed the registry entry -- and end as a shell that exited.
+    Kill {
+        end: bool,
+        reply: tokio::sync::oneshot::Sender<i32>,
+        written: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+/// How long a session killed by a sibling waits for its door to have
+/// answered the sibling before it closes its own client's link.
+const DONE_WRITTEN_WITHIN: Duration = Duration::from_secs(2);
+
 /// The remote half: owns the PTY and the authoritative screen.
+///
+/// Or, as a **lobby**, no PTY at all (switcher spec §2.1): the same link,
+/// the same sync loop answering the client's frames with a blank screen, and
+/// no shell. A connect-time lobby starts that way ([`HostSession::lobby`]);
+/// a session whose shell was killed on its client's request becomes one. A
+/// lobby ends when its link closes or its client has been silent for
+/// [`DETACH_AFTER`]; asked for `New`, it starts its shell and is a session.
 pub struct HostSession {
-    term: HostTerm,
+    /// `None` is a lobby.
+    term: Option<HostTerm>,
+    /// The shell a lobby starts, and how.
+    shell: String,
+    start: oxutrm_term::Start,
+    scrollback: usize,
     screen_tx: oxutrm_sync::Sender<ScreenState>,
     /// `pub(crate)` for the session tests, which drive both halves.
     pub(crate) input_rx: Receiver<InputState>,
@@ -111,6 +142,10 @@ pub struct HostSession {
     last_heard: Instant,
     /// `last_heard` and the link it was heard on, for the door.
     presence: Presence,
+    /// How long a client may be silent before the session counts as
+    /// detached -- and a lobby ends. [`DETACH_AFTER`]; a field so a test can
+    /// wait for it in a second.
+    detach_after: Duration,
 }
 
 impl HostSession {
@@ -121,6 +156,7 @@ impl HostSession {
     ///
     /// `start` says where and how: a session's is a login shell in `$HOME`
     /// (switcher spec §3.4); the tests' is a plain `/bin/sh`.
+    #[cfg(test)]
     pub fn spawn(
         shell: &str,
         start: &oxutrm_term::Start,
@@ -128,14 +164,20 @@ impl HostSession {
         scrollback: usize,
         link: Link,
     ) -> Result<HostSession> {
-        let (term_name, colorterm) = oxutrm_term::negotiate_term();
-        let mut env = vec![("TERM".to_owned(), term_name)];
-        if let Some(ct) = colorterm {
-            env.push(("COLORTERM".to_owned(), ct));
-        }
+        let mut session = HostSession::lobby(shell, start, size, scrollback, link)?;
+        session.start_shell()?;
+        Ok(session)
+    }
 
-        let term = HostTerm::spawn_with(shell, &[], &env, size, scrollback, start)
-            .context("starting the shell on a pty")?;
+    /// A lobby over `link`: everything a session has but the shell, which
+    /// [`HostSession::start_shell`] starts as `shell` and `start` say.
+    pub(crate) fn lobby(
+        shell: &str,
+        start: &oxutrm_term::Start,
+        size: TermSize,
+        scrollback: usize,
+        link: Link,
+    ) -> Result<HostSession> {
         let blank = ScreenState::blank(size.rows, size.cols)?;
         let empty = InputState {
             seq: 1,
@@ -144,7 +186,10 @@ impl HostSession {
         };
 
         Ok(HostSession {
-            term,
+            term: None,
+            shell: shell.to_owned(),
+            start: start.clone(),
+            scrollback,
             screen_tx: oxutrm_sync::Sender::new(blank),
             input_rx: Receiver::new(empty),
             link,
@@ -156,7 +201,53 @@ impl HostSession {
             // immediately, so "now" is true rather than optimistic.
             last_heard: Instant::now(),
             presence: Presence::default(),
+            detach_after: DETACH_AFTER,
         })
+    }
+
+    /// Start the shell, at the session's current size: a lobby becomes a
+    /// session. Its first screen goes out on the next turn.
+    pub(crate) fn start_shell(&mut self) -> Result<()> {
+        let (term_name, colorterm) = oxutrm_term::negotiate_term();
+        let mut env = vec![("TERM".to_owned(), term_name)];
+        if let Some(ct) = colorterm {
+            env.push(("COLORTERM".to_owned(), ct));
+        }
+        let term = HostTerm::spawn_with(
+            &self.shell,
+            &[],
+            &env,
+            self.size,
+            self.scrollback,
+            &self.start,
+        )
+        .context("starting the shell on a pty")?;
+        self.term = Some(term);
+        self.written = self.input_rx.state().pending.len();
+        self.screen_stale = true;
+        Ok(())
+    }
+
+    /// Whether this is a lobby: no shell.
+    pub(crate) fn is_lobby(&self) -> bool {
+        self.term.is_none()
+    }
+
+    /// The shell is gone on request: the session is a lobby from here, and
+    /// its client sees a blank screen.
+    fn become_lobby(&mut self) -> Result<()> {
+        self.term = None;
+        self.screen_tx
+            .update(ScreenState::blank(self.size.rows, self.size.cols)?);
+        self.screen_stale = false;
+        Ok(())
+    }
+
+    /// Wait for a silent client for `d` instead of [`DETACH_AFTER`].
+    #[cfg(test)]
+    pub(crate) fn with_detach_after(mut self, d: Duration) -> HostSession {
+        self.detach_after = d;
+        self
     }
 
     /// Share whether a client is attached with `presence`, the door's copy.
@@ -260,29 +351,32 @@ impl HostSession {
         // continue, so the session resumes instantly when the peer comes back.
         // `DETACH_AFTER` is six times the client's heartbeat interval.
         let closed = self.link.sink.connection().close_reason().is_some();
-        let quiet_too_long = now.duration_since(self.last_heard) >= DETACH_AFTER;
+        let quiet_too_long = now.duration_since(self.last_heard) >= self.detach_after;
         let attached = !closed && !quiet_too_long;
         turn.detached = !attached;
 
         // ---- the terminal --------------------------------------------------
-        let moved = self.term.poll().context("draining the pty")?;
-        if attached {
-            if moved || self.screen_stale {
-                // The sequence number is a placeholder; `update` mints the real
-                // one, keeping numbering in exactly one place.
-                let snapshot = self.term.snapshot(1);
-                self.screen_tx.update(snapshot);
-                self.screen_stale = false;
+        // A lobby has none: its screen is the blank one it was given.
+        if let Some(term) = self.term.as_mut() {
+            let moved = term.poll().context("draining the pty")?;
+            if attached {
+                if moved || self.screen_stale {
+                    // The sequence number is a placeholder; `update` mints
+                    // the real one, keeping numbering in exactly one place.
+                    let snapshot = term.snapshot(1);
+                    self.screen_tx.update(snapshot);
+                    self.screen_stale = false;
+                }
+            } else if moved {
+                self.screen_stale = true;
             }
-        } else if moved {
-            self.screen_stale = true;
         }
 
         // ---- outbound: the screen ------------------------------------------
         if attached {
             turn.sent = self.offer_frame();
         }
-        turn.exited = self.term.child_exited();
+        turn.exited = self.term.as_mut().and_then(HostTerm::child_exited);
         Ok(turn)
     }
 
@@ -302,9 +396,10 @@ impl HostSession {
         }
         if self.written < pending.len() {
             let fresh = pending[self.written..].to_vec();
-            self.term
-                .write_input(&fresh)
-                .context("writing to the pty")?;
+            // A lobby has nowhere to put typing: it is taken and dropped.
+            if let Some(term) = self.term.as_mut() {
+                term.write_input(&fresh).context("writing to the pty")?;
+            }
             self.written = pending.len();
         }
         Ok(())
@@ -362,7 +457,13 @@ impl HostSession {
         if size == self.size {
             return Ok(());
         }
-        self.term.resize(size).context("resizing the pty")?;
+        match self.term.as_mut() {
+            Some(term) => term.resize(size).context("resizing the pty")?,
+            // A lobby's screen is blank at whatever size its client is.
+            None => self
+                .screen_tx
+                .update(ScreenState::blank(size.rows, size.cols)?),
+        }
         self.size = size;
         Ok(())
     }
@@ -374,6 +475,7 @@ impl HostSession {
     /// makes a closed receiver disable that arm rather than make it hot — see
     /// `run_with_attaches`' own note — so this costs nothing and every
     /// existing caller and test is unchanged.
+    #[cfg(test)]
     pub async fn run(&mut self) -> Result<i32> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         // Dropped, not merely unnamed. `let (_tx, ...)` binds the sender for
@@ -399,25 +501,30 @@ impl HostSession {
     /// description, harmless here in a way it is NOT for the client's
     /// keyboard: this description is ours and we set its `O_NONBLOCK`
     /// ourselves in `Pty::spawn`.
+    #[cfg(test)]
     pub async fn run_with_attaches(
         &mut self,
         attaches: &mut tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
     ) -> Result<i32> {
-        let output = self.term.output_fd().try_clone_to_owned()?;
-        let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
-            .context("waiting on the pty")?;
-        let exit = match self.term.exit_wake().as_fd() {
-            Some(fd) => Some(
-                tokio::io::unix::AsyncFd::with_interest(
-                    fd.try_clone_to_owned()?,
-                    tokio::io::Interest::READABLE,
-                )
-                .context("waiting on the child")?,
-            ),
-            // Already gone when it was watched. The first turn below reports
-            // the exit before anything waits, so there is nothing to miss.
-            None => None,
-        };
+        let (tx, mut cmds) = tokio::sync::mpsc::channel(1);
+        // Dropped, for the reason `run` drops its sender.
+        drop(tx);
+        self.run_with_doors(attaches, &mut cmds).await
+    }
+
+    /// [`HostSession::run_with_attaches`], plus what the door asks of the
+    /// loop ([`LoopCmd`]): start a lobby's shell, kill this one's.
+    ///
+    /// Returns the shell's exit status, or `0` for a lobby that ended -- its
+    /// link closed, or its client silent for [`DETACH_AFTER`].
+    pub(crate) async fn run_with_doors(
+        &mut self,
+        attaches: &mut tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
+        cmds: &mut tokio::sync::mpsc::Receiver<LoopCmd>,
+    ) -> Result<i32> {
+        // The shell's descriptors, while there is a shell; watched again
+        // whenever the loop starts or ends one.
+        let mut watch = self.watch()?;
 
         // A frame taken off the source by the select, owed to the next turn.
         let mut pending: Option<Frame> = None;
@@ -467,7 +574,11 @@ impl HostSession {
             // whole reason a detached session keeps emulating at all. It is
             // kept as the cheap half of a guarantee whose expensive half
             // (`READ_BUDGET` versus the kernel's PTY buffer) is not ours.
-            if self.term.more_output_waiting() {
+            if self
+                .term
+                .as_ref()
+                .is_some_and(HostTerm::more_output_waiting)
+            {
                 continue;
             }
 
@@ -484,6 +595,14 @@ impl HostSession {
                 deadline = Some(deadline.map_or(at, |d| d.min(at)));
             }
 
+            // A lobby has nothing to outlive its client for: it ends with its
+            // link, or after `detach_after` of silence. Its own two arms,
+            // armed only in a lobby -- a session must outlive a vanished
+            // client, which is the entire point (see below).
+            let lobby = self.is_lobby();
+            let conn = self.link.sink.connection().clone();
+            let silent_until = tokio::time::Instant::from_std(self.last_heard + self.detach_after);
+
             // Nothing here touches `self`; every borrow starts after the
             // select expression has ended and dropped these futures (C1).
             //
@@ -494,7 +613,8 @@ impl HostSession {
             // `close_reason` whenever something else wakes it, which is
             // exactly when the answer can matter.
             let wake: HostWake = tokio::select! {
-                r = output.readable() => match r {
+                r = async { watch.as_ref().expect("armed").output.readable().await },
+                    if watch.is_some() => match r {
                     // Cleared HERE, having just established above that the PTY
                     // came up empty. Read-then-clear is the ordering `try_io`
                     // uses, and clearing while bytes remain would stall the
@@ -502,7 +622,8 @@ impl HostSession {
                     Ok(mut g) => { g.clear_ready(); HostWake::Pty }
                     Err(e) => return Err(e).context("waiting on the pty"),
                 },
-                r = async { exit.as_ref().expect("armed").readable().await }, if exit.is_some() => match r {
+                r = async { watch.as_ref().and_then(|w| w.exit.as_ref()).expect("armed").readable().await },
+                    if watch.as_ref().is_some_and(|w| w.exit.is_some()) => match r {
                     Ok(mut g) => { g.clear_ready(); HostWake::Exit }
                     Err(e) => return Err(e).context("waiting on the child"),
                 },
@@ -522,6 +643,9 @@ impl HostSession {
                         Some(frame) => HostWake::StandbyFrame(frame),
                         None => HostWake::StandbyGone,
                     },
+                Some(c) = cmds.recv() => HostWake::Cmd(c),
+                _ = conn.closed(), if lobby => HostWake::LobbyOver,
+                () = tokio::time::sleep_until(silent_until), if lobby => HostWake::LobbyOver,
             };
 
             match wake {
@@ -536,8 +660,91 @@ impl HostSession {
                 // Its connection is already closed, which is what ended the
                 // source; there is nothing left to close.
                 HostWake::StandbyGone => standby = None,
+                HostWake::LobbyOver => {
+                    let closed = self.link.sink.connection().close_reason().is_some();
+                    let silent = self.last_heard.elapsed() >= self.detach_after;
+                    if self.is_lobby() && (closed || silent) {
+                        if let Some(parked) = standby.take() {
+                            parked
+                                .sink
+                                .connection()
+                                .close(quinn::VarInt::from_u32(0), SUPERSEDED);
+                        }
+                        return Ok(0);
+                    }
+                }
+                HostWake::Cmd(LoopCmd::StartShell { reply }) => {
+                    let started = if self.is_lobby() {
+                        self.start_shell().map_err(|e| format!("{e:#}"))
+                    } else {
+                        Err("this session already has a shell".to_string())
+                    };
+                    let ok = started.is_ok();
+                    let _ = reply.send(started);
+                    if ok {
+                        watch = self.watch()?;
+                    }
+                }
+                HostWake::Cmd(LoopCmd::Kill {
+                    end,
+                    reply,
+                    written,
+                }) => {
+                    if self.is_lobby() {
+                        let _ = reply.send(-1);
+                        continue;
+                    }
+                    let code = self.hang_up_shell(KILL_GRACE).await;
+                    // The parked standby belonged to this shell's client;
+                    // it goes as a standby goes when the shell exits.
+                    if let Some(parked) = standby.take() {
+                        close_as_exited(parked.sink.connection(), code);
+                    }
+                    if end {
+                        // A sibling asked: end as a shell that exited, once
+                        // the door has told the sibling it is done.
+                        let _ = reply.send(code);
+                        let _ = tokio::time::timeout(DONE_WRITTEN_WITHIN, written).await;
+                        self.finish(code).await;
+                        return Ok(code);
+                    }
+                    // Our own client asked: a lobby from here.
+                    self.become_lobby()?;
+                    watch = None;
+                    let _ = reply.send(code);
+                }
             }
         }
+    }
+
+    /// The shell's descriptors to wait on, or `None` in a lobby.
+    ///
+    /// Duplicated out of the terminal so the loop's arms borrow locals
+    /// rather than `self`, which is what lets the body call `&mut self`
+    /// methods afterwards (C1). A `dup` shares the file description,
+    /// harmless here in a way it is NOT for the client's keyboard: this
+    /// description is ours and we set its `O_NONBLOCK` ourselves in
+    /// `Pty::spawn`.
+    fn watch(&self) -> Result<Option<Watch>> {
+        let Some(term) = self.term.as_ref() else {
+            return Ok(None);
+        };
+        let output = term.output_fd().try_clone_to_owned()?;
+        let output = tokio::io::unix::AsyncFd::with_interest(output, tokio::io::Interest::READABLE)
+            .context("waiting on the pty")?;
+        let exit = match term.exit_wake().as_fd() {
+            Some(fd) => Some(
+                tokio::io::unix::AsyncFd::with_interest(
+                    fd.try_clone_to_owned()?,
+                    tokio::io::Interest::READABLE,
+                )
+                .context("waiting on the child")?,
+            ),
+            // Already gone when it was watched. The first turn reports the
+            // exit before anything waits, so there is nothing to miss.
+            None => None,
+        };
+        Ok(Some(Watch { output, exit }))
     }
 
     /// End the shell on request: hang it up as a closing terminal would, and
@@ -548,27 +755,26 @@ impl HostSession {
     ///
     /// Drains the pty while it waits: on macOS a child killed while writing
     /// to a pty is not reaped until its output is read (`Pty::reap`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the door's Kill calls it from Task 6 on")
-    )]
     pub(crate) async fn hang_up_shell(&mut self, grace: Duration) -> i32 {
+        let Some(term) = self.term.as_mut() else {
+            return -1;
+        };
         // A shell that is already gone is not signalled: its pid may be
         // someone else's by now.
-        if let Some(code) = self.term.child_exited() {
+        if let Some(code) = term.child_exited() {
             return code;
         }
-        self.term.hang_up();
+        term.hang_up();
         let start = tokio::time::Instant::now();
         let mut killed = false;
         loop {
-            let _ = self.term.poll();
-            if let Some(code) = self.term.child_exited() {
+            let _ = term.poll();
+            if let Some(code) = term.child_exited() {
                 return code;
             }
             let waited = start.elapsed();
             if !killed && waited >= grace {
-                self.term.kill_group();
+                term.kill_group();
                 killed = true;
             }
             if killed && waited >= grace + REAP_AFTER_KILL {
@@ -601,8 +807,10 @@ impl HostSession {
     /// Infallible on purpose: nothing here is worth reporting instead of the
     /// status of a shell that has already exited.
     pub async fn finish(&mut self, code: i32) {
-        if self.term.poll().unwrap_or(false) {
-            let snapshot = self.term.snapshot(1);
+        if let Some(term) = self.term.as_mut()
+            && term.poll().unwrap_or(false)
+        {
+            let snapshot = term.snapshot(1);
             self.screen_tx.update(snapshot);
         }
         self.last_send = None;
@@ -632,7 +840,7 @@ impl HostSession {
     /// read it directly.
     #[cfg(test)]
     pub(crate) fn term_mut(&mut self) -> &mut HostTerm {
-        &mut self.term
+        self.term.as_mut().expect("a session, not a lobby")
     }
 
     /// The authoritative screen, for tests. Nothing in the session loop reads
@@ -784,6 +992,16 @@ enum HostWake {
     StandbyFrame(Frame),
     /// The parked standby's connection is gone.
     StandbyGone,
+    /// The door asked for something only the loop can do.
+    Cmd(LoopCmd),
+    /// A lobby's link closed, or its client may have been silent too long.
+    LobbyOver,
+}
+
+/// The shell's two descriptors, as the loop waits on them.
+struct Watch {
+    output: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    exit: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
 }
 
 #[cfg(test)]
@@ -855,5 +1073,143 @@ mod tests {
         let code = host.hang_up_shell(grace).await;
         assert_eq!(code, 128 + 9, "ended by the SIGKILL");
         assert!(begun.elapsed() >= grace, "{:?}", begun.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_whose_link_closes_ends() {
+        let (host_link, client) = link_pair().await;
+        let mut lobby = HostSession::lobby(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        assert!(lobby.is_lobby());
+        let task = tokio::spawn(async move { lobby.run_with_attaches(&mut closed()).await });
+        client
+            .sink
+            .connection()
+            .close(quinn::VarInt::from_u32(0), b"the client quit");
+        let code = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the lobby outlived its link")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_whose_client_vanished_ends_after_the_silence() {
+        let (host_link, _client) = link_pair().await;
+        let silence = Duration::from_millis(300);
+        let mut lobby = HostSession::lobby(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap()
+        .with_detach_after(silence);
+        let begun = Instant::now();
+        let task = tokio::spawn(async move { lobby.run_with_attaches(&mut closed()).await });
+        let code = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a silent lobby never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+        assert!(begun.elapsed() >= silence, "{:?}", begun.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_whose_client_vanished_does_not_end() {
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap()
+        .with_detach_after(Duration::from_millis(100));
+        let task = tokio::spawn(async move { host.run_with_attaches(&mut closed()).await });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !task.is_finished(),
+            "only a lobby ends on its client's silence"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_answers_its_client_with_a_blank_screen() {
+        let (host_link, client_link) = link_pair().await;
+        let mut lobby = HostSession::lobby(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        let mut client = crate::session::ClientSession::new(
+            size(),
+            oxutrm_proto::TerminalCaps {
+                truecolor: true,
+                colors: 16_777_216,
+                bracketed_paste: true,
+                mouse_sgr: true,
+                osc52: true,
+                term_name: "xterm-256color".to_owned(),
+            },
+            client_link,
+            None,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.applied_kinds() == (0, 0) {
+            assert!(Instant::now() < deadline, "the lobby never answered");
+            client.turn(b"ls\n", &mut out).unwrap();
+            lobby.turn().unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            client.screen().cells.iter().all(|c| c.text.as_str() == " "),
+            "a lobby's screen is blank"
+        );
+    }
+
+    /// An attach channel whose sender is gone, as `run` uses.
+    fn closed() -> tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached> {
+        let (_, rx) = tokio::sync::mpsc::channel(1);
+        rx
+    }
+
+    /// A lobby's client resizing its terminal: the blank screen follows, so
+    /// no cell of the old size is left for the client to paint.
+    #[tokio::test]
+    async fn a_lobbys_blank_screen_follows_its_clients_size() {
+        let (host_link, _client) = link_pair().await;
+        let mut lobby = HostSession::lobby(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        let bigger = TermSize {
+            cols: 160,
+            rows: 50,
+        };
+        lobby.resize(bigger).unwrap();
+        let screen = lobby.screen();
+        assert_eq!((screen.cols, screen.rows), (160, 50));
+        assert!(screen.cells.iter().all(|c| c.text.as_str() == " "));
     }
 }

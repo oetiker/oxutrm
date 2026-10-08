@@ -262,7 +262,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn without_an_attach_loop_a_standby_request_ends_at_once_and_probes_are_answered() {
         let dir = tempfile::tempdir().unwrap();
-        let door = crate::door::Door::new(
+        let door = crate::door::Door::assembled(
             dir.path().to_path_buf(),
             meta(SESSION, None),
             None,
