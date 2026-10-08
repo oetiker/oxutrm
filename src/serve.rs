@@ -83,7 +83,7 @@ async fn serve(
     begin: Begin,
     exe: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let cfg = NetConfig::default();
+    let cfg = host_net_config();
     let mut meta = SessionMeta {
         session_id: oxutrm_host::new_session_id().context("naming the session")?,
         attach_id: 0,
@@ -154,6 +154,27 @@ async fn serve(
     )
     .await
     .map(|_| ())
+}
+
+/// Set in a debug build's environment, it keeps `host --serve` off the
+/// network beyond the exchange itself: no STUN servers, no port mapping, no
+/// birthday blast. The tests' siblings carry it (`door::spawn_sibling`), so
+/// `make test` reaches neither the internet nor the router. A release
+/// build ignores it.
+pub(crate) const HERMETIC_NET_ENV: &str = "OXUTRM_TEST_HERMETIC_NET";
+
+/// The host's network configuration: the default, unless a debug build is
+/// told [`HERMETIC_NET_ENV`].
+fn host_net_config() -> NetConfig {
+    if cfg!(debug_assertions) && std::env::var_os(HERMETIC_NET_ENV).is_some() {
+        return NetConfig {
+            stun_servers: vec![],
+            enable_port_mapping: false,
+            enable_birthday: false,
+            ..NetConfig::default()
+        };
+    }
+    NetConfig::default()
 }
 
 /// This session's own binary, for a sibling to run: on Linux
@@ -534,7 +555,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn killing_a_sibling_ends_it_as_a_shell_that_exited() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
+        // The sibling's shell is a script that says when it runs and then
+        // is a plain `sleep`: an interactive `/bin/sh` hung up while it is
+        // still starting can outlive the grace (bash 3.2's SIGHUP handler is
+        // not async-signal-safe), and then the status is SIGKILL's, not
+        // SIGHUP's. In a directory of its own: a socket path under it would
+        // add to the registry's.
+        let scripts = tempfile::tempdir().unwrap();
+        let ready = scripts.path().join("ready");
+        let script = scripts.path().join("sleeper");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n: > '{}'\nexec sleep 1000\n", ready.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let me = process(
             dir.path(),
             BUILD,
@@ -548,10 +585,19 @@ mod tests {
             LOGS,
             Some("logs"),
             Begin::Session { name: None },
-            sh(),
+            Shell {
+                program: script.to_str().unwrap().to_string(),
+                start: oxutrm_term::Start::default(),
+                sibling: None,
+            },
         )
         .await;
         registry_holds(dir.path(), &[BUILD, LOGS]).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "the shell never ran");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         done(ask_over(me.client.sink.connection(), Request::Kill { id: id(LOGS) }).await);
         let live = oxutrm_host::Registry::list_in(dir.path()).unwrap();

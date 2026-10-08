@@ -513,6 +513,12 @@ fn spawn_sibling(
         .stdin(std::process::Stdio::from(theirs.try_clone()?))
         .stdout(std::process::Stdio::from(theirs))
         .stderr(std::process::Stdio::null());
+    // A sibling the tests start stays off the network beyond its exchange.
+    // Set here because the test process cannot set it on itself for the
+    // child to inherit: `set_var` is `unsafe` in edition 2024, and this
+    // crate forbids unsafe code.
+    #[cfg(test)]
+    command.env(crate::serve::HERMETIC_NET_ENV, "1");
     let mut child = command.spawn()?;
     // `command` held the child's ends; they go with it, so only the child
     // has them now.
