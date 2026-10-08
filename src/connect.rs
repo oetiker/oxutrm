@@ -203,7 +203,15 @@ async fn connect(target: &str, attach: Option<&str>, new: bool, name: Option<Nam
     // The two identities a rebuild needs: the target the user typed, and
     // whichever session actually resulted -- which for `Choice::New` is an id
     // the client had no way to guess in advance.
-    let rebuild = Rebuild::new(target.to_owned(), established.session_id.clone());
+    //
+    // A lobby is never reattached: a rebuild from one asks for a fresh one
+    // (switcher spec §3.5).
+    let lobby = chosen == Choice::Lobby;
+    let rebuild = if lobby {
+        Rebuild::aimed(target.to_owned(), crate::rebuild::Aim::Lobby)
+    } else {
+        Rebuild::new(target.to_owned(), established.session_id.clone())
+    };
     let standby = offers_standby(&established.host_features);
     let mut session = ClientSession::new(size, detect_caps(), established.link, Some(rebuild))
         .context("preparing the client session")?
@@ -219,6 +227,9 @@ async fn connect(target: &str, attach: Option<&str>, new: bool, name: Option<Nam
             target,
             &established.session_id,
         ));
+    if lobby {
+        session = session.with_lobby();
+    }
     // Spec §2.1: only a host that said it can park a standby is asked for
     // one. An older host would read the request as a stray line and drop it.
     // Created whatever `network.standby` says: the setting only switches it
@@ -410,44 +421,10 @@ where
     establish_from(first, reader, writer, size, cfg, admit_remote).await
 }
 
-/// [`establish`] on a control stream after an `Open` that runs an attach
-/// exchange -- a `Switch`, a `New` in a session (switcher spec §4.1): the
-/// one answer is the exchange's `HostHello`, or a refusal, which is the
-/// host's words for the user ([`HostRefused`]).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the switcher's requests use it from Task 9 on")
-)]
-pub(crate) async fn establish_answering<R, W>(
-    reader: R,
-    writer: W,
-    size: TermSize,
-    cfg: &NetConfig,
-) -> Result<Established>
-where
-    R: tokio::io::AsyncBufRead + Unpin + Send,
-    W: tokio::io::AsyncWrite + Unpin + Send,
-{
-    let mut reader = reader;
-    match oxutrm_host::signalling::read_answer_async(&mut reader)
-        .await
-        .context("reading the host's answer")?
-    {
-        oxutrm_proto::Answer::Signal(first) => {
-            establish_from(first, reader, writer, size, cfg, None).await
-        }
-        oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Refused(why)) => {
-            Err(anyhow::Error::new(HostRefused(why)))
-        }
-        oxutrm_proto::Answer::Reply(other) => Err(anyhow::anyhow!(
-            "the host answered with {other:?} where an attach should have begun"
-        )),
-    }
-}
-
 /// L4 and L6 to L10, once the host's first line -- its hello, or why not --
-/// is in hand.
-async fn establish_from<R, W>(
+/// is in hand: from [`establish`], and from the switcher's `Switch` and
+/// `New`, whose first answer may be a refusal instead (`switcher::ask`).
+pub(crate) async fn establish_from<R, W>(
     first: Signal,
     reader: R,
     writer: W,

@@ -830,19 +830,24 @@ mod tests {
         conn: &quinn::Connection,
         req: Request,
     ) -> anyhow::Result<crate::connect::Established> {
-        use oxutrm_host::signalling::write_line_async;
-        let (mut send, recv) = conn.open_bi().await?;
-        write_line_async(&mut send, &oxutrm_proto::Open::new(req)).await?;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            crate::connect::establish_answering(
-                tokio::io::BufReader::new(recv),
-                send,
-                SIZE,
-                &crate::attach_exchange::fixtures::stun_free(),
-            ),
+        use crate::switcher::{Answered, Ask};
+        let ask = match req {
+            Request::Switch { to } => Ask::Switch { to },
+            Request::New { name } => Ask::New { name },
+            other => panic!("{other:?} runs no attach"),
+        };
+        match crate::switcher::ask(
+            conn.clone(),
+            ask,
+            SIZE,
+            &crate::attach_exchange::fixtures::stun_free(),
         )
-        .await?
+        .await
+        {
+            Answered::Landed(e) => Ok(*e),
+            Answered::Failed(why) => Err(anyhow::anyhow!(why)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -42,6 +42,7 @@ mod roam;
 mod serve;
 mod session;
 mod standby;
+mod switcher;
 mod ui;
 mod view;
 

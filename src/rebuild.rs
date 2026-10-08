@@ -333,7 +333,29 @@ impl Default for Ties {
     }
 }
 
-/// One attempt at getting back into `session_id` on `target`.
+/// Where a rebuild goes (switcher spec §3.5): the session the client is in,
+/// or -- while it is in a lobby -- a fresh lobby. A lobby is never
+/// reattached: it ended after `DETACH_AFTER` of silence, or will.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Aim {
+    Session(String),
+    Lobby,
+}
+
+impl Aim {
+    /// What the attempt answers the offer with.
+    fn choice(&self) -> Result<Choice, String> {
+        match self {
+            Aim::Session(id) => id
+                .parse()
+                .map(|id| Choice::Attach { id })
+                .map_err(|_| format!("{id:?} is not a session id")),
+            Aim::Lobby => Ok(Choice::Lobby),
+        }
+    }
+}
+
+/// One attempt at getting back to `aim` on `target`.
 ///
 /// `launcher` is the injection point, exactly as it is for
 /// [`SshChannel::open`]: production passes [`SshLauncher::ssh`] and the tests
@@ -362,21 +384,12 @@ impl Default for Ties {
 pub(crate) async fn attempt(
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
 ) -> AttemptOutcome {
-    attempt_within(
-        ATTEMPT_DEADLINE,
-        launcher,
-        target,
-        session_id,
-        size,
-        cfg,
-        ties,
-    )
-    .await
+    attempt_within(ATTEMPT_DEADLINE, launcher, target, aim, size, cfg, ties).await
 }
 
 /// [`attempt`], with its outer bound as a parameter.
@@ -394,12 +407,12 @@ async fn attempt_within(
     deadline: std::time::Duration,
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
 ) -> AttemptOutcome {
-    let body = one_attempt(launcher, target, session_id, size, cfg, ties);
+    let body = one_attempt(launcher, target, aim, size, cfg, ties);
     match tokio::time::timeout(deadline, body).await {
         Ok(outcome) => outcome,
         Err(_) => AttemptOutcome::Retry(format!(
@@ -415,7 +428,7 @@ async fn attempt_within(
 async fn one_attempt(
     launcher: &SshLauncher,
     target: &str,
-    session_id: &str,
+    aim: &Aim,
     size: TermSize,
     cfg: &NetConfig,
     ties: &Ties,
@@ -446,10 +459,10 @@ async fn one_attempt(
     if !ties.commitment.commit() {
         return AttemptOutcome::Retry("abandoned for the standby".to_owned());
     }
-    let Ok(id) = session_id.parse() else {
-        return AttemptOutcome::Definite(format!("{session_id:?} is not a session id"));
+    let choice = match aim.choice() {
+        Ok(choice) => choice,
+        Err(why) => return AttemptOutcome::Definite(why),
     };
-    let choice = Choice::Attach { id };
     if let Err(e) = channel.send(&Signal::Choose { choice }).await {
         return classify(target, &anyhow::Error::new(e));
     }
@@ -473,7 +486,7 @@ async fn one_attempt(
 /// this is only ever touched between laps.
 pub(crate) struct Rebuild {
     target: String,
-    session_id: String,
+    aim: Aim,
     /// How to start ssh. The injection point, as in [`attempt`].
     launcher: SshLauncher,
     cfg: NetConfig,
@@ -506,9 +519,14 @@ pub(crate) struct Rebuild {
 
 impl Rebuild {
     pub(crate) fn new(target: String, session_id: String) -> Rebuild {
+        Rebuild::aimed(target, Aim::Session(session_id))
+    }
+
+    /// A rebuild that goes to `aim`.
+    pub(crate) fn aimed(target: String, aim: Aim) -> Rebuild {
         Rebuild {
             target,
-            session_id,
+            aim,
             launcher: SshLauncher::ssh(),
             cfg: NetConfig::default(),
             in_flight: None,
@@ -519,6 +537,19 @@ impl Rebuild {
             started: None,
             displacing: false,
         }
+    }
+
+    /// Where the next attempt goes, after a switch, a new session or a kill
+    /// moved the client (switcher spec §3.5). An attempt already running
+    /// keeps its own.
+    pub(crate) fn retarget(&mut self, aim: Aim) {
+        self.aim = aim;
+    }
+
+    /// Where the next attempt goes.
+    #[cfg(test)]
+    pub(crate) fn aim(&self) -> &Aim {
+        &self.aim
     }
 
     /// The network settings and the connect timeout the next attempt runs
@@ -642,7 +673,7 @@ impl Rebuild {
         let generation = self.generation;
         let launcher = self.launcher.clone();
         let target = self.target.clone();
-        let session_id = self.session_id.clone();
+        let aim = self.aim.clone();
         let cfg = self.cfg.clone();
         let ties = Ties {
             commitment: Commitment::default(),
@@ -652,7 +683,7 @@ impl Rebuild {
         self.commitment = ties.commitment.clone();
         self.displacing = true;
         self.in_flight = Some(tokio::spawn(async move {
-            let outcome = attempt(&launcher, &target, &session_id, size, &cfg, &ties).await;
+            let outcome = attempt(&launcher, &target, &aim, size, &cfg, &ties).await;
             // A closed receiver means the session this was for has ended.
             // There is nobody to tell, and that is not a failure.
             let _ = outcomes
@@ -929,10 +960,14 @@ mod tests {
     }
 
     async fn run_attempt(fake: &FakeHost, session_id: &str) -> AttemptOutcome {
+        run_attempt_to(fake, &Aim::Session(session_id.to_owned())).await
+    }
+
+    async fn run_attempt_to(fake: &FakeHost, aim: &Aim) -> AttemptOutcome {
         attempt(
             &fake.launcher,
             "bastion.example.net",
-            session_id,
+            aim,
             a_size(),
             &test_config(),
             &Ties::default(),
@@ -1046,7 +1081,7 @@ mod tests {
                 std::time::Duration::from_millis(200),
                 &fake.launcher,
                 "bastion.example.net",
-                "3ff1218f5e0c4b7d9a1c2e3f40516273",
+                &Aim::Session("3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned()),
                 a_size(),
                 &test_config(),
                 &Ties::default(),
@@ -1528,6 +1563,33 @@ mod tests {
         assert_eq!(
             recorded,
             serde_json::json!({"c": "Attach", "id": "3ff1218f5e0c4b7d9a1c2e3f40516273"})
+        );
+    }
+
+    /// A client in a lobby is rebuilt into a fresh lobby, never into the old
+    /// one, which has ended or will (switcher spec §3.5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attempt_from_a_lobby_asks_for_a_fresh_lobby() {
+        let fake = fake_host_recording_the_choice();
+        let record = fake.path("choice.json");
+        let _ = run_attempt_to(&fake, &Aim::Lobby).await;
+        let line = std::fs::read_to_string(&record).expect("the fake host recorded no choice");
+        let signal: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON");
+        assert_eq!(signal["choice"], serde_json::json!({"c": "Lobby"}));
+    }
+
+    #[test]
+    fn a_rebuild_is_retargeted_by_a_move() {
+        let mut r = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        );
+        r.retarget(Aim::Lobby);
+        assert_eq!(r.aim(), &Aim::Lobby);
+        r.retarget(Aim::Session("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_owned()));
+        assert_eq!(
+            r.aim(),
+            &Aim::Session("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60".to_owned())
         );
     }
 }

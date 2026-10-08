@@ -137,6 +137,8 @@ enum Wake {
     Standby(crate::standby::StandbyEvent),
     /// The standby's connection closed, with this reason.
     StandbyClosed(quinn::ConnectionError),
+    /// A switcher request was answered.
+    Answered(crate::switcher::Answered),
     Closed(quinn::ConnectionError),
     /// A readiness that turned out to be nothing. Costs one lap.
     Nothing,
@@ -236,6 +238,15 @@ pub const SUPERSEDED: &[u8] = b"superseded by a newer standby";
 /// is already carrying the session. It exists so that a `close` here is as
 /// legible in a packet trace as [`TAKEN_OVER`] is.
 pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
+
+/// Why the client closed a link of its own: it moved to another session
+/// (switcher spec §4.3). The session it left detaches quietly, as after any
+/// client loss; a lobby ends.
+pub const MOVED_AWAY: &[u8] = b"the client moved to another session";
+
+/// Why a client in a lobby closed its link: the user quit. The lobby ends
+/// with its link rather than after `DETACH_AFTER`.
+pub const QUIT: &[u8] = b"the client quit";
 
 /// What `conn` reports right now, as plain values for [`Quality`].
 fn reading_of(conn: &quinn::Connection) -> Reading {
@@ -365,6 +376,17 @@ pub struct ClientSession {
     /// `network.standby` as last applied. The standby itself is switched by
     /// the loop, which owns the tasks it stops (`standby_switch`).
     standby_wanted: bool,
+    /// In a lobby: the far end has no shell (switcher spec §2.1). No standby
+    /// is searched for, and a rebuild aims at a fresh lobby.
+    in_lobby: bool,
+    /// A request for the host, waiting for the loop to send it.
+    asking: Option<crate::switcher::Ask>,
+    /// The request in flight, which its answer is read against.
+    asked: Option<crate::switcher::Ask>,
+    /// The host's sessions, as last fetched.
+    sessions: Vec<oxutrm_proto::SessionEntry>,
+    /// What an attach exchange of the switcher's runs with: `apply`'s.
+    net: oxutrm_net::NetConfig,
 }
 
 /// The startup splash while it shows; the picture is
@@ -512,6 +534,11 @@ impl ClientSession {
             config: ConfigState::defaults(),
             config_warned: std::collections::HashSet::new(),
             standby_wanted: true,
+            in_lobby: false,
+            asking: None,
+            asked: None,
+            sessions: Vec::new(),
+            net: oxutrm_net::NetConfig::default(),
         })
     }
 
@@ -627,6 +654,193 @@ impl ClientSession {
         self
     }
 
+    /// Start in a lobby: the connect chose `Lobby` (switcher spec §3.1).
+    pub(crate) fn with_lobby(mut self) -> ClientSession {
+        self.in_lobby = true;
+        self
+    }
+
+    /// Whether the far end is a lobby.
+    #[cfg(test)]
+    pub(crate) fn in_lobby(&self) -> bool {
+        self.in_lobby
+    }
+
+    /// Ask the host `a` on the loop's next lap. One at a time: `false`, and
+    /// nothing asked, while another is waiting or in flight.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the selector uses it from Task 10 on")
+    )]
+    pub(crate) fn ask(&mut self, a: crate::switcher::Ask) -> bool {
+        if self.asking.is_some() || self.asked.is_some() {
+            return false;
+        }
+        self.asking = Some(a);
+        true
+    }
+
+    /// Whether a request is waiting or in flight.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the selector uses it from Task 12 on")
+    )]
+    pub(crate) fn asking(&self) -> bool {
+        self.asking.is_some() || self.asked.is_some()
+    }
+
+    /// The request to send now, if one is waiting; from here it is in
+    /// flight.
+    fn take_ask(&mut self) -> Option<crate::switcher::Ask> {
+        let a = self.asking.take()?;
+        self.asked = Some(a.clone());
+        Some(a)
+    }
+
+    /// The host's sessions, as last fetched.
+    #[cfg(test)]
+    pub(crate) fn sessions(&self) -> &[oxutrm_proto::SessionEntry] {
+        &self.sessions
+    }
+
+    /// How the activity log names session `id`: its name from the last
+    /// fetched list, else the start of its id.
+    fn label_of(&self, id: &oxutrm_proto::SessionId) -> String {
+        self.sessions
+            .iter()
+            .find(|e| e.id == *id)
+            .and_then(|e| e.name.as_ref())
+            .map_or_else(|| id.short(), |n| oxutrm_client::legible(n.as_str()))
+    }
+
+    /// The session this client is in, as an id.
+    fn here(&self) -> Option<oxutrm_proto::SessionId> {
+        self.identity.as_ref()?.session_id.parse().ok()
+    }
+
+    /// Point a rebuild at where the client now is.
+    fn aim_rebuild(&mut self) {
+        let aim = match (self.in_lobby, &self.identity) {
+            (true, _) => crate::rebuild::Aim::Lobby,
+            (false, Some(id)) => crate::rebuild::Aim::Session(id.session_id.clone()),
+            (false, None) => return,
+        };
+        if let Some(r) = self.rebuild.as_mut() {
+            r.retarget(aim);
+        }
+    }
+
+    /// What came of the request in flight. True when the link the session
+    /// runs on, or its standby, changed under the loop -- a switch, a new
+    /// sibling, a kill into a lobby -- and the loop must follow.
+    pub(crate) fn answered(&mut self, a: crate::switcher::Answered, now: Instant) -> Result<bool> {
+        use crate::switcher::{Answered, Ask};
+        let asked = self.asked.take();
+        match a {
+            Answered::Sessions(list) => {
+                self.sessions = list;
+                Ok(false)
+            }
+            Answered::Landed(e) => {
+                let label = match &asked {
+                    Some(Ask::Switch { to }) => format!("switched to {}", self.label_of(to)),
+                    Some(Ask::New { name: Some(n) }) => {
+                        format!("new session {}", oxutrm_client::legible(n.as_str()))
+                    }
+                    _ => format!("new session {}", &e.session_id[..8.min(e.session_id.len())]),
+                };
+                self.moved(*e, now)?;
+                self.activity.record_shown(Kind::Session, &label, &label);
+                Ok(true)
+            }
+            Answered::Started(entry) => {
+                self.in_lobby = false;
+                if let Some(id) = self.identity.as_mut() {
+                    id.session_id = entry.id.to_string();
+                }
+                self.aim_rebuild();
+                // The screen starts over as after a switch (switcher spec
+                // §3.4), but on the same link: the host's screen and input
+                // streams run on through the change, so only what is painted
+                // is forgotten -- resetting the sync state here would put the
+                // client out of step with them.
+                self.renderer.invalidate();
+                let label = match &entry.name {
+                    Some(n) => format!("new session {}", oxutrm_client::legible(n.as_str())),
+                    None => format!("new session {}", entry.id.short()),
+                };
+                self.activity.record_shown(Kind::Session, &label, &label);
+                Ok(false)
+            }
+            Answered::Killed(id) => {
+                let label = format!("killed {}", self.label_of(&id));
+                self.activity.record_shown(Kind::Session, &label, &label);
+                if Some(id) != self.here() {
+                    return Ok(false);
+                }
+                // This session's shell is gone, and the process is a lobby
+                // now (switcher spec §3.4): no standby there, and a rebuild
+                // goes to a fresh lobby.
+                self.in_lobby = true;
+                self.aim_rebuild();
+                if let Some(s) = self.standby.as_mut() {
+                    s.forget(now);
+                }
+                Ok(true)
+            }
+            Answered::Renamed(entry) => {
+                let label = match &entry.name {
+                    Some(n) => format!(
+                        "renamed {} to {}",
+                        entry.id.short(),
+                        oxutrm_client::legible(n.as_str())
+                    ),
+                    None => format!("{} has no name now", entry.id.short()),
+                };
+                self.activity.record_shown(Kind::Session, &label, &label);
+                Ok(false)
+            }
+            Answered::Failed(why) => {
+                let what = match &asked {
+                    Some(Ask::Sessions) => "listing the sessions".to_string(),
+                    Some(Ask::Switch { to }) => format!("switching to {}", self.label_of(to)),
+                    Some(Ask::New { .. }) => "starting a new session".to_string(),
+                    Some(Ask::Kill { id }) => format!("killing {}", self.label_of(id)),
+                    Some(Ask::Rename { id, .. }) => format!("renaming {}", self.label_of(id)),
+                    None => "a request".to_string(),
+                };
+                self.activity.record_shown(
+                    Kind::Session,
+                    &format!("{what} failed: {why}"),
+                    &format!("{what} failed"),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Move to the session `e` reached, make-before-break (switcher spec
+    /// §3.3): the new link is up, so it is adopted, the old one closed as
+    /// [`MOVED_AWAY`], the old link's parked standby dropped, the screen
+    /// started over, and the rebuild pointed at the new session. A rebuild
+    /// attempt still running was for the old one and is stood down.
+    fn moved(&mut self, e: crate::connect::Established, now: Instant) -> Result<()> {
+        if let Some(r) = self.rebuild.as_mut() {
+            r.stood_down();
+        }
+        self.swap_in_as(e.link, now, MOVED_AWAY)?;
+        if let Some(s) = self.standby.as_mut() {
+            s.forget(now);
+        }
+        self.in_lobby = false;
+        if let Some(id) = self.identity.as_mut() {
+            id.session_id = e.session_id.clone();
+        }
+        self.aim_rebuild();
+        self.path = Some(e.path);
+        Ok(())
+    }
+
     /// Keep the activity log in `activity` -- the one with the file, which
     /// `connect` opens -- instead of the ring-only log `new` starts with.
     pub(crate) fn with_activity(mut self, activity: Activity) -> ClientSession {
@@ -668,6 +882,7 @@ impl ClientSession {
         self.link_state
             .retune(s.silent_after, s.effective_rebuild_after());
         let cfg = s.net_config();
+        self.net = cfg.clone();
         if let Some(r) = self.rebuild.as_mut() {
             r.retune(cfg.clone(), s.connect_timeout);
         }
@@ -1078,7 +1293,17 @@ impl ClientSession {
             self.link_state.hold_keys(&routed.to_hold);
         }
         match routed.command {
-            Some(Command::Quit) => return Ok(Some(0)),
+            Some(Command::Quit) => {
+                // A lobby ends with its link: closed here, it does not wait
+                // out `DETACH_AFTER`. A session detaches, as it always did.
+                if self.in_lobby {
+                    self.link
+                        .sink
+                        .connection()
+                        .close(quinn::VarInt::from_u32(0), QUIT);
+                }
+                return Ok(Some(0));
+            }
             Some(Command::SendHeld) => {
                 let held = self.link_state.take_held();
                 self.activity.record(
@@ -1504,7 +1729,9 @@ impl ClientSession {
         now: Instant,
         rebuild: RebuildStage,
     ) -> crate::standby::StandbyAction {
-        let Some(s) = self.standby.as_mut() else {
+        // Searched for only in a session, never in a lobby (switcher spec
+        // §2.1): a lobby has nothing a second path would keep alive.
+        let Some(s) = self.standby.as_mut().filter(|_| !self.in_lobby) else {
             return crate::standby::StandbyAction::Nothing;
         };
         let first_probe = s.probe() == crate::linkstate::ProbeState::Idle;
@@ -1888,6 +2115,12 @@ impl ClientSession {
         let mut _search_task: Option<crate::attach_exchange::AbortOnDrop> = None;
         let mut _probe_task: Option<crate::attach_exchange::AbortOnDrop> = None;
 
+        // Where a switcher request reports back, and the request in flight:
+        // locals for the reason `outcomes` is one (C1). One deep: one
+        // request at a time.
+        let (answers_tx, mut answers) = tokio::sync::mpsc::channel::<crate::switcher::Answered>(1);
+        let mut _ask_task: Option<crate::attach_exchange::AbortOnDrop> = None;
+
         let mut winch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .context("watching for window size changes")?;
@@ -1939,6 +2172,7 @@ impl ClientSession {
                 () = splash_due(splash_at) => Wake::SplashFrame,
                 Some(report) = outcomes.recv() => Wake::Rebuilt(report),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
+                Some(a) = answers.recv() => Wake::Answered(a),
                 // Quiet until the standby goes away; a closed connection is
                 // ready for ever, which is why the handler disarms it.
                 reason = async { standby_conn.as_ref().expect("armed").closed().await },
@@ -2028,6 +2262,19 @@ impl ClientSession {
                     standby_conn = None;
                     self.on_standby_closed(&reason, Instant::now());
                 }
+                Wake::Answered(a) => {
+                    _ask_task = None;
+                    if self.answered(a, Instant::now())? {
+                        // As after a landed rebuild: the arm watches the new
+                        // connection, the old one was closed on purpose, and
+                        // the standby -- the old session's -- is gone.
+                        conn = self.link.sink.connection().clone();
+                        takeover_expected = false;
+                        standby_conn = None;
+                        _search_task = None;
+                        _probe_task = None;
+                    }
+                }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
                 // nothing at all.
@@ -2101,6 +2348,18 @@ impl ClientSession {
                 && let Some(s) = self.standby.as_mut()
             {
                 s.route_moved(now);
+            }
+
+            // A switcher request, on its own stream of the live link.
+            if let Some(ask) = self.take_ask() {
+                let primary = self.link.sink.connection().clone();
+                let (size, cfg) = (self.size, self.net.clone());
+                let tx = answers_tx.clone();
+                let task = tokio::spawn(async move {
+                    let a = crate::switcher::ask(primary, ask, size, &cfg).await;
+                    let _ = tx.send(a).await;
+                });
+                _ask_task = Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
             }
 
             // The `bool` is for the tests, which hold the clock still and ask
@@ -9695,5 +9954,301 @@ mod tests {
             let shown = format!("config: {w}");
             assert_eq!(times(&shown), 1, "{shown}: {:#?}", shown_log(&session));
         }
+    }
+
+    // ---- the switcher, on the client (switcher spec §3.3 to §3.5) ----------
+
+    const BUILD_ID: &str = "3ff1218f5e0c4b7d9a1c2e3f40516273";
+    const LOGS_ID: &str = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60";
+
+    /// A client on `link`, in session `id` on `thinlinc`, whose switcher
+    /// exchanges reach no STUN server.
+    fn client_on(link: Link, id: &str) -> ClientSession {
+        let mut c = ClientSession::new(crate::serve::fixtures::SIZE, caps(), link, None)
+            .unwrap()
+            .with_identity(Identity {
+                target: "thinlinc".to_owned(),
+                session_id: id.to_owned(),
+            });
+        c.net = crate::attach_exchange::fixtures::stun_free();
+        c
+    }
+
+    /// Send the request the client has waiting, as the loop does, and hand
+    /// the answer back to it. Returns what `answered` returned.
+    async fn ask_now(c: &mut ClientSession, a: crate::switcher::Ask) -> bool {
+        assert!(c.ask(a), "another request was in flight");
+        let a = c.take_ask().expect("the request just asked");
+        let answered =
+            crate::switcher::ask(c.link.sink.connection().clone(), a, c.size, &c.net.clone()).await;
+        c.answered(answered, Instant::now()).expect("answered")
+    }
+
+    fn id_of(s: &str) -> oxutrm_proto::SessionId {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_moves_the_client_and_the_old_session_stays_listed() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        assert!(!ask_now(&mut client, crate::switcher::Ask::Sessions).await);
+        assert_eq!(client.sessions().len(), 2);
+
+        let old = client.link.sink.connection().clone();
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Switch { to: id_of(LOGS_ID) }
+            )
+            .await,
+            "a switch moves the loop to a new link"
+        );
+        assert_ne!(client.link.sink.connection().stable_id(), old.stable_id());
+        assert!(
+            matches!(
+                old.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the old link was not closed: {:?}",
+            old.close_reason()
+        );
+        assert_eq!(client.identity.as_ref().unwrap().session_id, LOGS_ID);
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Session(LOGS_ID.to_owned())
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "switched to logs".to_owned()))
+        );
+        // The old session detached and is still there.
+        assert!(!build.task.is_finished());
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        // And the client is in `logs` now: its shell's exit is the client's.
+        let (keys, mut typing) = keyboard();
+        let mut out = SharedOut::default();
+        let looping = tokio::spawn(async move { client.run_on(keys, &mut out).await });
+        typing.write_all(b"exit 7\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(logs.task.await.unwrap().unwrap(), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_that_fails_leaves_the_client_where_it_was_and_says_why() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            None,
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        let before = client.link.sink.connection().stable_id();
+        assert!(
+            !ask_now(
+                &mut client,
+                crate::switcher::Ask::Switch { to: id_of(LOGS_ID) }
+            )
+            .await
+        );
+        assert_eq!(client.link.sink.connection().stable_id(), before);
+        assert!(client.link.sink.connection().close_reason().is_none());
+        let (kind, text) = last_entry(&client).unwrap();
+        assert_eq!(kind, Kind::Session);
+        assert!(
+            text.starts_with("switching to a3f9c01e failed: ") && text.contains("no session"),
+            "{text}"
+        );
+        assert!(!client.asking(), "the failed request is still in flight");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn killing_this_session_puts_the_client_in_the_lobby_and_new_takes_it_out() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        assert!(!ask_now(&mut client, crate::switcher::Ask::Sessions).await);
+
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Kill {
+                    id: id_of(BUILD_ID)
+                }
+            )
+            .await
+        );
+        assert!(client.in_lobby());
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Lobby
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "killed build".to_owned()))
+        );
+        assert!(
+            client.link.sink.connection().close_reason().is_none(),
+            "the link stays"
+        );
+        registry_holds(dir.path(), &[]).await;
+
+        // What is painted now is the model: painting again writes nothing.
+        let mut painted = Vec::new();
+        client.paint(&mut painted, "painting").unwrap();
+        painted.clear();
+        client.paint(&mut painted, "painting").unwrap();
+        assert!(painted.is_empty(), "the control: nothing to repaint");
+
+        let again = oxutrm_proto::Name::parse("again").unwrap();
+        assert!(!ask_now(&mut client, crate::switcher::Ask::New { name: Some(again) }).await);
+        assert!(!client.in_lobby());
+        client.paint(&mut painted, "painting").unwrap();
+        assert!(
+            !painted.is_empty(),
+            "the screen did not start over when the lobby became a session"
+        );
+        assert_eq!(
+            client.rebuild.as_ref().unwrap().aim(),
+            &crate::rebuild::Aim::Session(BUILD_ID.to_owned()),
+            "a lobby keeps its id when it becomes the session"
+        );
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "new session again".to_owned()))
+        );
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quitting_in_a_lobby_ends_the_lobby_with_the_link() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let lobby = process(dir.path(), BUILD_ID, None, Begin::Lobby, sh()).await;
+        let mut client = client_on(lobby.client, BUILD_ID).with_lobby();
+        let mut out = Vec::new();
+        let at = Instant::now();
+        assert_eq!(
+            client
+                .route_keys_at(&[CTRL_BACKSLASH, b'q'], at, &mut out)
+                .unwrap(),
+            Some(0)
+        );
+        let code = tokio::time::timeout(Duration::from_secs(5), lobby.task)
+            .await
+            .expect("the lobby outlived its client's quit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn no_standby_is_searched_for_in_a_lobby() {
+        let (_host, client) = crate::link::fixtures::link_pair().await;
+        let due = crate::standby::Standby::new(
+            crate::attach_exchange::fixtures::stun_free(),
+            Instant::now()
+                .checked_sub(crate::linkstate::STANDBY_DELAY)
+                .expect("a clock this young"),
+        );
+        let mut c = client_on(client, BUILD_ID).with_lobby().with_standby(due);
+        let action = c.standby_step(Phase::Live, Instant::now(), RebuildStage::Idle);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Nothing),
+            "a lobby searched for a standby"
+        );
+        c.in_lobby = false;
+        let action = c.standby_step(Phase::Live, Instant::now(), RebuildStage::Idle);
+        assert!(
+            matches!(action, crate::standby::StandbyAction::Search { .. }),
+            "the control: in a session the search is due"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rename_is_recorded_and_a_refused_one_says_why() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            None,
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+
+        let name = |n: &str| Some(oxutrm_proto::Name::parse(n).unwrap());
+        let rename = |n| crate::switcher::Ask::Rename {
+            id: id_of(BUILD_ID),
+            name: n,
+        };
+        assert!(!ask_now(&mut client, rename(name("build"))).await);
+        assert_eq!(
+            last_entry(&client),
+            Some((Kind::Session, "renamed 3ff1218f to build".to_owned()))
+        );
+        assert!(!ask_now(&mut client, rename(name("logs"))).await);
+        let (_, text) = last_entry(&client).unwrap();
+        assert!(
+            text.starts_with("renaming 3ff1218f failed: ") && text.contains("taken"),
+            "{text}"
+        );
     }
 }
