@@ -90,6 +90,9 @@ pub(crate) struct Selector {
     rename: Option<(SessionId, Field)>,
     /// The line under the list: why something was refused or failed.
     note: Option<String>,
+    /// Why the last list fetch failed: no list is on its way. Shown under
+    /// the list, where no note is, until a list arrives.
+    list_failed: Option<String>,
     /// Inside a bracketed paste whose end has not arrived yet, and how many
     /// bytes of that end the last read finished on (see
     /// [`crate::ui::paste_through`]). A paste is never a command: its text
@@ -136,6 +139,21 @@ impl Selector {
         self.rows = rows;
         self.cursor = at;
         self.loading = false;
+        self.list_failed = None;
+    }
+
+    /// The list could not be fetched: say why under the list until one
+    /// arrives. Nothing is on its way any more, so the selector stops
+    /// saying it is asking; with no list, `+ new session` is all it offers.
+    pub(crate) fn fail_list(&mut self, why: String) {
+        self.question = None;
+        self.loading = false;
+        self.list_failed = Some(why);
+    }
+
+    /// Why the last list fetch failed, until a list arrives.
+    pub(crate) fn list_failed(&self) -> Option<&str> {
+        self.list_failed.as_deref()
     }
 
     /// Something failed: say why under the list. A question still up is
@@ -491,6 +509,23 @@ mod tests {
         assert_eq!(names, ["a3f9c01e", "build", "logs"]);
         assert_eq!(s.cursor(), 1, "on build, which is this");
         assert!(!s.loading());
+    }
+
+    /// A failed list ends the wait; its line lasts through the reads that
+    /// follow, until a list arrives.
+    #[test]
+    fn a_failed_list_ends_loading_and_lasts_until_a_list_arrives() {
+        let mut s = Selector::default();
+        s.open();
+        s.fail_list("listing the sessions failed: refused".to_string());
+        assert!(!s.loading());
+        s.keys(b"j", LIVE, Instant::now());
+        assert_eq!(
+            s.list_failed(),
+            Some("listing the sessions failed: refused")
+        );
+        s.set_rows(three());
+        assert_eq!(s.list_failed(), None);
     }
 
     #[test]

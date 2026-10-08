@@ -810,8 +810,12 @@ impl ClientSession {
                 }
                 // This session's shell is gone, and the process is a lobby
                 // now (switcher spec §3.4): no standby there, and a rebuild
-                // goes to a fresh lobby.
+                // goes to a fresh lobby. A lobby always shows the selector,
+                // even when the popup was closed before the answer came.
                 self.in_lobby = true;
+                if self.ui.mode() != Mode::Sessions {
+                    self.ui.open_sessions();
+                }
                 self.aim_rebuild();
                 if let Some(s) = self.standby.as_mut() {
                     s.forget(now);
@@ -846,10 +850,13 @@ impl ClientSession {
                     &format!("{what} failed"),
                 );
                 // Under the list, as one line; the detail is in client.log.
-                self.ui.selector_mut().fail(format!(
-                    "{what} failed: {}",
-                    oxutrm_client::summarised(&why)
-                ));
+                // A list that failed is not on its way any more: the
+                // selector says so until one arrives.
+                let line = format!("{what} failed: {}", oxutrm_client::summarised(&why));
+                match asked {
+                    Some(Ask::Sessions) => self.ui.selector_mut().fail_list(line),
+                    _ => self.ui.selector_mut().fail(line),
+                }
                 Ok(false)
             }
         }
@@ -1405,7 +1412,6 @@ impl ClientSession {
         // A connect-time lobby: the selector, once the splash is down.
         if self.open_selector && self.splash.is_none() {
             self.open_selector = false;
-            self.ui.set_switcher(self.in_lobby, self.asking());
             self.ui.open_sessions();
             self.fetch_list();
         }
@@ -1425,6 +1431,10 @@ impl ClientSession {
                 self.activity.record_detail(Kind::Link, &text);
                 let (text, shown) = std::mem::take(&mut self.outage).summary(outage);
                 self.activity.record_shown(Kind::Outage, &text, &shown);
+                // A list that failed in the outage is fetched again now.
+                if self.ui.mode() == Mode::Sessions && self.ui.selector().list_failed().is_some() {
+                    self.fetch_list();
+                }
             }
             None => {}
         }
@@ -10475,6 +10485,8 @@ mod tests {
         wait_for_screen(&out, SIZE, "s sessions", Duration::from_secs(10)).await;
         typing.write_all(b"s").expect("type");
         wait_for_screen(&out, SIZE, "\u{25b8} build", Duration::from_secs(10)).await;
+        // There to begin with, so its absence below is the kill's doing.
+        wait_for_screen(&out, SIZE, "this", Duration::from_secs(10)).await;
         typing.write_all(b"x").expect("type");
         wait_for_screen(&out, SIZE, "kill build? y/n", Duration::from_secs(10)).await;
         tokio::time::sleep(crate::ui::ANSWER_GUARD + Duration::from_millis(100)).await;
@@ -10593,5 +10605,151 @@ mod tests {
         assert_eq!(session.ui.mode(), Mode::Sessions);
         assert_eq!(session.take_ask(), None, "a new session was asked for");
         assert_eq!(session.ui.selector().note(), Some(crate::selector::BUSY));
+    }
+
+    /// The selector open on a client in session `BUILD_ID` on `thinlinc`,
+    /// its list fetch sent and in flight.
+    async fn on_the_selector() -> (HostSession, ClientSession) {
+        let (host, mut session) = pair("/bin/sh").await;
+        session.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), Some(crate::switcher::Ask::Sessions));
+        (host, session)
+    }
+
+    /// The line under the list, as the selector shows it now.
+    fn selector_line(session: &ClientSession) -> String {
+        session
+            .sessions_view(session.link_state.phase_now(), Instant::now())
+            .line
+    }
+
+    /// A list that could not be fetched is not on its way any more: the
+    /// selector stops saying it is asking, says why under the list through
+    /// the reads that follow, and `⏎` on `+ new session` -- all there is
+    /// without a list -- asks for one.
+    #[tokio::test]
+    async fn a_failed_list_ends_the_wait_and_says_why_until_a_list_arrives() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session
+            .answered(
+                Answered::Failed("the host did not answer in time".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        type_in(&mut session, b"j");
+        type_in(&mut session, b"k");
+        assert!(!session.ui.selector().loading());
+        assert_eq!(
+            selector_line(&session),
+            "listing the sessions failed: the host did not answer in time"
+        );
+        type_in(&mut session, b"\r");
+        assert_eq!(session.take_ask(), Some(Ask::New { name: None }));
+    }
+
+    /// A list that failed in an outage is fetched again once the link is
+    /// back.
+    #[tokio::test]
+    async fn a_failed_list_is_fetched_again_when_the_link_is_back() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        let t = Instant::now();
+        session.note_heard(t);
+        session.note_sent(t);
+        let _ = session.layer_at(t);
+        let _ = session.layer_at(t + Duration::from_secs(3));
+        assert!(session.link_state.phase_now().is_outage());
+        session
+            .answered(
+                Answered::Failed("the host did not answer in time".to_string()),
+                t + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(session.take_ask(), None, "fetched again inside the outage");
+        session.note_heard(t + Duration::from_millis(4_500));
+        let _ = session.layer_at(t + Duration::from_millis(4_500));
+        assert_eq!(session.link_state.phase_now(), Phase::Live);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+    }
+
+    /// A failed request says what failed and why, in one line under the
+    /// list: the reason's first line only, the rest is in client.log.
+    #[tokio::test]
+    async fn a_failed_request_is_one_line_under_the_list() {
+        use crate::selector::fixtures::entry;
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        let logs = entry(
+            LOGS_ID,
+            Some("logs"),
+            "/bin/bash",
+            1_700_000_000,
+            oxutrm_proto::Attached::No,
+        );
+        session
+            .answered(Answered::Sessions(vec![logs]), Instant::now())
+            .unwrap();
+        assert!(session.ask(Ask::Kill { id: id_of(LOGS_ID) }));
+        session.take_ask();
+        session
+            .answered(
+                Answered::Failed("no such session\nsee the host's log".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            selector_line(&session),
+            "killing logs failed: no such session"
+        );
+    }
+
+    /// The kill of this session answered after the popup was closed: the
+    /// client is in a lobby, and a lobby always shows the selector -- never
+    /// a closed popup over a blank screen.
+    #[tokio::test]
+    async fn a_kill_of_this_session_answered_after_esc_opens_the_selector() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session
+            .answered(Answered::Sessions(Vec::new()), Instant::now())
+            .unwrap();
+        assert!(session.ask(Ask::Kill {
+            id: id_of(BUILD_ID)
+        }));
+        session.take_ask();
+        session.ui.close_popup();
+        assert!(
+            session
+                .answered(Answered::Killed(id_of(BUILD_ID)), Instant::now())
+                .unwrap()
+        );
+        assert!(session.in_lobby());
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+    }
+
+    /// A rebuild from a lobby lands in a fresh lobby: the client takes its
+    /// id, and the selector open on it lists what is there now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_into_a_lobby_takes_its_id_and_fetches_the_list() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = on_the_selector().await;
+        session.in_lobby = true;
+        session
+            .answered(Answered::Sessions(Vec::new()), Instant::now())
+            .unwrap();
+        let (_rebuilt_host, rebuilt) = crate::link::fixtures::link_pair().await;
+        let mut landed = standby_established(rebuilt);
+        landed.session_id = LOGS_ID.to_owned();
+        session.rebuild_landed(landed, Instant::now()).unwrap();
+        assert_eq!(session.identity.as_ref().unwrap().session_id, LOGS_ID);
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
     }
 }

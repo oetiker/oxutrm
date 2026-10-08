@@ -542,6 +542,7 @@ pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
     let line = match (sel.question(), sel.note()) {
         (Some(q), _) => legible(&q.text()),
         (None, Some(note)) => summarised(note),
+        (None, None) if let Some(failed) = sel.list_failed() => summarised(failed),
         (None, None) if sel.loading() => "asking the host for its sessions\u{2026}".to_string(),
         (None, None) => String::new(),
     };
