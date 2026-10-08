@@ -192,8 +192,9 @@
   you as the reason it could not connect rather than reporting a network
   failure — and if it happens while a session is being rebuilt after an outage,
   oxutrm names it as a version mismatch and stops instead of retrying an answer
-  that will not change. There is no protocol version bump, because the version
-  field lives in the hellos and this exchange happens before them.
+  that will not change. The usage error, not the protocol version, is what
+  tells an older host apart here: this exchange happens before the hellos,
+  which carry the version (now 3, see above).
 
 ### Changed
 
@@ -208,10 +209,11 @@
 
 - **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
   carry a `features` list — empty today except for the host, which advertises
-  `control` and `standby`. Absent on either side, it is read as "nothing", so
-  an older peer on the other end of the exchange is unaffected and there is no
-  `PROTO_VERSION` bump. Three signals, `StandbyRequest`, `Probe` and
-  `ProbeAck`, are what the standby link above sends over the wire.
+  `control` and `standby`. Absent on either side, it is read as "nothing".
+  The standby link above asks for its standby and probes its link with
+  requests on a link's control stream (`Attach` as a standby, and `Probe`,
+  answered by `ProbeAck`); the version they travel under is `PROTO_VERSION`
+  3, see Compatibility.
 
 - **Nothing is written over the session any more.** The `standby: …`, `no
   standby path`, `switched to standby …` and `path migrated …` lines are gone:

@@ -14,10 +14,21 @@ between them from the client.
 
 Even exactly one running session opens the selector: nothing is resumed
 silently. `--attach` takes a session's exact name, or at least four
-characters of its id; ids are lowercase hex and a prefix is matched exactly as
-written, so `3FF1` finds nothing where `3ff1` does. A name always contains a
-character outside `0-9a-f`, so a name and an id prefix can never be confused.
-`--name` without `--new` is refused.
+characters of its id. The name is tried first, then the id prefix. Ids are
+lowercase hex and a prefix is matched exactly as written, so `3FF1` finds
+nothing where `3ff1` does. A prefix that begins more than one session's id is
+refused, and the refusal lists the sessions it could mean, by name and id:
+give more characters. `--name` without `--new` is refused.
+
+## The lobby
+
+When the selector opens by itself at connect, or after you kill the session
+you are in, the client is in a **lobby**: a session process with no shell.
+Its screen is blank, and the selector is always open over it. Picking a
+session moves you there; `+ new session` or `n` starts a shell in the lobby
+itself, which then is that new session. `q` or `Esc` in a lobby's selector
+ends the client, as there is no session to go back to. A lobby whose client
+has gone away, or not been heard from for 30 seconds, ends by itself.
 
 ## The selector
 
@@ -42,15 +53,16 @@ the session you are in, `in use` for one attached to another client, `?` for
 one that did not answer in time, `old version` for one started by another
 version of oxutrm. A session that cannot be reattached (it tunnels its data
 through the ssh connection that created it) and one of another version are
-dimmed, and `⏎` on them says why instead of switching.
+dimmed, and `⏎` on them says why instead of switching. Rows are in the order
+the sessions were started, oldest first, with `+ new session` last.
 
 | Key | Does |
 |---|---|
 | `↑` `↓` (`k` `j`) | move |
-| `⏎` | switch to that session; on `+ new session`, start one; on `this`, close |
+| `⏎` | switch to that session; on `+ new session`, start one; on `this`, close the popup |
 | `n` | start a new session |
 | `r` | name or rename the session in place: `⏎` saves, `Esc` cancels, an empty name clears it |
-| `x` | kill the session, after `kill build? y/n` |
+| `x` | kill the session, after `kill build? y/n` -- or `kill build (in use elsewhere)? y/n` for one attached to another client |
 | `q` `Esc` | back to the popup -- or, with no session to go back to, quit |
 
 Switching to a session that is `in use` asks first, then takes it over: its
