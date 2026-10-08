@@ -1,4 +1,4 @@
-//! `oxutrm [--attach <id>] [--new] <target>`: the flags, through the real
+//! `oxutrm [--attach <name|id>] [--new [--name <name>]] <target>`: the flags, through the real
 //! binary.
 //!
 //! `run_connect` (`src/connect.rs`) parses these before ever touching ssh, so
@@ -62,7 +62,7 @@ fn attach_without_an_id_exits_two() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("needs a session id"),
+        stderr.contains("needs a session's name or id"),
         "the error does not say what was actually wrong -- an \"unknown \
          option\" message from dispatch's old catch-all would also contain \
          \"--attach\" without ever reaching run_connect's own parser: {stderr}"
@@ -129,7 +129,7 @@ fn attach_followed_by_a_flag_is_refused_before_ssh() {
          and try to connect: {stderr}"
     );
     assert!(
-        stderr.contains("needs a session id"),
+        stderr.contains("needs a session's name or id"),
         "the error must say what was actually wrong rather than reporting a \
          session the user never asked for: {stderr}"
     );
@@ -155,8 +155,42 @@ fn help_mentions_the_attach_flag() {
     assert!(output.status.success(), "--help must exit successfully");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[--attach <session-id>]"),
+        stdout.contains("[--attach <name|session-id>]"),
         "the help text does not mention the client's --attach flag (as \
          opposed to the pre-existing, unrelated `host --attach`): {stdout}"
     );
+}
+
+/// Run oxutrm with `args`, which must be refused before ssh: its exit
+/// status and stderr.
+fn refused_before_ssh(args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_oxutrm"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running oxutrm");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// `--name` names a NEW session; on its own it would be a name for nothing.
+#[test]
+fn name_without_new_is_refused() {
+    let (code, stderr) = refused_before_ssh(&["--name", "build", "no-such-host.invalid"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--name") && stderr.contains("--new"),
+        "{stderr}"
+    );
+}
+
+/// A name that breaks a rule is a usage mistake, reported with the rule,
+/// before ssh: an all-hex name would read as a session id.
+#[test]
+fn a_name_that_could_be_an_id_is_refused_with_the_rule() {
+    let (code, stderr) = refused_before_ssh(&["--new", "--name", "cafe", "no-such-host.invalid"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("session id"), "{stderr}");
 }

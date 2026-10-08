@@ -155,11 +155,10 @@ async fn serve(
 /// (switcher spec §2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Begin {
-    Session,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "`Choice::Lobby` starts one from Task 7 on")
-    )]
+    /// Registered as `name`, if given, with its shell started.
+    Session {
+        name: Option<oxutrm_proto::Name>,
+    },
     Lobby,
 }
 
@@ -176,18 +175,25 @@ pub(crate) struct Shell {
 /// over a socket pair, a lobby. A function of its own, apart from the fork
 /// and the sever, so the whole of it runs in a test.
 ///
-/// `Begin::Session` registers (under `meta.name`) and starts the shell;
+/// `Begin::Session` registers (under its name) and starts the shell;
 /// `Begin::Lobby` does neither until it is asked for `New`. Returns the
 /// shell's exit status, or `0` for a lobby that ended.
 pub(crate) async fn run_process(
     link: crate::link::Link,
     client_size: TermSize,
-    meta: SessionMeta,
+    mut meta: SessionMeta,
     registry: std::path::PathBuf,
     cfg: NetConfig,
     begin: Begin,
     shell: Shell,
 ) -> anyhow::Result<i32> {
+    let starts_shell = match begin {
+        Begin::Session { name } => {
+            meta.name = name.map(String::from);
+            true
+        }
+        Begin::Lobby => false,
+    };
     let presence = crate::host_session::Presence::default();
     let (cmds_tx, mut cmds) = tokio::sync::mpsc::channel(1);
     let (attached_tx, mut attaches) = tokio::sync::mpsc::channel(1);
@@ -205,7 +211,7 @@ pub(crate) async fn run_process(
     let mut session =
         HostSession::lobby(&shell.program, &shell.start, client_size, SCROLLBACK, link)?
             .with_presence(presence);
-    if begin == Begin::Session {
+    if starts_shell {
         // R13: registered, and its socket bound where the rung allows one.
         door.register()
             .context("recording the session in the registry")?;
@@ -267,7 +273,14 @@ pub(crate) mod fixtures {
         shell: Shell,
     ) -> Process {
         let (host, client) = crate::link::fixtures::link_pair().await;
-        let mut meta = crate::door::fixtures::meta(id, name);
+        // A session's name travels in its `Begin`, as `--new --name` sends it.
+        let begin = match begin {
+            Begin::Session { .. } => Begin::Session {
+                name: name.map(|n| oxutrm_proto::Name::parse(n).expect("a name")),
+            },
+            Begin::Lobby => Begin::Lobby,
+        };
+        let mut meta = crate::door::fixtures::meta(id, None);
         meta.size = SIZE;
         let task = tokio::spawn(run_process(
             host,
@@ -435,7 +448,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn killing_this_session_leaves_a_lobby_that_can_start_again() {
         let dir = tempfile::tempdir().unwrap();
-        let p = process(dir.path(), BUILD, Some("build"), Begin::Session, sh()).await;
+        let p = process(
+            dir.path(),
+            BUILD,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
         registry_holds(dir.path(), &[BUILD]).await;
 
         done(ask_over(p.client.sink.connection(), Request::Kill { id: id(BUILD) }).await);
@@ -478,8 +498,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn killing_a_sibling_ends_it_as_a_shell_that_exited() {
         let dir = tempfile::tempdir().unwrap();
-        let me = process(dir.path(), BUILD, Some("build"), Begin::Session, sh()).await;
-        let sibling = process(dir.path(), LOGS, Some("logs"), Begin::Session, sh()).await;
+        let me = process(
+            dir.path(),
+            BUILD,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let sibling = process(
+            dir.path(),
+            LOGS,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
         registry_holds(dir.path(), &[BUILD, LOGS]).await;
 
         done(ask_over(me.client.sink.connection(), Request::Kill { id: id(LOGS) }).await);
@@ -529,7 +563,7 @@ mod tests {
             &registry,
             BUILD,
             None,
-            Begin::Session,
+            Begin::Session { name: None },
             Shell {
                 program: script.to_str().unwrap().to_string(),
                 start: oxutrm_term::Start::default(),
@@ -556,8 +590,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rename_here_and_on_a_sibling_and_a_taken_name_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let me = process(dir.path(), BUILD, None, Begin::Session, sh()).await;
-        let _sibling = process(dir.path(), LOGS, Some("logs"), Begin::Session, sh()).await;
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
+        let _sibling = process(
+            dir.path(),
+            LOGS,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
         registry_holds(dir.path(), &[BUILD, LOGS]).await;
         let conn = me.client.sink.connection();
 
@@ -619,7 +660,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_request_for_a_session_that_is_not_there_is_refused_with_its_short_id() {
         let dir = tempfile::tempdir().unwrap();
-        let me = process(dir.path(), BUILD, None, Begin::Session, sh()).await;
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
         registry_holds(dir.path(), &[BUILD]).await;
         let why =
             refused(ask_over(me.client.sink.connection(), Request::Kill { id: id(LOGS) }).await);
@@ -629,7 +670,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_name_that_is_all_hex_never_reaches_the_session() {
         let dir = tempfile::tempdir().unwrap();
-        let me = process(dir.path(), BUILD, None, Begin::Session, sh()).await;
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
         registry_holds(dir.path(), &[BUILD]).await;
         // Written by hand: `Name` cannot hold it, so the line is malformed and
         // the door answers nothing.
@@ -673,7 +714,7 @@ mod tests {
             registry_dir.path(),
             BUILD,
             None,
-            Begin::Session,
+            Begin::Session { name: None },
             Shell {
                 program: script.to_str().unwrap().to_string(),
                 start: oxutrm_term::Start::login_in(home_dir(Some(home.clone().into_os_string()))),

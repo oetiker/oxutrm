@@ -71,10 +71,10 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         Some("host") => run_host(&args[1..]),
         Some("loopback") => run_loopback(&args[1..]),
-        // `--attach` and `--new` are `run_connect`'s own flags, not unknown
+        // `--attach`, `--new` and `--name` are `run_connect`'s own flags, not unknown
         // options: they come before the target, so they must reach it rather
         // than be caught by the catch-all below.
-        Some("--attach") | Some("--new") => connect::run_connect(args),
+        Some("--attach") | Some("--new") | Some("--name") => connect::run_connect(args),
         Some(other) if other.starts_with('-') => {
             eprintln!("oxutrm: unknown option {other:?}\nTry `oxutrm --help`.");
             std::process::exit(2);
@@ -94,7 +94,16 @@ fn run_host(args: &[String]) -> Result<()> {
         // Works today: it needs the registry and nothing else.
         Some("--list") => run_host_list(),
         Some("--connect") => run_host_connect(),
-        Some("--serve") => serve::run_host_serve(serve::Begin::Session),
+        Some("--serve") => match args.get(1..).unwrap_or_default() {
+            [] => serve::run_host_serve(serve::Begin::Session { name: None }),
+            [flag, name] if flag == "--name" => match oxutrm_proto::Name::parse(name) {
+                Ok(name) => serve::run_host_serve(serve::Begin::Session { name: Some(name) }),
+                Err(why) => Err(anyhow::anyhow!("--name {name:?}: {why}")),
+            },
+            _ => Err(anyhow::anyhow!(
+                "`oxutrm host --serve` takes nothing but `--name <name>`. Try `oxutrm host --help`."
+            )),
+        },
         Some("--attach") => match args.get(1) {
             Some(id) => run_host_attach(id),
             None => Err(anyhow::anyhow!(
@@ -175,7 +184,10 @@ fn run_host_connect() -> Result<()> {
     oxutrm_proto::write_signal(
         &mut stdout,
         &Signal::Sessions {
-            sessions: oxutrm_host::attach::summarize(&sessions),
+            list: sessions
+                .iter()
+                .filter_map(oxutrm_host::SessionMeta::offer)
+                .collect(),
         },
     )
     .context("offering the live sessions")?;
@@ -210,21 +222,41 @@ fn run_host_connect() -> Result<()> {
             }
         };
 
+    // A refusal goes back on this channel, because the client is still
+    // listening on it: a `Failed` it can read is worth more than an exit code
+    // it has to guess at.
+    let refuse = |reason: String| {
+        let _ = oxutrm_proto::write_signal(
+            &mut std::io::stdout(),
+            &Signal::Failed {
+                reason: reason.clone(),
+            },
+        );
+        Err(anyhow::anyhow!(reason))
+    };
     match choice {
-        Choice::New => serve::run_host_serve(serve::Begin::Session),
+        Choice::New { name } => {
+            // A taken name is refused before the fork and the exchange, so
+            // the client hears why instead of reaching a session that then
+            // fails to register. `Door::register` checks again under the
+            // same lock, for the race this leaves.
+            if let Some(n) = &name {
+                let dir = oxutrm_host::Registry::dir_at(&root.base);
+                let _lock = oxutrm_host::NamesLock::take(&dir)?;
+                if let Some(why) =
+                    oxutrm_host::name_refusal(&dir, n.as_str(), "").context("checking the name")?
+                {
+                    return refuse(why);
+                }
+            }
+            serve::run_host_serve(serve::Begin::Session { name })
+        }
+        Choice::Lobby => serve::run_host_serve(serve::Begin::Lobby),
         Choice::Attach { id } => {
-            // Refused HERE rather than inside the relay, because the client is
-            // still listening on this channel: a `Failed` it can read is worth
-            // more than an exit code it has to guess at.
+            let id = id.to_string();
+            // Refused HERE rather than inside the relay.
             if !sessions.iter().any(|m| m.session_id == id) {
-                let reason = format!("no such session on this host: {id}");
-                let _ = oxutrm_proto::write_signal(
-                    &mut std::io::stdout(),
-                    &Signal::Failed {
-                        reason: reason.clone(),
-                    },
-                );
-                return Err(anyhow::anyhow!(reason));
+                return refuse(format!("no such session on this host: {id}"));
             }
             run_host_attach(&id)
         }
@@ -478,6 +510,7 @@ USAGE
                               what is running, then serve or attach.
   oxutrm host --list          Sessions on this machine, oldest first.
   oxutrm host --serve         Create a session and hand it to a client.
+              [--name <name>] Name it.
   oxutrm host --attach <id>   Relay a new attach into a running session.
 
 --connect is not normally typed by hand either: it is what a client actually
@@ -513,12 +546,14 @@ oxutrm — a remote terminal that survives bad networks, changing IP addresses
 and NAT on both ends.
 
 USAGE
-  oxutrm [--attach <session-id>] [--new] <ssh-target>
-      Connect to that host. If a session of yours is already running
-      there it is resumed; with several, oxutrm asks which. --attach
-      names one directly, --new always starts a fresh session.
+  oxutrm [--attach <name|session-id>] [--new [--name <name>]] <ssh-target>
+      Connect to that host. With no session of yours running there, a
+      new one starts. With any running -- even one -- the session
+      selector opens, to switch to one, start, rename or kill one.
+      --attach goes straight to a session by its name or by the start
+      of its id; --new always starts a fresh one, named with --name.
 
-  oxutrm host --serve
+  oxutrm host --serve [--name <name>]
       Run the remote half. Spawned over SSH; not normally typed by hand.
 
   oxutrm host --list
@@ -586,7 +621,7 @@ mod tests {
     #[test]
     fn help_is_the_default_and_names_every_subcommand() {
         for needle in [
-            "oxutrm [--attach <session-id>] [--new] <ssh-target>",
+            "oxutrm [--attach <name|session-id>] [--new [--name <name>]] <ssh-target>",
             "oxutrm host --serve",
             "oxutrm host --list",
             "oxutrm host --attach",

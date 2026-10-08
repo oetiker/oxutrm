@@ -6369,7 +6369,7 @@ mod tests {
             &script,
             format!(
                 "#!/bin/sh\n{ASKED_SSH_G}\
-                 printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+                 printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
                  read -r choice\n\
                  exec sleep 300\n"
             ),

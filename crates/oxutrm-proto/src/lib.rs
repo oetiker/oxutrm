@@ -113,7 +113,7 @@ pub use open::{
     parse_answer, parse_line,
 };
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
-pub use signal::{Choice, MAX_SIGNAL_LINE, SessionSummary, Signal, read_signal, write_signal};
+pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{

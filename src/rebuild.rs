@@ -446,9 +446,10 @@ async fn one_attempt(
     if !ties.commitment.commit() {
         return AttemptOutcome::Retry("abandoned for the standby".to_owned());
     }
-    let choice = Choice::Attach {
-        id: session_id.to_owned(),
+    let Ok(id) = session_id.parse() else {
+        return AttemptOutcome::Definite(format!("{session_id:?} is not a session id"));
     };
+    let choice = Choice::Attach { id };
     if let Err(e) = channel.send(&Signal::Choose { choice }).await {
         return classify(target, &anyhow::Error::new(e));
     }
@@ -869,7 +870,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s\\n' '{{\"t\":\"Failed\",\"reason\":\"{reason}\"}}'\n"
         );
@@ -919,7 +920,7 @@ mod tests {
         let record = dir.path().join("choice.json");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s' \"$choice\" > '{}'\n",
             record.display()
@@ -968,7 +969,7 @@ mod tests {
         // Failed would spawn ssh every eight seconds until the user noticed.
         let outcome = attempt_against(
             fake_host_replying_failed("no such session on this host"),
-            "abc123",
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
         )
         .await;
         match outcome {
@@ -981,7 +982,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ssh_that_dies_is_retried() {
-        match attempt_against(fake_host_that_exits_immediately(), "abc123").await {
+        match attempt_against(
+            fake_host_that_exits_immediately(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await
+        {
             // The reason, and not merely the variant: `Retry` is what
             // `classify` returns for everything that is not one of the two
             // definite cases, so a `classify` that had stopped reading its
@@ -1000,7 +1006,12 @@ mod tests {
     /// saying so beats an ssh every eight seconds for ever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_remote_that_rejects_the_option_is_definite() {
-        match attempt_against(fake_host_rejecting_the_option(), "abc123").await {
+        match attempt_against(
+            fake_host_rejecting_the_option(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await
+        {
             AttemptOutcome::Definite(reason) => {
                 assert!(
                     reason.contains("bastion.example.net"),
@@ -1035,7 +1046,7 @@ mod tests {
                 std::time::Duration::from_millis(200),
                 &fake.launcher,
                 "bastion.example.net",
-                "abc123",
+                "3ff1218f5e0c4b7d9a1c2e3f40516273",
                 a_size(),
                 &test_config(),
                 &Ties::default(),
@@ -1076,7 +1087,7 @@ mod tests {
         let record = dir.path().join("choice.json");
         let body = format!(
             "#!/bin/sh\n\
-             printf '%s\\n' '{{\"t\":\"Sessions\",\"sessions\":[]}}'\n\
+             printf '%s\\n' '{{\"t\":\"Sessions\",\"list\":[]}}'\n\
              read -r choice\n\
              printf '%s' \"$choice\" > '{}'\n\
              exec sleep 300\n",
@@ -1087,8 +1098,11 @@ mod tests {
 
     /// A `Rebuild` that runs its attempts against `fake`, with one begun.
     fn rebuilding_against(fake: &FakeHost) -> Rebuild {
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         rebuild.begin(a_size(), tx, Instant::now());
         rebuild
@@ -1165,7 +1179,7 @@ mod tests {
                 rtt_ms: 38,
                 mtu: 1400,
             },
-            session_id: "abc123".to_owned(),
+            session_id: "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
             attach_id: 2,
             host_features: vec![],
         };
@@ -1261,7 +1275,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let body = "#!/bin/sh\n\
                     exec 0<&-\n\
-                    printf '%s\\n' '{\"t\":\"Sessions\",\"sessions\":[]}'\n\
+                    printf '%s\\n' '{\"t\":\"Sessions\",\"list\":[]}'\n\
                     exec sleep 300\n";
         FakeHost::new(dir, body)
     }
@@ -1279,8 +1293,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_attempt_commits_before_it_writes_its_attach() {
         let fake = fake_host_that_will_not_read_the_choice();
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         rebuild.begin(a_size(), tx, Instant::now());
 
@@ -1320,7 +1337,7 @@ mod tests {
     /// said about its configuration.
     async fn rebuild_arguments(config: &str) -> Vec<String> {
         let fake = fake_ssh_recording_its_arguments(config);
-        let _ = run_attempt(&fake, "abc123").await;
+        let _ = run_attempt(&fake, "3ff1218f5e0c4b7d9a1c2e3f40516273").await;
         std::fs::read_to_string(fake.path("args"))
             .expect("the fake ssh recorded no arguments")
             .lines()
@@ -1354,8 +1371,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_retuned_rebuild_runs_its_next_attempt_with_the_new_settings() {
         let fake = fake_ssh_recording_its_arguments("connecttimeout none");
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let cfg = oxutrm_net::NetConfig {
             enable_birthday: false,
             ..test_config()
@@ -1408,8 +1428,11 @@ mod tests {
     /// often each was asked `ssh -G`, and whether each carried the
     /// connect timeout.
     async fn two_attempts(fake: &FakeHost) -> (usize, [bool; 2]) {
-        let mut rebuild = Rebuild::new("bastion.example.net".to_owned(), "abc123".to_owned())
-            .via(fake.launcher.clone(), test_config());
+        let mut rebuild = Rebuild::new(
+            "bastion.example.net".to_owned(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        )
+        .via(fake.launcher.clone(), test_config());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut bounded = [false; 2];
         for b in &mut bounded {
@@ -1497,7 +1520,14 @@ mod tests {
     async fn an_attempt_asks_for_the_session_it_came_from() {
         // The side effect, not the return value: a rebuild that answered `New`
         // would silently start a second shell and look like it had worked.
-        let recorded = attempt_against_recording(fake_host_recording_the_choice(), "abc123").await;
-        assert_eq!(recorded, serde_json::json!({"c": "Attach", "id": "abc123"}));
+        let recorded = attempt_against_recording(
+            fake_host_recording_the_choice(),
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        )
+        .await;
+        assert_eq!(
+            recorded,
+            serde_json::json!({"c": "Attach", "id": "3ff1218f5e0c4b7d9a1c2e3f40516273"})
+        );
     }
 }
