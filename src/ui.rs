@@ -298,10 +298,6 @@ impl Ui {
 
     /// What the selector needs to know about the session: whether it is in
     /// a lobby, and whether a request is in flight. Set before every read.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the session uses it from Task 12 on")
-    )]
     pub(crate) fn set_switcher(&mut self, lobby: bool, busy: bool) {
         self.lobby = lobby;
         self.busy = busy;
@@ -320,20 +316,12 @@ impl Ui {
         &self.selector
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the session uses it from Task 12 on")
-    )]
     pub(crate) fn selector_mut(&mut self) -> &mut crate::selector::Selector {
         &mut self.selector
     }
 
     /// Close the popup, wherever it was: a switch landed, or a lobby
     /// became a session.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the session uses it from Task 12 on")
-    )]
     pub(crate) fn close_popup(&mut self) {
         self.leave_config();
         self.mode = Mode::Closed;

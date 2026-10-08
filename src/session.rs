@@ -387,6 +387,12 @@ pub struct ClientSession {
     sessions: Vec<oxutrm_proto::SessionEntry>,
     /// What an attach exchange of the switcher's runs with: `apply`'s.
     net: oxutrm_net::NetConfig,
+    /// A connect-time lobby's selector is still to open: once the splash
+    /// is down (switcher spec §3.1).
+    open_selector: bool,
+    /// The selector wants the list, but another request was out when it
+    /// asked: fetched once that one is answered.
+    list_owed: bool,
 }
 
 /// The startup splash while it shows; the picture is
@@ -539,6 +545,8 @@ impl ClientSession {
             asked: None,
             sessions: Vec::new(),
             net: oxutrm_net::NetConfig::default(),
+            open_selector: false,
+            list_owed: false,
         })
     }
 
@@ -655,8 +663,11 @@ impl ClientSession {
     }
 
     /// Start in a lobby: the connect chose `Lobby` (switcher spec §3.1).
+    ///
+    /// The selector opens over the blank screen once the splash is down.
     pub(crate) fn with_lobby(mut self) -> ClientSession {
         self.in_lobby = true;
+        self.open_selector = true;
         self
     }
 
@@ -677,10 +688,6 @@ impl ClientSession {
     }
 
     /// Whether a request is waiting or in flight.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the selector uses it from Task 12 on")
-    )]
     pub(crate) fn asking(&self) -> bool {
         self.asking.is_some() || self.asked.is_some()
     }
@@ -730,10 +737,31 @@ impl ClientSession {
     /// runs on, or its standby, changed under the loop -- a switch, a new
     /// sibling, a kill into a lobby -- and the loop must follow.
     pub(crate) fn answered(&mut self, a: crate::switcher::Answered, now: Instant) -> Result<bool> {
+        let moved = self.take_answer(a, now)?;
+        // A list the selector asked for while this request was out: its
+        // turn now. Whatever this answer was -- even one from a link a
+        // rebuild has since replaced -- the list then shows what is there.
+        if std::mem::take(&mut self.list_owed) && self.ui.mode() == Mode::Sessions {
+            self.ask(crate::switcher::Ask::Sessions);
+        }
+        Ok(moved)
+    }
+
+    /// The selector wants the list: asked now, or once the request out is
+    /// answered.
+    fn fetch_list(&mut self) {
+        if !self.ask(crate::switcher::Ask::Sessions) {
+            self.list_owed = true;
+        }
+    }
+
+    /// What `answered` does with each answer.
+    fn take_answer(&mut self, a: crate::switcher::Answered, now: Instant) -> Result<bool> {
         use crate::switcher::{Answered, Ask};
         let asked = self.asked.take();
         match a {
             Answered::Sessions(list) => {
+                self.ui.selector_mut().set_rows(list.clone());
                 self.sessions = list;
                 Ok(false)
             }
@@ -747,6 +775,8 @@ impl ClientSession {
                 };
                 self.moved(*e, now)?;
                 self.activity.record_shown(Kind::Session, &label, &label);
+                // The selector closes: the user is in the new shell.
+                self.ui.close_popup();
                 Ok(true)
             }
             Answered::Started(entry) => {
@@ -766,11 +796,15 @@ impl ClientSession {
                     None => format!("new session {}", entry.id.short()),
                 };
                 self.activity.record_shown(Kind::Session, &label, &label);
+                self.ui.close_popup();
                 Ok(false)
             }
             Answered::Killed(id) => {
                 let label = format!("killed {}", self.label_of(&id));
                 self.activity.record_shown(Kind::Session, &label, &label);
+                // The list changed: fetched again, the selector staying
+                // open -- without the `this` row if that was this session.
+                self.fetch_list();
                 if Some(id) != self.here() {
                     return Ok(false);
                 }
@@ -794,6 +828,7 @@ impl ClientSession {
                     None => format!("{} has no name now", entry.id.short()),
                 };
                 self.activity.record_shown(Kind::Session, &label, &label);
+                self.fetch_list();
                 Ok(false)
             }
             Answered::Failed(why) => {
@@ -810,6 +845,11 @@ impl ClientSession {
                     &format!("{what} failed: {why}"),
                     &format!("{what} failed"),
                 );
+                // Under the list, as one line; the detail is in client.log.
+                self.ui.selector_mut().fail(format!(
+                    "{what} failed: {}",
+                    oxutrm_client::summarised(&why)
+                ));
                 Ok(false)
             }
         }
@@ -1281,6 +1321,7 @@ impl ClientSession {
             self.paint(out, "painting the screen after the splash")?;
         }
         let phase = self.link_state.phase_now();
+        self.ui.set_switcher(self.in_lobby, self.asking());
         let routed = self.ui.keys(keys, phase, now);
         if !routed.to_host.is_empty() {
             self.turn(&routed.to_host, out)?;
@@ -1315,8 +1356,17 @@ impl ClientSession {
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
             Some(Command::Config(c)) => self.config_command(c),
+            // `s` while a request is out: the list follows its answer. The
+            // selector makes no other request while one is out (`busy`);
+            // should one come anyway, the line under the list says why
+            // nothing happens rather than dropping it unsaid.
+            Some(Command::Ask(crate::switcher::Ask::Sessions)) => self.fetch_list(),
             Some(Command::Ask(a)) => {
-                self.ask(a);
+                if !self.ask(a) {
+                    self.ui
+                        .selector_mut()
+                        .fail(crate::selector::BUSY.to_string());
+                }
             }
             None => {}
         }
@@ -1352,6 +1402,13 @@ impl ClientSession {
     /// rarely and costs one comparison otherwise; a change of phase is
     /// reported the lap it happens.
     fn layer_at(&mut self, now: Instant) -> Option<Popup> {
+        // A connect-time lobby: the selector, once the splash is down.
+        if self.open_selector && self.splash.is_none() {
+            self.open_selector = false;
+            self.ui.set_switcher(self.in_lobby, self.asking());
+            self.ui.open_sessions();
+            self.fetch_list();
+        }
         let owed = self.input_tx.current().seq() != self.screen_rx.peer_ack();
         let phase = self.link_state.evaluate(now, owed);
         match self.ui.tick(phase, now) {
@@ -1630,6 +1687,16 @@ impl ClientSession {
                 Kind::Rebuild,
                 &format!("landed via {label} after the old link came back"),
             );
+        }
+        // From a lobby a rebuild lands in a fresh one, with an id of its
+        // own; the selector, still open, lists what is there now.
+        if self.in_lobby {
+            if let Some(id) = self.identity.as_mut() {
+                id.session_id = e.session_id.clone();
+            }
+            if self.ui.mode() == Mode::Sessions {
+                self.fetch_list();
+            }
         }
         self.path = Some(e.path);
         Ok(())
@@ -10012,12 +10079,20 @@ mod tests {
 
     /// Send the request the client has waiting, as the loop does, and hand
     /// the answer back to it. Returns what `answered` returned.
+    ///
+    /// A list the answer asks for in turn -- after a kill or a rename -- is
+    /// fetched too, as the loop would.
     async fn ask_now(c: &mut ClientSession, a: crate::switcher::Ask) -> bool {
         assert!(c.ask(a), "another request was in flight");
-        let a = c.take_ask().expect("the request just asked");
-        let answered =
-            crate::switcher::ask(c.link.sink.connection().clone(), a, c.size, &c.net.clone()).await;
-        c.answered(answered, Instant::now()).expect("answered")
+        let mut first = None;
+        while let Some(a) = c.take_ask() {
+            let answered =
+                crate::switcher::ask(c.link.sink.connection().clone(), a, c.size, &c.net.clone())
+                    .await;
+            let moved = c.answered(answered, Instant::now()).expect("answered");
+            first.get_or_insert(moved);
+        }
+        first.expect("the request just asked")
     }
 
     fn id_of(s: &str) -> oxutrm_proto::SessionId {
@@ -10283,8 +10358,240 @@ mod tests {
         assert!(!ask_now(&mut client, rename(name("logs"))).await);
         let (_, text) = last_entry(&client).unwrap();
         assert!(
-            text.starts_with("renaming 3ff1218f failed: ") && text.contains("taken"),
+            text.starts_with("renaming build failed: ") && text.contains("taken"),
             "{text}"
         );
+    }
+
+    /// The spec's success line, from a connect: a bare connect to a host
+    /// with a session lands in a lobby, the selector opens over its blank
+    /// screen, and `⏎` switches to the session listed. That session has a
+    /// client of its own, so it is `in use`: the switch asks first, and the
+    /// other client is taken over (switcher spec §3.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_opens_the_selector_and_enter_switches_into_the_session() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let lobby = process(dir.path(), BUILD_ID, None, Begin::Lobby, sh()).await;
+        registry_holds(dir.path(), &[LOGS_ID]).await;
+
+        let client = client_on(lobby.client, BUILD_ID).with_lobby();
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move { client.run_on(keys, &mut out).await }
+        });
+
+        wait_for_screen(&out, SIZE, "sessions on thinlinc", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "\u{25b8} logs", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "q quit", Duration::from_secs(10)).await;
+        wait_for_screen(&out, SIZE, "in use", Duration::from_secs(10)).await;
+        typing.write_all(b"\r").expect("type");
+        wait_for_screen(
+            &out,
+            SIZE,
+            "take over logs from its other client? y/n",
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(crate::ui::ANSWER_GUARD + Duration::from_millis(100)).await;
+        typing.write_all(b"y").expect("type");
+        wait_off_screen(&out, SIZE, "sessions on thinlinc", Duration::from_secs(20)).await;
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            logs.client.sink.connection().closed(),
+        )
+        .await
+        .expect("the other client was not taken over");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.reason.as_ref() == TAKEN_OVER),
+            "{reason:?}"
+        );
+        typing.write_all(b"exit 7\n").expect("type");
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 7, "the shell that exited was logs'");
+        assert_eq!(logs.task.await.unwrap().unwrap(), 7);
+        // The lobby the client left ended with its link.
+        let ended = tokio::time::timeout(Duration::from_secs(10), lobby.task)
+            .await
+            .expect("the lobby outlived the client's move");
+        assert_eq!(ended.unwrap().unwrap(), 0);
+    }
+
+    /// Killing the session you are in: the selector stays, without `this`,
+    /// and `q` there ends the client -- and the lobby with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn killing_this_session_from_the_selector_keeps_it_open_as_a_lobby() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+
+        let client = client_on(build.client, BUILD_ID);
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move {
+                let code = client.run_on(keys, &mut out).await;
+                (code, client)
+            }
+        });
+
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, SIZE, "s sessions", Duration::from_secs(10)).await;
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, SIZE, "\u{25b8} build", Duration::from_secs(10)).await;
+        typing.write_all(b"x").expect("type");
+        wait_for_screen(&out, SIZE, "kill build? y/n", Duration::from_secs(10)).await;
+        tokio::time::sleep(crate::ui::ANSWER_GUARD + Duration::from_millis(100)).await;
+        typing.write_all(b"y").expect("type");
+        wait_for_screen(&out, SIZE, "q quit", Duration::from_secs(15)).await;
+        wait_off_screen(&out, SIZE, "this", Duration::from_secs(10)).await;
+        registry_holds(dir.path(), &[LOGS_ID]).await;
+
+        typing.write_all(b"q").expect("type");
+        let (code, client) = tokio::time::timeout(Duration::from_secs(10), looping)
+            .await
+            .expect("q in the lobby did not end the client")
+            .unwrap();
+        assert_eq!(code.unwrap(), 0);
+        assert!(client.in_lobby());
+        let ended = tokio::time::timeout(Duration::from_secs(10), build.task)
+            .await
+            .expect("the lobby outlived its client's quit");
+        assert_eq!(ended.unwrap().unwrap(), 0);
+    }
+
+    /// The shell exiting on its own while the selector is open ends the
+    /// client with its status, exactly as without the selector: only a kill
+    /// from the selector leads to a lobby (switcher spec §1.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_that_exits_while_the_selector_is_open_ends_the_client() {
+        use crate::serve::fixtures::{SIZE, process, registry_holds};
+        use crate::serve::{Begin, Shell};
+        use std::os::unix::fs::PermissionsExt as _;
+        let scripts = tempfile::tempdir().unwrap();
+        let go = scripts.path().join("go");
+        let script = scripts.path().join("quits");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.1; done\nexit 3\n",
+                go.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            Shell {
+                program: script.to_str().unwrap().to_string(),
+                start: oxutrm_term::Start::default(),
+                sibling: None,
+            },
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+
+        let client = client_on(build.client, BUILD_ID);
+        let (keys, mut typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move { client.run_on(keys, &mut out).await }
+        });
+        typing.write_all(&[CTRL_BACKSLASH]).expect("type");
+        wait_for_screen(&out, SIZE, "s sessions", Duration::from_secs(10)).await;
+        typing.write_all(b"s").expect("type");
+        wait_for_screen(&out, SIZE, "\u{25b8} build", Duration::from_secs(10)).await;
+        std::fs::write(&go, b"").unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(15), looping)
+            .await
+            .expect("the client outlived its shell")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 3);
+    }
+
+    /// `s` while another request is still out: the selector opens, and the
+    /// list it waits for is fetched as soon as that request is answered --
+    /// not dropped, which left an empty list under `+ new session`.
+    #[tokio::test]
+    async fn s_while_a_request_is_out_fetches_the_list_once_it_is_answered() {
+        use crate::switcher::{Answered, Ask};
+        let (_host, mut session) = pair("/bin/sh").await;
+        assert!(session.ask(Ask::Kill { id: id_of(LOGS_ID) }));
+        assert_eq!(session.take_ask(), Some(Ask::Kill { id: id_of(LOGS_ID) }));
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert!(session.ui.selector().loading());
+        assert_eq!(session.take_ask(), None, "nothing can go out yet");
+
+        session
+            .answered(
+                Answered::Failed("no such session".to_string()),
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            session.take_ask(),
+            Some(Ask::Sessions),
+            "the list the selector waits for was never fetched"
+        );
+    }
+
+    /// While the list is on its way the cursor sits on `+ new session`; a
+    /// quick `⏎` there asks nothing, and the line under the list says why.
+    #[tokio::test]
+    async fn enter_while_the_list_is_on_its_way_asks_nothing() {
+        use crate::switcher::Ask;
+        let (_host, mut session) = pair("/bin/sh").await;
+        type_in(&mut session, &[crate::ui::PREFIX]);
+        type_in(&mut session, b"s");
+        assert_eq!(session.take_ask(), Some(Ask::Sessions));
+        type_in(&mut session, b"\r");
+        assert_eq!(session.ui.mode(), Mode::Sessions);
+        assert_eq!(session.take_ask(), None, "a new session was asked for");
+        assert_eq!(session.ui.selector().note(), Some(crate::selector::BUSY));
     }
 }
