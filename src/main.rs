@@ -244,11 +244,16 @@ fn run_host_connect() -> Result<()> {
             // same lock, for the race this leaves.
             if let Some(n) = &name {
                 let dir = oxutrm_host::Registry::dir_at(&root.base);
-                let _lock = oxutrm_host::NamesLock::take(&dir)?;
-                if let Some(why) =
-                    oxutrm_host::name_refusal(&dir, n.as_str(), "").context("checking the name")?
-                {
-                    return refuse(why);
+                // Every way this can fail goes back to the client as a
+                // reason, not as a channel that simply ends.
+                let _lock = match oxutrm_host::NamesLock::take(&dir) {
+                    Ok(lock) => lock,
+                    Err(e) => return refuse(format!("{e:#}")),
+                };
+                match oxutrm_host::name_refusal(&dir, n.as_str(), "") {
+                    Ok(None) => {}
+                    Ok(Some(why)) => return refuse(why),
+                    Err(e) => return refuse(format!("checking the name: {e:#}")),
                 }
             }
             serve::run_host_serve(serve::Begin::Session { name })

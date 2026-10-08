@@ -81,10 +81,7 @@ fn decide_attach(offered: &[OfferEntry], x: &str) -> Decision {
         [one] => attach_to(one),
         many => Decision::Refused(format!(
             "{x:?} begins more than one session's id: {}. Give more characters.",
-            many.iter()
-                .map(|e| e.id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            many.iter().map(|e| label(e)).collect::<Vec<_>>().join(", ")
         )),
     }
 }
@@ -238,9 +235,11 @@ mod tests {
 
     #[test]
     fn an_ambiguous_prefix_is_refused_listing_the_candidates() {
-        let offered = [offer(BUILD, None, true), offer(LOGS, None, true)];
+        let offered = [offer(BUILD, Some("build"), true), offer(LOGS, None, true)];
         let why = refused(decide(&offered, Some("3ff1"), false, None));
         assert!(why.contains(BUILD) && why.contains(LOGS), "{why}");
+        // Names as well as ids (switcher spec §3.1).
+        assert!(why.contains(&format!("build ({BUILD})")), "{why}");
         // One more character settles it.
         assert_eq!(decide(&offered, Some("3ff12"), false, None), attach(BUILD));
     }
