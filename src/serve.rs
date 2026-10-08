@@ -134,18 +134,19 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         oxutrm_host::RegistryGuard::register_in(&oxutrm_host::Registry::dir_at(&root.base), &meta)
             .context("recording the session in the registry")?;
 
-    // `RegistryGuard` becomes an `Arc` here because the listener task and this
+    // `RegistryGuard` becomes an `Arc` here because the door and this
     // function both need it, and its `Drop` removes the session directory: the
     // directory must outlive both, which is exactly what an `Arc` says.
     let guard = std::sync::Arc::new(guard);
     let shell = meta.shell.clone();
-    let meta = std::sync::Arc::new(tokio::sync::Mutex::new(meta));
+    let presence = crate::host_session::Presence::default();
 
     // The socket path has always been computed and registered. Nothing has
     // ever bound it until now -- and only when this session severed from ssh:
     // rung 4 keeps `sock` false, because its QUIC traffic runs inside the ssh
     // connection and a socket bound anyway would offer an attach that cannot
     // outlive it.
+    let registry = oxutrm_host::Registry::dir_at(&root.base);
     let listening = if sock {
         let path = guard.socket_path();
         oxutrm_host::check_socket_path_length(&path)?;
@@ -153,18 +154,28 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
             .with_context(|| format!("binding the session socket at {}", path.display()))?;
         Some(open_doors(
             listener,
+            registry,
+            meta,
             std::sync::Arc::clone(&guard),
-            std::sync::Arc::clone(&meta),
+            presence.clone(),
             cfg,
             attached.link.sink.connection().clone(),
         ))
     } else {
-        // No socket, so no listener to run a standby's exchange. Such a
+        // No socket, so no attach loop to run a standby's exchange. Such a
         // session (rung 4, whose QUIC runs inside ssh) has nothing a standby
         // could outlive it through, but its hello advertised a control stream
-        // all the same, so the link still serves one: probes are answered and
-        // a standby request is refused at once rather than left waiting.
-        crate::control::serve_control_without_door(attached.link.sink.connection().clone());
+        // all the same, so the link is served through a door with no attach
+        // loop: probes are answered and a standby request ends at once
+        // rather than being left waiting.
+        let door = crate::door::Door::new(
+            registry,
+            meta,
+            Some(std::sync::Arc::clone(&guard)),
+            presence.clone(),
+            None,
+        );
+        crate::control::serve_control(attached.link.sink.connection().clone(), door);
         None
     };
 
@@ -182,15 +193,18 @@ async fn serve(detached: oxutrm_host::Detached, root: &RegistryRoot) -> anyhow::
         SCROLLBACK,
         attached.link,
     )
-    .context("starting the shell")?;
+    .context("starting the shell")?
+    .with_presence(presence);
 
     // R15, then R16: dropping the guard takes the session directory with it,
     // so a session that exits cleanly leaves nothing for `--list` to prune.
     let code = match listening {
-        Some((task, mut attach_rx)) => {
+        Some((tasks, mut attach_rx)) => {
             let code = session.run_with_attaches(&mut attach_rx).await;
             // Abort AND await, and why both, is `close_the_door`'s own note.
-            crate::listener::close_the_door(task).await;
+            for task in tasks {
+                crate::listener::close_the_door(task).await;
+            }
             code
         }
         None => session.run().await,
@@ -207,38 +221,42 @@ pub(crate) fn home_dir(home: Option<std::ffi::OsString>) -> Option<std::path::Pa
 }
 
 /// The two ways into a severed session after its first attach: the Unix
-/// socket, and the door that the first link's control stream knocks on.
+/// socket, and the control stream of every link, both through one door
+/// ([`crate::door`]).
 ///
-/// Returns the listener task and where completed attaches arrive. A function
-/// of its own so the first link's control server, which nothing else starts,
-/// can be reached from a test: every later link's is started by the listener
-/// as it hands the link over.
+/// Returns the door's two tasks -- the socket's accept loop and the serial
+/// attach loop -- and where completed attaches arrive. A function of its own
+/// so the first link's control server, which nothing else starts, can be
+/// reached from a test: every later link's is started by the attach loop as
+/// it hands the link over.
 pub(crate) fn open_doors(
     listener: tokio::net::UnixListener,
+    registry: std::path::PathBuf,
+    meta: SessionMeta,
     guard: std::sync::Arc<oxutrm_host::RegistryGuard>,
-    meta: std::sync::Arc<tokio::sync::Mutex<SessionMeta>>,
+    presence: crate::host_session::Presence,
     cfg: NetConfig,
     first: quinn::Connection,
 ) -> (
-    tokio::task::JoinHandle<()>,
+    [tokio::task::JoinHandle<()>; 2],
     tokio::sync::mpsc::Receiver<crate::attach_exchange::Attached>,
 ) {
     let (attach_tx, attach_rx) = tokio::sync::mpsc::channel(1);
-    // The door: standby requests from the control streams, served by the
-    // same loop as the socket.
-    let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-    crate::control::serve_control(first, door_tx.clone());
-    let task = tokio::spawn(crate::listener::serve_attaches(
+    let (queue, inbox) = crate::door::attach_queue();
+    let door = crate::door::Door::new(registry, meta, Some(guard), presence, Some(queue));
+    crate::control::serve_control(first, std::sync::Arc::clone(&door));
+    let accept = tokio::spawn(crate::listener::accept_doors(
         listener,
-        guard,
-        meta,
+        std::sync::Arc::clone(&door),
+    ));
+    let attaches = tokio::spawn(crate::listener::serve_attaches(
+        door,
         cfg,
         crate::listener::ATTACH_TIMEOUT,
-        door_rx,
-        door_tx,
+        inbox,
         attach_tx,
     ));
-    (task, attach_rx)
+    ([accept, attaches], attach_rx)
 }
 
 #[cfg(test)]

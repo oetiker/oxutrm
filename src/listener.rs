@@ -42,55 +42,75 @@ use crate::control::{DoorRequest, Role};
 /// never the thing it cuts off.
 pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Serve second attaches for the life of the session.
+/// Accept on the session's Unix socket for the life of the session, and
+/// hand every connection to the door ([`crate::door::serve`]) on a task of
+/// its own. Never returns on its own: it is spawned, and stopped with
+/// [`close_the_door`].
+///
+/// A task per connection is the point (switcher spec §2.2): a connection
+/// that stalls before saying what it wants holds its own task, never the
+/// accept, and a `Myself` is answered while an attach is under way.
+pub(crate) async fn accept_doors(
+    listener: tokio::net::UnixListener,
+    door: std::sync::Arc<crate::door::Door>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((s, _)) => {
+                let (r, w) = s.into_split();
+                tokio::spawn(crate::door::serve(
+                    std::sync::Arc::clone(&door),
+                    crate::door::Via::Socket,
+                    tokio::io::BufReader::new(r),
+                    w,
+                ));
+            }
+            // A failed accept is not a reason to stop answering the door.
+            Err(_) => tokio::task::yield_now().await,
+        }
+    }
+}
+
+/// Run attaches for the life of the session, one at a time.
 ///
 /// Never returns on its own: it is spawned, and dropped when the session ends.
 ///
-/// `doors` brings standby requests from the control streams; `door_tx` is its
-/// sender, handed to the control server started on every link this hands the
-/// session, so that link can carry the next request.
+/// `inbox` brings what the doors were asked to attach: primaries -- an
+/// ssh-relayed `--attach`, a client switching here -- and standbys from a
+/// client's control stream. Each completed link goes to the session on `tx`,
+/// and gets a control server of its own through `door`, so it can carry the
+/// next request.
 ///
 /// `attach_timeout` is a parameter rather than a constant read here so the
 /// guard for it can be exercised in a second instead of in ninety. It is not a
 /// knob: the one production call site passes [`ATTACH_TIMEOUT`], and there is
 /// no flag, environment variable or configuration field behind it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is a distinct thing the loop is handed once; a struct \
-              around them would only be a second name for this signature"
-)]
 pub(crate) async fn serve_attaches(
-    listener: tokio::net::UnixListener,
-    guard: std::sync::Arc<oxutrm_host::RegistryGuard>,
-    meta: std::sync::Arc<tokio::sync::Mutex<SessionMeta>>,
+    door: std::sync::Arc<crate::door::Door>,
     cfg: NetConfig,
     attach_timeout: Duration,
-    mut doors: tokio::sync::mpsc::Receiver<DoorRequest>,
-    door_tx: tokio::sync::mpsc::Sender<DoorRequest>,
+    mut inbox: crate::door::AttachInbox,
     tx: tokio::sync::mpsc::Sender<Attached>,
 ) {
-    // A socket attach that pre-empted a standby's exchange, served next.
-    let mut preempting: Option<tokio::net::UnixStream> = None;
+    // The exchange's working record: `begin_attach` moves its generation at
+    // R4, before the exchange can fail. Seeded from the door's record, which
+    // is what the session's first attach already wrote.
+    let mut meta: SessionMeta = door.meta();
+    // A primary that pre-empted a standby's exchange, served next.
+    let mut preempting: Option<DoorRequest> = None;
     loop {
-        // Two ways in, one door. The Unix socket brings ssh-relayed attaches
-        // (primary: newest attach wins); a control stream brings a standby.
-        // Both are served here, serially, under the one meta lock, for the
-        // reason the comment below gives: two concurrent exchanges would both
-        // bump the generation and race to hand the session a link.
-        //
-        // `doors` never closes while this runs, because `door_tx` is held
-        // right here; the `Some` pattern is only there to say so.
-        let (reader, writer, role): Pipes = match preempting.take() {
-            Some(s) => primary_pipes(s),
+        // A primary first: newest attach wins among primaries by running in
+        // turn, and a standby is only an insurance policy.
+        let req = match preempting.take() {
+            Some(r) => r,
             None => tokio::select! {
-                r = listener.accept() => match r {
-                    Ok((s, _)) => primary_pipes(s),
-                    // A failed accept is not a reason to stop answering the door.
-                    Err(_) => continue,
-                },
-                Some(d) = doors.recv() => (d.reader, d.writer, d.role),
+                biased;
+                Some(r) = inbox.primary.recv() => r,
+                Some(r) = inbox.standby.recv() => r,
+                else => return,
             },
         };
+        let role = req.role;
 
         // One attach at a time, deliberately. Two concurrent exchanges would
         // both bump the generation and race to hand the session a link, and
@@ -98,32 +118,31 @@ pub(crate) async fn serve_attaches(
         //
         // Which is exactly why the attempt is bounded: serial and unbounded
         // means one stalled peer closes the door for the life of the session.
-        let mut m = meta.lock().await;
         let exchange = tokio::time::timeout(
             attach_timeout,
-            crate::attach_exchange::run_attach_exchange(reader, writer, &mut m, &cfg),
+            crate::attach_exchange::run_attach_exchange(req.reader, req.writer, &mut meta, &cfg),
         );
         // A standby gives way to a primary. The standby is an insurance
-        // policy on a link that still works; a socket attach is the client's
-        // ssh rebuild, or a user taking the session over, and either one is
-        // the thing that matters now. A standby whose control stream went
-        // silent would otherwise hold the door for the whole of
-        // `attach_timeout`, longer than a rebuild is prepared to wait. The
-        // dropped attempt is a failed attempt like any other: the registry is
-        // not written and the session never hears of it. A primary is never
-        // pre-empted: newest attach wins among primaries by running in turn.
+        // policy on a link that still works; a primary is the client's ssh
+        // rebuild, a user taking the session over, or a client switching
+        // here, and any of them is the thing that matters now. A standby
+        // whose control stream went silent would otherwise hold the loop for
+        // the whole of `attach_timeout`, longer than a rebuild is prepared to
+        // wait. The dropped attempt is a failed attempt like any other: the
+        // registry is not written and the session never hears of it. A
+        // primary is never pre-empted.
         let outcome = if role == Role::Standby {
             tokio::select! {
                 o = exchange => o,
-                Ok((s, _)) = listener.accept() => {
-                    preempting = Some(s);
+                Some(r) = inbox.primary.recv() => {
+                    preempting = Some(r);
                     continue;
                 }
             }
         } else {
             exchange.await
         };
-        let attached = match outcome {
+        let mut attached = match outcome {
             Ok(Ok(a)) => a,
             // The attempt failed. The running session is untouched: it never
             // heard about this, which is the whole point of the arm firing
@@ -131,9 +150,9 @@ pub(crate) async fn serve_attaches(
             Ok(Err(_)) => continue,
             // A timed-out attempt is a failed attempt and nothing more: the
             // registry is not written, the session never hears about it, and
-            // the door is open again on the next lap. Said aloud on stderr,
-            // because "the socket stopped answering" is otherwise indis-
-            // tinguishable from a wedged session.
+            // the loop takes the next request. Said aloud on stderr, because
+            // "the socket stopped answering" is otherwise indistinguishable
+            // from a wedged session.
             Err(_) => {
                 eprintln!(
                     "oxutrm: an attach attempt got no further than {}s and was \
@@ -143,12 +162,9 @@ pub(crate) async fn serve_attaches(
                 continue;
             }
         };
-        // `update`'s own doc: "after every attach, because attach_id moves".
-        let _ = guard.update(&m);
-        drop(m);
+        door.record_attach(&meta);
 
         // The exchange cannot know why it was run; the way in does.
-        let mut attached = attached;
         attached.role = role;
         let conn = attached.link.sink.connection().clone();
 
@@ -156,29 +172,12 @@ pub(crate) async fn serve_attaches(
             // The session is gone; so is the reason to keep listening.
             return;
         }
-        // Every link the session is handed can carry the next standby
-        // request and answer probes. The server dies with the connection.
-        // Started only once the session has the link, so a link nobody took
-        // is not held open by a server of its own.
-        crate::control::serve_control(conn, door_tx.clone());
+        // Every link the session is handed can carry the next request and
+        // answer probes. The server dies with the connection. Started only
+        // once the session has the link, so a link nobody took is not held
+        // open by a server of its own.
+        crate::control::serve_control(conn, std::sync::Arc::clone(&door));
     }
-}
-
-/// An attach's two pipes, and what the attach is for.
-type Pipes = (
-    Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
-    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-    Role,
-);
-
-/// The pipes of an attach that came in over the Unix socket.
-fn primary_pipes(s: tokio::net::UnixStream) -> Pipes {
-    let (r, w) = s.into_split();
-    (
-        Box::new(tokio::io::BufReader::new(r)),
-        Box::new(w),
-        Role::Primary,
-    )
 }
 
 /// Stop answering the door once the shell has exited.
@@ -204,6 +203,9 @@ pub(crate) async fn close_the_door(task: tokio::task::JoinHandle<()>) {
 mod tests {
     use super::*;
     use crate::attach_exchange::fixtures::{fresh_meta, stun_free};
+    use crate::door::{AttachQueue, Door, attach_queue};
+    use oxutrm_host::signalling::write_line_async;
+    use oxutrm_proto::{Open, Request};
 
     /// Long enough that a live loop always answers, short enough that a dead
     /// one does not hold the suite up. Nothing real waits on it: with
@@ -213,294 +215,227 @@ mod tests {
     /// How long "nothing arrived" is observed for.
     const QUIET: Duration = Duration::from_millis(500);
 
-    /// Connect, and read what the accept loop says back.
+    /// A session's doors as `serve.rs` opens them: registered as `meta` in a
+    /// temp registry, its socket accepted on, its attach loop running.
+    struct Doors {
+        _dir: tempfile::TempDir,
+        registry: std::path::PathBuf,
+        sock: std::path::PathBuf,
+        door: Option<std::sync::Arc<Door>>,
+        queue: AttachQueue,
+        guard_dir: std::path::PathBuf,
+        rx: tokio::sync::mpsc::Receiver<Attached>,
+        accept: tokio::task::JoinHandle<()>,
+        attaches: tokio::task::JoinHandle<()>,
+    }
+
+    fn doors(meta: SessionMeta, attach_timeout: Duration) -> Doors {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = dir.path().to_path_buf();
+        let guard = std::sync::Arc::new(
+            oxutrm_host::RegistryGuard::register_in(&registry, &meta).expect("register"),
+        );
+        let sock = guard.socket_path();
+        let guard_dir = guard.dir().to_path_buf();
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let (queue, inbox) = attach_queue();
+        let door = Door::new(
+            registry.clone(),
+            meta,
+            Some(guard),
+            crate::host_session::Presence::default(),
+            Some(queue.clone()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let accept = tokio::spawn(accept_doors(listener, std::sync::Arc::clone(&door)));
+        let attaches = tokio::spawn(serve_attaches(
+            std::sync::Arc::clone(&door),
+            stun_free(),
+            attach_timeout,
+            inbox,
+            tx,
+        ));
+        Doors {
+            _dir: dir,
+            registry,
+            sock,
+            door: Some(door),
+            queue,
+            guard_dir,
+            rx,
+            accept,
+            attaches,
+        }
+    }
+
+    /// Connect, ask for a primary attach, and return the stream's halves.
+    async fn open_attach(
+        sock: &std::path::Path,
+    ) -> (
+        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
+        let stream = tokio::net::UnixStream::connect(sock)
+            .await
+            .expect("connecting to the session socket");
+        let (r, mut w) = stream.into_split();
+        write_line_async(
+            &mut w,
+            &Open::new(Request::Attach {
+                role: Role::Primary,
+            }),
+        )
+        .await
+        .expect("asking to attach");
+        (tokio::io::BufReader::new(r), w)
+    }
+
+    /// Ask for an attach, and read what the loop says back.
     ///
     /// **This, and not a bare `connect`, is how "the door is still open" is
     /// observed.** `UnixStream::connect` succeeds off the kernel's listen
     /// backlog whether or not anything is still calling `accept`, so it cannot
-    /// tell a live loop from a dead one — a socket whose owner has stopped
-    /// accepting takes connections just the same, until the backlog fills. A
-    /// `HostHello` cannot be produced that way: only a loop that went round,
-    /// accepted, and ran the exchange as far as R6 writes one.
+    /// tell a live loop from a dead one. A `HostHello` cannot be produced that
+    /// way: only a loop that went round and ran the exchange as far as R6
+    /// writes one.
     ///
     /// The write half is bound rather than dropped, so the connection is not
     /// shut down before the loop has answered on it.
     async fn hello_off(sock: &std::path::Path) -> oxutrm_proto::Signal {
-        let stream = tokio::net::UnixStream::connect(sock)
-            .await
-            .expect("connecting to the session socket");
-        let (r, _w) = stream.into_split();
-        let mut r = tokio::io::BufReader::new(r);
+        let (mut r, _w) = open_attach(sock).await;
         tokio::time::timeout(
             ANSWER_WITHIN,
             oxutrm_host::signalling::read_signal_async(&mut r),
         )
         .await
-        .expect("the accept loop never answered; it is not accepting any more")
-        .expect("the accept loop answered with something that is not a Signal")
+        .expect("the attach loop never answered; it is not accepting any more")
+        .expect("the attach loop answered with something that is not a Signal")
     }
 
-    /// A failed attach attempt must not disturb the running session.
-    ///
-    /// The arm only ever fires on a COMPLETED link, so a client that connects
-    /// and hangs up costs the session nothing — no message on the channel, and
-    /// the listener still accepting afterwards.
-    ///
-    /// Both halves of that used to be unobservable. `try_recv` ran microseconds
-    /// after the drop, before the loop could have finished handling it, so it
-    /// read "empty" whatever `serve_attaches` did; and the second `connect`
-    /// proved only that the kernel has a backlog. Both are completed
-    /// observations now: a wait that must elapse, and an answer that must
-    /// arrive.
+    fn on_disk(d: &Doors) -> SessionMeta {
+        serde_json::from_slice(
+            &std::fs::read(d.guard_dir.join(oxutrm_host::META_FILE)).expect("meta.json is there"),
+        )
+        .expect("meta.json parses")
+    }
+
+    /// A failed attach attempt must not disturb the running session: a
+    /// client that asks and hangs up costs nothing -- no message on the
+    /// channel, and the loop still attaching afterwards.
     #[tokio::test]
     async fn an_abandoned_attempt_sends_nothing_and_leaves_the_door_open() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("door");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            guard,
-            std::sync::Arc::clone(&meta),
-            stun_free(),
+        let mut d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
             ATTACH_TIMEOUT,
-            door_rx,
-            door_tx,
-            tx,
-        ));
-
-        // Connect and hang up without saying anything.
-        drop(
-            tokio::net::UnixStream::connect(&sock)
-                .await
-                .expect("connect"),
         );
 
-        // Nothing reaches the session, and the loop has had [`QUIET`] to be
-        // wrong about that. An elapsed wait is the passing case; the two ways
-        // of not elapsing are different defects and say so separately.
-        match tokio::time::timeout(QUIET, rx.recv()).await {
+        drop(open_attach(&d.sock).await);
+
+        match tokio::time::timeout(QUIET, d.rx.recv()).await {
             Err(_) => {}
             Ok(Some(_)) => {
                 panic!("an attempt that never completed handed a link to the session")
             }
             Ok(None) => panic!(
-                "the accept loop dropped its sender: it stopped serving on a \
+                "the attach loop dropped its sender: it stopped serving on a \
                  failed attempt instead of going round again"
             ),
         }
 
-        // And the door is still open. See [`hello_off`] for why a second
-        // `connect` is not that observation.
-        let hello = hello_off(&sock).await;
+        let hello = hello_off(&d.sock).await;
         assert!(
             matches!(hello, oxutrm_proto::Signal::HostHello { .. }),
-            "the loop answered the second connection with {hello:?} instead of \
-             an offer"
+            "the loop answered the second attach with {hello:?} instead of an offer"
         );
-        task.abort();
     }
 
-    /// A peer that connects and then says nothing must not close the door for
-    /// the life of the session.
-    ///
-    /// The exchange runs inline in the accept loop, one at a time, by design.
-    /// Nothing inside it bounded the wait for a `ClientHello`, so a peer that
-    /// stayed alive and silent parked the loop for ever: the session went on
-    /// advertising a socket it would never answer on again, silently, and the
-    /// only remedy was killing the session.
-    ///
-    /// A short timeout is passed in rather than [`ATTACH_TIMEOUT`] so this
-    /// costs a fifth of a second instead of ninety. The code it exercises is
-    /// the same.
+    /// A peer that asks to attach and then says nothing must not close the
+    /// door for the life of the session. A short timeout is passed in rather
+    /// than [`ATTACH_TIMEOUT`] so this costs a fifth of a second instead of
+    /// ninety. The code it exercises is the same.
     #[tokio::test]
     async fn a_stalled_attach_gives_up_and_the_door_opens_again() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("stall");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            std::sync::Arc::clone(&guard),
-            std::sync::Arc::clone(&meta),
-            stun_free(),
+        let d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
             Duration::from_millis(200),
-            door_rx,
-            door_tx,
-            tx,
-        ));
+        );
+        // Alive and silent: the connection is HELD, so the exchange's read of
+        // the client's hello never returns.
+        let stalled = open_attach(&d.sock).await;
 
-        // Alive and silent, which is the case that has no other rescue: the
-        // connection is HELD, so the exchange's read of the client's hello
-        // never returns and nothing about the peer being gone can free the
-        // loop.
-        let stalled = tokio::net::UnixStream::connect(&sock)
-            .await
-            .expect("connecting to the session socket");
-
-        // The loop has to come back to `accept` on its own clock.
-        let hello = hello_off(&sock).await;
+        let hello = hello_off(&d.sock).await;
         assert!(
             matches!(hello, oxutrm_proto::Signal::HostHello { .. }),
-            "the loop answered the second connection with {hello:?} instead of \
-             an offer"
+            "the loop answered the second attach with {hello:?} instead of an offer"
         );
-
-        // A timed-out attempt is a failed attempt, and nothing more.
-        let on_disk: SessionMeta =
-            serde_json::from_slice(&std::fs::read(guard.meta_path()).expect("meta.json is there"))
-                .expect("meta.json parses");
         assert_eq!(
-            on_disk.attach_id, 0,
+            on_disk(&d).attach_id,
+            0,
             "an attempt that timed out still advertised its generation"
         );
-
         drop(stalled);
-        task.abort();
     }
 
     /// A failed attempt must not advertise a generation that never served.
-    ///
-    /// `begin_attach` bumps `attach_id` at R4, before the exchange can fail,
-    /// so the in-memory record moves even when nothing comes of it. The
-    /// registry is only written on success — otherwise `--list` and a
-    /// reconnecting client would name a generation that no link ever ran as.
+    /// `begin_attach` bumps `attach_id` at R4, before the exchange can fail;
+    /// the registry is only written on success.
     #[tokio::test]
     async fn a_failed_attempt_does_not_write_its_generation_to_the_registry() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("gen");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            std::sync::Arc::clone(&guard),
-            std::sync::Arc::clone(&meta),
-            stun_free(),
+        let d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
             ATTACH_TIMEOUT,
-            door_rx,
-            door_tx,
-            tx,
-        ));
-
-        // Connect and hang up: R4 runs, R7 fails.
-        drop(
-            tokio::net::UnixStream::connect(&sock)
-                .await
-                .expect("connect"),
         );
 
-        // Ordered by the loop itself, not by a sleep. The exchange is serial —
-        // one attach at a time is this loop's whole design — so a second
-        // connection being ANSWERED is proof that the first attempt is over
-        // and has written whatever it was going to write. The fixed 50 ms
-        // sleep this replaces was not proof of anything: with a three-second
-        // gather budget in front of it, it is how this guard once passed under
-        // an injected bug, reading `meta.json` while the exchange was still
-        // probing.
-        let hello = hello_off(&sock).await;
+        // Ask and hang up: R4 runs, R7 fails.
+        drop(open_attach(&d.sock).await);
+
+        // Ordered by the loop itself, not by a sleep: it is serial, so a
+        // second attach being ANSWERED is proof that the first attempt is
+        // over and has written whatever it was going to write.
+        let hello = hello_off(&d.sock).await;
         assert!(
             matches!(hello, oxutrm_proto::Signal::HostHello { .. }),
             "the first attempt never finished, so nothing below is ordered \
              after it: {hello:?}"
         );
-
-        let on_disk: SessionMeta =
-            serde_json::from_slice(&std::fs::read(guard.meta_path()).expect("meta.json is there"))
-                .expect("meta.json parses");
         assert_eq!(
-            on_disk.attach_id, 0,
-            "the registry advertises generation {} but no link ever ran as it; \
-             a client told to expect it would be waiting for a host that is \
-             not there",
-            on_disk.attach_id
+            on_disk(&d).attach_id,
+            0,
+            "the registry advertises a generation no link ever ran as"
         );
-        task.abort();
     }
 
-    /// A standby comes in through the door, runs the very same exchange, and
-    /// comes out marked as a standby — while an attach over the Unix socket
-    /// comes out as a primary.
-    ///
-    /// The role is what the session acts on: a standby is parked, a primary
-    /// takes over. A standby that came out as a primary would displace the
-    /// live link and close it as taken over, which ends the client. So both
-    /// exchanges are driven to completion by the real client half,
-    /// `connect::establish`, and the role is read off the `Attached` the
-    /// session would receive — the socket case first, so "every attach says
-    /// Standby" cannot pass either.
+    /// A standby comes in through the queue, runs the very same exchange,
+    /// and comes out marked as a standby -- while an attach over the socket
+    /// comes out as a primary. A standby that came out as a primary would
+    /// displace the live link and end the client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_door_request_runs_the_same_exchange_and_carries_its_role() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("roles");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            guard,
-            std::sync::Arc::clone(&meta),
-            stun_free(),
+    async fn a_queued_standby_runs_the_same_exchange_and_carries_its_role() {
+        let mut d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
             ATTACH_TIMEOUT,
-            door_rx,
-            door_tx.clone(),
-            tx,
-        ));
+        );
         let size = oxutrm_proto::TermSize { cols: 80, rows: 24 };
         let within = Duration::from_secs(10);
 
-        // Over the Unix socket: a primary.
-        let stream = tokio::net::UnixStream::connect(&sock)
-            .await
-            .expect("connecting to the session socket");
-        let (cr, cw) = stream.into_split();
+        let (cr, cw) = open_attach(&d.sock).await;
         let primary = tokio::time::timeout(
             within,
-            crate::connect::establish(tokio::io::BufReader::new(cr), cw, size, &stun_free(), None),
+            crate::connect::establish(cr, cw, size, &stun_free(), None),
         )
         .await
         .expect("the client exchange over the socket must not hang")
         .expect("the client exchange over the socket completes");
-        let attached = tokio::time::timeout(within, rx.recv())
+        let attached = tokio::time::timeout(within, d.rx.recv())
             .await
             .expect("the socket attach never reached the session")
-            .expect("the listener dropped its sender");
-        assert_eq!(
-            attached.role,
-            Role::Primary,
-            "an ssh-relayed attach must take over, not park"
-        );
+            .expect("the loop dropped its sender");
+        assert_eq!(attached.role, Role::Primary);
 
-        // Through the door: the same exchange over a different pipe.
         let (client_side, host_side) = tokio::io::duplex(64 * 1024);
         let (hr, hw) = tokio::io::split(host_side);
-        door_tx
+        d.queue
+            .standby
             .send(DoorRequest {
                 reader: Box::new(tokio::io::BufReader::new(hr)),
                 writer: Box::new(hw),
@@ -514,79 +449,37 @@ mod tests {
             crate::connect::establish(tokio::io::BufReader::new(cr), cw, size, &stun_free(), None),
         )
         .await
-        .expect("the client exchange through the door must not hang")
-        .expect("the client exchange through the door completes");
-        let attached = tokio::time::timeout(within, rx.recv())
+        .expect("the standby exchange must not hang")
+        .expect("the standby exchange completes");
+        let attached = tokio::time::timeout(within, d.rx.recv())
             .await
-            .expect("the door attach never reached the session")
-            .expect("the listener dropped its sender");
-        assert_eq!(
-            attached.role,
-            Role::Standby,
-            "a standby came out of the door as a takeover: it would displace \
-             the live link and end the client"
-        );
+            .expect("the standby never reached the session")
+            .expect("the loop dropped its sender");
+        assert_eq!(attached.role, Role::Standby);
+        assert_eq!(on_disk(&d).attach_id, 2, "both generations were recorded");
 
-        // Every link handed over carries a control server of its own. On the
-        // standby it answers the probe failover waits on; on the primary it
-        // takes the next standby request. Nothing in this test starts one, so
-        // only the listener can be answering. And a link with no server is
-        // not answered, so the probe itself cannot pass on its own.
+        // Every link handed over carries a control server of its own.
         let (_unserved_host, unserved) = crate::link::fixtures::link_pair().await;
-        assert!(
-            !crate::control::probe(unserved.sink.connection().clone(), 1).await,
-            "a link with no control server answered a probe"
-        );
-        assert!(
-            crate::control::probe(standby.link.sink.connection().clone(), 2).await,
-            "the standby the listener handed over answers no probe: failover \
-             would never fire"
-        );
-        assert!(
-            crate::control::probe(primary.link.sink.connection().clone(), 3).await,
-            "the primary the listener handed over answers no probe, so it \
-             cannot carry the next standby request either"
-        );
-        task.abort();
+        assert!(!crate::control::probe(unserved.sink.connection().clone(), 1).await);
+        assert!(crate::control::probe(standby.link.sink.connection().clone(), 2).await);
+        assert!(crate::control::probe(primary.link.sink.connection().clone(), 3).await);
     }
 
-    /// A standby's exchange gives way to an attach over the socket.
-    ///
-    /// The door is serial, and a standby whose control stream went silent
-    /// never errors: without pre-emption it would hold the door for the whole
-    /// of [`ATTACH_TIMEOUT`], ninety seconds, while the client's ssh rebuild —
-    /// the attach that matters — queued behind it. The real timeout is passed
-    /// on purpose, so nothing but pre-emption can free the loop in time.
+    /// A standby's exchange gives way to a primary. The real timeout is
+    /// passed on purpose, so nothing but pre-emption can free the loop in
+    /// time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_socket_attach_preempts_a_stalled_standby() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("preempt");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            guard,
-            std::sync::Arc::clone(&meta),
-            stun_free(),
+    async fn a_primary_preempts_a_stalled_standby() {
+        let mut d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
             ATTACH_TIMEOUT,
-            door_rx,
-            door_tx.clone(),
-            tx,
-        ));
+        );
         let within = Duration::from_secs(10);
 
-        // A standby whose peer hears the offer and then says nothing, held
-        // open so nothing about the peer being gone can end the attempt.
         let (client_side, host_side) = tokio::io::duplex(64 * 1024);
         let (hr, hw) = tokio::io::split(host_side);
-        door_tx
+        d.queue
+            .standby
             .send(DoorRequest {
                 reader: Box::new(tokio::io::BufReader::new(hr)),
                 writer: Box::new(hw),
@@ -596,26 +489,18 @@ mod tests {
             .unwrap();
         let (cr, _cw) = tokio::io::split(client_side);
         let mut cr = tokio::io::BufReader::new(cr);
-        // Before: the standby's exchange is under way, holding the door.
         let offer =
             tokio::time::timeout(within, oxutrm_host::signalling::read_signal_async(&mut cr))
                 .await
                 .expect("the standby's exchange never started")
                 .expect("the standby's exchange sent something that is not a Signal");
-        assert!(
-            matches!(offer, oxutrm_proto::Signal::HostHello { .. }),
-            "{offer:?}"
-        );
+        assert!(matches!(offer, oxutrm_proto::Signal::HostHello { .. }));
 
-        // After: a socket attach gets through anyway, and as a primary.
-        let stream = tokio::net::UnixStream::connect(&sock)
-            .await
-            .expect("connecting to the session socket");
-        let (sr, sw) = stream.into_split();
+        let (sr, sw) = open_attach(&d.sock).await;
         tokio::time::timeout(
             within,
             crate::connect::establish(
-                tokio::io::BufReader::new(sr),
+                sr,
                 sw,
                 oxutrm_proto::TermSize { cols: 80, rows: 24 },
                 &stun_free(),
@@ -623,78 +508,130 @@ mod tests {
             ),
         )
         .await
-        .expect(
-            "the socket attach waited behind a stalled standby: the rebuild \
-             it stands for would queue for the whole attach timeout",
-        )
-        .expect("the socket attach completes");
-        let attached = tokio::time::timeout(within, rx.recv())
+        .expect("the primary waited behind a stalled standby")
+        .expect("the primary completes");
+        let attached = tokio::time::timeout(within, d.rx.recv())
             .await
-            .expect("the socket attach never reached the session")
-            .expect("the listener dropped its sender");
+            .expect("the primary never reached the session")
+            .expect("the loop dropped its sender");
         assert_eq!(attached.role, Role::Primary);
-        task.abort();
     }
 
-    /// The listener's `Arc` clone of the guard has to be gone before the
-    /// session drops its own, or the session directory outlives the session.
-    ///
-    /// `serve()` (`src/serve.rs`) ends on [`close_the_door`], and so does
-    /// this test; the listener must also be gone at all, which the timeout
-    /// asserts. `abort()` only SCHEDULES cancellation: without the await, the spawned
-    /// future — and its clone of the guard — is still alive when `drop(guard)`
-    /// runs, `RegistryGuard::drop` decrements two to one instead of one to
-    /// zero, `remove_dir_all` never runs, and the session leaves an entry
-    /// behind for `--list` to prune. Worse, `run_host_serve`'s comment cites
-    /// that cleanup as the reason it is allowed to `shutdown_background()` and
-    /// walk away.
-    ///
-    /// Asserted on the directory — the side effect — rather than on a strong
-    /// count, which is the mechanism.
-    #[tokio::test]
-    async fn awaiting_the_aborted_listener_is_what_lets_the_guard_clean_up() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let (door_tx, door_rx) = tokio::sync::mpsc::channel(1);
-        let start = fresh_meta("clean");
-        let guard = std::sync::Arc::new(
-            oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
-        );
-        let session_dir = guard.dir().to_path_buf();
-        let meta = std::sync::Arc::new(tokio::sync::Mutex::new(start));
-
-        let task = tokio::spawn(serve_attaches(
-            listener,
-            std::sync::Arc::clone(&guard),
-            meta,
-            stun_free(),
+    /// `Myself` is answered while the session is in the middle of an attach
+    /// (switcher spec §2.2): it never waits on the serial loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn myself_is_answered_while_an_attach_is_under_way() {
+        let d = doors(
+            crate::door::fixtures::meta("3ff1218f5e0c4b7d9a1c2e3f40516273", Some("build")),
             ATTACH_TIMEOUT,
-            door_rx,
-            door_tx,
-            tx,
-        ));
-        assert!(session_dir.exists(), "the fixture registered nothing");
+        );
+        // An attach that has its hello and will say nothing more: the loop
+        // is held for the whole attach timeout.
+        let (mut r, _w) = open_attach(&d.sock).await;
+        let _ = oxutrm_host::signalling::read_signal_async(&mut r).await;
 
-        // Exactly what `serve()` does when the shell exits -- the same call,
-        // not a copy of it. A copy is how `serve()` lost its `abort()` while
-        // this test, aborting on its own, stayed green: the listener never
-        // returns by itself, so the session's daemon outlived its shell,
-        // stayed on `--list`, and handed the next reattach a dead link.
-        tokio::time::timeout(Duration::from_secs(5), close_the_door(task))
+        let begun = std::time::Instant::now();
+        let answer = crate::door::fixtures::ask(&d.sock, Request::Myself).await;
+        assert!(
+            matches!(&answer, oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Entry(e)) if e.name.as_ref().map(oxutrm_proto::Name::as_str) == Some("build")),
+            "{answer:?}"
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "Myself waited on the attach: {:?}",
+            begun.elapsed()
+        );
+    }
+
+    /// A `Sessions` fetch asks each sibling `Myself`; it must not cancel a
+    /// sibling's standby exchange, which a fetch through the attach loop
+    /// would pre-empt (switcher spec §2.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sessions_fetch_does_not_cancel_a_siblings_standby_search() {
+        let mut sibling = doors(
+            crate::door::fixtures::meta("a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60", Some("logs")),
+            ATTACH_TIMEOUT,
+        );
+        // This session, in the same registry, asking.
+        let (me, _inbox, _) = crate::door::fixtures::registered(
+            &sibling.registry,
+            crate::door::fixtures::meta("3ff1218f5e0c4b7d9a1c2e3f40516273", Some("build")),
+        );
+        let me_sock = oxutrm_host::Registry::socket_path_in(
+            &sibling.registry,
+            "3ff1218f5e0c4b7d9a1c2e3f40516273",
+        );
+        crate::door::fixtures::socket_door(
+            me,
+            tokio::net::UnixListener::bind(&me_sock).expect("bind"),
+        );
+
+        // The sibling's standby exchange, under way.
+        let (client_side, host_side) = tokio::io::duplex(64 * 1024);
+        let (hr, hw) = tokio::io::split(host_side);
+        sibling
+            .queue
+            .standby
+            .send(DoorRequest {
+                reader: Box::new(tokio::io::BufReader::new(hr)),
+                writer: Box::new(hw),
+                role: Role::Standby,
+            })
             .await
-            .expect(
-                "the listener was still running after the shell exited: the \
-                 daemon outlives its session and keeps accepting attaches",
-            );
-        drop(guard);
+            .unwrap();
+
+        let answer = crate::door::fixtures::ask(&me_sock, Request::Sessions).await;
+        let oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Sessions(list)) = answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(list.len(), 2, "{list:?}");
+
+        // And the standby still completes, as a standby.
+        let (cr, cw) = tokio::io::split(client_side);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::connect::establish(
+                tokio::io::BufReader::new(cr),
+                cw,
+                oxutrm_proto::TermSize { cols: 80, rows: 24 },
+                &stun_free(),
+                None,
+            ),
+        )
+        .await
+        .expect("the standby hung")
+        .expect("the standby was cancelled by the fetch");
+        let attached = sibling.rx.recv().await.expect("the standby landed");
+        assert_eq!(attached.role, Role::Standby);
+    }
+
+    /// The tasks' clones of the door -- and through it of the guard -- have
+    /// to be gone before the session drops its own, or the session
+    /// directory outlives the session. `abort()` only SCHEDULES
+    /// cancellation; [`close_the_door`] awaits it.
+    #[tokio::test]
+    async fn awaiting_the_aborted_tasks_is_what_lets_the_guard_clean_up() {
+        let mut d = doors(
+            fresh_meta("3ff1218f5e0c4b7d9a1c2e3f40516273"),
+            ATTACH_TIMEOUT,
+        );
+        assert!(d.guard_dir.exists(), "the fixture registered nothing");
+
+        let accept = std::mem::replace(&mut d.accept, tokio::spawn(async {}));
+        let attaches = std::mem::replace(&mut d.attaches, tokio::spawn(async {}));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            close_the_door(accept).await;
+            close_the_door(attaches).await;
+        })
+        .await
+        .expect("the door's tasks were still running after the shell exited");
+        drop(d.door.take());
 
         assert!(
-            !session_dir.exists(),
-            "the session ended and {} is still there: the listener task was \
-             still holding a clone of the guard, so its Drop never ran",
-            session_dir.display()
+            !d.guard_dir.exists(),
+            "the session ended and {} is still there: a task was still \
+             holding the door, so the guard's Drop never ran",
+            d.guard_dir.display()
         );
     }
 }

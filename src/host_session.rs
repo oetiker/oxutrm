@@ -59,6 +59,34 @@ pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
 /// once in practice; this bounds the wait for one that cannot be.
 const REAP_AFTER_KILL: Duration = Duration::from_secs(2);
 
+/// Whether a session has a client right now, for the door to answer
+/// `Myself` and `Sessions` without asking the loop (switcher spec §2.2).
+///
+/// The loop writes it -- the connection it serves and when it last heard a
+/// frame -- and the door reads it, under a lock held for a copy. The answer
+/// is the one [`HostSession::turn_at`] gives itself: open, and heard from
+/// within [`DETACH_AFTER`].
+#[derive(Clone, Default)]
+pub(crate) struct Presence(std::sync::Arc<std::sync::Mutex<Option<(quinn::Connection, Instant)>>>);
+
+impl Presence {
+    fn heard(&self, conn: &quinn::Connection, at: Instant) {
+        if let Ok(mut p) = self.0.lock() {
+            *p = Some((conn.clone(), at));
+        }
+    }
+
+    /// Whether a client is attached at `now`.
+    pub(crate) fn attached(&self, now: Instant) -> bool {
+        let Ok(p) = self.0.lock() else {
+            return false;
+        };
+        p.as_ref().is_some_and(|(conn, at)| {
+            conn.close_reason().is_none() && now.saturating_duration_since(*at) < DETACH_AFTER
+        })
+    }
+}
+
 /// The remote half: owns the PTY and the authoritative screen.
 pub struct HostSession {
     term: HostTerm,
@@ -81,6 +109,8 @@ pub struct HostSession {
     /// clock, because `close_reason()` stopped being one when the transport's
     /// idle timeout went. See [`DETACH_AFTER`].
     last_heard: Instant,
+    /// `last_heard` and the link it was heard on, for the door.
+    presence: Presence,
 }
 
 impl HostSession {
@@ -125,7 +155,15 @@ impl HostSession {
             // An attach has just completed and R5 obliges the client to send
             // immediately, so "now" is true rather than optimistic.
             last_heard: Instant::now(),
+            presence: Presence::default(),
         })
+    }
+
+    /// Share whether a client is attached with `presence`, the door's copy.
+    pub(crate) fn with_presence(mut self, presence: Presence) -> HostSession {
+        presence.heard(self.link.sink.connection(), self.last_heard);
+        self.presence = presence;
+        self
     }
 
     /// One turn: apply whatever arrived, drain the PTY, offer a frame.
@@ -160,6 +198,7 @@ impl HostSession {
             // rejects: a stale sequence number says the client is behind, not
             // that it is gone.
             self.last_heard = now;
+            self.presence.heard(self.link.sink.connection(), now);
             // A rejected frame is not a disconnection: the state and the ack
             // are both untouched, and the peer's next diff will apply.
             match self.input_rx.on_frame(&frame) {
@@ -654,6 +693,8 @@ impl HostSession {
         // An attach has just completed and the client sends immediately, so
         // "now" is true rather than optimistic — the same reasoning as `spawn`.
         self.last_heard = Instant::now();
+        self.presence
+            .heard(self.link.sink.connection(), self.last_heard);
         Ok(())
     }
 

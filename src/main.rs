@@ -28,6 +28,7 @@ mod choose;
 mod config;
 mod connect;
 mod control;
+mod door;
 mod egress;
 mod host_session;
 mod ladder;
@@ -256,6 +257,16 @@ fn run_host_attach(id: &str) -> Result<()> {
             oxutrm_host::attach::connect_to_session(&oxutrm_host::Registry::dir_at(&root.base), id)
                 .await?;
         let (sr, mut sw) = stream.into_split();
+        // The socket is a door (switcher spec §4.1): say what this is before
+        // relaying the client's side of the exchange into it.
+        oxutrm_host::signalling::write_line_async(
+            &mut sw,
+            &oxutrm_proto::Open::new(oxutrm_proto::Request::Attach {
+                role: oxutrm_proto::Role::Primary,
+            }),
+        )
+        .await
+        .context("asking the session for an attach")?;
         let mut sr = tokio::io::BufReader::new(sr);
         let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
         let mut stdout = tokio::io::stdout();

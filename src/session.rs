@@ -6605,10 +6605,14 @@ mod tests {
         let (mut host, mut client, relay) = pair_through_relay_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let (standby_host, standby_client) = crate::link::fixtures::link_pair().await;
-        // The probe is answered by the standby's own control server. Its door
-        // is never knocked on.
-        let (door_tx, _door_rx) = tokio::sync::mpsc::channel(1);
-        crate::control::serve_control(standby_host.sink.connection().clone(), door_tx);
+        // The probe is answered by the standby's own control server. Its
+        // attach loop is never asked for anything.
+        let door_dir = tempfile::tempdir().expect("a scratch directory");
+        let (door, _inbox, _) = crate::door::fixtures::registered(
+            door_dir.path(),
+            crate::door::fixtures::meta("00112233445566778899aabbccddeeff", None),
+        );
+        crate::control::serve_control(standby_host.sink.connection().clone(), door);
         let standby_id = standby_client.sink.connection().stable_id();
         assert_ne!(standby_id, primary_id);
 
@@ -6683,18 +6687,18 @@ mod tests {
         let (mut host, mut client) = pair_sized("", BIG).await;
         let primary_id = client.link.sink.connection().stable_id();
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let listener =
-            tokio::net::UnixListener::bind(dir.path().join("sock")).expect("binding the socket");
         let start =
             crate::attach_exchange::fixtures::fresh_meta("00112233445566778899aabbccddeeff");
         let guard = Arc::new(
             oxutrm_host::RegistryGuard::register_in(dir.path(), &start).expect("register"),
         );
-        let meta = Arc::new(tokio::sync::Mutex::new(start));
-        let (door_task, mut attach_rx) = crate::serve::open_doors(
+        let listener = tokio::net::UnixListener::bind(guard.socket_path()).expect("binding");
+        let (door_tasks, mut attach_rx) = crate::serve::open_doors(
             listener,
-            guard,
-            Arc::clone(&meta),
+            dir.path().to_path_buf(),
+            start,
+            Arc::clone(&guard),
+            crate::host_session::Presence::default(),
             crate::attach_exchange::fixtures::stun_free(),
             host.link.sink.connection().clone(),
         );
@@ -6727,11 +6731,22 @@ mod tests {
         typing.write_all(&[CTRL_BACKSLASH]).expect("type");
         wait_for_screen(&out, BIG, "Esc close", Duration::from_secs(10)).await;
         wait_for_screen(&out, BIG, "found ", Duration::from_secs(20)).await;
-        assert_eq!(
-            meta.lock().await.attach_id,
-            1,
-            "the host did not run an exchange for the standby"
-        );
+        // The host records the generation just after its `Established`
+        // went out, so the client may see the standby a moment first.
+        let recorded = async {
+            loop {
+                let on_disk: oxutrm_host::SessionMeta =
+                    serde_json::from_slice(&std::fs::read(guard.meta_path()).expect("meta.json"))
+                        .expect("meta.json parses");
+                if on_disk.attach_id == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), recorded)
+            .await
+            .expect("the host did not run an exchange for the standby");
 
         // The open popup takes every key: close it, then talk to the shell.
         close_the_popup(&mut typing, &out, BIG).await;
@@ -6754,7 +6769,9 @@ mod tests {
             "the standby was shown but not recorded"
         );
         assert_eq!(host_loop.await.expect("host task").expect("host loop"), 7);
-        crate::listener::close_the_door(door_task).await;
+        for task in door_tasks {
+            crate::listener::close_the_door(task).await;
+        }
     }
 
     /// What the popup may not say while `Silent` or `Confirming`, wherever

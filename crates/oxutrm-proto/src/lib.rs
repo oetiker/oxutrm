@@ -130,7 +130,13 @@ pub use types::{
 /// with one missing field, it is a client that can never be let in. A hard
 /// version failure with both numbers in it is the only useful outcome, and it
 /// is what `check_version` already does.
-pub const PROTO_VERSION: u32 = 2;
+///
+/// **3**: the session switcher. Every door of a session process -- the
+/// control stream and the Unix socket -- reads an [`Open`] first, the ssh
+/// offer lists [`OfferEntry`]s, and `Choice` gained `Lobby` and a name. No
+/// compatibility with 2: a host session started by an older binary must be
+/// ended before a new client can reach that host.
+pub const PROTO_VERSION: u32 = 3;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";

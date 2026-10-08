@@ -173,17 +173,6 @@ pub enum Signal {
     Failed {
         reason: String,
     },
-    /// client -> host, first line on a control stream: run an attach exchange
-    /// over this stream and park the result as a standby (spec §3.2).
-    StandbyRequest,
-    /// client -> host on a standby's control stream. Answered without
-    /// adopting anything: a sync frame is what adopts (spec §3.4).
-    Probe {
-        nonce: u64,
-    },
-    ProbeAck {
-        nonce: u64,
-    },
 }
 
 impl Signal {
@@ -1137,20 +1126,6 @@ mod tests {
         match old {
             Signal::HostHello { features, .. } => assert!(features.is_empty()),
             other => panic!("parsed as {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_standby_signals_round_trip() {
-        for s in [
-            Signal::StandbyRequest,
-            Signal::Probe { nonce: 42 },
-            Signal::ProbeAck { nonce: 42 },
-        ] {
-            let mut line = Vec::new();
-            write_signal(&mut line, &s).unwrap();
-            let back = read_signal(&mut &line[..]).unwrap();
-            assert_eq!(format!("{back:?}"), format!("{s:?}"));
         }
     }
 }
