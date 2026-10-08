@@ -649,6 +649,16 @@ where
     }
     match open.req {
         Request::Attach { role } => attach(&door, role, reader, writer).await,
+        // A probe asks whether a client's link answers: it comes over that
+        // link's control stream (switcher spec §4.1, "unchanged semantics").
+        // Nothing on the socket has a link to ask about.
+        Request::Probe { .. } if via == Via::Socket => {
+            let _ = write_line_async(
+                &mut writer,
+                &Reply::Refused("a probe comes over a client's link, not the socket".to_string()),
+            )
+            .await;
+        }
         Request::Probe { nonce } => probes(nonce, reader, writer).await,
         Request::Myself => {
             let reply = match door.own_entry(Via::Socket) {
@@ -721,7 +731,9 @@ where
 }
 
 /// Answer a probe, and every further probe on the same stream, until it
-/// ends: one stream can serve a whole outage's probing.
+/// ends: one stream can serve a whole outage's probing. Each further probe
+/// is waited for as a first line is, within [`OPEN_TIMEOUT`]: a stream that
+/// goes quiet is let go of, and the next probe opens a stream of its own.
 async fn probes<R, W>(nonce: u64, mut reader: R, mut writer: W)
 where
     R: AsyncBufRead + Unpin,
@@ -735,11 +747,11 @@ where
         {
             return;
         }
-        match read_line_async::<_, Open>(&mut reader).await {
-            Ok(Open {
+        match tokio::time::timeout(OPEN_TIMEOUT, read_line_async::<_, Open>(&mut reader)).await {
+            Ok(Ok(Open {
                 req: Request::Probe { nonce: next },
                 ..
-            }) => nonce = next,
+            })) => nonce = next,
             _ => return,
         }
     }
@@ -763,8 +775,12 @@ async fn sessions(door: &Door, via: Via) -> Vec<SessionEntry> {
             asked.spawn(async move { (i, ask_myself(&registry, &m).await) });
         }
     }
-    while let Some(Ok((i, entry))) = asked.join_next().await {
-        found[i] = entry;
+    // A sibling query that panicked is skipped, not the end of the list:
+    // the others are still answering.
+    while let Some(joined) = asked.join_next().await {
+        if let Ok((i, entry)) = joined {
+            found[i] = entry;
+        }
     }
     found.into_iter().flatten().collect()
 }
@@ -1014,6 +1030,50 @@ mod tests {
         let list = sessions(&me, Via::Client).await;
         let logs = list.iter().find(|e| e.id.to_string() == LOGS).unwrap();
         assert_eq!(logs.attached, Attached::Elsewhere);
+    }
+
+    /// A probe on the socket is refused: nothing there has a link to ask
+    /// about, and a probe stream holds its task for as long as it is open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_on_the_socket_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _door = sibling(dir.path(), BUILD, Some("build"));
+        let path = Registry::socket_path_in(dir.path(), BUILD);
+        let answer = ask(&path, Request::Probe { nonce: 7 }).await;
+        assert!(
+            matches!(answer, Answer::Reply(Reply::Refused(_))),
+            "{answer:?}"
+        );
+    }
+
+    /// A probe stream that goes quiet after its answer is let go of within
+    /// `OPEN_TIMEOUT`, as a door that never hears a first line is: no wait
+    /// on a stream is unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_stream_that_goes_quiet_is_let_go_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let (door, _inbox, _) = registered(dir.path(), meta(BUILD, None));
+        let (near, far) = tokio::io::duplex(4096);
+        let (far_r, mut far_w) = tokio::io::split(far);
+        let (near_r, near_w) = tokio::io::split(near);
+        let served = tokio::spawn(serve(
+            door,
+            Via::Client,
+            tokio::io::BufReader::new(near_r),
+            near_w,
+        ));
+        write_line_async(&mut far_w, &Open::new(Request::Probe { nonce: 7 }))
+            .await
+            .unwrap();
+        let mut far_r = tokio::io::BufReader::new(far_r);
+        let back: Reply = read_line_async(&mut far_r).await.unwrap();
+        assert_eq!(back, Reply::ProbeAck { nonce: 7 });
+        // Held open and silent: only the bound ends the wait.
+        tokio::time::timeout(OPEN_TIMEOUT + Duration::from_secs(1), served)
+            .await
+            .expect("a quiet probe stream held its task past OPEN_TIMEOUT")
+            .unwrap();
+        drop(far_w);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

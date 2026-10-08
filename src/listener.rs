@@ -42,6 +42,9 @@ use crate::control::{DoorRequest, Role};
 /// never the thing it cuts off.
 pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a failed accept on the session's socket waits before the next.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
 /// Accept on the session's Unix socket for the life of the session, and
 /// hand every connection to the door ([`crate::door::serve`]) on a task of
 /// its own. Never returns on its own: it is spawned, and stopped with
@@ -54,9 +57,12 @@ pub(crate) async fn accept_doors(
     listener: tokio::net::UnixListener,
     door: std::sync::Arc<crate::door::Door>,
 ) {
+    // Said once per run of failures, not once per retry.
+    let mut failing = false;
     loop {
         match listener.accept().await {
             Ok((s, _)) => {
+                failing = false;
                 let (r, w) = s.into_split();
                 tokio::spawn(crate::door::serve(
                     std::sync::Arc::clone(&door),
@@ -66,7 +72,19 @@ pub(crate) async fn accept_doors(
                 ));
             }
             // A failed accept is not a reason to stop answering the door.
-            Err(_) => tokio::task::yield_now().await,
+            // Nor is it to be retried at once: an error such as EMFILE
+            // persists, and the retry would spin a core in a daemon that is
+            // already in trouble.
+            Err(e) => {
+                if !std::mem::replace(&mut failing, true) {
+                    eprintln!(
+                        "oxutrm: accepting on the session's socket failed ({e}); \
+                         retrying every {}ms",
+                        ACCEPT_RETRY.as_millis()
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY).await;
+            }
         }
     }
 }
