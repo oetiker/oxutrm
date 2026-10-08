@@ -39,6 +39,11 @@ mod loopback;
 mod quality;
 mod rebuild;
 mod roam;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the session drives it from Task 12 on")
+)]
+mod selector;
 mod serve;
 mod session;
 mod standby;

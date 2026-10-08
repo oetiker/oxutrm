@@ -668,10 +668,6 @@ impl ClientSession {
 
     /// Ask the host `a` on the loop's next lap. One at a time: `false`, and
     /// nothing asked, while another is waiting or in flight.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the selector uses it from Task 10 on")
-    )]
     pub(crate) fn ask(&mut self, a: crate::switcher::Ask) -> bool {
         if self.asking.is_some() || self.asked.is_some() {
             return false;
@@ -1319,6 +1315,9 @@ impl ClientSession {
                     .record(Kind::Input, &format!("held input dropped ({n})"));
             }
             Some(Command::Config(c)) => self.config_command(c),
+            Some(Command::Ask(a)) => {
+                self.ask(a);
+            }
             None => {}
         }
         Ok(None)

@@ -22,10 +22,6 @@ use crate::connect::Established;
 
 /// What the selector asks the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the selector asks from Task 10 on")
-)]
 pub(crate) enum Ask {
     Sessions,
     Switch { to: SessionId },
