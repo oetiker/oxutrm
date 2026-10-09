@@ -33,8 +33,13 @@ pub(crate) enum Out {
 /// A question the selector asks before it acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Question {
-    /// Switching to a session another client is attached to.
-    TakeOver { id: SessionId, label: String },
+    /// Switching to a session another client is attached to, or one that
+    /// did not say whether it is (`unknown`).
+    TakeOver {
+        id: SessionId,
+        label: String,
+        unknown: bool,
+    },
     Kill {
         id: SessionId,
         label: String,
@@ -46,6 +51,11 @@ impl Question {
     /// The line the question is put in.
     pub(crate) fn text(&self) -> String {
         match self {
+            Question::TakeOver {
+                label,
+                unknown: true,
+                ..
+            } => format!("take over {label} (state unknown)? y/n"),
             Question::TakeOver { label, .. } => {
                 format!("take over {label} from its other client? y/n")
             }
@@ -318,10 +328,11 @@ impl Selector {
             self.note = Some(other_version(row));
             return None;
         }
-        if row.attached == Attached::Elsewhere {
+        if matches!(row.attached, Attached::Elsewhere | Attached::Unknown) {
             let question = Question::TakeOver {
                 id: row.id,
                 label: label(row),
+                unknown: row.attached == Attached::Unknown,
             };
             self.question = Some((question, now));
             return None;
@@ -589,6 +600,24 @@ mod tests {
             Some(Out::Ask(Ask::Switch { to: id(FISH) }))
         );
         assert!(s.question().is_none());
+    }
+
+    #[test]
+    fn a_session_that_did_not_answer_asks_before_it_is_taken_over() {
+        let t = Instant::now();
+        let mut rows = three();
+        rows[2].attached = Attached::Unknown;
+        let mut s = opened(rows);
+        s.keys(b"j", LIVE, t);
+        assert_eq!(s.keys(b"\r", LIVE, t), None);
+        assert_eq!(
+            s.question().unwrap().text(),
+            "take over logs (state unknown)? y/n"
+        );
+        assert_eq!(
+            s.keys(b"y", LIVE, later(t)),
+            Some(Out::Ask(Ask::Switch { to: id(LOGS) }))
+        );
     }
 
     #[test]
