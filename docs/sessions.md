@@ -66,7 +66,9 @@ the sessions were started, oldest first, with `+ new session` last.
 | `q` `Esc` | back to the popup -- or, with no session to go back to, quit |
 
 Switching to a session that is `in use` asks first, then takes it over: its
-other client is told it was taken over, as with `--attach`. A question's
+other client is told it was taken over, as with `--attach`. A `?` session
+may be in use too, so switching to it asks as well (`take over logs (state
+unknown)? y/n`). A question's
 `y` does nothing for the first half second, so typing already in flight
 cannot answer it.
 

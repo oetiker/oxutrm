@@ -817,7 +817,7 @@ pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
     let cap = (size.rows - 2).min(MAX_BOX.rows);
     let inside = lines.len()
         + usize::from(!v.header.is_empty())
-        + usize::from(!v.line.is_empty())
+        + usize::from(line_rows(v, box_cols - FRAME_COLS, cap))
         // The rule and the key bar.
         + 2;
     let box_rows = u16::try_from(inside)
@@ -826,6 +826,15 @@ pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
         .min(cap);
     let buf = draw_sessions(v, &lines, box_cols, box_rows);
     overlay_from_buffer(&buf, (size.rows - box_rows) / 2, (size.cols - box_cols) / 2)
+}
+
+/// How many rows the line under the list takes wrapped at `width`, capped
+/// at `height`: none when there is no line.
+fn line_rows(v: &SessionsView, width: u16, height: u16) -> u16 {
+    if v.line.is_empty() {
+        return 0;
+    }
+    wrapped_row_count(&[Line::from(v.line.clone())], width, height).max(1)
 }
 
 /// The selector in a box `cols` by `rows`, at least 4 rows: the key bar
@@ -837,18 +846,23 @@ fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Bu
     let keys = fitted_key_line(&v.keys, cols.saturating_sub(FRAME_COLS));
     let (mut buf, mut body) = framed(&v.title, keys, cols, rows);
     let ask = v.question && !v.line.is_empty();
-    let put_line = |body: &mut Rect, buf: &mut Buffer| {
+    // The line wraps over as many rows as it needs and `room` allows.
+    let put_line = |body: &mut Rect, buf: &mut Buffer, room: u16| {
+        let want = line_rows(v, body.width, body.height);
+        let used = want.min(room).max(1);
+        let area = Rect {
+            y: body.bottom() - used,
+            height: used,
+            ..*body
+        };
+        Paragraph::new(Line::from(v.line.clone()))
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
         // Cut visibly, never silently.
-        let line = cut(&v.line, usize::from(body.width), false);
-        Paragraph::new(Line::from(line)).render(
-            Rect {
-                y: body.bottom() - 1,
-                height: 1,
-                ..*body
-            },
-            buf,
-        );
-        body.height -= 1;
+        if want > used {
+            buf[(area.right() - 1, area.bottom() - 1)].set_symbol("\u{2026}");
+        }
+        body.height -= used;
     };
     // The rule only with a row of the list left above it, and the
     // question's row.
@@ -857,13 +871,16 @@ fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Bu
         body.height -= 1;
     }
     if ask {
-        put_line(&mut body, &mut buf);
+        // The question keeps a row of the list above it when it can.
+        let room = body.height.saturating_sub(1);
+        put_line(&mut body, &mut buf, room);
     }
     if !v.header.is_empty() && (!ask || body.height >= 2) {
         body = place_one(Line::from(v.header.clone()), body, &mut buf);
     }
     if !ask && !v.line.is_empty() && body.height >= 2 {
-        put_line(&mut body, &mut buf);
+        let room = body.height - 1;
+        put_line(&mut body, &mut buf, room);
     }
     let height = usize::from(body.height);
     let at = v.cursor.min(lines.len().saturating_sub(1));
@@ -2216,6 +2233,41 @@ mod tests {
             &sessions_view(),
             TermSize { cols: 80, rows: 24 }
         )));
+    }
+
+    #[test]
+    fn a_long_line_under_the_list_wraps_and_the_box_grows_for_it() {
+        let mut v = sessions_view();
+        v.line = "a3f9c01e runs another version of oxutrm; it can be ended only \
+                  by ending its shell"
+            .to_string();
+        let short = layout_sessions(&sessions_view(), TermSize { cols: 60, rows: 24 });
+        let o = layout_sessions(&v, TermSize { cols: 60, rows: 24 });
+        let text = text_of(&o);
+        // Every word is on screen, none cut away behind an ellipsis.
+        let words: Vec<&str> = text
+            .lines()
+            .flat_map(|l| l.trim_matches(|c| c == '\u{2502}' || c == ' ').split(' '))
+            .collect();
+        for word in v.line.split(' ') {
+            assert!(words.contains(&word), "{word} missing: {text}");
+        }
+        assert!(!text.contains('\u{2026}'), "{text}");
+        // One row for the line itself, one more for its wrap.
+        assert_eq!(o.rows, short.rows + 2, "{text}");
+    }
+
+    #[test]
+    fn a_line_that_cannot_wrap_into_the_room_left_is_cut_visibly() {
+        let mut v = sessions_view();
+        v.line = "a3f9c01e runs another version of oxutrm; it can be ended only \
+                  by ending its shell"
+            .to_string();
+        let o = layout_sessions(&v, TermSize { cols: 40, rows: 8 });
+        let text = text_of(&o);
+        assert!(text.contains('\u{2026}'), "{text}");
+        // The cursor's row is still shown above it.
+        assert!(text.contains("build"), "{text}");
     }
 
     #[test]
