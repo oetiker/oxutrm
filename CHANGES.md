@@ -19,10 +19,11 @@
   in place and `x` kills one after asking. A switch travels over the live
   link and never touches ssh: the new session's link is built while you stay
   in the old one, and only once it is up does the client move, so a switch
-  that fails leaves you where you were with the reason under the list. A
-  session another client is attached to -- or one that did not answer, and
-  may be -- is taken over after asking, as `--attach` does. Killing the session you are in leaves the selector open
-  over a blank screen until you pick another, start one, or quit with `q`;
+  that fails leaves you where you were with the reason under the list,
+  wrapped over as many lines as it needs. A session another client is
+  attached to -- or one that did not answer, and may be -- is taken over
+  after asking, as `--attach` does. Killing the session you are in leaves the
+  selector open over a blank screen until you pick another, start one, or quit with `q`;
   killing never ends the client by itself. Every switch, kill and rename is in
   the popup's log and in `client.log`. `docs/sessions.md` has the whole of it.
 
