@@ -65,7 +65,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use oxutrm_proto::{Candidate, CandidateKind, NatType};
 
-use crate::{NetConfig, ice_priority, unmap};
+use crate::{NetConfig, ice_priority, to_socket_family, unmap};
 
 /// One observed mapping, and which probe observed it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -231,6 +231,13 @@ async fn probe(
     server: SocketAddr,
     timeout: std::time::Duration,
 ) -> Option<SocketAddr> {
+    // In the socket's own family: a dual-stack socket sends to an IPv4
+    // server mapped, and `stunclient` compares each answer's source with
+    // this address, which the socket reports mapped too.
+    let server = match socket.local_addr() {
+        Ok(local) => to_socket_family(&local, server),
+        Err(_) => server,
+    };
     let mut client = stunclient::StunClient::new(server);
     client.set_timeout(timeout);
     client
@@ -536,6 +543,41 @@ mod tests {
         for c in &cands {
             assert_eq!(c.kind, CandidateKind::ServerReflexive);
         }
+    }
+
+    /// An IPv4 server asked over the session's own dual-stack socket, which
+    /// can only send to it in mapped form (`send_to` with a plain IPv4
+    /// address is EINVAL on `[::]`), and sees its answers come back mapped.
+    #[tokio::test]
+    async fn an_ipv4_server_answers_over_the_dual_stack_session_socket() {
+        let s1 = StunResponder::start_on(a("127.0.0.1:0"), MappingBehaviour::Truthful)
+            .await
+            .expect("responder");
+        let std_sock = crate::bind_socket(&NetConfig {
+            prefer_port: 0,
+            ..NetConfig::default()
+        })
+        .expect("bind");
+        if !std_sock.local_addr().expect("local_addr").is_ipv6() {
+            eprintln!("SKIP: this host has no IPv6, so no dual-stack socket");
+            return;
+        }
+        std_sock.set_nonblocking(true).expect("nonblocking");
+        let sock = tokio::net::UdpSocket::from_std(std_sock).expect("tokio socket");
+        let cfg = NetConfig {
+            stun_servers: vec![s1.server_string()],
+            gather_timeout: std::time::Duration::from_secs(3),
+            ..NetConfig::default()
+        };
+        let (cands, _nat) = stun_discover(&sock, &cfg).await;
+        assert!(
+            !cands.is_empty(),
+            "the IPv4 server never answered the dual-stack socket"
+        );
+        assert!(
+            cands[0].addr.is_ipv4(),
+            "a candidate is unmapped: {cands:?}"
+        );
     }
 
     /// A server list confined to ONE IP can never supply the other-IP probe,
