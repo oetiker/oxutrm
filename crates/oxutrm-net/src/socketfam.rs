@@ -58,17 +58,25 @@ pub fn bind_socket(cfg: &NetConfig) -> anyhow::Result<UdpSocket> {
 }
 
 /// A socket bound to `[::]` with `IPV6_V6ONLY` off, so it accepts IPv4 too.
+///
+/// The option is set BEFORE `bind`: once a socket has a port, Linux and
+/// macOS both refuse to change it (EINVAL). `std` can only hand out a socket
+/// already bound, so this one is built with `rustix` and given to `std` after.
 fn bind_dual_stack(port: u16) -> std::io::Result<UdpSocket> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    // Close-on-exec as `std` would set it: in the call where the platform
+    // has the flag, right after it where it does not.
+    #[cfg(not(target_vendor = "apple"))]
+    let flags = SocketFlags::CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let flags = SocketFlags::empty();
+    let fd = rustix::net::socket_with(AddressFamily::INET6, SocketType::DGRAM, flags, None)?;
+    #[cfg(target_vendor = "apple")]
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::net::sockopt::set_ipv6_v6only(&fd, false)?;
     let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0);
-    let sock = std::net::UdpSocket::bind(SocketAddr::V6(addr))?;
-    set_v6only(&sock, false)?;
-    Ok(sock)
-}
-
-/// `IPV6_V6ONLY`. Not in `std`, and `rustix` exposes it directly.
-fn set_v6only(sock: &UdpSocket, on: bool) -> std::io::Result<()> {
-    use std::os::fd::AsFd;
-    rustix::net::sockopt::set_ipv6_v6only(sock.as_fd(), on).map_err(std::io::Error::from)
+    rustix::net::bind(&fd, &addr)?;
+    Ok(UdpSocket::from(fd))
 }
 
 /// Rewrite `peer` into the form `local`'s socket family can actually send to.
@@ -189,18 +197,26 @@ mod tests {
 
     #[test]
     fn a_dual_stack_socket_accepts_both_families() {
-        let sock = match bind_dual_stack(0) {
-            Ok(s) => s,
-            // A host with IPv6 switched off entirely; the fallback covers it
-            // and there is nothing to assert here.
-            Err(_) => return,
-        };
+        // A host with IPv6 switched off entirely cannot bind `[::]` at all;
+        // the fallback covers it and there is nothing to assert here. Asked
+        // of a plain bind, not of `bind_dual_stack`: its own failure is what
+        // this test is for, and once hid that it failed everywhere
+        // (`IPV6_V6ONLY` set after `bind` is EINVAL on Linux and macOS).
+        if UdpSocket::bind("[::]:0").is_err() {
+            return;
+        }
+        let sock = bind_dual_stack(0).expect("a host with IPv6 binds dual-stack");
         let local = sock.local_addr().expect("local_addr");
         assert!(local.is_ipv6(), "dual-stack sockets are bound as IPv6");
 
         use std::os::fd::AsFd;
         let v6only = rustix::net::sockopt::ipv6_v6only(sock.as_fd()).expect("read IPV6_V6ONLY");
         assert!(!v6only, "the socket refuses IPv4 and is not dual-stack");
+        let fd_flags = rustix::io::fcntl_getfd(sock.as_fd()).expect("read FD flags");
+        assert!(
+            fd_flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "the socket would leak into every child the session spawns"
+        );
     }
 
     #[test]

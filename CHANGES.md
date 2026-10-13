@@ -250,6 +250,15 @@
 
 ### Fixed
 
+- **Direct IPv6 works.** The session socket was meant to be dual-stack -- one
+  socket for IPv6 and IPv4 peers, so the direct IPv6 rung and the STUN punch
+  share one NAT mapping -- but it switched IPv4 on after binding, which Linux
+  and macOS both refuse. Every session therefore fell back to an IPv4-only
+  socket while still offering its IPv6 addresses, and the direct IPv6 rung
+  could never succeed. The option is now set before the bind. STUN discovery
+  addresses IPv4 servers in the mapped form a dual-stack socket needs, which
+  the IPv4-only socket had hidden.
+
 - **The status popup shows the link's real MTU.** The header now ends in
   `mtu <N>`, sampled once a second from the link that is carrying the
   session, so it follows a failover or a rebuild. The only figure the client
