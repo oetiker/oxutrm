@@ -57,6 +57,32 @@ pub fn bind_socket(cfg: &NetConfig) -> anyhow::Result<UdpSocket> {
         .context("could not bind a UDP socket on any port or family")
 }
 
+/// Bind a socket to take over a live connection to `peer`.
+///
+/// `peer` is the remote address as the connection holds it, and that form is
+/// fixed: it was written in the family of the socket the connection was
+/// dialled from (see [`to_socket_family`]), and moving to a new socket does
+/// not rewrite it. So the replacement must be of that same family. A plain
+/// IPv4 peer needs an IPv4 socket, since `send_to` on `[::]` rejects it; any
+/// IPv6 form, mapped or not, needs a dual-stack one.
+///
+/// [`bind_socket`] does not guarantee this. The old socket is still bound
+/// while its replacement is made, so if it holds the preferred port, both
+/// attempts at that port fail and the fallback can land in the other family.
+pub fn bind_replacement(cfg: &NetConfig, peer: SocketAddr) -> anyhow::Result<UdpSocket> {
+    let bind = |port| match peer {
+        SocketAddr::V4(_) => UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            port,
+        ))),
+        SocketAddr::V6(_) => bind_dual_stack(port),
+    };
+    if let Ok(sock) = bind(cfg.prefer_port) {
+        return Ok(sock);
+    }
+    bind(0).with_context(|| format!("could not bind a socket that can reach {peer}"))
+}
+
 /// A socket bound to `[::]` with `IPV6_V6ONLY` off, so it accepts IPv4 too.
 ///
 /// The option is set BEFORE `bind`: once a socket has a port, Linux and
@@ -193,6 +219,58 @@ mod tests {
         drop(squat_v4);
         drop(squat_v6);
         drop(sock);
+    }
+
+    /// The case a route change hits whenever the old socket holds the
+    /// preferred port: it is still bound while its replacement is made, so
+    /// `bind_socket` falls past both 443 attempts to dual-stack `[::]:0`. A
+    /// connection dialled from an IPv4 socket holds its peer as plain IPv4,
+    /// which a `[::]` socket cannot send to.
+    #[test]
+    fn a_replacement_for_an_ipv4_connection_stays_ipv4() {
+        let old = UdpSocket::bind("0.0.0.0:0").expect("the old socket");
+        let cfg = NetConfig {
+            prefer_port: old.local_addr().expect("local_addr").port(),
+            ..NetConfig::default()
+        };
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        if UdpSocket::bind("[::]:0").is_ok() {
+            let fresh = bind_socket(&cfg).expect("bind");
+            assert!(
+                fresh.local_addr().expect("local_addr").is_ipv6(),
+                "bind_socket no longer changes family here; this test lost its premise"
+            );
+        }
+
+        let sock = bind_replacement(&cfg, peer).expect("an IPv4 replacement");
+        let local = sock.local_addr().expect("local_addr");
+        assert!(
+            local.is_ipv4(),
+            "{local} cannot send to the connection's peer {peer}"
+        );
+        sock.send_to(b"x", peer)
+            .expect("the replacement sends to the peer as the connection holds it");
+    }
+
+    /// A connection dialled from a dual-stack socket holds an IPv4 peer in
+    /// mapped form, which only another dual-stack socket can address.
+    #[test]
+    fn a_replacement_for_a_mapped_connection_is_dual_stack() {
+        // A mapped peer exists only where `[::]` could be bound in the first
+        // place.
+        if UdpSocket::bind("[::]:0").is_err() {
+            return;
+        }
+        let peer: SocketAddr = "[::ffff:127.0.0.1]:9".parse().unwrap();
+        let sock = bind_replacement(&NetConfig::default(), peer).expect("a dual-stack replacement");
+        assert!(sock.local_addr().expect("local_addr").is_ipv6());
+
+        use std::os::fd::AsFd;
+        let v6only = rustix::net::sockopt::ipv6_v6only(sock.as_fd()).expect("read IPV6_V6ONLY");
+        assert!(!v6only, "the replacement cannot reach the mapped peer");
+        sock.send_to(b"x", peer)
+            .expect("the replacement sends to the peer as the connection holds it");
     }
 
     #[test]
