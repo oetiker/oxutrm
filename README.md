@@ -1,267 +1,221 @@
 # oxutrm
 
+[![CI](https://github.com/oetiker/oxutrm/actions/workflows/ci.yml/badge.svg)](https://github.com/oetiker/oxutrm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/oetiker/oxutrm)](https://github.com/oetiker/oxutrm/releases/latest)
+
 A remote terminal that survives bad networks, changing IP addresses, and NAT on
 both ends.
 
-It is, deliberately, **Mosh rebuilt in Rust with a real terminal emulator on
-both ends**, and it sets out to solve the two things Mosh never did: NAT
-traversal and working scrollback. NAT traversal works today. **Scrollback does
-not yet** — the host keeps it, nothing serves it to a client, and that is phase
-C work.
+oxutrm is Mosh rebuilt in Rust, with a terminal emulator on both ends. The host
+owns the authoritative screen and sends the client the differences over QUIC;
+ssh is used only to start a session and to rebuild a lost link. It adds NAT
+traversal on both ends and a session switcher. Scrollback is kept on the host
+but not yet sent to the client.
 
-> **Status: phase A+B.** The transport, the terminal core and the session loops
-> work and are tested. It is not yet something to put on a machine you care
-> about. See [What does not work yet](#what-does-not-work-yet) — that section is
-> longer than this one, and honestly so.
+> **Status:** the transport, the terminal core and the session loops work and
+> are tested. oxutrm is young; see [What does not work yet](#what-does-not-work-yet).
 
-## Why
+The full reference is the man page, [`docs/manual.md`](docs/manual.md)
+(`man oxutrm` once installed).
 
-`ssh` plus `tmux` is "reconnect and hope". Close a laptop lid, walk between
-Wi-Fi and mobile, or move between offices, and the shell is gone or the
-connection hangs until a TCP timeout notices.
+## Installing
 
-oxutrm keeps the session. The state is replicated rather than streamed, so a
-lost packet costs nothing, and the connection is QUIC, so an IP change is a
-migration rather than a disconnection.
+oxutrm has to be installed on **both machines**: the one you type on and the
+one you connect to. `oxutrm <ssh-target>` runs `ssh <ssh-target> oxutrm host
+--connect`, so the far end needs `oxutrm` on a `PATH` that a non-interactive
+ssh searches. Check it with:
+
+```sh
+ssh <ssh-target> command -v oxutrm
+```
+
+The binaries are statically linked, so the far end's distribution and glibc
+version do not matter.
+
+Release archives for Linux (`x86_64` and `aarch64`, musl), macOS (`x86_64`
+and `aarch64`) and illumos (`x86_64`) are on the
+[releases page](https://github.com/oetiker/oxutrm/releases/latest). There is
+no Windows build: oxutrm needs a pty, `fork` and Unix sockets.
+
+Debian and Ubuntu:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/gitea-oposs.asc https://gitea.oetiker.ch/api/packages/oposs/debian/repository.key
+echo "deb [signed-by=/etc/apt/keyrings/gitea-oposs.asc] https://gitea.oetiker.ch/api/packages/oposs/debian stable main" | sudo tee /etc/apt/sources.list.d/oposs.list
+sudo apt update && sudo apt install oxutrm
+```
+
+Fedora, RHEL, Rocky and Alma, with dnf4 and dnf5 alike:
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/oposs.repo https://gitea.oetiker.ch/api/packages/oposs/rpm.repo
+sudo dnf install oxutrm
+```
+
+Homebrew:
+
+```sh
+brew tap oetiker/oxutrm https://github.com/oetiker/oxutrm
+brew trust --formula oetiker/oxutrm/oxutrm
+brew install oxutrm
+```
+
+`brew trust` exists from Homebrew 6 on; skip it on older versions.
+
+mise:
+
+```sh
+mise use -g github:oetiker/oxutrm
+```
+
+## Using it
+
+```
+oxutrm <ssh-target>                        # pick a session there, or start one
+oxutrm --attach <name|id> <ssh-target>     # go straight to that one
+oxutrm --new [--name <name>] <ssh-target>  # start a new one regardless
+oxutrm host --list                         # sessions on this machine
+oxutrm loopback                            # both halves in one process, no network
+```
+
+`oxutrm <ssh-target>` drives ssh, tries the connection ladder, brings up QUIC
+on the first path that works, and hands you the shell. The session survives the
+client going away. Connect again and the far end offers what is running: with
+any session there, the **session selector** opens, to switch to one, start a
+new one, rename or kill one. Nothing is resumed silently. `--attach` goes
+straight to a session by its name or the start of its id (lowercase hex), and
+`--new` always starts a new one, named with `--name`. The same selector is `s`
+in the status popup, and switching there uses the live link, not ssh. See
+[`docs/sessions.md`](docs/sessions.md).
+
+A client whose network dies reconnects by itself. After twenty seconds of
+silence it rebuilds the link with a new ssh, back into the same session. The
+first attempt starts at once; after that it waits two seconds, then four, then
+eight, and every eight seconds for as long as you leave it running. The old
+link stays open meanwhile, and whichever link answers first carries the
+session. These attempts run `ssh -o BatchMode=yes`, so a key that needs a
+passphrase typed cannot be unlocked; the attempt fails and the status popup
+says why.
+
+While a link is up, the client also keeps a **standby**: a second connection
+to the same session from a different local source address, for example the
+open internet next to a split-tunnel VPN. When the primary goes quiet and the
+standby still answers, the client fails over to it in about three seconds,
+without ssh. It does not switch back. On a machine with only one way out
+there is no standby, and the client searches again at intervals that grow from
+thirty seconds to five minutes; each search raises the session's attach number.
+
+`Ctrl-\` opens a status popup, and an outage opens it by itself. It shows the
+round-trip time and its range over the last minute, loss, throughput, the path
+MTU, which link of the session this is, the standby, what the rebuild is
+trying, and the last things oxutrm did. Two quick presses send one literal
+`Ctrl-\` to the remote program. Input typed during an outage is held, and when
+the host answers the popup asks whether to send it (`s`) or drop it (`d`).
+Everything oxutrm does to keep the session alive is also appended to
+`~/.local/state/oxutrm/client.log`.
+
+The popup key, the timings and the network features are set in
+`~/.config/oxutrm/config.toml`, or with `c` in the status popup. See
+[`docs/config.md`](docs/config.md).
+
+oxutrm never parses `~/.ssh/config`. It runs `ssh` and expects
+`ssh <ssh-target>` to work already, by whatever means: jump host, VPN, reverse
+tunnel.
 
 ## How it differs from Mosh
 
 | | Mosh | oxutrm |
 |---|---|---|
-| Transport | hand-rolled AES-OCB over UDP | QUIC, key pinned via SSH |
+| Transport | AES-OCB over UDP | QUIC, key pinned via SSH |
 | Roaming | custom address-update logic | QUIC connection migration |
-| NAT | none — the server must be reachable | a five-rung ladder; both ends may be behind NAT |
-| Firewalls | UDP 60000–61000, widely blocked | UDP/443, the one UDP port usually open |
-| Emulation | heuristic prediction overlay | a real `vt`-class emulator on **both** ends |
-| Scrollback | broken | synced (phase C) |
-| Reattach | none | the same code path as first connect |
-| `TERM` | hardcoded `xterm-256color` | negotiated from what the emulator actually supports |
-
-The emulator on both ends is the load-bearing difference. Mosh guesses what the
-screen will look like; oxutrm knows, because the client renders from
-authoritative state rather than approximating it.
-
-## Installing
-
-**oxutrm has to be on both machines** — the one you type on and the one you
-connect to. `oxutrm <ssh-target>` runs `ssh <target> oxutrm host --connect` on
-the far end, so the far end needs it on a `PATH` that a *non-interactive* ssh
-searches. `ssh <target> command -v oxutrm` is the check; a login shell's `PATH`
-is not the one that matters.
-
-Releases carry a `.deb`, an `.rpm` and a `.tar.gz` for `x86_64` and `aarch64`.
-
-```
-sudo dpkg -i oxutrm_<version>_amd64.deb          # Debian, Ubuntu
-sudo rpm -i oxutrm-<version>.x86_64.rpm          # Fedora, RHEL, SUSE
-tar xzf oxutrm-<version>-x86_64-unknown-linux-musl.tar.gz   # anything else
-```
-
-The binaries are **statically linked**, which matters here more than it usually
-does: the far end is a machine you did not choose and cannot rebuild for. A
-dynamically linked binary built on a current distribution refuses to start on an
-older one — glibc 2.39 against a host at 2.35 is enough — and it fails inside a
-session you cannot see. A static binary has no such argument with its
-destination.
-
-**Unix only, and only Linux is shipped.** oxutrm uses `fork`, `setsid`, a pty
-and a Unix socket, so there is no Windows build. The two places that used to be
-Linux-only — enumerating this process's descriptors, and asking when a pid
-started — now have a macOS implementation, and everything but the QUIC crates
-type-checks for `aarch64-apple-darwin`. Nothing has ever been *run* on a Mac,
-and no macOS package is built, so treat it as unproven rather than supported.
-
-## Using it
-
-```
-oxutrm <ssh-target>                    # pick a session there, or start one
-oxutrm --attach <name|id> <ssh-target> # go straight to that one
-oxutrm --new [--name <name>] <tgt>     # start a fresh one regardless
-oxutrm host --list                     # sessions on this machine
-oxutrm loopback              # both halves in one process, no network
-```
-
-`oxutrm <ssh-target>` works: it drives ssh, races the connection ladder, brings
-up QUIC on whichever rung wins, and hands you the shell. The session survives
-the client going away, and you get it back by connecting again: the far end
-offers what is already running, and with any session there the **session
-selector** opens -- to switch to one, start a new one, rename or kill one.
-Nothing is resumed silently. `--attach` goes straight to a session by its name
-or the start of its id (lowercase hex), and `--new` always starts a fresh one,
-named with `--name`. The same selector is `s` in the status popup, and
-switching there uses the live link, not ssh. See `docs/sessions.md`.
-
-A client whose network dies reconnects by itself. After twenty seconds of
-silence it rebuilds the link — a new ssh, back into the same session. The first
-attempt is immediate, since the twenty seconds have already been waited, and
-after that it backs off: two seconds after the first failure, then four, then
-eight, and every eight for as long as you leave it running. The old link is
-held throughout, so whichever comes back first wins.
-Until the askpass work lands, those attempts run `ssh -o BatchMode=yes`: a key
-that needs a passphrase typed cannot be unlocked from under a session that owns
-the screen, so the attempt fails cleanly and the status popup says why.
-
-While a link is up, the client also looks for a **standby**: a second
-connection to the same session over whatever path the kernel would route
-through a different local address than the primary — the open internet next to
-a split-tunnel VPN, say. It is kept warm by the same ten-second QUIC keep-alive
-that already holds a punched NAT mapping open: one more keep-alive every ten
-seconds on each end. When the primary goes quiet and the standby still answers, the
-client fails over to it in about three seconds, with no ssh — never because
-the standby is faster, only because the primary has stopped answering, and
-there is no switching back once it has.
-
-`Ctrl-\` opens a status popup on a healthy link, and an outage opens it by
-itself: the round-trip time and its range over the last minute, loss,
-throughput, which link of the session this is, the standby and what it is
-doing, what the rebuild is trying, and the last things oxutrm did. Two quick
-presses send one literal `Ctrl-\` to the remote program. Typing done while it
-was closed during an outage is held, and when the host answers the popup asks
-whether to send it (`s`) or drop it (`d`); keys pressed in the first half
-second after the question appears do nothing. Everything oxutrm does to keep
-the session alive is also appended to `~/.local/state/oxutrm/client.log` (or
-under `$XDG_STATE_HOME`), capped at 2 MiB with one rotation.
-
-A standby row that says "none" means the session has no fallback, and the next
-outage waits for the twenty-second rebuild above instead. On a machine with
-only one way out the client keeps looking all the same: the wait between
-searches grows from thirty seconds to five minutes, and a route change brings
-the next one forward. Each search is a full attach exchange with the host: that
-is why the session's attach number climbs on such a machine.
-
-`loopback` runs both halves in one process with no network in between: a shell
-on a PTY, through the emulator, diffed, encoded to bytes, decoded, and painted.
-It stays the fastest way to exercise the terminal core.
-
-```
-oxutrm host --serve          # the remote half; spawned over ssh, not by hand
-oxutrm host --attach <id>    # reattach                 (not yet wired)
-```
-
-oxutrm never parses `~/.ssh/config`. It shells out to `ssh` and assumes
-`ssh <target>` already works, by whatever means — jump host, VPN, reverse
-tunnel. If you trust `ssh <target>` today, you trust oxutrm: there is no new
-trust root, no new credential store, and no additional service exposed.
+| NAT | the server must be reachable | a five-rung ladder; both ends may be behind NAT |
+| Firewalls | UDP 60000-61000 | UDP/443 first |
+| Emulation | prediction overlay | a terminal emulator on both ends |
+| Scrollback | none | kept on the host, not yet sent to the client |
+| Reattach | none | the same path as a first connect, with a session selector |
+| `TERM` | `xterm-256color` | from what the local terminal reports |
 
 ## How it connects
 
-The host binds **UDP/443** where permitted, because restrictive networks tend to
-leave it open — blocking it breaks HTTP/3 for every browser present. Then a
-ladder, first validated path wins:
+The host binds UDP/443 where it can. Then client and host try a ladder, and
+the first path that validates wins:
 
-| Rung | Mechanism | Wins when |
+| Rung | Mechanism | Works when |
 |---|---|---|
-| 0 | IPv6 direct | both ends have global IPv6 — no NAT to traverse |
+| 0 | IPv6 direct | both ends have global IPv6 |
 | 1 | Router port mapping (NAT-PMP, PCP, UPnP-IGD) | a typical home router |
-| 2 | STUN + hole punch | most NATs |
-| 3 | Birthday-paradox blast | symmetric NAT |
-| 4 | SSH tunnel | UDP blocked entirely |
+| 2 | STUN and hole punch | most NATs |
+| 3 | Birthday-paradox punch | symmetric NAT |
+| 4 | SSH tunnel | UDP is blocked |
 
-You are told which one you got, in one line, once:
+The result is printed once:
 
 ```
 oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452
 oxutrm  IPv4 punched (birthday, 312 probes)  ·  61 ms  ·  symmetric NAT
-oxutrm  SSH tunnel — no UDP path, not detachable  ·  45 ms      [warning]
 ```
 
-Rung 4 is a warning rather than a success because that session runs inside the
-SSH connection: it cannot detach and cannot be reattached. Degrading to it
-silently would remove both properties the project exists to provide.
-
-The packets genuinely **are** QUIC, with ALPN `oxutrm/1`. oxutrm does not forge
-anyone else's domain in SNI to look like something it is not.
+A session on rung 4 runs inside the ssh connection: it ends with it and cannot
+be reattached, so it is reported as a warning. The packets are QUIC with ALPN
+`oxutrm/1`.
 
 ## What does not work yet
 
-Phase A+B is the transport, the terminal core and the session loops. In
-progress or not started:
-
-- **A reconnect cannot ask for a passphrase.** The client rebuilds a lost link
-  with `ssh -o BatchMode=yes`, because raw mode is held and a passphrase prompt
-  would fight the renderer for the terminal. If your key needs unlocking and no
-  agent is holding it, the attempts fail and say so rather than reconnecting.
-- **A session taken over by somebody else is reported as an error**, not as its
-  own state: the client says the host closed the session without the shell
-  exiting. It is accurate and it is not the sentence that case deserves.
-- **Scrollback is not synced.** The host keeps it; the client cannot fetch it
-  yet. Phase C.
-- **No speculative local echo.** Typing waits for the round trip. Phase C.
-- **No `tmux -CC` integration.** Phase D.
+- **A reconnect cannot ask for a passphrase.** A rebuild runs
+  `ssh -o BatchMode=yes`; a key that needs unlocking and is not held by an
+  agent makes the attempts fail, and the popup says so.
+- **A session taken over by another client is reported as an error**: the
+  client says the host closed the session without the shell exiting.
+- **Scrollback is not synced.** The host keeps it; the client cannot fetch it.
+- **No local echo.** Typing waits for the round trip.
+- **No `tmux -CC` integration.**
 - **Bandwidth adaptation is a fixed pacing interval**, `clamp(rtt/2, 8ms,
-  100ms)`, not the loss-aware policy phase C describes.
+  100ms)`, not a loss-aware policy.
 
-## What it will never do
+## What it will not do
 
-Named rather than left implicit, so nobody plans around them:
-
-- **No graphics protocols** — no Sixel, no Kitty, no iTerm2 inline images. The
-  emulator does not model them and claiming support would be a lie.
-- **No Windows.** Unix PTY semantics are assumed throughout.
-- **No GUI.** oxutrm renders into a terminal you already have.
-- **Not a VPN or a port forwarder.** It moves one terminal session.
-- **It will not replace tmux.** Phase D integrates with it instead.
+- **Graphics protocols**: no Sixel, Kitty or iTerm2 inline images.
+- **Windows.**
+- **A GUI.** oxutrm renders into the terminal you already have.
+- **VPN or port forwarding.** It moves one terminal session.
+- **Replace tmux.**
 
 ## Known limitations
 
-Real ones, found by testing rather than guessed at:
-
-- **Blink is reconstructed, and scrolling drops it.** The emulator parses
-  SGR 5/6/25 and then discards them, so oxutrm recovers blink in a parallel
-  plane. A resize reflows the grid and the plane is cleared rather than guessed
-  at, so blinking text loses its blink across a resize.
-- **All five underline styles render as one.** Double, curly, dotted and dashed
-  underlines all arrive as a plain underline. Drawing a curly underline as a
-  straight one is a smaller lie than drawing none.
-- **No icon name.** OSC 1 is silently dropped by the parser, so there is no
-  field for it — an icon field could only ever hold a value oxutrm invented.
-- **Reflow is lossless across the grid, not across the visible screen.**
-  Narrowing the window wraps a long line and pushes the rows that no longer fit
-  into scrollback; widening again does not pull them back down. That matches
-  what a local terminal does, but "lossless in both directions" is too strong a
-  claim for what a client actually sees.
-- **"Both ends behind NAT" is a design property, not yet a tested one.** The
-  network-namespace tests put one end behind a NAT — cone, symmetric, and
-  nested double NAT — and prove traversal, ICE nomination and the birthday
-  blast against it. No topology yet NATs *both* ends simultaneously. The ladder
-  is symmetric by construction and candidate exchange runs both ways, so there
-  is no known reason it would fail, but that is reasoning rather than evidence.
-- **A better path found after connect is lost until the next attach.** QUIC
-  migration lets a client change its own *local* address; there is no mechanism
-  to repoint an established connection at a different *remote* address. A
-  standby does not change that: it is a second connection over a different
-  local source address, switched to when the primary fails, never because it
-  is faster.
-- **A standby can still share the primary's wire.** The filter that keeps a
-  standby off the primary's path compares the kernel's reported source address
-  for each candidate, not the interface (`src/egress.rs`): a dual-stack or
-  multi-address NIC can route two different source addresses over the very
-  same physical link. A standby admitted that way looks like a different path
-  and is not one — if that link dies, the standby dies with it, and there is
-  nothing left to fail over to.
-- **Under a saturating writer the loop runs slower than its pacing interval.**
-  The screen stays current and nothing queues, but a turn costs more than the
-  8 ms floor when something like `yes` is running.
+- **Blinking text loses its blink across a resize.**
+- **All five underline styles render as a plain underline.**
+- **The icon name (OSC 1) is ignored.**
+- **Narrowing the window pushes wrapped rows into scrollback**, and widening
+  it again does not bring them back, as in a local terminal.
+- **Both ends behind NAT is untested.** The network-namespace tests put one end
+  behind cone, symmetric and nested double NAT; no test NATs both ends at once.
+- **A better path found after connect is used only from the next attach.** QUIC
+  migration changes the client's local address, not the remote one; a standby
+  is used only when the primary fails.
+- **A standby can share the primary's physical link.** It is chosen by source
+  address, not by interface, so on a dual-stack or multi-address NIC both
+  connections can use one wire and fail together.
+- **Under a saturating writer such as `yes`**, a loop turn takes longer than
+  the 8 ms pacing floor. The screen stays current and nothing queues.
 
 ## Security
 
-- **The trust root is SSH, unchanged.** No certificate authority, no new
-  credential store, no additional listening service.
-- The host generates a **fresh self-signed certificate and PSK per attach**. The
-  SHA-256 of its SPKI travels over SSH, and the client accepts that fingerprint
-  and nothing else — *and still verifies the handshake signature*, because
-  pinning without signature verification is not weaker authentication, it is
-  none.
-- ICE connectivity checks carry `MESSAGE-INTEGRITY` over direction-labelled
-  credentials derived from the PSK, so a stranger cannot advance the state
-  machine and oxutrm cannot be used as a reflector.
-- **No key material is ever written to disk**, on either side.
-- Public STUN servers learn only that an IP is using STUN — no session content,
-  no peer address, no identity. The server list is configurable.
+- The trust root is SSH. There is no certificate authority, no new credential
+  store and no additional listening service.
+- The host generates a fresh self-signed certificate and PSK for every attach.
+  The SHA-256 of its SPKI travels over SSH; the client accepts that fingerprint
+  only, and verifies the handshake signature.
+- ICE connectivity checks carry `MESSAGE-INTEGRITY` over credentials derived
+  from the PSK, so a stranger cannot advance the state machine or use oxutrm
+  as a reflector.
+- No key material is written to disk on either side.
+- Public STUN servers learn only that an address uses STUN. The server list is
+  configurable.
 
 ## Building
 
-Rust 1.85 or newer (edition 2024).
+Rust 1.96 or newer (edition 2024).
 
 ```
 make            # fmt-check, clippy, then tests
@@ -269,16 +223,13 @@ make test
 make lint
 ```
 
-Every rule caps parallelism at 4 and passes `--workspace`. The `--workspace` is
-not decoration: the repo root is both a `[package]` and a `[workspace]`, so a
-bare `cargo test` selects only the root binary and reports "ok" while running
-none of the crates' tests.
+Every rule caps parallelism at 4 and passes `--workspace`.
 
 ## Layout
 
 ```
 crates/oxutrm-proto/   wire types, the screen model, framing
-crates/oxutrm-sync/    the state/diff engine — NO I/O AT ALL
+crates/oxutrm-sync/    the state/diff engine, with no I/O
 crates/oxutrm-term/    PTY, emulator, ScreenState conversion
 crates/oxutrm-net/     candidates, STUN, NAT traversal, QUIC
 crates/oxutrm-host/    session registry, daemonize, PTY supervision
@@ -286,12 +237,9 @@ crates/oxutrm-client/  renderer, raw mode, the status line
 src/                   the binary: subcommand dispatch and the session loops
 ```
 
-The load-bearing boundary is that **`oxutrm-sync` has no I/O** — no sockets, no
-files, no clocks. That is what lets the riskiest property in the protocol (for
-any sequence of states and any subset of frames dropped, duplicated or
-reordered, the two ends converge) be tested exhaustively without a network. A
-test asserts it against the crate's own manifest, so the boundary is enforced
-rather than remembered.
+`oxutrm-sync` has no sockets, files or clocks, so convergence under dropped,
+duplicated and reordered frames is tested without a network. A test checks
+the crate's manifest for this.
 
 ## Licence
 
