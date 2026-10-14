@@ -12,16 +12,16 @@
   was taken over rather than leaving it to report silence.
 
 - **A session selector, at connect and in the status popup.** A host may run
-  several oxutrm sessions; `s` in the status popup now lists them -- name,
+  several oxutrm sessions; `s` in the status popup now lists them (name,
   shell, when each started, its size, and whether it is the one you are in,
-  attached to another client (`in use`), or did not answer (`?`) -- and from
+  attached to another client (`in use`), or did not answer (`?`)), and from
   the list `⏎` switches to one, `n` starts a new one, `r` names or renames one
   in place and `x` kills one after asking. A switch travels over the live
   link and never touches ssh: the new session's link is built while you stay
   in the old one, and only once it is up does the client move, so a switch
   that fails leaves you where you were with the reason under the list,
   wrapped over as many lines as it needs. A session another client is
-  attached to -- or one that did not answer, and may be -- is taken over
+  attached to, or one that did not answer and may be, is taken over
   after asking, as `--attach` does. Killing the session you are in leaves the
   selector open over a blank screen until you pick another, start one, or quit with `q`;
   killing never ends the client by itself. Every switch, kill and rename is in
@@ -30,7 +30,7 @@
 - **Connecting to a host shows its sessions instead of resuming one.**
   `oxutrm <ssh-target>` asks the far end what is running before either side
   commits to anything. With nothing of yours there you get a new session,
-  exactly as before. With any session running -- even exactly one -- the
+  exactly as before. With any session running, even exactly one, the
   selector opens over a blank screen, after the splash: nothing is resumed
   silently any more. `--attach <name>` or `--attach <id-prefix>` (four
   lowercase hex characters or more, as ids are written) goes straight to one
@@ -44,8 +44,8 @@
   connection that created it is listed dimmed and refused with that reason.
 
 - **A client whose network dies reconnects by itself.** After twenty seconds of
-  silence — long enough that a blip is not raced against an outage about to end
-  on its own — the client builds a new link back into the same session: a fresh
+  silence (long enough that a blip is not raced against an outage about to end
+  on its own), the client builds a new link back into the same session: a fresh
   ssh, the same handshake a first connect runs. The first attempt goes out
   immediately, because the twenty seconds have already been waited; each
   failure after that backs off, two seconds, then four, then eight, and every
@@ -58,14 +58,14 @@
   the host has been quiet, which attempt is next, when it is due, and why the
   last one failed. If the far end answers that the session is gone, that is an
   answer rather than an outage: oxutrm says so and stops. An attempt that gets
-  no answer at all — a far end that accepts the connection and then goes quiet
-  — is given up after two minutes and tried again, rather than leaving the
+  no answer at all (a far end that accepts the connection and then goes quiet)
+  is given up after two minutes and tried again, rather than leaving the
   client waiting on it for ever.
 
   Once an outage is over, it is over: if somebody else takes the session over
   later on, oxutrm tells you and exits, exactly as it would have if no outage
   had ever happened. It used to stay quietly convinced, for the rest of that
-  session, that any takeover must be its own reconnection — so it swallowed the
+  session, that any takeover must be its own reconnection, so it swallowed the
   notice, sat on a connection the host had already closed showing a screen that
   would never change again, and after twenty seconds took the session back off
   whoever had attached to it.
@@ -79,12 +79,12 @@
 - **The client keeps a second, warm connection to the session, and fails over
   to it.** While a link is up, the client builds a standby: a second QUIC
   connection over whatever path the kernel would route through a different
-  local source address than the primary — a split-tunnel VPN next to the open
+  local source address than the primary: a split-tunnel VPN next to the open
   internet, say. The ten-second QUIC keep-alive that already holds a punched
   NAT mapping open keeps this one warm too: one more keep-alive every ten
   seconds on each end, and nothing else while nothing is wrong.
   When the primary goes silent and the standby still answers, the client fails
-  over to it about three seconds in, with no ssh and no new handshake prompt —
+  over to it about three seconds in, with no ssh and no new handshake prompt,
   never because the standby is faster, only because the primary has stopped
   answering, and there is no switching back once it has. A host advertises the
   capability with `features: ["control", "standby"]` in its hello; an older
@@ -112,8 +112,8 @@
 - **A status popup shows what the connection is doing.** `Ctrl-\` opens it in
   every phase while it is closed; pressed twice within half a second it sends
   one literal `Ctrl-\` to the remote program instead. It also opens by itself
-  two seconds into an outage, and when the link comes back it says so —
-  `● LIVE again   outage 4.2 s · IPv4 punched · …` — for three seconds before
+  two seconds into an outage, and when the link comes back it says so
+  (`● LIVE again   outage 4.2 s · IPv4 punched · …`) for three seconds before
   closing, unless you pressed a key in it. It shows the round-trip time now
   and its range over the last minute beside an RTT sparkline with gaps where
   the link was down, loss, throughput, which link of the session this is, the
@@ -125,13 +125,12 @@
   meanwhile is held as before, and when the host answers again the popup opens
   to ask about it: `s` sends what you typed, `d` drops it; keys pressed in the
   first half second after the question appears do nothing, so typing still in
-  flight cannot answer it. `c config` and `s sessions` are shown dimmed; they
-  come later.
+  flight cannot answer it.
 
 - **A session opens with the oxutrm logo.** Once the terminal is in raw
   mode, a fresh connect shows the ox head tuning in like a badly received
-  TV — about 0.8 s of snow, torn rows and flicker across the whole screen,
-  settling into the logo with the name under it, held for 1.5 s — and then
+  TV (about 0.8 s of snow, torn rows and flicker across the whole screen,
+  settling into the logo with the name under it, held for 1.5 s) and then
   your remote screen. Under the name it says which session you landed in and
   how it is reached (`resumed session 3ff1218f · IPv4 punched`), since the
   logo covers the line that says so before raw mode. Any key ends it at once and still goes to the remote
@@ -161,8 +160,8 @@
   servers, port mapping and the birthday punch. A `[host."<target>"]` table
   overrides any of them for one ssh target, spelled as on the command line.
   A missing file is today's behaviour; a broken one, a typo or a value out of
-  range is a warning in the popup's log and in `client.log` -- never a failed
-  connect -- and the splash says how many there were. `c` in the status popup
+  range is a warning in the popup's log and in `client.log`, never a failed
+  connect, and the splash says how many there were. `c` in the status popup
   opens the config screen: every setting with its value and where it came
   from, edited in place and applied at once where it can be, `x` to let the
   next layer show through, and `w` to save for all hosts (`a`) or for this host
@@ -196,7 +195,7 @@
   it can be offered the live sessions before choosing one. An older host does
   not know that option and exits with its own usage error, which oxutrm shows
   you as the reason it could not connect rather than reporting a network
-  failure — and if it happens while a session is being rebuilt after an outage,
+  failure; and if it happens while a session is being rebuilt after an outage,
   oxutrm names it as a version mismatch and stops instead of retrying an answer
   that will not change. The usage error, not the protocol version, is what
   tells an older host apart here: this exchange happens before the hellos,
@@ -214,7 +213,7 @@
   half-written one.
 
 - **The hellos now say what a peer can do.** `HostHello` and `ClientHello`
-  carry a `features` list — empty today except for the host, which advertises
+  carry a `features` list, empty today except for the host, which advertises
   `control` and `standby`. Absent on either side, it is read as "nothing".
   The standby link above asks for its standby and probes its link with
   requests on a link's control stream (`Attach` as a standby, and `Probe`,
@@ -237,8 +236,8 @@
   into the border. During an outage a block right under the first line has
   one row for the standby probe and one for the ssh rebuild, each with its own
   state and clock (`ssh rebuild   attempt 1 · running 14 s`). The log shows
-  one line per outage once it is over — `22:59  outage 8.1 s → switched to
-  standby (IPv4 punched)` — in local time, with identical lines folded into
+  one line per outage once it is over (`22:59  outage 8.1 s → switched to
+  standby (IPv4 punched)`) in local time, with identical lines folded into
   `×N` and a long line wrapping under its own text. Every step of the outage
   is still in `client.log`, unchanged and in UTC, followed by that summary
   line. A standby search that finds nothing says `no second path found`; the
@@ -246,18 +245,18 @@
   has to say, so a short log leaves no empty rows. The attach id, the average
   RTT and the cumulative sent/lost counts are no longer shown.
 
-- **The box that appeared during an outage is the popup now.** What it said —
-  how long the host has been silent, what was typed blind, the rebuild attempt
-  and its countdown, the question about held input — is a section of the
+- **The box that appeared during an outage is the popup now.** What it said
+  (how long the host has been silent, what was typed blind, the rebuild attempt
+  and its countdown, the question about held input) is a section of the
   popup. Its keys lose the `Ctrl-\` prefix: `q` quits, `s` and `d` answer the
   question. Typing into the popup is no longer held; close it with `Esc` to
   type blind.
 
 ### Fixed
 
-- **Direct IPv6 works.** The session socket was meant to be dual-stack -- one
+- **Direct IPv6 works.** The session socket was meant to be dual-stack (one
   socket for IPv6 and IPv4 peers, so the direct IPv6 rung and the STUN punch
-  share one NAT mapping -- but it switched IPv4 on after binding, which Linux
+  share one NAT mapping), but it switched IPv4 on after binding, which Linux
   and macOS both refuse. Every session therefore fell back to an IPv4-only
   socket while still offering its IPv6 addresses, and the direct IPv6 rung
   could never succeed. The option is now set before the bind. STUN discovery
@@ -326,20 +325,20 @@
 
 - **Reattaching no longer needs `loginctl enable-linger`.** A detached session
   outlives your login on most systems, but the directory it registered itself
-  in — `/run/user/<uid>` — does not, so oxutrm used to record sessions in your
+  in, `/run/user/<uid>`, does not, so oxutrm used to record sessions in your
   home directory instead. On a networked home that put the session's Unix
   socket on a filesystem where Unix sockets are not reliable, and on a shared
   home it meant `--list` could show sessions belonging to another machine and
   test their process ids against the wrong computer. Sessions are now recorded
-  on local storage — `/dev/shm` on Linux, `/var/tmp` elsewhere — which survives
+  on local storage (`/dev/shm` on Linux, `/var/tmp` elsewhere), which survives
   logout without any administrative setup, and each entry records which boot it
-  belongs to, so entries left behind by an earlier boot — or, on Linux, a
-  different machine — are recognised instead of believed. If something else
+  belongs to, so entries left behind by an earlier boot (or, on Linux, a
+  different machine) are recognised instead of believed. If something else
   has taken the directory oxutrm wants, it now says so and stops rather than
   quietly falling back to the home directory.
 
 - **The directory oxutrm records sessions in is now private.** Whatever
-  location it ends up using — including one you point `OXUTRM_STATE_DIR` at —
+  location it ends up using, including one you point `OXUTRM_STATE_DIR` at,
   is created, or corrected, to mode `0700` before anything is written into it.
   Its parent must already exist: oxutrm no longer creates intermediate
   directories on the way there, so an `OXUTRM_STATE_DIR` pointed at a path
@@ -351,7 +350,7 @@
   probe interval is `pto_base * 2^min(pto_count, 16)`, and normally the idle
   timeout closes such a connection long before that matters. With no idle
   timeout nothing did, so a session whose path had returned waited on a timer
-  that had doubled its way into the minutes — both ends alive, host merely
+  that had doubled its way into the minutes: both ends alive, host merely
   detached, path perfect, terminal dead. The backoff exponent is now capped at
   6, so the probe interval tops out at 64x the base rather than 65536x. A
   150-second blackout recovers in 1.24 s where it used to take 106.65 s; a

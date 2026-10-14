@@ -48,7 +48,7 @@ the splash is down.
 ```
 
 Each row is a session: its name (or the start of its id), its shell, when it
-started (the time today, the date before), its size, and a mark -- `this` for
+started (the time today, the date before), its size, and a mark: `this` for
 the session you are in, `in use` for one attached to another client, `?` for
 one that did not answer in time, `old version` for one started by another
 version of oxutrm. A session that cannot be reattached (it tunnels its data
@@ -62,8 +62,8 @@ the sessions were started, oldest first, with `+ new session` last.
 | `⏎` | switch to that session; on `+ new session`, start one; on `this`, close the popup |
 | `n` | start a new session |
 | `r` | name or rename the session in place: `⏎` saves, `Esc` cancels, an empty name clears it |
-| `x` | kill the session, after `kill build? y/n` -- or `kill build (in use elsewhere)? y/n` for one attached to another client |
-| `q` `Esc` | back to the popup -- or, with no session to go back to, quit |
+| `x` | kill the session, after `kill build? y/n`, or `kill build (in use elsewhere)? y/n` for one attached to another client |
+| `q` `Esc` | back to the popup, or quit when there is no session to go back to |
 
 Switching to a session that is `in use` asks first, then takes it over: its
 other client is told it was taken over, as with `--attach`. A `?` session
@@ -72,7 +72,7 @@ unknown)? y/n`). A question's
 `y` does nothing for the first half second, so typing already in flight
 cannot answer it.
 
-A switch travels over the live link -- never over ssh. The new session's link
+A switch travels over the live link, never over ssh. The new session's link
 is built while you stay in the old one, and only once it is up does the client
 move; a switch that fails leaves you where you were, with the reason under the
 list and in the popup's log. The session you left is detached, as if your
@@ -80,8 +80,8 @@ client had gone away, and is still listed.
 
 Killing a session hangs its shell up the way a closing terminal does, and
 kills what is left of it three seconds later. Killing the session you are in
-keeps the selector open over a blank screen -- with only `+ new session` if it
-was the last one -- until you pick another, start one, or quit. Killing never
+keeps the selector open over a blank screen (with only `+ new session` if it
+was the last one) until you pick another, start one, or quit. Killing never
 ends the client by itself; a shell that exits on its own (`exit`, a crash)
 still does.
 
@@ -96,7 +96,7 @@ sessions. Set one with `--new --name`, or with `r` in the selector.
 
 ## New shells
 
-Every new shell -- from a first connect, from the selector, after a kill -- is
+Every new shell (from a first connect, from the selector, after a kill) is
 a login shell (`-bash`) started in your home directory, as ssh would start it.
 
 ## Versions
