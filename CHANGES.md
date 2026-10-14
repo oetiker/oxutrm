@@ -250,13 +250,6 @@
 
 ### Fixed
 
-- **A session keeps showing output after the laptop changes networks.** On a
-  new Wi-Fi or a new address the client moves the connection to a fresh local
-  socket, and that socket could come up in the other IP family (IPv6 instead
-  of IPv4) and so be unable to reach the host: the screen stopped updating
-  and typing went nowhere. The fresh socket now always uses the family the
-  connection started on.
-
 - **Direct IPv6 works.** The session socket was meant to be dual-stack -- one
   socket for IPv6 and IPv4 peers, so the direct IPv6 rung and the STUN punch
   share one NAT mapping -- but it switched IPv4 on after binding, which Linux
