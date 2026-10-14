@@ -1,8 +1,21 @@
 # Changes
 
-## Unreleased
+## [Unreleased]
 
 ### New
+
+- **macOS builds, and a Homebrew tap.** Each release carries archives for
+  Intel and Apple silicon Macs, and `brew tap oetiker/oxutrm
+  https://github.com/oetiker/oxutrm` followed by `brew install oxutrm` installs
+  oxutrm on macOS and on Linux.
+
+- **An illumos build.** Each release carries an archive for
+  `x86_64-unknown-illumos`.
+
+- **apt and dnf repositories.** The `.deb` and `.rpm` packages are published
+  to the package registry at `https://gitea.oetiker.ch/oposs`, so `apt
+  upgrade` and `dnf upgrade` pick up new releases. They are still attached to
+  each GitHub release as well.
 
 - **A running session can be picked up from another terminal.** `oxutrm host
   --list` has always shown live sessions and `--attach` has always refused to
@@ -198,6 +211,11 @@
   which carry the version (now 3, see above).
 
 ### Changed
+
+- **The release archives carry the man page and no longer carry
+  `CHANGES.md`.** Each archive holds `oxutrm`, `man/oxutrm.1`, `README.md`
+  and `LICENSE`. The `.deb` and `.rpm` packages install the man page as well,
+  and still install `CHANGES.md` under `/usr/share/doc/oxutrm`.
 
 - **New shells are login shells in your home directory**, as ssh would start
   them: `argv[0]` is `-bash` (or whatever your shell is), so your profile is
