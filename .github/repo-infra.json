@@ -20,7 +20,6 @@
   "release_assets": [
     "oxutrm-*-x86_64-unknown-linux-musl.tar.gz",
     "oxutrm-*-aarch64-unknown-linux-musl.tar.gz",
-    "oxutrm-*-x86_64-unknown-illumos.tar.gz",
     "oxutrm-*-x86_64-apple-darwin.tar.gz",
     "oxutrm-*-aarch64-apple-darwin.tar.gz",
     "oxutrm_*_amd64.deb",
@@ -61,6 +60,6 @@
     ]
   },
   "exceptions": {
-    "native-targets": "no Windows archives: oxutrm needs a pty, fork, setsid and a Unix socket, which Windows does not offer"
+    "native-targets": "no Windows archives: oxutrm needs a pty, fork, setsid and a Unix socket, which Windows does not offer. No illumos archive: netdev 0.46 does not compile for illumos, rustix-openpty has no login_tty there, and oxutrm-host has no boot_token for it"
   }
 }

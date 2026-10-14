@@ -9,9 +9,6 @@
   https://github.com/oetiker/oxutrm` followed by `brew install oxutrm` installs
   oxutrm on macOS and on Linux.
 
-- **An illumos build.** Each release carries an archive for
-  `x86_64-unknown-illumos`.
-
 - **apt and dnf repositories.** The `.deb` and `.rpm` packages are published
   to the package registry at `https://gitea.oetiker.ch/oposs`, so `apt
   upgrade` and `dnf upgrade` pick up new releases. They are still attached to

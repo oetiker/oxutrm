@@ -132,14 +132,16 @@ description = "A remote terminal that survives bad networks, changing IP address
 # Packaging
 # ---------------------------------------------------------------------------
 #
-# The release builds archives for Linux (x86_64 and aarch64), macOS (Intel and
-# Apple silicon) and illumos, .deb and .rpm packages from the Linux archives
+# The release builds archives for Linux (x86_64 and aarch64) and macOS (Intel
+# and Apple silicon), .deb and .rpm packages from the Linux archives
 # (nfpm.yaml), and a Homebrew bottle (Formula/oxutrm.rb). The callers are in
 # .github/workflows/release-build.yml.
 #
 # Windows is not possible: oxutrm needs a pty, `fork`, `setsid` and the
 # session's Unix socket. macOS is a published platform; the owner runs oxutrm
-# on a Mac every day. illumos is attempted.
+# on a Mac every day. illumos does not build yet: the netdev crate does not
+# compile for it, rustix-openpty has no `login_tty` there, and
+# oxutrm-host's `boot_token` has no illumos reader.
 #
 # The Linux archives are **static musl**, and that is not a preference. The
 # host half is copied to whatever machine the user sshes into, and a binary
