@@ -8284,8 +8284,13 @@ mod tests {
     /// `Link::rebind` has an end-to-end test of its own, but it self-skips on
     /// macOS -- so on the machine this is developed on, nothing exercised the
     /// branch `follow_route` takes when a route really has moved. Everything
-    /// here is real: a real quinn connection, a real socket bound the way the
-    /// ladder binds one, and a real `rebind_abstract` under it.
+    /// here is real: a real quinn connection, a real replacement socket bound
+    /// by `follow_route` itself, and a real `rebind_abstract` under it.
+    ///
+    /// The connection starts on an IPv4 `127.0.0.1` socket from the fixture,
+    /// not on the dual-stack one the ladder binds. That is what makes this
+    /// catch a replacement of the wrong family: quinn keeps the peer in the
+    /// form it was dialled, and a dual-stack socket cannot send to plain IPv4.
     ///
     /// The move is manufactured the only way loopback allows: the baseline is
     /// set to an address this machine cannot be reached on, so the probe --
