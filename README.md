@@ -29,11 +29,11 @@ ssh searches. Check it with:
 ssh <ssh-target> command -v oxutrm
 ```
 
-The binaries are statically linked, so the far end's distribution and glibc
-version do not matter.
+The Linux binaries are statically linked, so the far end's distribution and
+glibc version do not matter.
 
-Release archives for Linux (`x86_64` and `aarch64`, musl), macOS (`x86_64`
-and `aarch64`) and illumos (`x86_64`) are on the
+Release archives for Linux (`x86_64` and `aarch64`, musl) and macOS
+(`x86_64` and `aarch64`) are on the
 [releases page](https://github.com/oetiker/oxutrm/releases/latest). There is
 no Windows build: oxutrm needs a pty, `fork` and Unix sockets.
 
@@ -62,6 +62,14 @@ brew install oxutrm
 ```
 
 `brew trust` exists from Homebrew 6 on; skip it on older versions.
+
+When the Mac is the far end, a non-interactive ssh does not search Homebrew's
+`bin` directory. Add it to `~/.zshenv` on the Mac, which zsh, the default
+shell on macOS, reads for every shell:
+
+```sh
+echo "export PATH=\"$(brew --prefix)/bin:\$PATH\"" >> ~/.zshenv
+```
 
 mise:
 

@@ -1,0 +1,56 @@
+# The .deb and .rpm of oxutrm, built by repo-infra's ri-release-nfpm from the
+# static musl archives. The piece fills in VERSION, MTIME and ARCH, and STAGE,
+# the unpacked oxutrm/ folder of one archive, before nfpm reads this file.
+# Write no dollar-brace name in a comment either: the piece fills in the whole
+# file and stops at a name it does not know. nfpm adds no automatic
+# requirements, so the static binary depends on nothing.
+#
+# CHANGES.md is not in the archive, so it comes from the checkout of the
+# release branch, where the release has already rolled it.
+name: oxutrm
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+release: "1"
+# nfpm 2.47.0 ignores SOURCE_DATE_EPOCH, so the timestamp is set here.
+mtime: "${MTIME}"
+section: net
+priority: optional
+maintainer: Tobias Oetiker <tobi@oetiker.ch>
+license: Apache-2.0
+homepage: https://github.com/oetiker/oxutrm
+description: |
+  A remote terminal that survives bad networks, changing addresses and NAT
+  oxutrm keeps a remote terminal alive across bad networks, changing IP
+  addresses and NAT on both ends. The host owns an authoritative screen and
+  ships state diffs rather than a byte stream, so a lost datagram costs
+  nothing. SSH is used only to start or reattach sessions and to carry ICE
+  candidates, never for the data path. A single static binary.
+contents:
+  - src: ${STAGE}/oxutrm
+    dst: /usr/bin/oxutrm
+    file_info:
+      mode: 0755
+  - src: ${STAGE}/man/oxutrm.1.gz
+    dst: /usr/share/man/man1/oxutrm.1.gz
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/README.md
+    dst: /usr/share/doc/oxutrm/README.md
+    file_info:
+      mode: 0644
+  - src: CHANGES.md
+    dst: /usr/share/doc/oxutrm/CHANGES.md
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/LICENSE
+    dst: /usr/share/doc/oxutrm/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/LICENSE
+    dst: /usr/share/doc/oxutrm/LICENSE
+    packager: rpm
+    type: doc
+    file_info:
+      mode: 0644

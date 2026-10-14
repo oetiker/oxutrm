@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## [Unreleased]
 
 ### New
 
@@ -121,6 +121,16 @@
   config file, and the files and environment variables oxutrm uses. The same
   text is `docs/manual.md` in the repository.
 
+- **oxutrm runs on macOS, from release archives or Homebrew.** Each release
+  carries archives for Intel and Apple silicon Macs. `brew tap oetiker/oxutrm
+  https://github.com/oetiker/oxutrm` and `brew install oxutrm` install oxutrm
+  on macOS and on Linux.
+
+- **oxutrm installs and upgrades from apt and dnf repositories.** The `.deb`
+  and `.rpm` packages are published at `https://gitea.oetiker.ch/oposs`, so
+  `apt upgrade` and `dnf upgrade` pick up new releases; the README shows the
+  setup. The packages stay attached to each GitHub release as well.
+
 ### Compatibility
 
 - **Upgrade the client and every host together, and end old sessions first.**
@@ -135,6 +145,11 @@
   symmetric NAT, turning it off makes a connect that cannot punch through fail.
 
 ### Changed
+
+- **The release archives contain the man page instead of `CHANGES.md`.**
+  Each archive holds `oxutrm`, `man/oxutrm.1`, `README.md` and `LICENSE`. The
+  `.deb` and `.rpm` packages install the man page too, and still put
+  `CHANGES.md` in `/usr/share/doc/oxutrm`.
 
 - **New shells are login shells started in your home directory**, as ssh
   starts them: your profile is read, and the shell starts in `$HOME` instead

@@ -1,0 +1,65 @@
+{
+  "moving_major_tag": false,
+  "version_files": [
+    {
+      "path": "Cargo.toml",
+      "pattern": "^name = \"oxutrm\"\nversion = \"[^\"]*\"",
+      "replacement": "name = \"oxutrm\"\nversion = \"$VERSION\"",
+      "verify": "^name = \"oxutrm\"\nversion = \"$VERSION\""
+    },
+    {
+      "path": "Cargo.lock",
+      "pattern": "^name = \"oxutrm\"\nversion = \"[^\"]*\"",
+      "replacement": "name = \"oxutrm\"\nversion = \"$VERSION\"",
+      "verify": "^name = \"oxutrm\"\nversion = \"$VERSION\""
+    }
+  ],
+  "release_files": [
+    "Formula/oxutrm.rb"
+  ],
+  "release_assets": [
+    "oxutrm-*-x86_64-unknown-linux-musl.tar.gz",
+    "oxutrm-*-aarch64-unknown-linux-musl.tar.gz",
+    "oxutrm-*-x86_64-apple-darwin.tar.gz",
+    "oxutrm-*-aarch64-apple-darwin.tar.gz",
+    "oxutrm_*_amd64.deb",
+    "oxutrm_*_arm64.deb",
+    "oxutrm-*.x86_64.rpm",
+    "oxutrm-*.aarch64.rpm",
+    "oxutrm-*.arm64_sonoma.bottle.tar.gz"
+  ],
+  "gitea_packages": {
+    "url": "https://gitea.oetiker.ch",
+    "owner": "oposs",
+    "debian": {
+      "distribution": "stable",
+      "component": "main"
+    },
+    "rpm": {
+      "group": ""
+    }
+  },
+  "rust": {
+    "lint": [
+      "oxutrm",
+      "oxutrm-client",
+      "oxutrm-host",
+      "oxutrm-net",
+      "oxutrm-proto",
+      "oxutrm-sync",
+      "oxutrm-term"
+    ],
+    "test": [
+      "oxutrm",
+      "oxutrm-client",
+      "oxutrm-host",
+      "oxutrm-net",
+      "oxutrm-proto",
+      "oxutrm-sync",
+      "oxutrm-term"
+    ]
+  },
+  "exceptions": {
+    "native-targets": "no Windows archives: oxutrm needs a pty, fork, setsid and a Unix socket, which Windows does not offer. No illumos archive: netdev 0.46 does not compile for illumos, rustix-openpty has no login_tty there, and oxutrm-host has no boot_token for it"
+  }
+}

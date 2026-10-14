@@ -2,3 +2,4 @@
 /.worktrees
 /.superpowers
 vendor/quinn-proto/target/
+man/

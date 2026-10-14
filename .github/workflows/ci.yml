@@ -5,107 +5,119 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # D28: Create release PR runs this file on the release branch before it
+  # opens the pull request, with the commit to test in `ref`.
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to test; empty on push and pull_request.
+        type: string
+        required: false
+        default: ''
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 
 jobs:
-  check:
-    name: Check & Lint
+  # Formatting, clippy and the tests of every crate the "rust" key of
+  # .github/repo-infra.json names. The repository root is both a [package] and
+  # a [workspace], so a bare `cargo test` would run the root binary's tests
+  # only; the key lists all seven crates.
+  rust:
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
+    uses: oposs/repo-infra/.github/workflows/ri-ci-rust.yml@v2
+    with:
+      ref: ${{ inputs.ref }}
+
+  # The static musl build the release ships, compiled on every pull request
+  # rather than discovered at release time. Cross.toml pins the images.
+  rust-musl:
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
+    uses: oposs/repo-infra/.github/workflows/ri-ci-rust-musl.yml@v2
+    with:
+      ref: ${{ inputs.ref }}
+
+  man:
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
+    uses: oposs/repo-infra/.github/workflows/ri-ci-man.yml@v2
+    with:
+      ref: ${{ inputs.ref }}
+
+  # oxutrm's own jobs: the MSRV check.
+  local:
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
+    uses: ./.github/workflows/ci-local.yml
+    with:
+      ref: ${{ inputs.ref }}
+
+  release-pr-current:
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
+    uses: oposs/repo-infra/.github/workflows/ri-release-pr-current.yml@v2
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    with:
+      ref: ${{ inputs.ref }}
+
+  # D28 release mode, decided by repo-infra (D33). It runs on every event and
+  # carries no D31 skip: on the release pull request Create release PR opened,
+  # this verdict is what ci-passed decides on.
+  release-verdict:
+    uses: oposs/repo-infra/.github/workflows/ri-release-verdict.yml@v2
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+
+  # The single context the ruleset requires (spec D2). It exists so branch
+  # protection can name one check that means "this repository's CI passed",
+  # whatever this repository's jobs happen to be. Its needs: list names every
+  # other job of ci.yml; check verifies it (D30). Copy the rest word for word.
+  #
+  # `if: always()` is load-bearing. Without it this job is *skipped* when a
+  # dependency fails, and a skipped job reports Success -- so the required
+  # check would go green on a red build. It fails open, silently, and looks
+  # like it is working.
+  #
+  # A required check cannot be a called workflow's job: GitHub names that
+  # `<caller job> / <called job>`, and a called workflow cannot read the
+  # caller's needs. So this job stays here and reads release-verdict (D33).
+  # On a release pull request the test results do not count: Create release
+  # PR tested exactly the head that carries the release-built status.
+  ci-passed:
+    if: always()
+    needs: [rust, rust-musl, man, local, release-pr-current, release-verdict]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # The same three stages as `make check`, in the same order, so a failure
-      # here is reproducible with one command locally.
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # Capped at 4 the way the Makefile caps it. Several tests here bind
-      # sockets, spawn shells on ptys and fork; letting the runner's full
-      # parallelism loose on them turns real failures into timing noise.
-      - name: Run tests
-        run: cargo test --workspace --jobs 4 -- --test-threads 4
-
-  msrv:
-    name: MSRV 1.96
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # The floor is not decoration: declaring a version in Cargo.toml and
-      # never testing it is how it quietly rises. It rose here -- `rcgen`
-      # pulls `time`, which now needs 1.88 -- and this job is what noticed.
-      # Keep this number and `workspace.package.rust-version` in step.
-      - name: Install Rust 1.96
-        uses: dtolnay/rust-toolchain@1.96
-
-      - name: Cargo check
-        run: cargo check --workspace --all-targets
-
-  musl:
-    name: Static musl ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # Pinned, not `main`: the release depends on this build shape and a
-      # cross-compile is the thing least likely to be rehearsed locally.
-      - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
-
-      # This is what the release ships, so it is compiled on every pull
-      # request rather than discovered at release time. `zstd-sys` needs a C
-      # compiler for the target and `ring` needs the right assembler; cross's
-      # images carry both, and a plain `cargo build --target` on the runner
-      # carries neither.
-      - name: Build
-        run: RUSTFLAGS="-C target-feature=+crt-static" cross build --release --bin oxutrm --target ${{ matrix.target }}
+      - name: Judge the needed jobs
+        env:
+          VERDICT: ${{ needs.release-verdict.result }}
+          MODE: ${{ needs.release-verdict.outputs.mode }}
+          OK: ${{ needs.release-verdict.outputs.ok }}
+          MESSAGE: ${{ needs.release-verdict.outputs.message }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$VERDICT" != success ]; then
+            echo "::error::release-verdict did not succeed ($VERDICT); no verdict, no green"
+            exit 1
+          fi
+          if [ "$MODE" = release ]; then
+            if [ "$OK" != true ]; then
+              echo "::error::$MESSAGE"
+              exit 1
+            fi
+            echo "::notice::$MESSAGE"
+            exit 0
+          fi
+          if [ "$MODE" != ordinary ]; then
+            echo "::error::release-verdict gave an unknown mode ($MODE); no verdict, no green"
+            exit 1
+          fi
+          if [ "$FAILED" = true ]; then
+            echo "::error::a job this one needs failed or was cancelled"
+            exit 1
+          fi

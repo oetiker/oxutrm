@@ -1,0 +1,53 @@
+name: Release build
+
+# Called by Create release PR on the release branch before the pull request
+# exists (D28). The three repo-infra release pieces it calls build the
+# archives, the deb and rpm packages from the musl archives, and the bottle
+# with the rewritten Formula/oxutrm.rb (D32). Read-only: nothing here writes
+# the repository.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version being released.
+        type: string
+        required: true
+      ref:
+        description: The release branch head to build.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # No Windows: oxutrm needs a pty, fork, setsid and a Unix socket. No
+  # illumos: netdev 0.46 and rustix-openpty's login_tty do not build there,
+  # and the host's boot token has no illumos reader. The musl targets are
+  # static, so the host half runs on any Linux the user sshes into, whatever
+  # its glibc.
+  binaries:
+    uses: oposs/repo-infra/.github/workflows/ri-release-rust-binaries.yml@feat/rust-binaries-targets
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ inputs.ref }}
+      bin: oxutrm
+      targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin
+
+  packages:
+    needs: binaries
+    uses: oposs/repo-infra/.github/workflows/ri-release-nfpm.yml@v2
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ inputs.ref }}
+      config: nfpm.yaml
+      packagers: '{"deb": {}, "rpm": {}}'
+      archives: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+  homebrew:
+    needs: binaries
+    uses: oposs/repo-infra/.github/workflows/ri-release-homebrew.yml@v2
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ inputs.ref }}
+      bin: oxutrm
