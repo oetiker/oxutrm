@@ -170,6 +170,11 @@
   and hand edit in the file; a symlinked file stays a symlink. Every key is
   described in `docs/config.md`.
 
+- **oxutrm has a man page.** `man oxutrm` describes every option, the keys
+  of the status popup, the session selector and the config screen, the
+  config file, and the files and environment variables oxutrm uses. The same
+  text is `docs/manual.md` in the repository.
+
 ### Compatibility
 
 - **The client and every host session must be the same version: end your old
