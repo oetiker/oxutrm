@@ -1,0 +1,16 @@
+#!/bin/sh
+# The demo's stand-in for ssh. oxutrm runs `ssh` from PATH, and record.sh puts
+# this directory first, so the recording needs no sshd, no keys and no
+# known_hosts entry. Everything after the login is real: the host runs, and
+# client and host talk QUIC over the loopback interface.
+#
+# `ssh -G <target>` (asked before a rebuild) gets no output: nothing special.
+for arg; do
+    [ "$arg" = -G ] && exit 0
+done
+# Drop the options and the target; what is left is the remote command,
+# `oxutrm host --connect`. Run it the way sshd would: in the home directory.
+while [ $# -gt 0 ] && [ "$1" != oxutrm ]; do
+    shift
+done
+cd "$HOME" && exec "$@"
