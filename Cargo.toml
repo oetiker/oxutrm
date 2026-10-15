@@ -132,40 +132,23 @@ description = "A remote terminal that survives bad networks, changing IP address
 # Packaging
 # ---------------------------------------------------------------------------
 #
-# Linux only, and that is now a choice about evidence rather than a property of
-# the program. The pty, `fork`, `setsid` and the session's Unix socket rule out
-# Windows outright. macOS is a different case: the two Linux-only calls --
-# enumerating this process's descriptors, and asking when a pid started -- both
-# have a macOS implementation as of 2026-08-28, and four of the six crates
-# type-check for `aarch64-apple-darwin`. But nothing has ever been run on a
-# Mac, so no macOS package is generated here. Shipping one on the strength of a
-# type check would be worse than not shipping it.
+# The release builds archives for Linux (x86_64 and aarch64) and macOS (Intel
+# and Apple silicon), .deb and .rpm packages from the Linux archives
+# (nfpm.yaml), and a Homebrew bottle (Formula/oxutrm.rb). The callers are in
+# .github/workflows/release-build.yml.
 #
-# Both targets are **static musl**, and that is not a preference either. The
+# Windows is not possible: oxutrm needs a pty, `fork`, `setsid` and the
+# session's Unix socket. macOS is a published platform; the owner runs oxutrm
+# on a Mac every day. illumos does not build yet: the netdev crate does not
+# compile for it, rustix-openpty has no `login_tty` there, and
+# oxutrm-host's `boot_token` has no illumos reader.
+#
+# The Linux archives are **static musl**, and that is not a preference. The
 # host half is copied to whatever machine the user sshes into, and a binary
 # linked against the builder's glibc does not run on an older one -- measured on
 # 2026-08-28, when a build needing GLIBC_2.39 would not load on an Ubuntu 22.04
 # host at 2.35, for the sake of two symbols. A static binary has no such
 # argument with its destination.
-
-[package.metadata.deb]
-maintainer = "Tobias Oetiker <tobi@oetiker.ch>"
-copyright = "Tobias Oetiker"
-extended-description = """oxutrm keeps a remote terminal alive across bad networks, changing IP addresses and NAT on both ends. The host owns an authoritative screen and ships state diffs rather than a byte stream, so a lost datagram costs nothing: the next diff is computed against the same acknowledged base and therefore contains what was lost. SSH is used only to start or reattach sessions and to carry ICE candidates -- never for the data path."""
-section = "net"
-priority = "optional"
-assets = [
-    ["target/release/oxutrm", "usr/bin/", "755"],
-    ["README.md", "usr/share/doc/oxutrm/README.md", "644"],
-    ["CHANGES.md", "usr/share/doc/oxutrm/CHANGES.md", "644"],
-]
-
-[package.metadata.generate-rpm]
-assets = [
-    { source = "target/release/oxutrm", dest = "/usr/bin/oxutrm", mode = "755" },
-    { source = "README.md", dest = "/usr/share/doc/oxutrm/README.md", mode = "644" },
-    { source = "CHANGES.md", dest = "/usr/share/doc/oxutrm/CHANGES.md", mode = "644" },
-]
 
 [[bin]]
 name = "oxutrm"

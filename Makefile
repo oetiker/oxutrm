@@ -8,6 +8,10 @@
 CARGO ?= cargo
 JOBS  ?= 4
 
+# `make man` builds man/oxutrm.1 from docs/manual.md.
+MAN_NAME = oxutrm
+include build/man.mk
+
 .PHONY: all build test lint fmt fmt-check check clean
 
 all: check
