@@ -2677,12 +2677,14 @@ impl ClientSession {
             return false;
         }
 
-        // The route moved. Bind a fresh socket the same way the ladder bound
-        // the first one -- wildcard, preferring 443 -- and hand it to the live
+        // The route moved. Bind a fresh socket the way the ladder bound the
+        // first one -- wildcard, preferring 443 -- and hand it to the live
         // connection. QUIC is identified by connection IDs, not addresses, so
-        // the connection itself does not notice.
+        // the connection itself does not notice. The family is the old
+        // socket's: quinn keeps `peer` in the form it was dialled in, and a
+        // socket of the other family cannot send to it.
         let cfg = oxutrm_net::NetConfig::default();
-        let Ok(bound) = oxutrm_net::bind_socket(&cfg) else {
+        let Ok(bound) = oxutrm_net::bind_replacement(&cfg, peer) else {
             return false;
         };
         let Ok(socket) = crate::ladder::adopt(bound) else {
@@ -3218,7 +3220,8 @@ mod tests {
             // THE INTERVENTION: a fresh socket, exactly as `follow_route`
             // builds one, the moment the path is back.
             let cfg = oxutrm_net::NetConfig::default();
-            let bound = oxutrm_net::bind_socket(&cfg).expect("a fresh socket");
+            let peer = client.link.sink.connection().remote_address();
+            let bound = oxutrm_net::bind_replacement(&cfg, peer).expect("a fresh socket");
             let socket = crate::ladder::adopt(bound).expect("adopting it");
             let rebound = client.rebind(socket).is_ok();
 
@@ -8281,8 +8284,13 @@ mod tests {
     /// `Link::rebind` has an end-to-end test of its own, but it self-skips on
     /// macOS -- so on the machine this is developed on, nothing exercised the
     /// branch `follow_route` takes when a route really has moved. Everything
-    /// here is real: a real quinn connection, a real socket bound the way the
-    /// ladder binds one, and a real `rebind_abstract` under it.
+    /// here is real: a real quinn connection, a real replacement socket bound
+    /// by `follow_route` itself, and a real `rebind_abstract` under it.
+    ///
+    /// The connection starts on an IPv4 `127.0.0.1` socket from the fixture,
+    /// not on the dual-stack one the ladder binds. That is what makes this
+    /// catch a replacement of the wrong family: quinn keeps the peer in the
+    /// form it was dialled, and a dual-stack socket cannot send to plain IPv4.
     ///
     /// The move is manufactured the only way loopback allows: the baseline is
     /// set to an address this machine cannot be reached on, so the probe --

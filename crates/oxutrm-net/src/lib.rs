@@ -62,7 +62,7 @@ pub use discover::{Probe, classify, stun_discover};
 pub use ice::{IceAgent, IceEvent, RemoteFilter};
 pub use mapping::{PortMapping, default_gateway};
 pub use quic::{ALPN, AcceptPermit, quic_client, quic_server};
-pub use socketfam::{bind_socket, to_socket_family, unmap, unmap_ip};
+pub use socketfam::{bind_replacement, bind_socket, to_socket_family, unmap, unmap_ip};
 pub use stunmsg::{
     Check, CheckKind, Direction, IceCredentials, IceRole, build_check_request,
     build_check_response, build_nomination, parse_check, random_transaction_id,
