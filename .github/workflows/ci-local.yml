@@ -31,7 +31,7 @@ jobs:
       # pulls `time`, which now needs 1.88 -- and this job is what noticed.
       # Keep this number and `workspace.package.rust-version` in step.
       - name: Install Rust 1.96
-        uses: dtolnay/rust-toolchain@1.96
+        uses: dtolnay/rust-toolchain@1.120
 
       - name: Cargo check
         run: cargo check --workspace --all-targets
