@@ -6,31 +6,35 @@
 class Oxutrm < Formula
   desc "Remote terminal that survives bad networks, changing addresses and NAT"
   homepage "https://github.com/oetiker/oxutrm"
-  version "0.0.0"
+  version "0.3.0"
   license "Apache-2.0"
 
   # BOTTLE-START
+  bottle do
+    root_url "https://github.com/oetiker/oxutrm/releases/download/v0.3.0"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma: "8bfe193ce0d051a88b26a58be25663833e57af7b9fd064003728e4589fb6ed22"
+  end
   # BOTTLE-END
 
   on_macos do
     on_arm do
       url "https://github.com/oetiker/oxutrm/releases/download/v#{version}/oxutrm-#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # mac-arm
+      sha256 "4377e918fb80873ea47304746d5664363a41d2d831dc343500d4c745ae3d83d5" # mac-arm
     end
     on_intel do
       url "https://github.com/oetiker/oxutrm/releases/download/v#{version}/oxutrm-#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # mac-x86
+      sha256 "51ce6ebff9003e37f1782185abd29b841866bad0ff758cae23ffc53d7c7a608b" # mac-x86
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/oetiker/oxutrm/releases/download/v#{version}/oxutrm-#{version}-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # linux-x86
+      sha256 "81b056ac5e7fb0a671dec23ca2daf335ce151cc94f4eb2fe983e6ff79a1af085" # linux-x86
     end
     on_arm do
       url "https://github.com/oetiker/oxutrm/releases/download/v#{version}/oxutrm-#{version}-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # linux-arm
+      sha256 "2fe849e44df99f6a742a74695a08d9313e62e7db236aa52eefcab6b2a2f3eeb3" # linux-arm
     end
   end
 
