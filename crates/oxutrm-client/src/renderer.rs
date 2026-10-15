@@ -97,10 +97,11 @@ impl Renderer {
 
         let mut full = self.painted.is_none();
 
-        // `\x1b[?1049h`/`l` swaps the physical screen buffer. Everything the
-        // model claims is painted belongs to the buffer being left, so from
-        // here on there is nothing to diff against: the bell is read before
-        // the model is dropped, and every later pass runs as a full repaint.
+        // The remote application swapped its screen buffer. The client paints
+        // both into the one buffer it owns, so everything the model claims is
+        // painted belongs to the screen being left, and from here on there is
+        // nothing to diff against: the bell is read before the model is
+        // dropped, and every later pass runs as a full repaint.
         let buffer_swapped = self
             .painted
             .as_ref()
@@ -111,8 +112,7 @@ impl Renderer {
         // the position whenever anything at all was emitted before it.
         let ring = self.should_ring(s);
 
-        // Modes go first, because the swap has to happen before the repaint
-        // that fills the buffer it swapped to.
+        // Modes go first, ahead of the cells they apply to.
         self.write_modes(&mut out, s, full);
         if buffer_swapped {
             self.painted = None;
@@ -229,13 +229,10 @@ impl Renderer {
             _ => true,
         };
 
-        if changed(|m| m.alt_screen) {
-            out.extend_from_slice(if s.modes.alt_screen {
-                b"\x1b[?1049h"
-            } else {
-                b"\x1b[?1049l"
-            });
-        }
+        // `alt_screen` is not stated, in either direction: the client
+        // paints in an alternate buffer of its own (`RawGuard`), and the
+        // remote application's is just another screen to paint into it.
+        // `render` repaints in full when it is crossed.
         // Bracketed paste is only offered if this terminal understands it;
         // enabling it on one that does not would leak `ESC[200~` into the
         // user's input.
@@ -579,8 +576,9 @@ mod tests {
 
     /// What a full repaint says about the modes when every one of them is off.
     /// Nothing is known about the terminal, so every mode is stated rather than
-    /// assumed — see [`Renderer::write_modes`].
-    const MODES_ALL_OFF: &str = "\u{1b}[?1049l\u{1b}[?2004l\
+    /// assumed — see [`Renderer::write_modes`]. The alternate buffer is not
+    /// among them: it belongs to the client, not to the remote application.
+    const MODES_ALL_OFF: &str = "\u{1b}[?2004l\
                                  \u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1006l";
 
     fn size() -> TermSize {
@@ -1038,8 +1036,8 @@ mod tests {
 
         let out = render(&mut r, &shell);
         assert!(
-            out.contains("\u{1b}[?1049l"),
-            "the terminal was left on the alternate buffer: {out:?}"
+            !out.contains("\u{1b}[?1049"),
+            "the renderer switched the client's own alternate buffer: {out:?}"
         );
         assert!(
             out.contains("\u{1b}[?2004l"),
@@ -1051,10 +1049,13 @@ mod tests {
         );
     }
 
-    /// `\x1b[?1049h`/`l` swaps the physical screen buffer under us. Cells that
-    /// match the model are not on the buffer we just switched to, so a diff
-    /// against that model paints nothing and the user sees the *other*
-    /// application's screen.
+    /// The remote application crossing into or out of its alternate buffer
+    /// is a whole new screen. The client paints it into the alternate buffer
+    /// it entered at start ([`crate::RawGuard`]) and never switches buffers
+    /// itself: `\x1b[?1049l` here would drop the user onto their own screen
+    /// mid-session, and leave the remote screen there when the client ends.
+    /// So the crossing is a full repaint, and a cell that matches the model
+    /// is painted all the same.
     #[test]
     fn crossing_the_alternate_buffer_repaints_rather_than_diffing() {
         let mut alt = blank_state();
@@ -1069,15 +1070,13 @@ mod tests {
         normal.modes.alt_screen = false;
 
         let out = render(&mut r, &normal);
-        let leave = out
-            .find("\u{1b}[?1049l")
-            .expect("the buffer swap was never emitted");
-        let clear = out.find("\u{1b}[H\u{1b}[2J").unwrap_or_else(|| {
-            panic!("the buffer swapped but the screen was not repainted: {out:?}")
-        });
         assert!(
-            leave < clear,
-            "the repaint went to the buffer we were leaving: {out:?}"
+            !out.contains("\u{1b}[?1049"),
+            "the renderer switched the client's own alternate buffer: {out:?}"
+        );
+        assert!(
+            out.contains("\u{1b}[H\u{1b}[2J"),
+            "the remote buffer swapped but the screen was not repainted: {out:?}"
         );
         assert!(
             out.contains('V'),
