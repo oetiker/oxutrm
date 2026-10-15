@@ -171,6 +171,10 @@
 
 ### Fixed
 
+- **`q` no longer says "oxutrm: the shell exited (0)."** The shell keeps
+  running after `q` in the status popup, so the client now says that the
+  session detached and shows the `oxutrm --attach` command that resumes it.
+
 - **A session whose network came back could stay dead for minutes.** After a
   long outage the connection waited on a retry timer that had grown into the
   minutes, although both ends and the path were fine. A 150-second outage now

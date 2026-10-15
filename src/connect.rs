@@ -20,7 +20,7 @@ use crate::choose::{Decision, decide};
 use crate::ladder::nominate;
 use crate::link::Link;
 use crate::rebuild::Rebuild;
-use crate::session::ClientSession;
+use crate::session::{ClientSession, Ended};
 use crate::standby::Standby;
 use crate::view::Identity;
 
@@ -114,15 +114,40 @@ pub fn run_connect(args: &[String]) -> Result<()> {
     // have stopped caring about is not a shutdown.
     runtime.shutdown_background();
 
-    let code = outcome?;
+    let ended = outcome?;
     // L14. The guard is already gone by here -- see `connect` -- so this line
     // lands on a terminal that has been given back to the user.
-    println!("oxutrm: the shell exited ({code}).");
-    std::process::exit(code);
+    if let Some(line) = closing_line(&ended, target) {
+        println!("{line}");
+    }
+    std::process::exit(ended.status());
+}
+
+/// The line the client leaves on the terminal when it ends, if any.
+///
+/// A quit is not a shell exiting: the session keeps running, and saying
+/// otherwise tells the user their work finished. A lobby that ends has
+/// nothing left to report.
+fn closing_line(ended: &Ended, target: &str) -> Option<String> {
+    match ended {
+        Ended::Exited(code) => Some(format!("oxutrm: the shell exited ({code}).")),
+        Ended::Quit(Some(id)) => {
+            let short: String = id.chars().take(8).collect();
+            Some(format!(
+                "oxutrm: session {short} detached; `oxutrm --attach {short} {target}` resumes it."
+            ))
+        }
+        Ended::Quit(None) => None,
+    }
 }
 
 /// L3 to L13.
-async fn connect(target: &str, attach: Option<&str>, new: bool, name: Option<Name>) -> Result<i32> {
+async fn connect(
+    target: &str,
+    attach: Option<&str>,
+    new: bool,
+    name: Option<Name>,
+) -> Result<Ended> {
     // The config file, for this target. Nothing is printed about it: a
     // line written here would be painted over within milliseconds. Its
     // warnings go to the activity log once the session has one.
@@ -1020,6 +1045,24 @@ mod tests {
         assert!(one.contains("1 session is"), "{one}");
         let three = opening_line(&Choice::Lobby, id, 3);
         assert!(three.contains("3 sessions are"), "{three}");
+    }
+
+    /// `q` leaves the session running, so the last line must not say the
+    /// shell exited: it says the session detached and how to get back.
+    #[test]
+    fn a_quit_says_the_session_detached_and_not_that_the_shell_exited() {
+        let id = "a3f9c01e5b7d4c2e8f6a1b0c9d8e7f60";
+        let quit = closing_line(&Ended::Quit(Some(id.to_owned())), "box").unwrap();
+        assert!(!quit.contains("exited"), "{quit}");
+        assert_eq!(
+            quit,
+            "oxutrm: session a3f9c01e detached; `oxutrm --attach a3f9c01e box` resumes it."
+        );
+        assert_eq!(
+            closing_line(&Ended::Exited(3), "box").as_deref(),
+            Some("oxutrm: the shell exited (3).")
+        );
+        assert_eq!(closing_line(&Ended::Quit(None), "box"), None, "a lobby");
     }
 
     fn a_host_hello() -> Signal {
