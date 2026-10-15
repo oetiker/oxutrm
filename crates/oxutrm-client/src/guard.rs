@@ -25,7 +25,9 @@
 //! screen, mouse reporting and a hidden cursor live inside the terminal
 //! emulator, where no `ioctl` reaches them. Undoing those needs an escape
 //! sequence — see [`TERMINAL_RESTORE`], which is why it is a `const` slice
-//! written with one `write(2)`.
+//! written with one `write(2)`. The alternate buffer among them is one the
+//! client switches on itself ([`TERMINAL_ENTER`]), so leaving it gives the
+//! user back the screen they had before the session.
 //!
 //! `SIGKILL` and `SIGSTOP` cannot be caught by anyone, so `kill -9` still
 //! leaves the terminal raw. That is a property of the kernel, not a gap here.
@@ -111,8 +113,20 @@ pub const TERMINAL_RESTORE: &[u8] = b"\x1b[?2026l\
                                       \x1b[?25h\
                                       \x1b[0m";
 
-/// Raw mode on entry, restored on `Drop`, on panic, and on a catchable
-/// termination signal.
+/// What the client switches on as it takes the terminal: the alternate
+/// screen buffer.
+///
+/// The client paints the remote screen, its popup and its splash into a
+/// buffer of its own, the way a full-screen program does, and
+/// [`TERMINAL_RESTORE`] leaves it again on every exit path above. What was on
+/// the user's screen before the session is then there again after it, rather
+/// than the remote screen with the user's prompt drawn over it. The
+/// renderer never switches buffers itself: a remote application's own
+/// alternate buffer is just another screen to paint into this one.
+pub const TERMINAL_ENTER: &[u8] = b"\x1b[?1049h";
+
+/// Raw mode and the alternate buffer on entry, both undone on `Drop`, on
+/// panic, and on a catchable termination signal.
 pub struct RawGuard {
     /// Set when this guard owns the process-wide restore, i.e. it was built by
     /// [`RawGuard::enter`]. A guard on a caller-supplied descriptor restores
@@ -137,7 +151,13 @@ pub struct RawGuard {
 /// is still only `write(2)` calls, and it cannot spin: every branch that is not
 /// forward progress breaks.
 fn emit_restore(fd: BorrowedFd<'_>) {
-    let mut rest = TERMINAL_RESTORE;
+    emit(fd, TERMINAL_RESTORE);
+}
+
+/// Write all of `bytes` to `fd`, giving up at the first write that makes no
+/// progress. Only `write(2)`, so callable from a signal handler.
+fn emit(fd: BorrowedFd<'_>, bytes: &[u8]) {
+    let mut rest = bytes;
     while !rest.is_empty() {
         match rustix::io::write(fd, rest) {
             Ok(0) | Err(_) => break,
@@ -191,6 +211,9 @@ impl RawGuard {
             }));
         });
         install_signal_handlers();
+        // After the restore is armed, so no exit path can leave the user on
+        // this buffer.
+        emit(out.as_fd(), TERMINAL_ENTER);
 
         Ok(RawGuard {
             global: true,
@@ -212,6 +235,7 @@ impl RawGuard {
         // No separate stdout here: the caller supplied the terminal, so the
         // terminal is also where the escape sequence belongs.
         let out = fd.try_clone().context("duplicate the terminal")?;
+        emit(out.as_fd(), TERMINAL_ENTER);
         Ok(RawGuard {
             global: false,
             fd,
@@ -650,13 +674,28 @@ mod tests {
         drop(guard);
 
         let got = read_with_timeout(master, "a normal exit");
+        let wanted = [TERMINAL_ENTER, TERMINAL_RESTORE].concat();
         assert_eq!(
             got,
-            TERMINAL_RESTORE,
+            wanted,
             "\nemitted: {}\nwanted:  {}",
             show(&got),
-            show(TERMINAL_RESTORE)
+            show(&wanted)
         );
+    }
+
+    /// The client paints into an alternate buffer of its own, so what was on
+    /// the user's screen before is there again after `TERMINAL_RESTORE`, and
+    /// the remote screen and the popup are not left under the user's prompt.
+    #[test]
+    fn entering_switches_to_the_alternate_buffer() {
+        let (master, name) = open_pty_with_name();
+        let _keepalive = open_slave(&name);
+
+        let _guard = RawGuard::enter_on(open_slave(&name)).expect("enter raw mode");
+
+        let got = read_with_timeout(master, "entering");
+        assert_eq!(got, TERMINAL_ENTER, "emitted: {}", show(&got));
     }
 
     /// The same bytes, from a real signal handler in a real process that then

@@ -171,6 +171,22 @@
 
 ### Fixed
 
+- **`q` no longer says "oxutrm: the shell exited (0)."** The shell keeps
+  running after `q` in the status popup, so the client now says that the
+  session detached and shows the `oxutrm --attach` command that resumes it.
+
+- **The client gives the screen back as it found it.** After `q`, a shell
+  that exited or an error, the remote screen and the status popup stayed on
+  the local terminal and the local prompt was drawn over them. The client now
+  draws on the terminal's alternate screen, so what was there before the
+  session reappears when it ends.
+
+- **A session left with `q` is no longer `in use` for 30 seconds.**
+  Connecting again right after `q` listed the session as `in use` and asked
+  `take over <id> from its other client? y/n`. The host now learns of the
+  quit at once, so the selector lists the session as detached and resumes it
+  without the question.
+
 - **A session whose network came back could stay dead for minutes.** After a
   long outage the connection waited on a retry timer that had grown into the
   minutes, although both ends and the path were fine. A 150-second outage now

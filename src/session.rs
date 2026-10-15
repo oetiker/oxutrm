@@ -244,8 +244,8 @@ pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
 /// client loss; a lobby ends.
 pub const MOVED_AWAY: &[u8] = b"the client moved to another session";
 
-/// Why a client in a lobby closed its link: the user quit. The lobby ends
-/// with its link rather than after `DETACH_AFTER`.
+/// Why a client closed its link: the user quit. A lobby ends with its link
+/// rather than after `DETACH_AFTER`; a session is detached from that moment.
 pub const QUIT: &[u8] = b"the client quit";
 
 /// What `conn` reports right now, as plain values for [`Quality`].
@@ -261,6 +261,36 @@ fn reading_of(conn: &quinn::Connection) -> Reading {
         black_holes: stats.path.black_holes_detected,
     }
 }
+
+/// How a client session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// The shell exited, with this status.
+    Exited(i32),
+    /// The user quit with `q`. `Some` names the session left behind, detached
+    /// and still running; `None` is a lobby, which ended with its link.
+    Quit(Option<String>),
+}
+
+impl Ended {
+    /// The client's exit status: the shell's, or 0 for a quit.
+    pub fn status(&self) -> i32 {
+        match self {
+            Ended::Exited(code) => *code,
+            Ended::Quit(_) => 0,
+        }
+    }
+}
+
+/// How long a quitting client waits for its close to leave.
+///
+/// The close is the host's only news that the client left on purpose, and
+/// the process exits as soon as the loop returns: without the wait, the
+/// packet dies in the runtime and the host counts the client as attached for
+/// [`crate::host_session::DETACH_AFTER`]. Bounded, because a close that cannot
+/// leave is not worth keeping the user waiting; the host then detaches the
+/// session after `DETACH_AFTER`, as for any client that vanished.
+const QUIT_FLUSH: Duration = Duration::from_millis(250);
 
 /// Why the session ended, as an exit status.
 ///
@@ -1312,7 +1342,7 @@ impl ClientSession {
     /// `Wake::Keys` arm because the arm cannot be reached from a test without
     /// a real terminal; the arm is a single call to this, so what is tested
     /// is what ships.
-    fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<i32>> {
+    fn route_keys<W: Write>(&mut self, keys: &[u8], out: &mut W) -> Result<Option<Ended>> {
         self.route_keys_at(keys, Instant::now(), out)
     }
 
@@ -1323,7 +1353,7 @@ impl ClientSession {
         keys: &[u8],
         now: Instant,
         out: &mut W,
-    ) -> Result<Option<i32>> {
+    ) -> Result<Option<Ended>> {
         // Any key ends the splash, and then goes wherever it would have gone
         // without it: the splash never costs a keystroke. Repainted here and
         // not on the next lap, so the key's echo lands on the real screen.
@@ -1341,15 +1371,27 @@ impl ClientSession {
         }
         match routed.command {
             Some(Command::Quit) => {
-                // A lobby ends with its link: closed here, it does not wait
-                // out `DETACH_AFTER`. A session detaches, as it always did.
-                if self.in_lobby {
-                    self.link
-                        .sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), QUIT);
+                // Closed here, so the host hears of the quit at once: a lobby
+                // ends with its link, and a session is listed detached rather
+                // than `in use` until `DETACH_AFTER` has passed. The standby
+                // goes with it; it was only ever a spare for this client.
+                self.link
+                    .sink
+                    .connection()
+                    .close(quinn::VarInt::from_u32(0), QUIT);
+                if let Some(c) = self
+                    .standby
+                    .as_ref()
+                    .and_then(crate::standby::Standby::connection)
+                {
+                    c.close(quinn::VarInt::from_u32(0), QUIT);
                 }
-                return Ok(Some(0));
+                let left = if self.in_lobby {
+                    None
+                } else {
+                    self.identity.as_ref().map(|i| i.session_id.clone())
+                };
+                return Ok(Some(Ended::Quit(left)));
             }
             Some(Command::SendHeld) => {
                 let held = self.link_state.take_held();
@@ -2058,7 +2100,7 @@ impl ClientSession {
     /// The caller owns raw mode. [`oxutrm_client::RawGuard`] is entered before
     /// this and dropped after it, so `run` touches the terminal's bytes and
     /// never its settings.
-    pub async fn run<W: Write>(&mut self, out: &mut W) -> Result<i32> {
+    pub async fn run<W: Write>(&mut self, out: &mut W) -> Result<Ended> {
         // `/dev/tty`, and NOT a duplicate of fd 0. That is not a detail.
         //
         // `AsyncFd` requires the descriptor to be non-blocking, and
@@ -2139,7 +2181,7 @@ impl ClientSession {
     /// refuses one outright — and a loop that can only run against a real
     /// terminal is a loop with no tests at all. A socket pair is pollable and
     /// behaves like a keyboard in every way this code can tell.
-    pub async fn run_on<K, W>(&mut self, keys: K, out: &mut W) -> Result<i32>
+    pub async fn run_on<K, W>(&mut self, keys: K, out: &mut W) -> Result<Ended>
     where
         K: AsFd + AsRawFd + Read,
         W: Write,
@@ -2298,8 +2340,12 @@ impl ClientSession {
                     continue;
                 }
                 Wake::Keys(n) => {
-                    if let Some(code) = self.route_keys(&buf[..n], out)? {
-                        return Ok(code);
+                    if let Some(ended) = self.route_keys(&buf[..n], out)? {
+                        // The close `route_keys` sent must leave before the
+                        // process does. See `QUIT_FLUSH`.
+                        let endpoint = self.link.endpoint.clone();
+                        let _ = tokio::time::timeout(QUIT_FLUSH, endpoint.wait_idle()).await;
+                        return Ok(ended);
                     }
                 }
                 Wake::Frame(frame) => {
@@ -2407,7 +2453,7 @@ impl ClientSession {
                         continue;
                     }
                     self.drain(out).await?;
-                    return exit_code(&reason);
+                    return exit_code(&reason).map(Ended::Exited);
                 }
             }
 
@@ -4209,7 +4255,11 @@ mod tests {
             .expect("the client loop never finished")
             .expect("the client loop failed");
 
-        assert_eq!(code, 42, "the exit status did not survive the trip");
+        assert_eq!(
+            code,
+            Ended::Exited(42),
+            "the exit status did not survive the trip"
+        );
         assert_eq!(
             host_loop.await.expect("host task").expect("host loop"),
             42,
@@ -4248,7 +4298,7 @@ mod tests {
             .expect("the client loop never finished")
             .expect("the client loop failed");
 
-        assert_eq!(code, 0);
+        assert_eq!(code, Ended::Exited(0));
         assert!(
             text(client.screen()).contains("marker-here"),
             "the loop never took the host's output in; screen was {:?}",
@@ -4285,7 +4335,7 @@ mod tests {
             .expect("the client loop never finished")
             .expect("the client loop failed");
 
-        assert_eq!(code, 0);
+        assert_eq!(code, Ended::Exited(0));
         assert!(
             text(client.screen()).contains("tail-marker"),
             "the tail of the burst never arrived: the loop slept on bytes it \
@@ -4437,7 +4487,11 @@ mod tests {
                 "a window resize ended the session: the local terminal changing shape \
                  is not a reason to kill a remote shell",
             );
-        assert_eq!(code, 7, "the shell's own status did not come back");
+        assert_eq!(
+            code,
+            Ended::Exited(7),
+            "the shell's own status did not come back"
+        );
         assert_eq!(
             client.size(),
             size(),
@@ -4494,7 +4548,11 @@ mod tests {
         let spent = thread_cpu_millis() - before;
         let _host = host_loop.await.expect("host task");
 
-        assert_eq!(code, 5, "the session did not outlive the keyboard");
+        assert_eq!(
+            code,
+            Ended::Exited(5),
+            "the session did not outlive the keyboard"
+        );
         assert!(
             spent < 400,
             "the loop burned {spent} ms of CPU across {} ms with the keyboard \
@@ -4716,7 +4774,7 @@ mod tests {
         let spent = thread_cpu_millis() - before;
         let _host = host_loop.await.expect("host task");
 
-        assert_eq!(code, 0);
+        assert_eq!(code, Ended::Exited(0));
         // A spinning loop spends the whole wall-clock window on a core; a
         // paced one spends a few milliseconds. The bar sits well below the
         // spin and well above the healthy figure, so it is a gap rather than a
@@ -6936,7 +6994,7 @@ mod tests {
             .await
             .expect("the client never finished")
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 7);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(7));
         assert!(
             !client.standby.as_ref().is_some_and(|s| s.has_link()),
             "the closed standby is still held"
@@ -7023,7 +7081,7 @@ mod tests {
             .expect("client task");
         assert_eq!(
             code.expect("the client loop failed"),
-            7,
+            Ended::Exited(7),
             "the shell's exit did not come back while the primary was dark"
         );
         assert_eq!(
@@ -7126,7 +7184,7 @@ mod tests {
             .await
             .expect("the client never finished")
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 7);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(7));
         assert_eq!(
             client.link.sink.connection().stable_id(),
             primary_id,
@@ -7204,7 +7262,7 @@ mod tests {
     /// Press `keys` once the question has been up for `ANSWER_GUARD`: the
     /// read is stamped that far past now, which is past when any lap or
     /// read before this one first saw `Confirming`.
-    fn answer(session: &mut ClientSession, keys: &[u8], out: &mut Vec<u8>) -> Option<i32> {
+    fn answer(session: &mut ClientSession, keys: &[u8], out: &mut Vec<u8>) -> Option<Ended> {
         session
             .route_keys_at(keys, Instant::now() + crate::ui::ANSWER_GUARD, out)
             .expect("the answer lands")
@@ -7323,17 +7381,28 @@ mod tests {
     }
 
     /// `q` is the popup's own key, so it must not reach the shell, and it
-    /// must end the client with a status of its own
-    /// rather than one invented for a shell that never exited.
+    /// must end the client as a quit -- status 0, and the session it left
+    /// named -- rather than as a shell that exited, which it did not.
     #[tokio::test]
-    async fn the_quit_key_ends_the_client_with_a_status_of_zero() {
+    async fn the_quit_key_ends_the_client_as_a_quit_not_as_a_shell_exit() {
         let (_host, mut session) = with_popup().await;
+        session.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned(),
+        });
         let before = spoken(&session);
         let mut out = Vec::new();
 
         let answer = session.route_keys(b"q", &mut out).unwrap();
 
-        assert_eq!(answer, Some(0), "the quit key did not end the client");
+        assert_eq!(
+            answer,
+            Some(Ended::Quit(Some(
+                "3ff1218f5e0c4b7d9a1c2e3f40516273".to_owned()
+            ))),
+            "the quit key did not end the client as a quit"
+        );
+        assert_eq!(answer.unwrap().status(), 0);
         assert_eq!(spoken(&session), before, "the command reached the shell");
     }
 
@@ -7409,7 +7478,10 @@ mod tests {
         let (_host, mut session) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
 
-        assert_eq!(answer(&mut session, b"q", &mut out), Some(0));
+        assert_eq!(
+            answer(&mut session, b"q", &mut out),
+            Some(Ended::Quit(None))
+        );
     }
 
     /// Final review, Important 1, at the session: a key that was in flight
@@ -8126,7 +8198,7 @@ mod tests {
             .expect("the client loop failed");
         let _ = host_loop.await;
 
-        assert_eq!(code, 0);
+        assert_eq!(code, Ended::Exited(0));
         assert!(
             !client.activity.entries().any(|e| e.text == "silent"),
             "a healthy session went silent"
@@ -8807,7 +8879,7 @@ mod tests {
                 )
             })
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 4);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(4));
         let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
             .await
             .expect("the host never finished")
@@ -8917,7 +8989,7 @@ mod tests {
                 )
             })
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 6);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(6));
         let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
             .await
             .expect("the host never finished")
@@ -8992,7 +9064,7 @@ mod tests {
             .await
             .expect("the client never finished")
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 5);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(5));
         let host_code = tokio::time::timeout(Duration::from_secs(20), host_loop)
             .await
             .expect("the host never finished")
@@ -9294,7 +9366,7 @@ mod tests {
             .expect("the client never finished");
         let _ = host_loop.await;
 
-        assert_eq!(code.expect("the client loop failed"), 3);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(3));
         assert!(
             start.elapsed()
                 < oxutrm_client::splash::FRAME * oxutrm_client::splash::FRAMES
@@ -9387,7 +9459,7 @@ mod tests {
             .await
             .expect("the client never finished")
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 3);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(3));
         let _ = host_loop.await;
     }
 
@@ -9694,7 +9766,7 @@ mod tests {
             .await
             .expect("the client never finished")
             .expect("client task");
-        assert_eq!(code.expect("the client loop failed"), 7);
+        assert_eq!(code.expect("the client loop failed"), Ended::Exited(7));
         let standby = client.standby.as_ref().expect("the standby");
         assert!(!standby.enabled() && !standby.has_link());
         assert!(
@@ -10189,7 +10261,7 @@ mod tests {
             .expect("the client never ended")
             .unwrap()
             .unwrap();
-        assert_eq!(code, 7);
+        assert_eq!(code, Ended::Exited(7));
         assert_eq!(logs.task.await.unwrap().unwrap(), 7);
     }
 
@@ -10309,7 +10381,8 @@ mod tests {
             client
                 .route_keys_at(&[CTRL_BACKSLASH, b'q'], at, &mut out)
                 .unwrap(),
-            Some(0)
+            Some(Ended::Quit(None)),
+            "a lobby that ends is not a session left detached"
         );
         let code = tokio::time::timeout(Duration::from_secs(5), lobby.task)
             .await
@@ -10317,6 +10390,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(code, 0);
+    }
+
+    /// `q` in a session detaches it AT ONCE. The host learns it from the
+    /// link's close, so the next connect finds the session detached and
+    /// offers it without a take-over question -- not `in use` for
+    /// `DETACH_AFTER`, which is for a client that vanished. Checked the moment
+    /// the loop returns, with nothing else awaited, because the process exits
+    /// right after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quitting_a_session_detaches_it_at_once() {
+        let (host, mut client) = pair("/bin/sh").await;
+        client.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        let presence = crate::host_session::Presence::default();
+        let mut host = host.with_presence(presence.clone());
+        let host_loop = tokio::spawn(async move { host.run().await });
+        assert!(
+            presence.attached(Instant::now()),
+            "the control: a client is attached before the quit"
+        );
+
+        let (keys, mut typing) = keyboard();
+        let looping = tokio::spawn(async move {
+            let mut out = Vec::new();
+            client.run_on(keys, &mut out).await
+        });
+        typing.write_all(&[CTRL_BACKSLASH, b'q']).expect("type");
+        let ended = tokio::time::timeout(Duration::from_secs(10), looping)
+            .await
+            .expect("the quit did not end the client")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ended, Ended::Quit(Some(BUILD_ID.to_owned())));
+        assert!(
+            !presence.attached(Instant::now()),
+            "the host still counts the client that quit as attached"
+        );
+        host_loop.abort();
     }
 
     #[tokio::test]
@@ -10446,7 +10560,7 @@ mod tests {
             .expect("the client never ended")
             .unwrap()
             .unwrap();
-        assert_eq!(code, 7, "the shell that exited was logs'");
+        assert_eq!(code, Ended::Exited(7), "the shell that exited was logs'");
         assert_eq!(logs.task.await.unwrap().unwrap(), 7);
         // The lobby the client left ended with its link.
         let ended = tokio::time::timeout(Duration::from_secs(10), lobby.task)
@@ -10511,7 +10625,7 @@ mod tests {
             .await
             .expect("q in the lobby did not end the client")
             .unwrap();
-        assert_eq!(code.unwrap(), 0);
+        assert_eq!(code.unwrap(), Ended::Quit(None));
         assert!(client.in_lobby());
         let ended = tokio::time::timeout(Duration::from_secs(10), build.task)
             .await
@@ -10572,7 +10686,7 @@ mod tests {
             .expect("the client outlived its shell")
             .unwrap()
             .unwrap();
-        assert_eq!(code, 3);
+        assert_eq!(code, Ended::Exited(3));
     }
 
     /// `s` while another request is still out: the selector opens, and the
