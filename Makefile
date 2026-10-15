@@ -12,7 +12,7 @@ JOBS  ?= 4
 MAN_NAME = oxutrm
 include build/man.mk
 
-.PHONY: all build test lint fmt fmt-check check clean
+.PHONY: all build test lint fmt fmt-check check clean demo
 
 all: check
 
@@ -41,3 +41,13 @@ check: fmt-check lint test
 
 clean:
 	$(CARGO) clean
+
+# Where cargo puts the release binary, asked of cargo so CARGO_TARGET_DIR and
+# build.target-dir are honoured.
+TARGET_DIR ?= $(shell $(CARGO) metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+
+## Record docs/demo/oxutrm.webp from demo/oxutrm.toml. Needs ansidrama
+## (https://github.com/oetiker/ansidrama). Run by hand; CI does not.
+demo:
+	$(CARGO) build --release --bin oxutrm --jobs $(JOBS)
+	demo/record.sh "$(TARGET_DIR)/release"

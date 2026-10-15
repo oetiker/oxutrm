@@ -12,6 +12,8 @@ ssh is used only to start a session and to rebuild a lost link. It adds NAT
 traversal on both ends and a session switcher. Scrollback is kept on the host
 but not yet sent to the client.
 
+![oxutrm: connect, run top, switch the splash off, quit, reconnect to the running top](docs/demo/oxutrm.webp)
+
 > **Status:** the transport, the terminal core and the session loops work and
 > are tested. oxutrm is young; see [What does not work yet](#what-does-not-work-yet).
 

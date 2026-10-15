@@ -1,0 +1,96 @@
+# The README demo: docs/demo/oxutrm.webp. Record it with `make demo`.
+#
+# record.sh runs this in a scratch home with no sessions and the splash on, and
+# puts demo/bin first on PATH, where a stand-in for ssh runs the host part
+# locally. The QUIC link, the host and the client are the real ones.
+launch    = "PS1='local$ ' bash --norc --noprofile -i"
+cols      = 96
+rows      = 28
+font      = "smalti"
+font_px   = 16
+card_font_px     = 64
+card_subtitle_px = 32
+out       = "../docs/demo/oxutrm.webp"
+env       = { COLORTERM = "truecolor" }
+quit_keys = ["C-d"]
+# The splash animates in short steps; a lower floor keeps them as frames.
+persist_ms = 15
+
+[chrome]
+style   = "macos"
+title   = "oxutrm"
+padding = 12
+
+[[scene]]
+card    = { lines = ["oxutrm", "a terminal that survives the network"], fg = "#fef9c3" }
+hold_cs = 250
+
+# First login: no session yet, so the splash plays and a new shell starts.
+[[scene]]
+text    = "oxutrm localhost"
+hold_cs = 40
+[[scene]]
+keys     = ["Enter"]
+await    = "host\\$"
+await_ms = 20000
+hold_cs  = 100
+
+[[scene]]
+text    = "top -u $USER"
+hold_cs = 40
+[[scene]]
+keys    = ["Enter"]
+await   = "load average"
+hold_cs = 200
+
+# The status popup, then its config screen: switch the splash off.
+[[scene]]
+keys    = ["C-\\"]
+await   = "c config"
+hold_cs = 300
+[[scene]]
+keys    = ["c"]
+await   = "next connect"
+hold_cs = 100
+[[scene]]
+keys    = ["Down", "Down", "Down"]
+hold_cs = 60
+[[scene]]
+keys     = ["Enter"]
+animated = true
+hold_cs  = 120
+[[scene]]
+keys     = ["w"]
+animated = true
+hold_cs  = 120
+[[scene]]
+keys     = ["a"]
+animated = true
+hold_cs  = 120
+
+# Quit the client; the session and its top keep running on the host.
+[[scene]]
+keys     = ["Esc"]
+animated = true
+hold_cs  = 60
+[[scene]]
+keys     = ["q"]
+await    = "resumes it"
+hold_cs  = 250
+
+# Second login: no splash, and the selector offers the running session.
+[[scene]]
+text    = "oxutrm localhost"
+hold_cs = 40
+[[scene]]
+keys     = ["Enter"]
+await    = "sessions on localhost"
+hold_cs  = 250
+[[scene]]
+keys     = ["Enter"]
+await    = "load average"
+hold_cs  = 300
+
+[[scene]]
+card    = { lines = ["oxutrm", "github.com/oetiker/oxutrm"], fg = "#fef9c3" }
+hold_cs = 250
