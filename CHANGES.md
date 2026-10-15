@@ -4,6 +4,12 @@
 
 ### New
 
+### Changed
+
+### Fixed
+
+## 0.3.0 - 2026-10-15
+### New
 - **Connecting to a host with sessions running opens a session selector
   instead of resuming one.** `oxutrm <ssh-target>` starts a new session when
   none of yours runs there; with one or more running, even exactly one, the
@@ -132,7 +138,6 @@
   setup. The packages stay attached to each GitHub release as well.
 
 ### Compatibility
-
 - **Upgrade the client and every host together, and end old sessions first.**
   The client refuses a session started by an older oxutrm, with both version
   numbers in the message, and the selector lists it as `old version` until its
@@ -145,7 +150,6 @@
   symmetric NAT, turning it off makes a connect that cannot punch through fail.
 
 ### Changed
-
 - **The release archives contain the man page instead of `CHANGES.md`.**
   Each archive holds `oxutrm`, `man/oxutrm.1`, `README.md` and `LICENSE`. The
   `.deb` and `.rpm` packages install the man page too, and still put
@@ -170,7 +174,6 @@
 - **`oxutrm host --list` never shows a half-written session entry.**
 
 ### Fixed
-
 - **`q` no longer says "oxutrm: the shell exited (0)."** The shell keeps
   running after `q` in the status popup, so the client now says that the
   session detached and shows the `oxutrm --attach` command that resumes it.
