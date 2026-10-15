@@ -244,8 +244,8 @@ pub const REBUILT: &[u8] = b"replaced by a rebuilt link";
 /// client loss; a lobby ends.
 pub const MOVED_AWAY: &[u8] = b"the client moved to another session";
 
-/// Why a client in a lobby closed its link: the user quit. The lobby ends
-/// with its link rather than after `DETACH_AFTER`.
+/// Why a client closed its link: the user quit. A lobby ends with its link
+/// rather than after `DETACH_AFTER`; a session is detached from that moment.
 pub const QUIT: &[u8] = b"the client quit";
 
 /// What `conn` reports right now, as plain values for [`Quality`].
@@ -281,6 +281,16 @@ impl Ended {
         }
     }
 }
+
+/// How long a quitting client waits for its close to leave.
+///
+/// The close is the host's only news that the client left on purpose, and
+/// the process exits as soon as the loop returns: without the wait, the
+/// packet dies in the runtime and the host counts the client as attached for
+/// [`crate::host_session::DETACH_AFTER`]. Bounded, because a close that cannot
+/// leave is not worth keeping the user waiting; the host then detaches the
+/// session after `DETACH_AFTER`, as for any client that vanished.
+const QUIT_FLUSH: Duration = Duration::from_millis(250);
 
 /// Why the session ended, as an exit status.
 ///
@@ -1361,13 +1371,20 @@ impl ClientSession {
         }
         match routed.command {
             Some(Command::Quit) => {
-                // A lobby ends with its link: closed here, it does not wait
-                // out `DETACH_AFTER`. A session detaches, as it always did.
-                if self.in_lobby {
-                    self.link
-                        .sink
-                        .connection()
-                        .close(quinn::VarInt::from_u32(0), QUIT);
+                // Closed here, so the host hears of the quit at once: a lobby
+                // ends with its link, and a session is listed detached rather
+                // than `in use` until `DETACH_AFTER` has passed. The standby
+                // goes with it; it was only ever a spare for this client.
+                self.link
+                    .sink
+                    .connection()
+                    .close(quinn::VarInt::from_u32(0), QUIT);
+                if let Some(c) = self
+                    .standby
+                    .as_ref()
+                    .and_then(crate::standby::Standby::connection)
+                {
+                    c.close(quinn::VarInt::from_u32(0), QUIT);
                 }
                 let left = if self.in_lobby {
                     None
@@ -2324,6 +2341,10 @@ impl ClientSession {
                 }
                 Wake::Keys(n) => {
                     if let Some(ended) = self.route_keys(&buf[..n], out)? {
+                        // The close `route_keys` sent must leave before the
+                        // process does. See `QUIT_FLUSH`.
+                        let endpoint = self.link.endpoint.clone();
+                        let _ = tokio::time::timeout(QUIT_FLUSH, endpoint.wait_idle()).await;
                         return Ok(ended);
                     }
                 }
@@ -10369,6 +10390,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(code, 0);
+    }
+
+    /// `q` in a session detaches it AT ONCE. The host learns it from the
+    /// link's close, so the next connect finds the session detached and
+    /// offers it without a take-over question -- not `in use` for
+    /// `DETACH_AFTER`, which is for a client that vanished. Checked the moment
+    /// the loop returns, with nothing else awaited, because the process exits
+    /// right after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quitting_a_session_detaches_it_at_once() {
+        let (host, mut client) = pair("/bin/sh").await;
+        client.identity = Some(Identity {
+            target: "thinlinc".to_owned(),
+            session_id: BUILD_ID.to_owned(),
+        });
+        let presence = crate::host_session::Presence::default();
+        let mut host = host.with_presence(presence.clone());
+        let host_loop = tokio::spawn(async move { host.run().await });
+        assert!(
+            presence.attached(Instant::now()),
+            "the control: a client is attached before the quit"
+        );
+
+        let (keys, mut typing) = keyboard();
+        let looping = tokio::spawn(async move {
+            let mut out = Vec::new();
+            client.run_on(keys, &mut out).await
+        });
+        typing.write_all(&[CTRL_BACKSLASH, b'q']).expect("type");
+        let ended = tokio::time::timeout(Duration::from_secs(10), looping)
+            .await
+            .expect("the quit did not end the client")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ended, Ended::Quit(Some(BUILD_ID.to_owned())));
+        assert!(
+            !presence.attached(Instant::now()),
+            "the host still counts the client that quit as attached"
+        );
+        host_loop.abort();
     }
 
     #[tokio::test]

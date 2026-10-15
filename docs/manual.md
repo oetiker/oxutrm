@@ -173,6 +173,7 @@ Names are unique among the live sessions of a host.
 A prefix that matches several sessions is refused with the list of the sessions it matches.
 
 A session whose client is gone detaches 30 seconds later and keeps running.
+A client that quits with `q` detaches its session at once.
 Attaching to a session that another client holds takes it over;
 the other client reports that the session was taken over and exits.
 
