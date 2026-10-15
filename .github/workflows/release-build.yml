@@ -27,7 +27,7 @@ jobs:
   # static, so the host half runs on any Linux the user sshes into, whatever
   # its glibc.
   binaries:
-    uses: oposs/repo-infra/.github/workflows/ri-release-rust-binaries.yml@feat/rust-binaries-targets
+    uses: oposs/repo-infra/.github/workflows/ri-release-rust-binaries.yml@v2
     with:
       version: ${{ inputs.version }}
       ref: ${{ inputs.ref }}
