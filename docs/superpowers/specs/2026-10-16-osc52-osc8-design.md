@@ -497,11 +497,10 @@ Each item works as decided above unless the owner says otherwise.
 
 ---
 
-## 10. Changes after the scratch build (2026-10-16)
+## 10. Judgement calls
 
-PR 1 was built for real in a throwaway worktree before its plan was written
-(`docs/superpowers/plans/2026-10-16-osc52-copy.md`). These points changed
-or settled the text above:
+Made while building PR 1 (OSC 52), all (controller, 2026-10-16). Where they
+contradict an earlier section, that section has been corrected.
 
 - The ack hook (§3.4) is `Sender::acked()` read in `HostSession::turn_at`.
 - serde's `rc` feature is on workspace-wide, for `Arc<str>`.
@@ -517,6 +516,9 @@ or settled the text above:
 - `terminal.clipboard` adds a fourth section, `terminal`, to the config
   screen.
 - `oxutrm loopback` does not write copies; it has no client session.
-- For D2: a preview `window()` returns `Clipboard::default()`, and only the
-  client session's own applied states feed `ClipboardRelay` (§4.8 applies to
-  the clipboard as well as to links).
+- The end-to-end tests let the client apply a first state before the shell
+  copies (`read go`), because of the baseline rule above.
+- For D2: a preview `window()` returns `Clipboard::default()` (clearing a
+  copy is `state.clipboard = Clipboard::default()`, or `without_text()` to
+  keep the serial), and only the client session's own applied states feed
+  `ClipboardRelay` (§4.8 applies to the clipboard as well as to links).
