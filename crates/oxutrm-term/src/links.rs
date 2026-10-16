@@ -19,6 +19,9 @@ use oxutrm_proto::{MAX_LINKS, check_link_uri};
 pub struct LinkTable {
     ids: HashMap<Hyperlink, u16>,
     uris: BTreeMap<u16, (Hyperlink, Arc<str>)>,
+    /// How often a link not yet in the table was judged, for the tests.
+    #[cfg(test)]
+    checks: usize,
 }
 
 impl LinkTable {
@@ -34,15 +37,41 @@ impl LinkTable {
     /// Every link not in `found` is freed first, so a screen whose old links
     /// have all scrolled away has the whole table for its new ones.
     pub fn assign(&mut self, found: &[Option<Hyperlink>]) -> Vec<u16> {
-        let live: std::collections::HashSet<&Hyperlink> = found.iter().flatten().collect();
-        self.ids.retain(|h, _| live.contains(h));
-        self.uris.retain(|_, (h, _)| live.contains(h));
+        // One verdict per distinct link and pass, so a link that is dropped
+        // is judged once, not once per cell it covers. Runs of cells share
+        // one link, and the previous cell answers those without a hash.
+        let mut verdicts: HashMap<&Hyperlink, u16> = HashMap::new();
+        let mut order: Vec<&Hyperlink> = Vec::new();
+        let mut prev: Option<&Hyperlink> = None;
+        for h in found.iter().flatten() {
+            if prev != Some(h) {
+                if !verdicts.contains_key(h) {
+                    verdicts.insert(h, 0);
+                    order.push(h);
+                }
+                prev = Some(h);
+            }
+        }
+        self.ids.retain(|h, _| verdicts.contains_key(h));
+        self.uris.retain(|_, (h, _)| verdicts.contains_key(h));
+        for h in order {
+            let id = self.intern(h);
+            verdicts.insert(h, id);
+        }
 
+        let mut prev: Option<(&Hyperlink, u16)> = None;
         found
             .iter()
             .map(|h| match h {
                 None => 0,
-                Some(h) => self.intern(h),
+                Some(h) => match prev {
+                    Some((p, id)) if p == h => id,
+                    _ => {
+                        let id = verdicts[h];
+                        prev = Some((h, id));
+                        id
+                    }
+                },
             })
             .collect()
     }
@@ -50,6 +79,10 @@ impl LinkTable {
     fn intern(&mut self, h: &Hyperlink) -> u16 {
         if let Some(&id) = self.ids.get(h) {
             return id;
+        }
+        #[cfg(test)]
+        {
+            self.checks += 1;
         }
         if self.uris.len() >= MAX_LINKS || check_link_uri(1, h.uri()).is_err() {
             return 0;
@@ -158,5 +191,28 @@ mod tests {
         assert_eq!(ids[MAX_LINKS - 1], MAX_LINKS as u16);
         assert_eq!(ids[MAX_LINKS], 0, "link MAX_LINKS + 1 does not fit");
         assert_eq!(t.table().len(), MAX_LINKS);
+    }
+
+    #[test]
+    fn a_dropped_link_is_checked_once_per_pass() {
+        let mut t = LinkTable::default();
+        let hostile = format!("http://{}", "ä".repeat(1000));
+        let found = vec![link("x", &hostile); 1000];
+        assert!(t.assign(&found).iter().all(|&id| id == 0));
+        assert_eq!(t.checks, 1, "one check for 1000 cells");
+        t.assign(&found);
+        assert_eq!(t.checks, 2, "and one more on the next pass");
+    }
+
+    #[test]
+    fn a_link_past_the_cap_is_checked_once_per_pass() {
+        let mut t = LinkTable::default();
+        let mut found: Vec<_> = (0..MAX_LINKS)
+            .map(|i| link(&i.to_string(), &format!("http://h/{i}")))
+            .collect();
+        found.extend(std::iter::repeat_n(link("late", "http://late"), 1000));
+        let ids = t.assign(&found);
+        assert!(ids[MAX_LINKS..].iter().all(|&id| id == 0));
+        assert_eq!(t.checks, MAX_LINKS + 1);
     }
 }
