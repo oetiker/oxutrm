@@ -15,6 +15,23 @@
 /// The longest OSC body passed on, in bytes.
 pub(crate) const MAX_OSC_LEN: usize = 512 * 1024;
 
+/// The longest title (OSC 0, 1 and 2) passed on, in bytes.
+///
+/// A title is kept, and `CSI 22 t` pushes a copy of it onto a stack 4096 deep:
+/// at the general cap that is 2 GiB pinned by 20 KiB of pushes. At 2 KiB it is
+/// 8 MiB. 2 KiB is four times `MAX_TITLE`, what a title is cut to before it
+/// is shown, so a long title, such as a shell's whole command line, still
+/// shows its first `MAX_TITLE` bytes rather than being dropped.
+pub(crate) const MAX_TITLE_OSC_LEN: usize = 2 * 1024;
+
+/// The longest hyperlink (OSC 8) passed on, in bytes.
+///
+/// Every cell a link covers keeps it, and each OSC 8 makes a new one, so a
+/// program can make the grid and the scrollback hold one link per cell. GNOME
+/// VTE ignores a URI over 2083 bytes and an id over 250; 4 KiB is that with
+/// room for the parameters.
+pub(crate) const MAX_LINK_OSC_LEN: usize = 4 * 1024;
+
 /// Sits between the PTY and the parser and holds every OSC body until it is
 /// terminated.
 ///
@@ -59,6 +76,27 @@ const ESC: u8 = 0x1b;
 /// What a buffer as large as the cap is shrunk back to after use, so one long
 /// OSC does not pin half a megabyte for the rest of the session.
 const KEEP_CAPACITY: usize = 4 * 1024;
+
+/// The cap for the OSC whose body so far is `held`, chosen by its number.
+///
+/// The number is read the way vte reads it: up to the first `;`, without the
+/// C0 controls vte leaves out of the body. Until the `;` arrives, `held` is
+/// the number so far, so a body cannot outgrow its cap while the number is
+/// still incomplete: a title stops being a title the moment a second digit
+/// or anything else but `;` follows the `2`.
+fn limit(held: &[u8]) -> usize {
+    let mut num = held
+        .split(|&b| b == b';')
+        .next()
+        .unwrap_or_default()
+        .iter()
+        .filter(|&&b| b >= 0x20);
+    match (num.next(), num.next()) {
+        (Some(b'0' | b'1' | b'2'), None) => MAX_TITLE_OSC_LEN,
+        (Some(b'8'), None) => MAX_LINK_OSC_LEN,
+        _ => MAX_OSC_LEN,
+    }
+}
 
 fn ends_osc(b: &u8) -> bool {
     matches!(*b, BEL | CAN | SUB | ESC)
@@ -108,13 +146,15 @@ impl OscGuard {
                     let end = rest.iter().position(ends_osc);
                     let body = &rest[..end.unwrap_or(rest.len())];
                     if self.state == State::Osc {
-                        if self.held.len() + body.len() > MAX_OSC_LEN {
+                        let fits = self.held.len() + body.len() <= MAX_OSC_LEN;
+                        if fits {
+                            self.held.extend_from_slice(body);
+                        }
+                        if !fits || self.held.len() > limit(&self.held) {
                             self.release();
                             // Aborts the parser's OSC, which holds nothing.
                             sink(&[CAN]);
                             self.state = State::Discard;
-                        } else {
-                            self.held.extend_from_slice(body);
                         }
                     }
                     i += body.len();
@@ -199,9 +239,11 @@ mod tests {
         }
     }
 
+    /// An unterminated OSC 52 whose body is `body_len` bytes long. OSC 52
+    /// because it has the general cap; titles and links have smaller ones.
     fn osc(body_len: usize) -> Vec<u8> {
-        let mut v = b"\x1b]2;".to_vec();
-        v.resize(v.len() + body_len - 2, b'x');
+        let mut v = b"\x1b]52;c;".to_vec();
+        v.resize(2 + body_len, b'A');
         v
     }
 
@@ -322,6 +364,75 @@ mod tests {
         }
     }
 
+    /// `ESC ] <num>;` and a body that makes the OSC `len` bytes long, ended
+    /// by BEL and followed by text.
+    fn numbered(num: &str, len: usize) -> Vec<u8> {
+        let mut v = format!("\x1b]{num};").into_bytes();
+        v.resize(len + 2, b'x');
+        v.extend_from_slice(b"\x07after");
+        v
+    }
+
+    fn dropped() -> Vec<u8> {
+        b"\x1b]\x18after".to_vec()
+    }
+
+    #[test]
+    fn titles_and_links_have_caps_of_their_own() {
+        for (num, cap) in [
+            ("0", MAX_TITLE_OSC_LEN),
+            ("1", MAX_TITLE_OSC_LEN),
+            ("2", MAX_TITLE_OSC_LEN),
+            ("8", MAX_LINK_OSC_LEN),
+        ] {
+            let at = numbered(num, cap);
+            same(
+                &run(&mut OscGuard::new(), &at),
+                &at,
+                &format!("OSC {num} at its cap"),
+            );
+            let over = numbered(num, cap + 1);
+            same(
+                &run(&mut OscGuard::new(), &over),
+                &dropped(),
+                &format!("OSC {num} over"),
+            );
+        }
+    }
+
+    #[test]
+    fn other_oscs_keep_the_general_cap() {
+        // OSC 52 and numbers that merely start like a title or a link.
+        for num in ["52", "22", "80", "104"] {
+            let input = numbered(num, MAX_TITLE_OSC_LEN * 4);
+            same(&run(&mut OscGuard::new(), &input), &input, num);
+        }
+    }
+
+    #[test]
+    fn a_control_inside_the_number_does_not_dodge_the_title_cap() {
+        // vte skips C0 controls in an OSC body, so to it this is OSC 2.
+        let mut input = b"\x1b]2\x01;".to_vec();
+        input.resize(MAX_TITLE_OSC_LEN + 8, b'x');
+        input.extend_from_slice(b"\x07after");
+        same(
+            &run(&mut OscGuard::new(), &input),
+            &dropped(),
+            "OSC 2 with a control",
+        );
+    }
+
+    #[test]
+    fn a_title_split_before_its_semicolon_is_still_a_title() {
+        let input = numbered("2", MAX_TITLE_OSC_LEN + 1);
+        for at in [2, 3, 4, 5] {
+            let mut g = OscGuard::new();
+            let mut out = run(&mut g, &input[..at]);
+            out.extend(run(&mut g, &input[at..]));
+            same(&out, &dropped(), &format!("split at {at}"));
+        }
+    }
+
     #[test]
     fn text_after_an_over_cap_osc_renders_and_the_osc_has_no_effect() {
         let dims = GridSize::new(TermSize { cols: 20, rows: 3 }, 10).expect("size");
@@ -344,7 +455,10 @@ mod tests {
             .collect();
         assert_eq!(row, "after");
         let signals = events.drain();
-        assert_eq!(signals.title, None, "the oversized title must not be set");
+        assert!(
+            signals.clipboard.is_empty(),
+            "no part of the oversized copy may reach the clipboard"
+        );
         assert_eq!(signals.bells, 0, "the BEL ended the OSC; it is no bell");
     }
 }
