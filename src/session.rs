@@ -3541,6 +3541,43 @@ mod tests {
         assert!(!out.is_empty(), "the renderer must have painted something");
     }
 
+    /// Over real QUIC: the copy reaches the client, and once the client has
+    /// acknowledged it the host drops the text and keeps the serial, on both
+    /// ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivered_copy_loses_its_text_on_both_ends() {
+        let (mut host, mut client) = pair("printf '\\033]52;c;aGVsbG8=\\007'\n").await;
+        let mut out = Vec::new();
+
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| c.screen().clipboard.serial == 1
+            )
+            .await,
+            "the copy never reached the client: {:?}",
+            client.screen().clipboard
+        );
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(10),
+                |h, c| h.screen().clipboard.copy.is_none() && c.screen().clipboard.copy.is_none()
+            )
+            .await,
+            "host {:?}, client {:?}",
+            host.screen().clipboard,
+            client.screen().clipboard
+        );
+        assert_eq!(host.screen().clipboard.serial, 1);
+        assert_eq!(client.screen().clipboard.serial, 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn keystrokes_reach_the_shell_and_the_answer_comes_back() {
         let (mut host, mut client) =

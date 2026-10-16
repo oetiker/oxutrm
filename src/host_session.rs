@@ -328,6 +328,20 @@ impl HostSession {
             }
         }
 
+        // ---- delivered clipboard copies ------------------------------------
+        // Once the client has acknowledged a state carrying a copy, the copy
+        // has reached it: the emulator drops the text and keeps the count, so
+        // later full states stay small and a later client is never handed
+        // stale clipboard content. The snapshot that says so is owed even if
+        // the pty is quiet, hence `screen_stale`.
+        self.screen_tx.on_ack(self.input_rx.peer_ack());
+        if let (Some(term), Some(acked)) = (self.term.as_mut(), self.screen_tx.acked())
+            && acked.clipboard.copy.is_some()
+            && term.clipboard_delivered(acked.clipboard.serial)
+        {
+            self.screen_stale = true;
+        }
+
         // The client's requested size arrives on the input diff. This has to
         // live in `turn` rather than in `run`, or a caller driving the loop
         // itself - which is every test, and will be M3's reattach path -
@@ -369,6 +383,22 @@ impl HostSession {
         // A lobby has none: its screen is the blank one it was given.
         if let Some(term) = self.term.as_mut() {
             let moved = term.poll().context("draining the pty")?;
+            if let Some(len) = term.take_dropped_copy() {
+                #[cfg_attr(
+                    not(test),
+                    expect(
+                        clippy::print_stderr,
+                        reason = "the host daemon's own stderr, from turn_at on \
+                                  HostSession; never a client's screen"
+                    )
+                )]
+                {
+                    eprintln!(
+                        "oxutrm: host dropped a {len}-byte clipboard copy (limit {})",
+                        oxutrm_proto::MAX_CLIPBOARD
+                    );
+                }
+            }
             if attached {
                 if moved || self.screen_stale {
                     // The sequence number is a placeholder; `update` mints
