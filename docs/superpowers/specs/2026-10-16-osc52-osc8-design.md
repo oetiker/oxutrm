@@ -265,29 +265,40 @@ links, as the OSC 8 spec requires. `Hyperlink` is `Eq + Hash` over
 - `links.len() <= MAX_LINKS`;
 - no key is 0;
 - every URI is 1..=`MAX_LINK_URI` bytes, each in `0x20..=0x7E`
-  (`ApplyError::BadLinkUri`, `TextTooLong { field: TextField::LinkUri }`);
+  (`ApplyError::BadLinkUri { id, byte }`, `byte: None` for an empty URI;
+  `TextTooLong { field: TextField::LinkUri }`); `TooManyLinks` and
+  `LinkIdZero` for the first two rules;
 - every cell's `link` is 0 or a key of `links` (`ApplyError::UnknownLink`).
 
 In `ScreenState::apply`, the URI and count checks on the diff's link entries
-run **before** anything is applied, as the title check does; the
+run **before** anything is applied, as the title check does (the count bound
+there is `2 * MAX_LINKS`: an honest diff names each id once, and the base and
+target tables hold at most `MAX_LINKS` each); the
 "every cell's link exists" check runs on the result through `validate`.
 Length is tested before the byte scan (the I8 ordering rule).
 
 ### 4.4 Host
 
-`HostTerm` keeps a `LinkTable`: `HashMap<Hyperlink, u16>` plus the reverse
-map. `screen_state_of` (which needs `&mut` access to it, or the table is
-passed in) does for each visible cell:
+`HostTerm` keeps a `LinkTable` (`crates/oxutrm-term/src/links.rs`):
+`HashMap<Hyperlink, u16>` plus the reverse map. `screen_state_of` takes it
+as `Option<&mut LinkTable>` and first collects every visible cell's
+hyperlink, then frees every entry no cell holds, then does for each cell:
 
 1. no hyperlink → `link = 0`;
-2. URI fails the I10 byte or length rule → `link = 0` (the text stays; row 15);
-3. already interned → its id;
+2. already interned → its id;
+3. URI fails the I10 byte or length rule → `link = 0` (the text stays; row 15);
 4. table has fewer than `MAX_LINKS` entries → intern at the lowest free id;
 5. otherwise → `link = 0` (row 14).
 
-After the pass, entries no cell referenced are freed, and `links` in the
-state is exactly the referenced set. A `WIDE_CONT` cell takes the same link
-as its lead cell.
+Freeing before interning, not after the pass, means a screen whose old
+links have all scrolled away has the whole table for its new ones. `links`
+in the state is exactly the referenced set. A `WIDE_CHAR_SPACER` cell takes
+the same link as its lead cell; a `LEADING_WIDE_CHAR_SPACER` (also sent as
+`WIDE_CONT`) has no lead and keeps its own.
+
+`HostTerm::snapshot` takes `&mut self` for the table. `HostTerm::picture`
+(`&self`) builds the same state with `None`: no cell has a link and the
+table is empty. The session preview uses it (§4.8).
 
 `HostTerm::scrollback` writes `link = 0` in every cell (row 18).
 
@@ -317,7 +328,8 @@ lead cell's link covers both columns.
 
 **Repaint.** A full repaint starts with a close before `ESC[H ESC[2J`, so a
 link left open by an interrupted earlier write cannot attach to the repaint.
-`RawGuard`'s restore on exit also writes a close.
+`RawGuard`'s restore on exit also writes a close (`TERMINAL_RESTORE`, right
+after leaving the alternate buffer).
 
 **What counts as changed.** `Painted` keeps the link table it painted
 (`BTreeMap` of `Arc<str>`, cheap to clone). A cell counts as changed when the
@@ -330,7 +342,8 @@ stamps. Overlay content therefore never carries a link and closes any link
 beneath it.
 
 **Off.** With `terminal.hyperlinks = false`, or `caps.osc8 == false`, no OSC 8
-is written and cells are painted as plain text. Changing the setting
+is written, not even the repaint's close, and cells are painted as plain
+text. Changing the setting
 invalidates the renderer, so the next render repaints with or without links.
 
 ### 4.6 Remote `file://` links
@@ -350,7 +363,9 @@ accident.
 D2 (feat/d2-preview) shows a cell-for-cell crop of another session's
 `ScreenState` in the selector. Its cells carry link ids from **that**
 session's table. If the preview is painted as an overlay, row 19 already
-strips them and D2 needs nothing. If D2 paints through another path, it must
+strips them and D2 needs nothing. As built: `ScreenState::window()` returns
+every cell with `link = 0` and an empty table, and the door's preview is
+cut from `HostTerm::picture`, so no link leaves the sibling at all. If D2 paints through another path, it must
 set `link = 0` on the cells it shows and must never pass preview states to
 `ClipboardRelay`. The plans for D2 and this PR note this contract; neither
 depends on the other's code.
@@ -533,3 +548,27 @@ contradict an earlier section, that section has been corrected.
   counts on from it (`HostTerm::count_on_from`), so its first copy is
   written once. A copy the killed shell made and the client never acked is
   lost with the shell.
+
+Made while building PR 2 (OSC 8), all (controller, 2026-10-16):
+
+- PR 2 is stacked on PR 1 and D2; `PROTO_VERSION` 6. `TerminalCaps` gained
+  `osc8` on the wire as well.
+- `LinkTable` frees before it interns (§4.4), so stale entries never crowd
+  out new links.
+- `HostTerm::snapshot` takes `&mut self`; the preview uses the link-free
+  `HostTerm::picture`, so a preview never moves the ids the attached client
+  holds, and `window()` strips links as a second line (§4.8).
+- The diff's link-entry count is bounded at `2 * MAX_LINKS` before apply
+  (§4.3).
+- `BadLinkUri` carries `byte: Option<u8>`, `None` for an empty URI.
+- A cell counts as relinked only while links are on; with them off a cell
+  that differs only in its id is repainted plain, which costs nothing.
+- With links off the full repaint writes no close either: the "no `\x1b]8`
+  anywhere" rule holds without exception.
+- `TERMINAL_RESTORE` closes a link right after `\x1b[?1049l`.
+- `oxutrm loopback` paints links: its renderer has no settings and the
+  default is on.
+- A control byte inside an OSC 8 URI cannot come through the emulator: vte
+  ends the sequence at ESC and BEL and drops other C0 bytes from it. The
+  end-to-end hostile test therefore uses a non-ASCII and an over-long URI;
+  ESC, BEL, C1 and `\n` are covered by the proto, sync and `LinkTable` units.
