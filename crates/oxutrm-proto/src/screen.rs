@@ -156,7 +156,11 @@ impl ScreenState {
         let rows = self.rows.min(max.rows);
         let cols = self.cols.min(max.cols);
         let top = if self.cursor.visible {
-            (self.cursor.row + 1)
+            // Saturating: a screen with no cells is exempt from I2, so its
+            // cursor can sit at u16::MAX and still validate.
+            self.cursor
+                .row
+                .saturating_add(1)
                 .saturating_sub(rows)
                 .min(self.rows - rows)
         } else {
@@ -484,5 +488,22 @@ mod tests {
         let w = shell(30).window(TermSize { cols: 0, rows: 0 });
         assert_eq!((w.rows, w.cols, w.cursor.row, w.cursor.col), (0, 0, 0, 0));
         w.validate().unwrap();
+    }
+
+    /// A screen with no cells is exempt from the cursor bound (I2), so a
+    /// peer can send one with its cursor anywhere at all: the window of it
+    /// is still empty and valid.
+    #[test]
+    fn a_screen_with_no_cells_and_its_cursor_at_the_end_has_an_empty_window() {
+        for (rows, cols) in [(0, 0), (0, 80), (24, 0)] {
+            let mut s = ScreenState::blank(rows, cols).unwrap();
+            s.cursor.row = u16::MAX;
+            s.cursor.col = u16::MAX;
+            s.cursor.visible = true;
+            s.validate().unwrap();
+            let w = s.window(PANE);
+            assert_eq!(w.cells.len(), 0, "{rows}x{cols}");
+            w.validate().unwrap();
+        }
     }
 }
