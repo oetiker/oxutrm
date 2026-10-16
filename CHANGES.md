@@ -22,6 +22,21 @@
   before connecting with this release.
 
 ### Fixed
+- A program that printed accents or other combining marks without end, such
+  as a `cat` of a file of stacked diacritics, made the memory of its session
+  on the host grow until the system killed it. A character now keeps only as
+  many marks as fit in what the screen shows of it, and the rest are dropped.
+- A program that printed the start of a terminal control sequence and never
+  ended it, such as a `cat` of a damaged file, or that set a very long window
+  title and saved it over and over, made the memory of its session on the host
+  grow until the system killed it. Such a sequence is now dropped once it
+  passes 512 KiB, a window title once it passes 2 KiB and a hyperlink once it
+  passes 4 KiB, and the output that follows shows as usual.
+- **Text after a tab no longer appears shifted to the left.** When a line
+  containing tabs was redrawn in place, for example while output scrolled,
+  the text after each tab moved one more column to the left, and leftover
+  characters from the earlier content stayed at the end of the redrawn part
+  of the line until the screen was repainted in full.
 - **Killing the session you were in from the session selector no longer
   freezes the screen.** If that shell had ever rung the bell or scrolled text
   off the top, the client stayed on its last picture instead of showing the
