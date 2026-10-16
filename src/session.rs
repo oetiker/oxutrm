@@ -146,6 +146,30 @@ enum Wake {
     Nothing,
 }
 
+/// A preview's answer: the session asked, and its screen or why there is
+/// none.
+type Previewed = (oxutrm_proto::SessionId, Result<ScreenState, String>);
+
+/// The preview request in flight and the channel its answer comes back on:
+/// a slot of their own, so a preview never holds up a switcher request.
+/// The loop's, not the session's, for the reason `outcomes` is a local
+/// (C1): its receiver is polled in the loop's `select!`.
+struct PreviewSlot {
+    tx: tokio::sync::mpsc::Sender<Previewed>,
+    rx: tokio::sync::mpsc::Receiver<Previewed>,
+    /// Held so the request ends with the loop, or as soon as nobody waits
+    /// for it any more.
+    task: Option<crate::attach_exchange::AbortOnDrop>,
+}
+
+impl PreviewSlot {
+    /// One deep: one request at a time.
+    fn new() -> PreviewSlot {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        PreviewSlot { tx, rx, task: None }
+    }
+}
+
 /// Was this link closed because a newer attach displaced it?
 ///
 /// The reason phrase, and not merely "an application close": every deliberate
@@ -1542,10 +1566,47 @@ impl ClientSession {
         })
     }
 
-    /// The preview's part of a lap (preview spec §3.4): the selection
+    /// The preview's part of a lap (preview spec §3.4): what
+    /// [`ClientSession::preview_step`] decides, done to the loop's `slot`.
+    /// A request [`crate::preview::Previews`] no longer has out -- the
+    /// selector closed, a switch landed -- is aborted, and the one to ask
+    /// now is sent from a task of the slot's, on its own control stream.
+    fn preview_lap(&mut self, now: Instant, slot: &mut PreviewSlot) {
+        let ask = self.preview_step(now);
+        if self.previews.out().is_none() {
+            slot.task = None;
+        }
+        if let Some(id) = ask {
+            let primary = self.link.sink.connection().clone();
+            let tx = slot.tx.clone();
+            let task = tokio::spawn(async move {
+                let shot = crate::switcher::preview(primary, id).await;
+                let _ = tx.send((id, shot)).await;
+            });
+            slot.task = Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
+        }
+    }
+
+    /// The answer to a preview request, from `slot`'s channel. One for a
+    /// request no longer out (its task had sent before it was aborted) is
+    /// dropped, and the request out now keeps its task.
+    fn previewed(
+        &mut self,
+        slot: &mut PreviewSlot,
+        id: oxutrm_proto::SessionId,
+        shot: Result<ScreenState, String>,
+        now: Instant,
+    ) {
+        self.previews.answered(id, shot, now);
+        if self.previews.out().is_none() {
+            slot.task = None;
+        }
+    }
+
+    /// The selection's part of a lap (preview spec §3.4): the selection
     /// arrives on its row, and the session to ask for now, if any, comes
-    /// back for the loop to send. With the selector closed, everything it
-    /// showed is forgotten; the loop drops the request out with it.
+    /// back to be sent. With the selector closed, everything it showed is
+    /// forgotten.
     fn preview_step(&mut self, now: Instant) -> Option<oxutrm_proto::SessionId> {
         if self.ui.mode() != Mode::Sessions {
             self.previews.clear();
@@ -2301,9 +2362,7 @@ impl ClientSession {
         let mut _ask_task: Option<crate::attach_exchange::AbortOnDrop> = None;
         // Where a preview request reports back, and the one in flight: a
         // slot of their own, so a preview never holds up a switcher request.
-        let (previewed_tx, mut previewed) =
-            tokio::sync::mpsc::channel::<(oxutrm_proto::SessionId, Result<ScreenState, String>)>(1);
-        let mut _preview_task: Option<crate::attach_exchange::AbortOnDrop> = None;
+        let mut previews = PreviewSlot::new();
 
         let mut winch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -2357,7 +2416,7 @@ impl ClientSession {
                 Some(report) = outcomes.recv() => Wake::Rebuilt(report),
                 Some(event) = standby_rx.recv() => Wake::Standby(event),
                 Some(a) = answers.recv() => Wake::Answered(a),
-                Some((id, shot)) = previewed.recv() => Wake::Previewed(id, shot),
+                Some((id, shot)) = previews.rx.recv() => Wake::Previewed(id, shot),
                 // Quiet until the standby goes away; a closed connection is
                 // ready for ever, which is why the handler disarms it.
                 reason = async { standby_conn.as_ref().expect("armed").closed().await },
@@ -2462,12 +2521,10 @@ impl ClientSession {
                         standby_conn = None;
                         _search_task = None;
                         _probe_task = None;
-                        _preview_task = None;
                     }
                 }
                 Wake::Previewed(id, shot) => {
-                    _preview_task = None;
-                    self.previews.answered(id, shot, Instant::now());
+                    self.previewed(&mut previews, id, shot, Instant::now());
                 }
                 // The link is gone, but what already arrived over it is not.
                 // Paint it before answering, or `ls; exit` shows the user
@@ -2521,19 +2578,7 @@ impl ClientSession {
             let now = Instant::now();
             // The selector's preview, before the popup is laid out, so the
             // pane already says what is being asked.
-            let ask_preview = self.preview_step(now);
-            if self.ui.mode() != Mode::Sessions {
-                _preview_task = None;
-            }
-            if let Some(id) = ask_preview {
-                let primary = self.link.sink.connection().clone();
-                let tx = previewed_tx.clone();
-                let task = tokio::spawn(async move {
-                    let shot = crate::switcher::preview(primary, id).await;
-                    let _ = tx.send((id, shot)).await;
-                });
-                _preview_task = Some(crate::attach_exchange::AbortOnDrop(task.abort_handle()));
-            }
+            self.preview_lap(now, &mut previews);
             self.layer_one(now, out)?;
             // The splash's timer goes with it: once it is down, no timer is
             // left that the session did not have before.
@@ -10282,6 +10327,14 @@ mod tests {
         client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
         assert!(!ask_now(&mut client, crate::switcher::Ask::Sessions).await);
         assert_eq!(client.sessions().len(), 2);
+        // A preview of logs out as the switch lands.
+        let logs_row = client
+            .sessions()
+            .iter()
+            .find(|e| e.id == id_of(LOGS_ID))
+            .cloned();
+        client.previews.arrive(logs_row.as_ref(), Instant::now());
+        assert_eq!(client.previews.ask_next(true), Some(id_of(LOGS_ID)));
 
         let old = client.link.sink.connection().clone();
         assert!(
@@ -10291,6 +10344,11 @@ mod tests {
             )
             .await,
             "a switch moves the loop to a new link"
+        );
+        assert_eq!(
+            client.previews.out(),
+            None,
+            "the old host's previews outlived the switch"
         );
         assert_ne!(client.link.sink.connection().stable_id(), old.stable_id());
         assert!(
@@ -11045,6 +11103,35 @@ mod tests {
         }
     }
 
+    /// What `following` prints, as a preview shows it.
+    const MARKER: &str = "sshd[4121]: Accepted publickey";
+
+    /// Wait until session `id`'s preview, asked over `conn`, shows
+    /// [`MARKER`]: its shell has printed before the client looks.
+    async fn has_printed(conn: &quinn::Connection, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let a = crate::serve::fixtures::ask_over(
+                conn,
+                oxutrm_proto::Request::Preview { id: id_of(id) },
+            )
+            .await;
+            let oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Preview(s)) = a else {
+                panic!("not a preview: {a:?}");
+            };
+            if s.cells
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+                .contains(MARKER)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the shell never printed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The text of an overlay's rows.
     fn overlay_text(o: &oxutrm_client::Overlay) -> Vec<String> {
         o.cells
@@ -11059,8 +11146,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn moving_onto_a_sibling_shows_its_screen_under_the_list() {
         use crate::serve::Begin;
-        use crate::serve::fixtures::{SIZE, ask_over, process, registry_holds, sh};
-        const MARKER: &str = "sshd[4121]: Accepted publickey";
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
         let dir = tempfile::tempdir().unwrap();
         let scripts = tempfile::tempdir().unwrap();
         let build = process(
@@ -11080,28 +11166,7 @@ mod tests {
         )
         .await;
         registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
-        // The sibling's shell has printed before the client looks.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let a = ask_over(
-                build.client.sink.connection(),
-                oxutrm_proto::Request::Preview { id: id_of(LOGS_ID) },
-            )
-            .await;
-            let oxutrm_proto::Answer::Reply(oxutrm_proto::Reply::Preview(s)) = a else {
-                panic!("not a preview: {a:?}");
-            };
-            if s.cells
-                .iter()
-                .map(|c| c.text.as_str())
-                .collect::<String>()
-                .contains(MARKER)
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "logs' shell never printed");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        has_printed(build.client.sink.connection(), LOGS_ID).await;
 
         let mut client = client_on(build.client, BUILD_ID);
         let open = |client: &mut ClientSession| {
@@ -11176,5 +11241,85 @@ mod tests {
             Some(id_of(LOGS_ID)),
             "the shot was dropped with the selector"
         );
+    }
+
+    /// The loop itself: in a lobby the selector opens on the one sibling,
+    /// whose screen the loop asks for, hears back through its own wake and
+    /// paints under the list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_paints_the_selected_siblings_screen() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{SIZE, process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            following(scripts.path()),
+        )
+        .await;
+        let lobby = process(dir.path(), BUILD_ID, None, Begin::Lobby, sh()).await;
+        registry_holds(dir.path(), &[LOGS_ID]).await;
+        has_printed(logs.client.sink.connection(), LOGS_ID).await;
+
+        let client = client_on(lobby.client, BUILD_ID).with_lobby();
+        let (keys, _typing) = keyboard();
+        let out = SharedOut::default();
+        let looping = tokio::spawn({
+            let mut out = out.clone();
+            let mut client = client;
+            async move { client.run_on(keys, &mut out).await }
+        });
+        wait_for_screen(&out, SIZE, "\u{25b8} logs", Duration::from_secs(10)).await;
+        wait_for_screen(
+            &out,
+            SIZE,
+            "\u{251c} preview \u{2500}",
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_screen(&out, SIZE, MARKER, Duration::from_secs(10)).await;
+        looping.abort();
+    }
+
+    /// A preview request lives exactly as long as someone waits for it: an
+    /// answer for another request leaves it be, and closing the selector
+    /// aborts it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closing_the_selector_aborts_the_preview_request_out() {
+        use crate::selector::fixtures::{FISH, LOGS, three};
+        // A host that takes the stream and never answers: the request
+        // stays out until something ends it.
+        let (_host, link) = crate::link::fixtures::link_pair().await;
+        let mut client = client_on(link, BUILD_ID);
+        let mut slot = PreviewSlot::new();
+        type_in(&mut client, &[crate::ui::PREFIX]);
+        type_in(&mut client, b"s");
+        assert_eq!(client.take_ask(), Some(crate::switcher::Ask::Sessions));
+        client
+            .answered(crate::switcher::Answered::Sessions(three()), Instant::now())
+            .unwrap();
+        // build, the second row, onto logs, the third.
+        type_in(&mut client, b"j");
+        client.preview_lap(Instant::now(), &mut slot);
+        assert_eq!(client.previews.out(), Some(id_of(LOGS)));
+        let task = slot.task.as_ref().expect("a request out").0.clone();
+
+        let blank = ScreenState::blank(18, 68).unwrap();
+        client.previewed(&mut slot, id_of(FISH), Ok(blank), Instant::now());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "an answer to nothing ended the request out"
+        );
+
+        type_in(&mut client, b"q");
+        assert_ne!(client.ui.mode(), Mode::Sessions);
+        client.preview_lap(Instant::now(), &mut slot);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(task.is_finished(), "the request outlived the selector");
+        assert!(slot.rx.try_recv().is_err(), "an aborted request answered");
     }
 }

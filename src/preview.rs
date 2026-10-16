@@ -133,6 +133,11 @@ impl Previews {
         self.shots.insert(id, (got, now));
     }
 
+    /// The session whose request is out, if any.
+    pub(crate) fn out(&self) -> Option<SessionId> {
+        self.out
+    }
+
     /// A fresh list: shots of sessions it no longer lists are dropped, and
     /// such a session is no longer wanted.
     pub(crate) fn keep(&mut self, list: &[SessionEntry]) {
