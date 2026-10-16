@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use oxutrm_proto::{
     Attrs, Cell, Color, Cursor, CursorShape, Modes, MouseMode, ScreenState, TermSize, TerminalCaps,
+    check_link_uri,
 };
 
 use crate::color::down_convert;
@@ -407,16 +408,18 @@ impl Renderer {
                         if open != 0 {
                             out.extend_from_slice(LINK_CLOSE);
                         }
-                        // `validate` guarantees the id is in the table; a
-                        // cell whose id is not is painted plain.
+                        // `validate` guarantees the id is in the table and
+                        // its URI is printable ASCII. The renderer checks
+                        // again, as it is what writes the URI into an escape
+                        // sequence: a cell whose link fails is painted plain.
                         open = match links.get(&cell.link) {
-                            Some(uri) => {
+                            Some(uri) if check_link_uri(cell.link, uri).is_ok() => {
                                 out.extend_from_slice(
                                     format!("\x1b]8;id={};{uri}\x07", cell.link).as_bytes(),
                                 );
                                 cell.link
                             }
-                            None => 0,
+                            _ => 0,
                         };
                     }
                     let want = self.sgr_for(cell);
@@ -1731,6 +1734,25 @@ mod tests {
         r.invalidate();
         let out = render(&mut r, &next);
         assert!(!out.contains("\u{1b}]8"), "{out:?}");
+    }
+
+    /// `validate` refuses a state whose URI could end the OSC 8 early, but
+    /// the renderer does not lean on it: a URI it could not write safely is
+    /// not written, and its cells are painted plain.
+    #[test]
+    fn a_link_with_a_bad_uri_is_painted_plain() {
+        let mut s = blank_state();
+        put_link(&mut s, 0, "ab", 1, "http://a/\u{7}\u{1b}]52;c;AAAA\u{7}");
+        put_link(&mut s, 3, "cd", 2, "http://ä/");
+        put_link(&mut s, 6, "ef", 3, "http://ok");
+        assert!(s.validate().is_err(), "the state is one validate refuses");
+
+        let out = render(&mut Renderer::new(size(), caps(16_777_216)), &s);
+        assert!(!out.contains("]52"), "{out:?}");
+        assert!(!out.contains('ä'), "{out:?}");
+        assert!(!out.contains("id=1;") && !out.contains("id=2;"), "{out:?}");
+        assert!(out.contains(&open(3, "http://ok")), "{out:?}");
+        assert!(out.contains("ab") && out.contains("cd"), "{out:?}");
     }
 
     /// Turning the setting off takes effect at the next render: the links
