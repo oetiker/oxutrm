@@ -427,7 +427,17 @@ impl Renderer {
                         out.extend_from_slice(&want);
                         pen = Some(want);
                     }
-                    out.extend_from_slice(cell.text.as_bytes());
+                    // Every other cell occupies its column, so one with no
+                    // text is a blank. Writing nothing would put everything
+                    // after it in this run one column to the left. Hosts up
+                    // to 0.3.0 send such a cell wherever a tab started, and
+                    // I8 cannot refuse them without freezing every session
+                    // that prints a tab, so the renderer pays for it here.
+                    if cell.text.is_empty() {
+                        out.push(b' ');
+                    } else {
+                        out.extend_from_slice(cell.text.as_bytes());
+                    }
                 }
                 if open != 0 {
                     out.extend_from_slice(LINK_CLOSE);
@@ -904,6 +914,84 @@ mod tests {
             "run did not reach back: {out:?}"
         );
         assert!(out.contains('世'), "the glyph was not redrawn: {out:?}");
+    }
+
+    /// Replay the renderer's output onto a one-row screen that already shows
+    /// `before`, the way a real terminal would: CUP moves, CSI and OSC are
+    /// otherwise ignored, and every other scalar fills one column. Enough for
+    /// ASCII; it is here to read off which column each character lands in.
+    fn replay(before: &str, out: &str) -> String {
+        let mut row: Vec<char> = before.chars().collect();
+        let mut col = 0usize;
+        let mut chars = out.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\u{1b}' => match chars.next() {
+                    Some('[') => {
+                        let mut params = String::new();
+                        for p in chars.by_ref() {
+                            if ('@'..='~').contains(&p) {
+                                match p {
+                                    'H' => {
+                                        let c = params.split(';').nth(1).unwrap_or("1");
+                                        col = c.parse::<usize>().unwrap_or(1) - 1;
+                                    }
+                                    'J' if params == "2" => row.fill(' '),
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            params.push(p);
+                        }
+                    }
+                    Some(']') => for _ in chars.by_ref().take_while(|p| *p != '\u{7}') {},
+                    _ => {}
+                },
+                _ => {
+                    if col < row.len() {
+                        row[col] = c;
+                    }
+                    col += 1;
+                }
+            }
+        }
+        row.into_iter().collect()
+    }
+
+    /// One row of 20 cells holding `cells`, left-aligned, blanks after.
+    fn row_state(cells: &[Cell], seq: u64) -> ScreenState {
+        let mut s = ScreenState::blank(1, 20).expect("1x20 is a valid screen");
+        s.seq = seq;
+        s.cells[..cells.len()].clone_from_slice(cells);
+        s
+    }
+
+    /// What a host up to 0.3.0 sends for `printf 'a\tb\tc'`: the cell where a
+    /// tab starts arrives empty, because the emulator stored `'\t'` there and
+    /// the control was dropped. An empty cell that is not a wide continuation
+    /// still occupies its column, so the renderer must paint it as a blank —
+    /// otherwise, inside one changed run, everything after it is written one
+    /// column to the left until the next cursor move.
+    #[test]
+    fn an_empty_cell_still_occupies_its_column() {
+        let mut row = vec![cell("a"), cell("")];
+        row.extend(std::iter::repeat_n(cell(" "), 6));
+        row.extend([cell("b"), cell("")]);
+        row.extend(std::iter::repeat_n(cell(" "), 6));
+        row.push(cell("c"));
+
+        // A row full of earlier output, so the whole row is one changed run —
+        // which is what scrolling does to every line it moves.
+        let old = row_state(&vec![cell("x"); 20], 1);
+        let mut r = Renderer::new(TermSize { cols: 20, rows: 1 }, caps(256));
+        r.render(&mut Vec::new(), &old).expect("priming render");
+
+        let out = render(&mut r, &row_state(&row, 2));
+        assert_eq!(
+            replay("xxxxxxxxxxxxxxxxxxxx", &out),
+            "a       b       c   ",
+            "{out:?}"
+        );
     }
 
     #[test]

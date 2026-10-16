@@ -9,7 +9,8 @@
 //! a newtype that implements the whole of [`vte::ansi::Handler`], forwards
 //! all 71 methods to the `Term` unchanged, and intercepts exactly two:
 //! `terminal_attribute`, to track whether blink is currently on, and `input`,
-//! to record the cursor position of every character written while it is.
+//! to record the cursor position of every character written while it is, and
+//! to drop a combining mark that would overfill its cell ([`crate::marks`]).
 //!
 //! **The forwarding is generated, not typed.** 71 hand-copied signatures is
 //! 71 chances to get an argument order wrong in a way that compiles, so they
@@ -138,6 +139,9 @@ impl<T: EventListener> Handler for BlinkTap<'_, T> {
             let point = self.term.grid().cursor.point;
             let point = point.grid_clamp(self.term, Boundary::Grid);
             self.blink.cells.remove(&key(point));
+        }
+        if !crate::marks::mark_fits(self.term, a0) {
+            return;
         }
         self.term.input(a0);
     }

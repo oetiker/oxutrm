@@ -51,6 +51,8 @@ mod grid;
 mod host;
 mod links;
 mod listener;
+mod marks;
+mod osc_guard;
 mod palette;
 mod pty;
 

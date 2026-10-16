@@ -18,6 +18,7 @@ use crate::blink::{BlinkPlane, BlinkTap};
 use crate::grid::{GridSize, cell_at};
 use crate::links::LinkTable;
 use crate::listener::EventSink;
+use crate::osc_guard::OscGuard;
 use crate::palette::{PALETTE_LEN, palette, to_proto_color};
 use crate::pty::Pty;
 
@@ -45,6 +46,8 @@ pub struct HostTerm {
     output_waiting: bool,
     term: Term<EventSink>,
     parser: Processor,
+    /// In front of `parser`, because the parser puts no limit on an OSC.
+    osc_guard: OscGuard,
     events: EventSink,
     blink: BlinkPlane,
     palette: [Rgb; PALETTE_LEN],
@@ -107,6 +110,7 @@ impl HostTerm {
             output_waiting: false,
             term,
             parser: Processor::new(),
+            osc_guard: OscGuard::new(),
             events,
             blink: BlinkPlane::default(),
             palette: palette(),
@@ -203,7 +207,9 @@ impl HostTerm {
                 // counting within seconds of the ring filling.
                 let mut tap =
                     BlinkTap::new(&mut self.term, &mut self.blink, &mut self.scrollback_len);
-                self.parser.advance(&mut tap, &buf[..n]);
+                let parser = &mut self.parser;
+                self.osc_guard
+                    .feed(&buf[..n], |bytes| parser.advance(&mut tap, bytes));
             }
             changed = true;
         }
@@ -582,16 +588,18 @@ fn blink_of(blink: &BlinkPlane, point: Point) -> Attrs {
 /// genuinely produce such a state: it puts **no cap at all** on how many
 /// zero-width marks it stacks onto one base character (`Term::input` pushes
 /// every width-0 scalar onto the previous cell, unbounded), so a program that
-/// prints combining marks in a loop grows one cell without limit. That is not
-/// hypothetical hostility — it is what `cat` of a file full of stacked
-/// diacritics does.
+/// prints combining marks in a loop would grow one cell without limit. That is
+/// not hypothetical hostility — it is what `cat` of a file full of stacked
+/// diacritics does. [`crate::marks`] stops the emulator storing marks past the
+/// same bound; this is what holds for a cell built any other way.
 ///
 /// So the bound is applied at the source, and applied while the string is
 /// being built rather than after: filtering a megabyte of marks down to 32
 /// bytes still costs the megabyte if it was assembled first.
 /// [`fit_cell_text`] then backstops the result, which is what makes the
-/// property total rather than merely likely — including for `cell.c` itself,
-/// which `alacritty_terminal` never sets to a control today.
+/// property total rather than merely likely. `cell.c` itself is mapped to a
+/// blank first when it is a control: `alacritty_terminal` does store `'\t'`
+/// there, and fitting would only drop it and leave the cell empty.
 fn cell_text(cell: &VteCell) -> CellText {
     // The right-hand half of a wide character carries a space in `c`. Sending
     // that space would make a renderer paint one and shift the row, so the
@@ -603,9 +611,21 @@ fn cell_text(cell: &VteCell) -> CellText {
         return CellText::const_new("");
     }
 
+    // `Term::put_tab` stores `'\t'` in the cell where a tab starts, and that
+    // is a blank column on the emulator's screen. Dropping the control would
+    // leave the cell EMPTY, and an empty cell paints zero columns, so every
+    // column after it would land one place to the left. Any control base is
+    // therefore a blank, never nothing; `'\t'` is the only one
+    // `alacritty_terminal` stores today (`Term::input` refuses the rest).
+    let base = if is_control_scalar(cell.c) {
+        ' '
+    } else {
+        cell.c
+    };
+
     let text = match cell.zerowidth() {
         Some(marks) if !marks.is_empty() => {
-            let mut text = CellText::new(cell.c.to_string());
+            let mut text = CellText::new(base.to_string());
             for m in marks {
                 // Stop at the cap instead of assembling the whole stack and
                 // trimming it afterwards. `break`, not `continue`: the marks
@@ -620,7 +640,7 @@ fn cell_text(cell: &VteCell) -> CellText {
         }
         _ => {
             let mut buf = [0u8; 4];
-            CellText::new(cell.c.encode_utf8(&mut buf))
+            CellText::new(base.encode_utf8(&mut buf))
         }
     };
     fit_cell_text(text)
@@ -887,6 +907,21 @@ mod tests {
             "the linked row scrolled off"
         );
         assert!(rows.iter().flatten().all(|c| c.link == 0));
+    }
+
+    /// `Term::put_tab` stores `'\t'` in the cell where a tab starts. Dropping
+    /// the control would leave that cell empty, and an empty cell paints as
+    /// nothing, so every column after it would land one place to the left.
+    /// The cell is blank on the emulator's screen and must be blank here.
+    #[test]
+    fn a_tab_cell_is_a_blank_not_an_empty_cell() {
+        assert_eq!(cell_text(&vte_cell('\t', &[])).as_str(), " ");
+        // A mark that lands on the tab cell keeps a base under it; a lone
+        // mark would paint zero columns just as an empty cell does.
+        assert_eq!(
+            cell_text(&vte_cell('\t', &['\u{301}'])).as_str(),
+            " \u{301}"
+        );
     }
 
     fn sh(script: &str, size: TermSize) -> HostTerm {
@@ -1310,6 +1345,25 @@ mod tests {
             "x",
             "the next character starts at column 2"
         );
+    }
+
+    #[test]
+    fn text_after_a_tab_is_in_the_tab_stop_column_and_no_cell_is_empty() {
+        let mut t = sh("printf 'a\\tb\\tc'; sleep 5", size());
+        poll_until(&mut t, Duration::from_secs(10), |t| {
+            t.snapshot(1).cell(0, 16).text == "c"
+        });
+        let s = t.snapshot(1);
+        assert_eq!(s.cell(0, 8).text, "b");
+        assert_eq!(s.cell(0, 16).text, "c");
+        for col in 0..s.cols {
+            let cell = s.cell(0, col);
+            assert!(
+                !cell.text.is_empty() || cell.attrs.contains(Attrs::WIDE_CONT),
+                "column {col} is empty without being a wide continuation: {:?}",
+                row_text(&s, 0)
+            );
+        }
     }
 
     #[test]
