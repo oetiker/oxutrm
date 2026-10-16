@@ -3684,18 +3684,34 @@ mod tests {
         let mut out = Vec::new();
         baseline_then_go(&mut host, &mut client, &mut out).await;
         relay.blackhole(true);
-        // Long enough for the copy to be made and its frames lost, short of
-        // `recovery.silent_after`.
-        drive(
-            &mut host,
-            &mut client,
-            &mut out,
-            Duration::from_millis(1200),
-            |_, _| false,
-        )
-        .await;
-        assert_eq!(host.screen().clipboard.serial, 1, "the copy was made");
-        assert_eq!(count(&out, HELLO_OSC52), 0, "and nothing got through");
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(5),
+                |h, _| h.screen().clipboard.serial == 1
+            )
+            .await,
+            "the copy was never made"
+        );
+        // Every frame from here on carries the unacknowledged copy. Three of
+        // them into the blackhole, the client turning all along, is a copy
+        // lost more than once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut lost = 0;
+        while lost < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the host stopped resending: did the copy get through?"
+            );
+            if host.turn().expect("host turn").sent.is_some() {
+                lost += 1;
+            }
+            client.turn(&[], &mut out).expect("client turn");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert_eq!(count(&out, HELLO_OSC52), 0, "nothing got through");
         relay.blackhole(false);
         assert!(
             drive(
