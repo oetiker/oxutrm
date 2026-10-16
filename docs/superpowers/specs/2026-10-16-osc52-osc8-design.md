@@ -73,8 +73,8 @@ All rows: (controller, 2026-10-16).
 ### 1.2 Not in scope
 
 - Paste from the local clipboard to the remote (OSC 52 read). See row 7.
-- Surfacing a dropped over-cap copy in the client's status popup. The host
-  writes one line to its stderr log.
+- Telling anyone about a dropped over-cap copy. It is dropped silently
+  (§10).
 - Rewriting `file://` links (to `sftp://` or similar).
 - Links in scrollback rows (row 18).
 - Any OSC 8 capability detection beyond `$TERM`.
@@ -166,12 +166,8 @@ OSC 52 out of cells (`crates/oxutrm-proto/src/text.rs`) stays as it is.
 `HostTerm` keeps `clipboard: Clipboard`. In `poll`, for each entry of
 `signals.clipboard`, in order:
 
-- text longer than `MAX_CLIPBOARD`: dropped, the serial does not move.
-  `HostTerm` records the length (`take_dropped_copy`) and the host session
-  writes one line on the host's stderr
-  (`oxutrm: host dropped a 300000-byte clipboard copy (limit 262144)`).
-  `HostTerm` itself never prints: `oxutrm loopback` runs it inside the
-  client, whose stderr is the painted terminal.
+- text longer than `MAX_CLIPBOARD`: dropped silently, the serial does not
+  move (§10 says why nothing is printed).
 - otherwise: `serial += 1` (saturating), `copy = Some(...)`, and `poll`
   reports a change so a frame goes out.
 
@@ -486,8 +482,8 @@ Each item works as decided above unless the owner says otherwise.
 | Item | Default chosen |
 |---|---|
 | OSC 52 on by default | On (`terminal.clipboard = true`); the local terminal's own OSC 52 policy still applies. |
-| Clipboard size cap | 256 KiB; larger copies dropped whole, logged on the host only. |
-| Telling the user about a dropped over-cap copy | Not shown in the client; one line in the host's stderr. |
+| Clipboard size cap | 256 KiB; larger copies dropped whole. |
+| Telling the user about a dropped over-cap copy | Not done; the copy is dropped silently. |
 | Delivering copies made while no client was attached | Not written by a client that attaches fresh (stale); written by a client that reattaches in the same process. |
 | OSC 52 reads | Never answered. |
 | OSC 8 on by default | On (`terminal.hyperlinks = true`). |
@@ -505,8 +501,10 @@ contradict an earlier section, that section has been corrected.
 - The ack hook (§3.4) is `Sender::acked()` read in `HostSession::turn_at`.
 - serde's `rc` feature is on workspace-wide, for `Arc<str>`.
 - The diff compares the whole `Clipboard` (§3.2), not serial and presence.
-- The over-cap log line is printed by the host session, not by `HostTerm`
-  (§3.4).
+- An over-cap copy is dropped silently (§3.4). The host daemon reopens its
+  stderr on `/dev/null` when it severs from ssh, so a printed line reached no
+  one, and `HostTerm` cannot print either: in `oxutrm loopback` its stderr is
+  the painted terminal. The host has no log to write it to instead.
 - `ClipboardRelay` takes `Option<SessionId>` and is built with
   `caps.osc52` (§3.5).
 - A clipboard write error is handled like the render write error beside it

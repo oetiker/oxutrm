@@ -383,22 +383,6 @@ impl HostSession {
         // A lobby has none: its screen is the blank one it was given.
         if let Some(term) = self.term.as_mut() {
             let moved = term.poll().context("draining the pty")?;
-            if let Some(len) = term.take_dropped_copy() {
-                #[cfg_attr(
-                    not(test),
-                    expect(
-                        clippy::print_stderr,
-                        reason = "the host daemon's own stderr, from turn_at on \
-                                  HostSession; never a client's screen"
-                    )
-                )]
-                {
-                    eprintln!(
-                        "oxutrm: host dropped a {len}-byte clipboard copy (limit {})",
-                        oxutrm_proto::MAX_CLIPBOARD
-                    );
-                }
-            }
             if attached {
                 if moved || self.screen_stale {
                     // The sequence number is a placeholder; `update` mints

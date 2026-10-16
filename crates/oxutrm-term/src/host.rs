@@ -64,9 +64,6 @@ pub struct HostTerm {
     /// The latest OSC 52 copy and the running count. The text stays until
     /// [`HostTerm::clipboard_delivered`] says the client has it.
     clipboard: Clipboard,
-    /// The length of the last copy refused for size, until
-    /// [`HostTerm::take_dropped_copy`] collects it for the host's log.
-    dropped_copy: Option<usize>,
 
     exited: Option<i32>,
 }
@@ -114,7 +111,6 @@ impl HostTerm {
             title: String::new(),
             scrollback_len: 0,
             clipboard: Clipboard::default(),
-            dropped_copy: None,
             exited: None,
         })
     }
@@ -198,10 +194,11 @@ impl HostTerm {
             changed = true;
         }
         for (kind, text) in signals.clipboard {
-            match record_copy(&mut self.clipboard, kind, text) {
-                Ok(()) => changed = true,
-                // Not printed here; see `take_dropped_copy`.
-                Err(len) => self.dropped_copy = Some(len),
+            // An over-cap copy is dropped silently: the host daemon's
+            // stderr is /dev/null, and in `oxutrm loopback` it would be the
+            // painted terminal.
+            if record_copy(&mut self.clipboard, kind, text).is_ok() {
+                changed = true;
             }
         }
         if let Some(code) = signals.child_exit {
@@ -242,14 +239,6 @@ impl HostTerm {
                 clipboard: self.clipboard.clone(),
             },
         )
-    }
-
-    /// The length of a clipboard copy refused for size since the last call,
-    /// for the host's log. The emulator does not print it itself: in
-    /// `oxutrm loopback` it runs inside the client, whose stderr is the
-    /// painted terminal.
-    pub fn take_dropped_copy(&mut self) -> Option<usize> {
-        self.dropped_copy.take()
     }
 
     /// The client has acknowledged a state carrying copy number `serial`:
@@ -1508,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn an_over_cap_copy_from_the_child_is_reported_once() {
+    fn an_over_cap_copy_from_the_child_is_dropped() {
         // MAX_CLIPBOARD + 3 bytes, base64'd in the shell: 'x' * 262147.
         let mut t = sh(
             "printf '\\033]52;c;'; head -c 262147 /dev/zero | tr '\\0' x | base64 | tr -d '\\n'; \
@@ -1522,8 +1511,6 @@ mod tests {
             "the shell never finished: {:?}",
             row_text(&t.snapshot(1), 0)
         );
-        assert_eq!(t.take_dropped_copy(), Some(MAX_CLIPBOARD + 3));
-        assert_eq!(t.take_dropped_copy(), None, "taken once");
         assert_eq!(t.snapshot(1).clipboard, Clipboard::default());
     }
 
