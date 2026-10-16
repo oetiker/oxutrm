@@ -520,7 +520,16 @@ contradict an earlier section, that section has been corrected.
   the I8 cap (`MAX_CLIPBOARD`) bounds the size of each write.
 - The end-to-end tests let the client apply a first state before the shell
   copies (`read go`), because of the baseline rule above.
-- For D2: a preview `window()` returns `Clipboard::default()` (clearing a
-  copy is `state.clipboard = Clipboard::default()`, or `without_text()` to
-  keep the serial), and only the client session's own applied states feed
-  `ClipboardRelay` (§4.8 applies to the clipboard as well as to links).
+- With D2 (PR 1 is stacked on it, `PROTO_VERSION` 5): `window()` returns
+  `Clipboard::default()`, no text and serial 0, for a sibling's preview over
+  the door and for the client's own row; a preview is cells and cursor only
+  (§4.8 applies to the clipboard as well as to links). Only the client
+  session's own applied states feed `ClipboardRelay`: a preview fed to it
+  would set the sibling's baseline at serial 0, and a switch to that
+  sibling would then write a copy made before the client arrived.
+- The clipboard serial is a counter the client holds across a kill into the
+  lobby and a `New` out of it, like the bell and the scrollback count (I9):
+  the lobby's blank keeps the serial without the text, and the next shell
+  counts on from it (`HostTerm::count_on_from`), so its first copy is
+  written once. A copy the killed shell made and the client never acked is
+  lost with the shell.
