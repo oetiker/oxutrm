@@ -109,8 +109,8 @@ pub use ids::SessionId;
 pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
 pub use name::{MAX_NAME, Name};
 pub use open::{
-    Answer, Attached, OfferEntry, Open, Reply, Request, Role, SessionEntry, encode_line,
-    parse_answer, parse_line,
+    Answer, Attached, OfferEntry, Open, PREVIEW_MAX, Reply, Request, Role, SessionEntry,
+    encode_line, parse_answer, parse_line,
 };
 pub use screen::{Cursor, CursorShape, Modes, MouseMode, ScreenState};
 pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
@@ -136,7 +136,11 @@ pub use types::{
 /// offer lists [`OfferEntry`]s, and `Choice` gained `Lobby` and a name. No
 /// compatibility with 2: a host session started by an older binary must be
 /// ended before a new client can reach that host.
-pub const PROTO_VERSION: u32 = 3;
+///
+/// **4**: the session preview. [`Request::Preview`] and [`Reply::Preview`]
+/// carry a window of a session's screen; a door of version 3 cannot parse
+/// either.
+pub const PROTO_VERSION: u32 = 4;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";
