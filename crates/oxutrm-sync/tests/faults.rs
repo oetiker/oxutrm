@@ -44,6 +44,7 @@ fn empty_diff() -> ScreenDiff {
         bell: None,
         scrollback_len: None,
         clipboard: None,
+        links: Vec::new(),
     }
 }
 

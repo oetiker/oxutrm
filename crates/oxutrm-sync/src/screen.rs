@@ -1,8 +1,10 @@
 //! Diffing one screen against another.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use oxutrm_proto::{ApplyError, Cell, Clipboard, Cursor, Modes, ScreenState, TermSize};
+use oxutrm_proto::{ApplyError, Cell, Clipboard, Cursor, MAX_LINKS, Modes, ScreenState, TermSize};
 
 use crate::SyncState;
 
@@ -51,6 +53,30 @@ pub struct ScreenDiff {
     /// The whole clipboard, when it differs from the base. Comparing it is
     /// cheap: `Arc<str>` equality checks the pointer before the bytes.
     pub clipboard: Option<Clipboard>,
+    /// Changes to the link table: `Some` sets or replaces an entry, `None`
+    /// removes it. Only entries that differ from the base; every entry in a
+    /// full state, whose `apply` clears the table first.
+    pub links: Vec<(u16, Option<Arc<str>>)>,
+}
+
+/// The link table changes that turn `base`'s table into `target`'s.
+///
+/// `Arc<str>` equality checks the pointer before the bytes, so an entry the
+/// host kept costs nothing to compare.
+fn link_changes(target: &ScreenState, base: &ScreenState) -> Vec<(u16, Option<Arc<str>>)> {
+    let mut out: Vec<(u16, Option<Arc<str>>)> = target
+        .links
+        .iter()
+        .filter(|(id, uri)| base.links.get(id) != Some(uri))
+        .map(|(&id, uri)| (id, Some(uri.clone())))
+        .collect();
+    out.extend(
+        base.links
+            .keys()
+            .filter(|id| !target.links.contains_key(id))
+            .map(|&id| (id, None)),
+    );
+    out
 }
 
 /// Turn one row's worth of cells into runs, emitting only what changed.
@@ -193,6 +219,7 @@ impl SyncState for ScreenState {
             scrollback_len: (self.scrollback_len != base.scrollback_len)
                 .then_some(self.scrollback_len),
             clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
+            links: link_changes(self, base),
         }
     }
 
@@ -218,6 +245,11 @@ impl SyncState for ScreenState {
             bell: Some(self.bell),
             scrollback_len: Some(self.scrollback_len),
             clipboard: Some(self.clipboard.clone()),
+            links: self
+                .links
+                .iter()
+                .map(|(&id, uri)| (id, Some(uri.clone())))
+                .collect(),
         }
     }
 
@@ -243,6 +275,25 @@ impl SyncState for ScreenState {
         // I8 for the clipboard, for the same reason and in the same place.
         if let Some(c) = &d.clipboard {
             oxutrm_proto::check_clipboard(c)?;
+        }
+        // I10 for the link entries, for the same reason and in the same
+        // place. A legitimate diff names each id at most once, and a table
+        // holds at most MAX_LINKS of them before and after, so twice that is
+        // the most an honest diff carries. Whether every cell's id exists is
+        // a property of the result, and `validate` checks it there.
+        if d.links.len() > 2 * MAX_LINKS {
+            return Err(ApplyError::TooManyLinks {
+                len: d.links.len(),
+                max: 2 * MAX_LINKS,
+            });
+        }
+        for (id, uri) in &d.links {
+            if *id == 0 {
+                return Err(ApplyError::LinkIdZero);
+            }
+            if let Some(uri) = uri {
+                oxutrm_proto::check_link_uri(*id, uri)?;
+            }
         }
 
         // The resize comes first, because every row index below is relative to
@@ -330,6 +381,20 @@ impl SyncState for ScreenState {
         if let Some(c) = &d.clipboard {
             self.clipboard.clone_from(c);
         }
+        // A full state builds on nothing, its table included.
+        if base == 0 {
+            self.links.clear();
+        }
+        for (id, uri) in &d.links {
+            match uri {
+                Some(uri) => {
+                    self.links.insert(*id, uri.clone());
+                }
+                None => {
+                    self.links.remove(id);
+                }
+            }
+        }
 
         self.seq = target;
         Ok(())
@@ -376,6 +441,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
         let err = s
             .apply(1, 2, &d)
@@ -416,6 +482,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -441,6 +508,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
         s.apply(1, 2, &d).expect("a 400x120 terminal is ordinary");
         assert_eq!(s.cells.len(), 400 * 120);
@@ -487,6 +555,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
 
         let err = s
@@ -530,6 +599,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -563,6 +633,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: None,
+            links: Vec::new(),
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -639,6 +710,7 @@ mod tests {
                 bell: None,
                 scrollback_len: None,
                 clipboard: None,
+                links: Vec::new(),
             };
             s.apply(1, 2, &d).expect("apply");
             let painted: String = s
@@ -852,6 +924,7 @@ mod tests {
             bell: None,
             scrollback_len: None,
             clipboard: Some(copied(1, &"x".repeat(oxutrm_proto::MAX_CLIPBOARD + 1))),
+            links: Vec::new(),
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -865,5 +938,156 @@ mod tests {
             "a refused diff must leave the screen exactly as it was"
         );
         assert_eq!(s.clipboard, Clipboard::default());
+    }
+
+    fn linked(cells: std::ops::Range<usize>, id: u16, uri: &str, s: &mut ScreenState) {
+        s.links.insert(id, uri.into());
+        for c in &mut s.cells[cells] {
+            c.link = id;
+        }
+    }
+
+    /// A link costs one table entry and the cells it covers, nothing else.
+    #[test]
+    fn adding_a_link_sends_one_upsert_and_only_the_linked_cells() {
+        let mut base = ScreenState::blank(10, 100).expect("blank");
+        for c in base.cells.iter_mut() {
+            c.text = "x".into();
+        }
+        let mut target = base.clone();
+        target.seq = 2;
+        linked(205..209, 1, "https://example.org/", &mut target);
+
+        let d = target.diff_from(&base);
+        assert_eq!(d.links, vec![(1, Some(Arc::from("https://example.org/")))]);
+        assert_eq!(d.rows.len(), 1, "one row changed");
+        let width: usize = d.rows[0].runs.iter().map(Run::width).sum();
+        assert_eq!(width, 4, "only the four linked cells travel");
+
+        let mut got = base.clone();
+        got.apply(1, 2, &d).expect("apply");
+        assert_eq!(got, target);
+        got.validate().expect("valid");
+
+        // And away again: one removal.
+        let mut gone = base.clone();
+        gone.seq = 3;
+        let d = gone.diff_from(&target);
+        assert_eq!(d.links, vec![(1, None)]);
+        got.apply(2, 3, &d).expect("apply");
+        assert_eq!(got, gone);
+    }
+
+    #[test]
+    fn an_unchanged_link_is_not_sent_again() {
+        let mut base = ScreenState::blank(2, 10).expect("blank");
+        linked(0..3, 1, "http://a", &mut base);
+        let mut target = base.clone();
+        target.seq = 2;
+        linked(5..7, 2, "http://b", &mut target);
+        let d = target.diff_from(&base);
+        assert_eq!(d.links, vec![(2, Some(Arc::from("http://b")))]);
+    }
+
+    /// The same id with another URI is a replacement, not a removal and an
+    /// addition, and the cells holding the id need not travel at all.
+    #[test]
+    fn a_reused_id_is_one_upsert() {
+        let mut base = ScreenState::blank(2, 10).expect("blank");
+        linked(0..3, 1, "http://a", &mut base);
+        let mut target = base.clone();
+        target.seq = 2;
+        target.links.insert(1, "http://b".into());
+        let d = target.diff_from(&base);
+        assert_eq!(d.links, vec![(1, Some(Arc::from("http://b")))]);
+        assert!(d.rows.is_empty());
+        let mut got = base.clone();
+        got.apply(1, 2, &d).expect("apply");
+        assert_eq!(got.links.get(&1).map(|u| &**u), Some("http://b"));
+    }
+
+    /// A full state carries the whole table and replaces whatever the
+    /// receiver held: a stale entry would otherwise outlive its session.
+    #[test]
+    fn a_full_state_carries_and_replaces_the_whole_table() {
+        let mut target = ScreenState::blank(2, 10).expect("blank");
+        target.seq = 9;
+        linked(0..3, 2, "http://b", &mut target);
+        let d = target.full_diff();
+        assert_eq!(d.links, vec![(2, Some(Arc::from("http://b")))]);
+
+        let mut got = ScreenState::blank(2, 10).expect("blank");
+        got.links.insert(1, "http://stale".into());
+        got.apply(0, 9, &d).expect("apply");
+        assert_eq!(got, target);
+    }
+
+    /// Same promise as the title's: `ApplyError` means nothing was applied.
+    #[test]
+    fn a_hostile_link_is_refused_before_any_row_is_painted() {
+        for (id, uri) in [
+            (1u16, Some("http://a/\x1b]52;c;AAAA\x07".to_owned())),
+            (1, Some("x".repeat(oxutrm_proto::MAX_LINK_URI + 1))),
+            (0, Some("http://a".to_owned())),
+        ] {
+            let mut s = ScreenState::blank(1, 4).expect("blank");
+            let d = ScreenDiff {
+                resize: None,
+                rows: vec![RowPatch {
+                    row: 0,
+                    runs: vec![Run {
+                        start_col: 0,
+                        repeat: 0,
+                        cells: vec![Cell {
+                            link: id,
+                            ..cell("h")
+                        }],
+                    }],
+                }],
+                cursor: None,
+                modes: None,
+                title: None,
+                bell: None,
+                scrollback_len: None,
+                clipboard: None,
+                links: vec![(id, uri.map(Arc::from))],
+            };
+            assert!(s.apply(1, 2, &d).is_err(), "id {id}");
+            assert!(
+                s.row(0).iter().all(|c| *c == Cell::blank()),
+                "a refused diff must leave the screen exactly as it was"
+            );
+            assert!(s.links.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_diff_with_more_link_changes_than_two_tables_is_refused() {
+        let mut s = ScreenState::blank(1, 4).expect("blank");
+        let mut d = s.diff_from(&s.clone());
+        d.links = (1..=(2 * MAX_LINKS as u16 + 1))
+            .map(|id| (id, None))
+            .collect();
+        assert!(matches!(
+            s.apply(1, 2, &d),
+            Err(ApplyError::TooManyLinks { .. })
+        ));
+    }
+
+    /// A cell that points at an id the diff never defined is caught on the
+    /// result, by `validate`, as every receiver runs it.
+    #[test]
+    fn a_cell_pointing_at_no_link_fails_validation_after_apply() {
+        let base = ScreenState::blank(1, 4).expect("blank");
+        let mut target = base.clone();
+        target.seq = 2;
+        target.cells[0].link = 5;
+        let d = target.diff_from(&base);
+        let mut got = base.clone();
+        got.apply(1, 2, &d).expect("apply does not look the id up");
+        assert_eq!(
+            got.validate_transition(&base),
+            Err(ApplyError::UnknownLink { id: 5 })
+        );
     }
 }
