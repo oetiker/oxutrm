@@ -1,6 +1,7 @@
 # oxutrm — Session preview in the selector
 
-Status: draft 2026-10-16. The owner delegated every design decision ("just
+Status: implemented 2026-10-16; the deviations of the implementation are
+folded in below and listed in §10. The owner delegated every design decision ("just
 work on it"); the controller decided each one, listed in §1.1 with its reason.
 What the owner may still want a say in is listed in §8, each with the default
 this spec takes.
@@ -109,7 +110,8 @@ Top to bottom inside the box: the header (an outage, as in D1), the list, the
 `preview` rule, the pane, the line under the list (question, note, refusal),
 the plain rule, the key bar. The pane's cells are the shot's cells, top-left
 aligned; a shot smaller than the pane leaves the rest blank. A **note** in
-place of a shot (§3.5) is one dimmed line, centred in the pane.
+place of a shot (§3.5) is dimmed text, wrapped at the pane's width and
+centred in the pane both ways.
 
 ### 3.2 The window rule
 
@@ -122,7 +124,11 @@ by the client to fit a shot to the pane and to preview its own session:
   cursor is visible, else `0`. The cursor's row is then always inside.
 - Cells: rows `top .. top + rows'`, columns `0 .. cols'`. A wide glyph in
   column `cols' − 1` whose continuation was cut off becomes a space with its
-  colours kept and no attributes, as `repair_wide_pairs` does it.
+  colours kept and no attributes, as `repair_wide_pairs` does it. The cut
+  lead is found by its neighbour: the cell in column `cols'` of the source
+  row carries `WIDE_CONT`. Unicode width is not consulted, so the rule
+  agrees with the cells the emulator made, whatever width tables either
+  side uses.
 - Cursor: `row − top` (hidden: clamped to `rows' − 1`), column clamped to
   `cols' − 1`, `visible` and `shape` kept. A 0-sized result puts it at 0,0.
 - `seq` 1, `title` empty, `bell` 0, `scrollback_len` 0, `modes` default.
@@ -160,28 +166,37 @@ session calls it each lap, as it calls the selector:
 - **Arrival.** When the selected row changes (or the selector opens), and the
   row is previewable — not `this`, not `+ new session`, detachable, not
   `OtherVersion` — and has no shot under `PREVIEW_FRESH` (2 s), it becomes
-  the **wanted** id.
+  the **wanted** id. Any other row replaces the wanted id with none: the
+  latest selection wins, and a row left before it was asked is not asked.
+  Nothing arrives while the list is still on its way; the pane is left out
+  until then.
 - **Asking.** On a live link, with no preview request out, the wanted id is
   asked: `Request::Preview { id }` on a fresh control stream, from a task the
   loop holds as `AbortOnDrop`, answered on a channel the loop's `select!`
   reads (a new `Wake::Previewed` arm, borrowing a local, C1). Preview
   requests have their own slot: they never make the selector `busy`, and a
   switch, kill or rename never waits for one.
-- **Answer.** A shot is checked (§4.2) and cached under its id with the time.
-  If the selection moved meanwhile and the new row is wanted, it is asked
-  next.
+- **Answer.** An answer is dropped unless its id is the request out. A shot
+  is checked (§4.2) and cached under its id with the time; a refusal or
+  failure is cached the same way, as its reason, and replaces an older
+  shot of that id. If the selection moved meanwhile and the new row is
+  wanted, it is asked next.
 - **Not live.** Nothing is asked; cached shots still show; a row with none
   shows `the link is down`.
 - **Close, switch.** The cache and any wanted id are dropped; the task in
   flight is aborted with its `AbortOnDrop`. A refetched list drops shots of
-  ids it no longer lists.
-- **`this`.** The pane shows `self.screen.window(PREVIEW_MAX)`, taken every
+  ids it no longer lists. The session notices the close on the next lap
+  (`preview_step` sees the mode is no longer `Sessions`), whatever closed
+  it. A link swapped by a rebuild drops nothing: a request out on the old
+  link fails and its reason shows until the row is asked again.
+- **`this`.** The pane shows `self.screen_rx.state().window(PREVIEW_MAX)`, taken every
   lap the selector's view is built; the view comparison in `layer_one`
   repaints only when it changed.
 
 ### 3.5 What the pane says when there is no shot
 
-All dimmed, centred, through `legible`:
+All dimmed, wrapped at the pane's width and centred both ways, through
+`legible`:
 
 | Row | Pane |
 |---|---|
@@ -197,15 +212,18 @@ All dimmed, centred, through `legible`:
 
 - **The door** (`src/door.rs`) gets one arm. `Preview { id }` for its own id
   asks its loop, `LoopCmd::Preview { reply }`, and waits up to
-  `SIBLING_TIMEOUT`; for any other id it forwards like `Kill`/`Rename` but
-  under `SIBLING_TIMEOUT`, not `FORWARD_TIMEOUT` (which is sized for a
-  kill's grace). The forwarding door refuses a reply larger than
+  `SIBLING_TIMEOUT`; a door with no loop behind it refuses with `this
+  session cannot show its screen`. For any other id it forwards like
+  `Kill`/`Rename` but under `SIBLING_TIMEOUT`, not `FORWARD_TIMEOUT` (which
+  is sized for a kill's grace): `forward()` takes its bound as a
+  parameter, and `Kill` and `Rename` pass `FORWARD_TIMEOUT`. The forwarding door refuses a reply larger than
   `PREVIEW_MAX` rather than pass it on. Both doors (control stream and
   socket) serve it, so a sibling's preview reaches a lobby and a session
   alike.
 - **The loop** (`src/host_session.rs`) answers `LoopCmd::Preview` from
   `fn preview(&self) -> Result<ScreenState, String>`: in a lobby,
-  `Err("this session has no shell")`; else
+  `Err("this session has no shell")`, which is what a preview of a
+  lobby's own id is refused with; else
   `term.snapshot(1).window(PREVIEW_MAX)`. A detached session's emulator is
   fed while nobody is attached (`DETACH_AFTER`'s doc), so the shot is
   current either way. The loop does not poll the pty for it.
@@ -283,15 +301,20 @@ bell and scrollback are never applied to anything.
 - `src/view.rs`: `SessionsFacts` gains `preview: Option<PreviewPane>`, built by
   the session from `Previews::pane` and passed through.
 - `src/preview.rs` (new): `Previews` — `arrive(selected, now)`,
-  `to_ask(live) -> Option<SessionId>`, `answered(id, Result<ScreenState, String>, now)`,
-  `keep(&[SessionEntry])`, `clear()`, `pane(selected, own: &ScreenState) -> Option<PreviewPane>`.
+  `ask_next(live) -> Option<SessionId>`, `answered(id, Result<ScreenState, String>, now)`,
+  `keep(&[SessionEntry])`, `clear()`,
+  `pane(selected, own: &ScreenState, live: bool) -> PreviewPane`. `live`
+  picks `the link is down` over `asking …`; the session wraps the pane in
+  `Some` once the list is in.
   Pure: no I/O, no clock of its own. Carries
   `#![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]`.
 - `src/switcher.rs`: `preview(conn, id) -> Result<ScreenState, String>`,
-  bounded by `PREVIEW_WITHIN` (5 s), on its own control stream.
-- `src/session.rs`: a `previews: Previews` field; on each lap, `arrive` with the
-  selected row, then `to_ask` and spawn; the `Wake::Previewed` arm; `clear`
-  on close and on `Landed`; `keep` on a refetched list. No other change.
+  on its own control stream, with one `PREVIEW_WITHIN` (5 s) bound over
+  opening the stream, sending and reading the answer.
+- `src/session.rs`: a `previews: Previews` field; on each lap, before the
+  popup is laid out, `preview_step` (`arrive` with the selected row, then
+  `ask_next`) and the spawn; the `Wake::Previewed` arm; `clear` on close
+  and on `Landed`; `keep` on a refetched list. No other change.
 
 ---
 
@@ -374,6 +397,9 @@ a CJK line — not single letters.
 - **Session wiring** (`src/session.rs`, one test): with the selector open and
   a fetched list, `↓` onto a sibling makes one preview request, its answer
   shows in the laid-out overlay, and closing the selector drops the cache.
+  The test drives `preview_step` and `switcher::preview` against real
+  session processes, as `ask_now` drives the switcher, rather than the
+  whole loop.
 - **Hand test** on thinlinc and the Mac: three sessions, one running
   `journalctl -f`, one `htop`, one with a CJK prompt; move through the
   selector at 80×24 and at 40×20; a narrow terminal shows no pane.
@@ -417,3 +443,37 @@ Under `### New`:
   few sessions, 15 rows, and is left out below that; this release changes
   the protocol version, so end host sessions started by an older oxutrm
   before connecting with this one.
+
+---
+
+## 10. Judgement calls
+
+Made while implementing, where the spec above was silent or wrong; each is
+folded into the section named.
+
+1. **Notes wrap** (§3.1, §3.5). A reason such as a sibling's timeout is
+   longer than a 30-column pane; one cut line would lose its end.
+2. **Two refusals for "no screen"** (§3.6). A door with no loop and a
+   lobby's loop are different cases and say so in different words.
+3. **`forward()` takes its bound** (§3.6) instead of a second forwarding
+   function for the shorter preview timeout.
+4. **A cut wide glyph is found by its `WIDE_CONT` neighbour** (§3.2), so the
+   window agrees with the emulator's cells rather than with a width table.
+5. **`to_ask` is `ask_next`** (§5): clippy's `wrong_self_convention` refuses
+   a `to_*` method that takes `&mut self`.
+6. **`pane` takes `live` and returns a `PreviewPane`** (§5): the note for a
+   row with no shot depends on the link, and the only time there is no
+   pane, while the list loads, is the session's to decide.
+7. **Failures are cached like shots** (§3.4), so holding `↓` over a dead
+   sibling does not re-ask it on every pass within 2 s; a failure replaces
+   an older shot, so the pane says what is true now.
+8. **A non-previewable row clears the wanted id** (§3.4): moving on to
+   `+ new session` while a request is out asks nothing more afterwards.
+9. **No pane while the list loads** (§3.4): the cursor sits on
+   `+ new session` then, and its note would describe a row nobody chose.
+10. **A rebuild drops no previews** (§3.4): the request on the old link
+    fails on its own within `PREVIEW_WITHIN` and the row is asked again on
+    the next arrival.
+11. **One bound for the whole client request** (§5): `PREVIEW_WITHIN` covers
+    opening the stream, writing and reading, which bounds each of those
+    waits too.
