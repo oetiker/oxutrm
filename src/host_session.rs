@@ -153,6 +153,19 @@ pub struct HostSession {
     detach_after: Duration,
 }
 
+/// A lobby's blank screen at `size`, keeping the bell and scrollback counts
+/// of `last`, the screen before it on the same link.
+///
+/// Both counters only ever go up across the states a client applies (I5, I6),
+/// so a blank that started them at zero again would have every frame from here
+/// on refused, and the client would sit on the dead shell's screen.
+fn lobby_screen(size: TermSize, last: &ScreenState) -> Result<ScreenState> {
+    let mut blank = ScreenState::blank(size.rows, size.cols)?;
+    blank.bell = last.bell;
+    blank.scrollback_len = last.scrollback_len;
+    Ok(blank)
+}
+
 impl HostSession {
     /// Start a shell and serve it over `link`.
     ///
@@ -218,7 +231,7 @@ impl HostSession {
         if let Some(ct) = colorterm {
             env.push(("COLORTERM".to_owned(), ct));
         }
-        let term = HostTerm::spawn_with(
+        let mut term = HostTerm::spawn_with(
             &self.shell,
             &[],
             &env,
@@ -227,6 +240,8 @@ impl HostSession {
             &self.start,
         )
         .context("starting the shell on a pty")?;
+        // The same link, so the counters the client holds go on from here.
+        term.count_on_from(self.screen_tx.current());
         self.term = Some(term);
         self.written = self.input_rx.state().pending.len();
         self.screen_stale = true;
@@ -241,9 +256,13 @@ impl HostSession {
     /// The shell is gone on request: the session is a lobby from here, and
     /// its client sees a blank screen.
     fn become_lobby(&mut self) -> Result<()> {
-        self.term = None;
-        self.screen_tx
-            .update(ScreenState::blank(self.size.rows, self.size.cols)?);
+        // The shell's own counters, not the sender's: those may lag a shell
+        // that moved while nobody was attached.
+        let last = match self.term.take() {
+            Some(term) => term.snapshot(1),
+            None => self.screen_tx.current().clone(),
+        };
+        self.screen_tx.update(lobby_screen(self.size, &last)?);
         self.screen_stale = false;
         Ok(())
     }
@@ -465,9 +484,10 @@ impl HostSession {
         match self.term.as_mut() {
             Some(term) => term.resize(size).context("resizing the pty")?,
             // A lobby's screen is blank at whatever size its client is.
-            None => self
-                .screen_tx
-                .update(ScreenState::blank(size.rows, size.cols)?),
+            None => {
+                let blank = lobby_screen(size, self.screen_tx.current())?;
+                self.screen_tx.update(blank);
+            }
         }
         self.size = size;
         Ok(())
@@ -1095,6 +1115,40 @@ mod tests {
             cols: 120,
             rows: 40,
         }
+    }
+
+    /// The bell is a counter the client holds across the lobby (I5): the
+    /// lobby's blank, a lobby resized, and the next shell all count on from
+    /// the dead shell's number rather than from zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lobby_and_the_next_shell_count_on_from_the_last_bell() {
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        host.term_mut().write_input(b"printf '\\a'\n").unwrap();
+        let begun = Instant::now();
+        while host.term_mut().snapshot(1).bell == 0 {
+            assert!(begun.elapsed() < Duration::from_secs(10), "no bell");
+            host.term_mut().poll().unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rang = host.term_mut().snapshot(1).bell;
+
+        host.become_lobby().unwrap();
+        assert_eq!(host.screen().bell, rang, "the lobby's blank");
+        let smaller = TermSize { cols: 80, rows: 24 };
+        host.resize(smaller).unwrap();
+        assert_eq!(host.screen().rows, 24);
+        assert_eq!(host.screen().bell, rang, "the lobby resized");
+
+        host.start_shell().unwrap();
+        assert_eq!(host.term_mut().snapshot(1).bell, rang, "the next shell");
     }
 
     /// A "shell" that ignores SIGHUP, as a script file the session runs. It
