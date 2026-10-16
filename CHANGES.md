@@ -10,14 +10,16 @@
   none. The preview needs a terminal of at least 38 columns and, with a
   few sessions, 15 rows, and is left out below that.
 
-- Text a remote program copies to the clipboard (vim, tmux `set-clipboard`,
-  OSC 52) now reaches the local clipboard, once, also after a lost packet or a
-  reconnect. The `terminal.clipboard` setting turns it off; a remote program
-  can never read the local clipboard.
+- **Text copied in a remote program reaches the local clipboard.** A copy
+  made in vim, in tmux with `set-clipboard` or by any other program using
+  OSC 52 is written once, also after a lost packet or a reconnect. The
+  `terminal.clipboard` setting turns it off; a remote program can never read
+  the local clipboard.
 
-- Hyperlinks printed by remote programs (`ls --hyperlink`, compiler
-  messages, OSC 8) are now clickable in terminals that support them. The
-  `terminal.hyperlinks` setting turns them off.
+- **Links printed by remote programs are clickable.** Hyperlinks from
+  `ls --hyperlink`, compiler messages and other OSC 8 output work in
+  terminals that support them. The `terminal.hyperlinks` setting turns them
+  off.
 
 ### Changed
 - **Host sessions started by an older oxutrm cannot be reached by this
@@ -26,13 +28,15 @@
   before connecting with this release.
 
 ### Fixed
-- A program that printed accents or other combining marks without end, such
-  as a `cat` of a file of stacked diacritics, made the memory of its session
-  on the host grow until the system killed it. A character now keeps only as
-  many marks as fit in what the screen shows of it, and the rest are dropped.
-- A program that printed the start of a terminal control sequence and never
-  ended it, such as a `cat` of a damaged file, or that set a very long window
-  title and saved it over and over, made the memory of its session on the host
+- **Endless accents no longer get a session killed for lack of memory.** A
+  program that printed accents or other combining marks without end, such as
+  a `cat` of a file of stacked diacritics, made its session on the host grow
+  until the system killed it. A character now keeps only as many marks as fit
+  in what the screen shows of it, and the rest are dropped.
+- **An unended control sequence no longer gets a session killed for lack of
+  memory.** A program that printed the start of a terminal control sequence
+  and never ended it, such as a `cat` of a damaged file, or that set a very
+  long window title and saved it over and over, made its session on the host
   grow until the system killed it. Such a sequence is now dropped once it
   passes 512 KiB, a window title once it passes 2 KiB and a hyperlink once it
   passes 4 KiB, and the output that follows shows as usual.
