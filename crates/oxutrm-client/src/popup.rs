@@ -2612,6 +2612,87 @@ mod tests {
         assert!(find(&o, "kill logs? y/n").is_some());
     }
 
+    /// A session smaller than the pane -- a 40x10 one in 68x13 -- is drawn
+    /// whole from the pane's top-left corner; the rest of the pane is blank.
+    #[test]
+    fn a_screen_smaller_than_the_pane_is_drawn_whole_at_its_top_left() {
+        use oxutrm_proto::{CellText, ScreenState};
+        let mut s = ScreenState::blank(10, 40).unwrap();
+        let lines = [
+            (0, "Last login: Fri Oct 16 09:14:02 2026"),
+            (9, "oetiker@thinlinc:~/src/oxutrm$ make -j4"),
+        ];
+        for (r, text) in lines {
+            for (c, ch) in text.chars().enumerate() {
+                s.cells[r * 40 + c].text = CellText::new(ch.to_string());
+            }
+        }
+        s.cursor.row = 9;
+        s.cursor.col = 39;
+        let v = SessionsView {
+            preview: Some(PreviewPane::Screen(s)),
+            ..preview_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        assert_eq!(pane_of(&o), Some((68, 13)), "{text}");
+        let top = rule_row(&o, Some("preview")).unwrap();
+        for (r, line) in lines {
+            let at = top + 1 + u16::try_from(r).unwrap();
+            let shown = row(&o, at);
+            // The border, one blank column, then the session's first column.
+            assert!(
+                shown.starts_with(&format!("\u{2502} {line}")),
+                "row {r} of the session is not at the pane's left: {text}"
+            );
+        }
+        for at in top + 11..top + 14 {
+            let inside: String = row(&o, at).chars().skip(1).take(70).collect();
+            assert!(
+                inside.trim().is_empty(),
+                "the pane under the session: {text}"
+            );
+        }
+    }
+
+    /// Every note of preview spec §3.5 is one dimmed line in the middle of
+    /// the 68x13 pane.
+    #[test]
+    fn each_note_sits_dimmed_in_the_middle_of_the_pane() {
+        for note in [
+            "another version of oxutrm: no preview",
+            "no preview: it dies with its ssh",
+            "asking logs for its screen\u{2026}",
+            "session 5d2e8a7c did not answer in time",
+            "logs sent a screen that is not valid",
+            "the link is down",
+        ] {
+            let v = SessionsView {
+                preview: Some(PreviewPane::Note(note.to_string())),
+                ..preview_view()
+            };
+            let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+            let text = text_of(&o);
+            let top = rule_row(&o, Some("preview")).expect("a pane");
+            let r = find(&o, note).unwrap_or_else(|| panic!("{note:?} not shown: {text}"));
+            assert_eq!(r, top + 1 + (13 - 1) / 2, "{note}: {text}");
+            let first = note.chars().next().unwrap().to_string();
+            assert!(
+                cell_of(&o, r, &first)
+                    .attrs
+                    .contains(oxutrm_proto::Attrs::DIM),
+                "{note} is not dimmed"
+            );
+            let line = row(&o, r);
+            let left = line
+                .chars()
+                .take_while(|&c| c != note.chars().next().unwrap())
+                .count();
+            let right = line.chars().count() - left - note.chars().count();
+            assert!(left.abs_diff(right) <= 1, "{note} is not centred: {line:?}");
+        }
+    }
+
     #[test]
     fn a_note_too_wide_for_the_pane_wraps_and_stays_in_the_middle() {
         let v = SessionsView {

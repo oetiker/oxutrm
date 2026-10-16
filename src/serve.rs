@@ -749,6 +749,12 @@ mod tests {
                 .all(|c| !c.text.chars().any(oxutrm_proto::is_control_scalar)),
             "a control scalar reached a cell"
         );
+        // The OSC 52 was consumed by the emulator: none of it is text.
+        assert!(
+            !text_of(&s).contains("52;c;"),
+            "{:?}",
+            text_of(&s).trim_end()
+        );
         assert_eq!(s.title, "");
 
         // Looking changed nothing the sibling says about itself.
