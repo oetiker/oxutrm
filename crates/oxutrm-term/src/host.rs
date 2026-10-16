@@ -16,6 +16,7 @@ use oxutrm_proto::{
 use crate::blink::{BlinkPlane, BlinkTap};
 use crate::grid::{GridSize, cell_at};
 use crate::listener::EventSink;
+use crate::osc_guard::OscGuard;
 use crate::palette::{PALETTE_LEN, palette, to_proto_color};
 use crate::pty::Pty;
 
@@ -43,6 +44,8 @@ pub struct HostTerm {
     output_waiting: bool,
     term: Term<EventSink>,
     parser: Processor,
+    /// In front of `parser`, because the parser puts no limit on an OSC.
+    osc_guard: OscGuard,
     events: EventSink,
     blink: BlinkPlane,
     palette: [Rgb; PALETTE_LEN],
@@ -104,6 +107,7 @@ impl HostTerm {
             output_waiting: false,
             term,
             parser: Processor::new(),
+            osc_guard: OscGuard::new(),
             events,
             blink: BlinkPlane::default(),
             palette: palette(),
@@ -192,7 +196,9 @@ impl HostTerm {
                 // counting within seconds of the ring filling.
                 let mut tap =
                     BlinkTap::new(&mut self.term, &mut self.blink, &mut self.scrollback_len);
-                self.parser.advance(&mut tap, &buf[..n]);
+                let parser = &mut self.parser;
+                self.osc_guard
+                    .feed(&buf[..n], |bytes| parser.advance(&mut tap, bytes));
             }
             changed = true;
         }
