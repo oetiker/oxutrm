@@ -460,9 +460,10 @@ fn blink_of(blink: &BlinkPlane, point: Point) -> Attrs {
 /// genuinely produce such a state: it puts **no cap at all** on how many
 /// zero-width marks it stacks onto one base character (`Term::input` pushes
 /// every width-0 scalar onto the previous cell, unbounded), so a program that
-/// prints combining marks in a loop grows one cell without limit. That is not
-/// hypothetical hostility — it is what `cat` of a file full of stacked
-/// diacritics does.
+/// prints combining marks in a loop would grow one cell without limit. That is
+/// not hypothetical hostility — it is what `cat` of a file full of stacked
+/// diacritics does. [`crate::marks`] stops the emulator storing marks past the
+/// same bound; this is what holds for a cell built any other way.
 ///
 /// So the bound is applied at the source, and applied while the string is
 /// being built rather than after: filtering a megabyte of marks down to 32

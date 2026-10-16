@@ -7,6 +7,10 @@
 ### Changed
 
 ### Fixed
+- A program that printed accents or other combining marks without end, such
+  as a `cat` of a file of stacked diacritics, made the memory of its session
+  on the host grow until the system killed it. A character now keeps only as
+  many marks as fit in what the screen shows of it, and the rest are dropped.
 - A program that printed the start of a terminal control sequence and never
   ended it, such as a `cat` of a damaged file, or that set a very long window
   title and saved it over and over, made the memory of its session on the host
