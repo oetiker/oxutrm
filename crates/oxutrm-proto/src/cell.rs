@@ -57,6 +57,10 @@ pub type CellText = compact_str::CompactString;
 /// `text` is a small string rather than a `char` so that grapheme clusters and
 /// combining marks survive intact; an accented character that arrived as two
 /// code points is stored as two code points and rendered as one glyph.
+///
+/// `text` is empty only on an [`Attrs::WIDE_CONT`] cell. Every other cell
+/// occupies one column, so a renderer paints an empty one as a blank: hosts up
+/// to 0.3.0 sent an empty cell wherever a tab started.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Cell {
     pub text: CellText,
