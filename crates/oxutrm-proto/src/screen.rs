@@ -454,10 +454,18 @@ mod tests {
         s.seq = 77;
         s.modes.alt_screen = true;
         s.modes.bracketed_paste = true;
+        s.clipboard = Clipboard {
+            serial: 3,
+            copy: Some(crate::ClipboardCopy {
+                target: crate::ClipboardTarget::Clipboard,
+                text: "hunter2".into(),
+            }),
+        };
         let w = s.window(PANE);
         assert_eq!(w.title, "");
         assert_eq!((w.seq, w.bell, w.scrollback_len), (1, 0, 0));
         assert_eq!(w.modes, Modes::default());
+        assert_eq!(w.clipboard, Clipboard::default(), "no copy, no serial");
     }
 
     #[test]

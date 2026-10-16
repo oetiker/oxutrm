@@ -11752,6 +11752,102 @@ mod tests {
         looping.abort();
     }
 
+    /// A sibling whose shell copied before anyone looked. Its preview
+    /// carries no clipboard text and goes nowhere near the clipboard relay:
+    /// a preview fed to the relay would set a baseline of serial 0 for the
+    /// sibling, and switching to it afterwards would write the copy it made
+    /// before this client ever arrived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn previewing_and_switching_to_a_sibling_that_copied_writes_no_osc_52() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let script = scripts.path().join("copying");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '\\033]52;c;aGk=\\007Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey\\r\\n$ '\nexec sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let copying = crate::serve::Shell {
+            program: script.to_str().unwrap().to_string(),
+            start: oxutrm_term::Start::default(),
+            sibling: None,
+        };
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            copying,
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+        has_printed(build.client.sink.connection(), LOGS_ID).await;
+
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        let mut out = Vec::new();
+        type_in(&mut client, &[crate::ui::PREFIX]);
+        type_in(&mut client, b"s");
+        let a = client.take_ask().expect("the list asked for");
+        let conn = client.link.sink.connection().clone();
+        let list = crate::switcher::ask(conn, a, client.size, &client.net.clone()).await;
+        client.answered(list, Instant::now()).unwrap();
+        let rows = client.ui.selector().rows();
+        let at = |id: &str| rows.iter().position(|e| e.id == id_of(id)).unwrap();
+        let key: &[u8] = if at(LOGS_ID) > at(BUILD_ID) {
+            b"j"
+        } else {
+            b"k"
+        };
+        type_in(&mut client, key);
+
+        // The loop's own path: the lap asks, the slot hears, `previewed`
+        // takes it, and the next turn paints it.
+        let mut slot = PreviewSlot::new();
+        client.preview_lap(Instant::now(), &mut slot);
+        let (id, shot) = tokio::time::timeout(Duration::from_secs(10), slot.rx.recv())
+            .await
+            .expect("the preview never came")
+            .expect("the slot closed");
+        let shown = shot.clone().expect("a screen");
+        assert_eq!(shown.clipboard, oxutrm_proto::Clipboard::default());
+        client.previewed(&mut slot, id, shot, Instant::now());
+        client.turn(&[], &mut out).unwrap();
+        assert_eq!(count(&out, b"\x1b]52;"), 0, "the preview wrote a copy");
+
+        type_in(&mut client, b"q");
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Switch { to: id_of(LOGS_ID) }
+            )
+            .await
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.screen().clipboard.serial == 0 {
+            assert!(Instant::now() < deadline, "logs' screen never came");
+            client.turn(&[], &mut out).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            client.screen().clipboard.copy.is_some(),
+            "the control: logs still holds the copy nobody took"
+        );
+        assert_eq!(count(&out, b"\x1b]52;"), 0, "a copy older than the client");
+    }
+
     /// A preview request lives exactly as long as someone waits for it: an
     /// answer for another request leaves it be, and closing the selector
     /// aborts it.

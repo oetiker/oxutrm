@@ -756,6 +756,9 @@ mod tests {
             text_of(&s).trim_end()
         );
         assert_eq!(s.title, "");
+        // The copy itself is not in the picture either: the shell's host
+        // still holds it, since nobody attached to take it.
+        assert_eq!(s.clipboard, oxutrm_proto::Clipboard::default());
 
         // Looking changed nothing the sibling says about itself.
         let after = entry(crate::door::fixtures::ask(&sock, Request::Myself).await);
@@ -783,6 +786,7 @@ mod tests {
         )
         .await;
         assert_eq!(s.cursor.row, 1, "the window ends on the prompt's row");
+        assert_eq!(s.clipboard, oxutrm_proto::Clipboard::default());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
