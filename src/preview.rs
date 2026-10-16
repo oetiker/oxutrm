@@ -57,6 +57,18 @@ pub(crate) struct Previews {
     out: Option<SessionId>,
 }
 
+/// Whether a received cell takes the columns a cell may: at most two, a
+/// wide glyph's. I8 bounds a cell's bytes, not its width, and the renderer
+/// writes a cell's text as it is, so a cell of 32 letters would push the
+/// rest of its row, the box's border with it, 31 columns out. A wide glyph
+/// whose `WIDE_CONT` is missing is left to the renderer's
+/// `repair_wide_pairs`, as on the main screen: an emulator whose width
+/// table disagrees with this one makes such pairs, and its screen is still
+/// worth showing.
+fn fits(c: &oxutrm_proto::Cell) -> bool {
+    unicode_width::UnicodeWidthStr::width(c.text.as_str()) <= 2
+}
+
 /// Whether `e` can be asked for its screen at all.
 fn previewable(e: &SessionEntry) -> bool {
     !e.this && e.detachable && e.attached != Attached::OtherVersion
@@ -110,7 +122,8 @@ impl Previews {
             Ok(s)
                 if s.validate().is_ok()
                     && s.rows <= PREVIEW_MAX.rows
-                    && s.cols <= PREVIEW_MAX.cols =>
+                    && s.cols <= PREVIEW_MAX.cols
+                    && s.cells.iter().all(fits) =>
             {
                 Got::Screen(s)
             }
@@ -399,6 +412,49 @@ mod tests {
         assert_eq!(
             note(&p.pane(Some(row(&list, LOGS)), &screen(40, 120), true)),
             "logs sent a screen that is not valid"
+        );
+    }
+
+    /// One cell with 32 characters in it passes `validate()` (I8 bounds a
+    /// cell's bytes, not its width) and would push the box's right border
+    /// 31 columns out.
+    #[test]
+    fn a_screen_with_a_cell_wider_than_a_glyph_is_not_valid() {
+        let list = three();
+        let mut p = Previews::default();
+        let t = Instant::now();
+        let mut forged = screen(18, 68);
+        forged.cells[70].text = CellText::new("x".repeat(oxutrm_proto::MAX_CELL_TEXT));
+        forged.validate().unwrap();
+        p.arrive(Some(row(&list, LOGS)), t);
+        p.ask_next(true);
+        p.answered(id(LOGS), Ok(forged), t);
+        assert_eq!(
+            note(&p.pane(Some(row(&list, LOGS)), &screen(40, 120), true)),
+            "logs sent a screen that is not valid"
+        );
+    }
+
+    /// A wide glyph is one cell measuring two columns; a screen with CJK in
+    /// it is a screen like any other.
+    #[test]
+    fn a_screen_with_wide_glyphs_is_kept() {
+        let list = three();
+        let mut p = Previews::default();
+        let t = Instant::now();
+        let mut cjk = screen(18, 68);
+        for (i, ch) in "日本語".chars().enumerate() {
+            cjk.cells[136 + 2 * i].text = CellText::new(ch.to_string());
+            cjk.cells[137 + 2 * i].text = CellText::new("");
+            cjk.cells[137 + 2 * i].attrs = oxutrm_proto::Attrs::WIDE_CONT;
+        }
+        cjk.validate().unwrap();
+        p.arrive(Some(row(&list, LOGS)), t);
+        p.ask_next(true);
+        p.answered(id(LOGS), Ok(cjk.clone()), t);
+        assert_eq!(
+            p.pane(Some(row(&list, LOGS)), &screen(40, 120), true),
+            PreviewPane::Screen(cjk)
         );
     }
 
