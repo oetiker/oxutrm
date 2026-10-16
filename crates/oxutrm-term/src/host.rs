@@ -462,8 +462,9 @@ fn blink_of(blink: &BlinkPlane, point: Point) -> Attrs {
 /// being built rather than after: filtering a megabyte of marks down to 32
 /// bytes still costs the megabyte if it was assembled first.
 /// [`fit_cell_text`] then backstops the result, which is what makes the
-/// property total rather than merely likely — including for `cell.c` itself,
-/// which `alacritty_terminal` never sets to a control today.
+/// property total rather than merely likely. `cell.c` itself is mapped to a
+/// blank first when it is a control: `alacritty_terminal` does store `'\t'`
+/// there, and fitting would only drop it and leave the cell empty.
 fn cell_text(cell: &VteCell) -> CellText {
     // The right-hand half of a wide character carries a space in `c`. Sending
     // that space would make a renderer paint one and shift the row, so the
@@ -475,9 +476,21 @@ fn cell_text(cell: &VteCell) -> CellText {
         return CellText::const_new("");
     }
 
+    // `Term::put_tab` stores `'\t'` in the cell where a tab starts, and that
+    // is a blank column on the emulator's screen. Dropping the control would
+    // leave the cell EMPTY, and an empty cell paints zero columns, so every
+    // column after it would land one place to the left. Any control base is
+    // therefore a blank, never nothing; `'\t'` is the only one
+    // `alacritty_terminal` stores today (`Term::input` refuses the rest).
+    let base = if is_control_scalar(cell.c) {
+        ' '
+    } else {
+        cell.c
+    };
+
     let text = match cell.zerowidth() {
         Some(marks) if !marks.is_empty() => {
-            let mut text = CellText::new(cell.c.to_string());
+            let mut text = CellText::new(base.to_string());
             for m in marks {
                 // Stop at the cap instead of assembling the whole stack and
                 // trimming it afterwards. `break`, not `continue`: the marks
@@ -492,7 +505,7 @@ fn cell_text(cell: &VteCell) -> CellText {
         }
         _ => {
             let mut buf = [0u8; 4];
-            CellText::new(cell.c.encode_utf8(&mut buf))
+            CellText::new(base.encode_utf8(&mut buf))
         }
     };
     fit_cell_text(text)
@@ -637,6 +650,21 @@ mod tests {
         for c in ['x', ' ', 'é', '\u{4f60}', '🦀'] {
             assert_eq!(cell_text(&vte_cell(c, &[])).as_str(), c.to_string());
         }
+    }
+
+    /// `Term::put_tab` stores `'\t'` in the cell where a tab starts. Dropping
+    /// the control would leave that cell empty, and an empty cell paints as
+    /// nothing, so every column after it would land one place to the left.
+    /// The cell is blank on the emulator's screen and must be blank here.
+    #[test]
+    fn a_tab_cell_is_a_blank_not_an_empty_cell() {
+        assert_eq!(cell_text(&vte_cell('\t', &[])).as_str(), " ");
+        // A mark that lands on the tab cell keeps a base under it; a lone
+        // mark would paint zero columns just as an empty cell does.
+        assert_eq!(
+            cell_text(&vte_cell('\t', &['\u{301}'])).as_str(),
+            " \u{301}"
+        );
     }
 
     fn sh(script: &str, size: TermSize) -> HostTerm {
@@ -1060,6 +1088,25 @@ mod tests {
             "x",
             "the next character starts at column 2"
         );
+    }
+
+    #[test]
+    fn text_after_a_tab_is_in_the_tab_stop_column_and_no_cell_is_empty() {
+        let mut t = sh("printf 'a\\tb\\tc'; sleep 5", size());
+        poll_until(&mut t, Duration::from_secs(10), |t| {
+            t.snapshot(1).cell(0, 16).text == "c"
+        });
+        let s = t.snapshot(1);
+        assert_eq!(s.cell(0, 8).text, "b");
+        assert_eq!(s.cell(0, 16).text, "c");
+        for col in 0..s.cols {
+            let cell = s.cell(0, col);
+            assert!(
+                !cell.text.is_empty() || cell.attrs.contains(Attrs::WIDE_CONT),
+                "column {col} is empty without being a wide continuation: {:?}",
+                row_text(&s, 0)
+            );
+        }
     }
 
     #[test]
