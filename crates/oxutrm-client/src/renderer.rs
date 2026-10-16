@@ -53,6 +53,10 @@ pub struct Renderer {
     /// `terminal.hyperlinks`. OSC 8 is written only when this and
     /// `caps.osc8` are both on.
     hyperlinks: bool,
+    /// A pass with links on began and no write has completed since, so the
+    /// terminal may hold a link that pass opened and never closed. Kept
+    /// apart from `hyperlinks`, which can be turned off in between.
+    link_may_be_open: bool,
 }
 
 impl Renderer {
@@ -63,6 +67,7 @@ impl Renderer {
             painted: None,
             overlay: None,
             hyperlinks: true,
+            link_may_be_open: false,
         }
     }
 
@@ -163,6 +168,9 @@ impl Renderer {
         };
 
         self.write_cells(&mut out, &cells, &s.links, s.rows, s.cols, full);
+        if self.links_on() {
+            self.link_may_be_open = true;
+        }
         self.write_cursor(&mut out, cursor, full);
         if ring {
             out.push(0x07);
@@ -192,6 +200,8 @@ impl Renderer {
         // rejected frame must cost a repaint, never a session.
         match w.write_all(&out) {
             Ok(()) => {
+                // Every run ends with its link closed.
+                self.link_may_be_open = false;
                 self.painted = Some(Painted {
                     cells: cells.into_owned(),
                     cursor,
@@ -349,7 +359,7 @@ impl Renderer {
         if full {
             // A link an interrupted earlier write left open must not attach
             // itself to the repaint.
-            if links_on {
+            if self.caps.osc8 && (links_on || self.link_may_be_open) {
                 out.extend_from_slice(LINK_CLOSE);
             }
             out.extend_from_slice(b"\x1b[H\x1b[2J");
@@ -1694,6 +1704,32 @@ mod tests {
         let mut c = caps(16_777_216);
         c.osc8 = false;
         let out = render(&mut Renderer::new(size(), c), &s);
+        assert!(!out.contains("\u{1b}]8"), "{out:?}");
+    }
+
+    /// A write that failed with links on may have left a link open on the
+    /// terminal. Turning links off before the next render must not let that
+    /// link cover the repaint.
+    #[test]
+    fn a_link_left_open_by_a_failed_write_is_closed_after_turning_links_off() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 0, "ab", 1, "http://a");
+        assert!(r.render(&mut FailingWriter, &next).is_err(), "write failed");
+
+        r.set_hyperlinks(false);
+        let out = render(&mut r, &next);
+        assert!(
+            out.contains(&format!("{CLOSE}\u{1b}[H\u{1b}[2J")),
+            "the repaint does not close the link first: {out:?}"
+        );
+        assert!(!out.contains(&open(1, "http://a")), "{out:?}");
+
+        // Once a write went out whole, nothing is open any more.
+        r.invalidate();
+        let out = render(&mut r, &next);
         assert!(!out.contains("\u{1b}]8"), "{out:?}");
     }
 
