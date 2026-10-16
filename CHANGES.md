@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### New
+- **The session selector shows the selected session's screen.** Under the
+  list, the last lines of the session's screen up to its cursor appear in
+  its colours as you move through the list; `+ new session`, a session of
+  another oxutrm version and one that cannot be reattached say why there is
+  none. The preview needs a terminal of at least 38 columns and, with a
+  few sessions, 15 rows, and is left out below that; this release changes
+  the protocol version, so end host sessions started by an older oxutrm
+  before connecting with this one.
 
 ### Changed
 

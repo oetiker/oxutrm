@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_with_no_screen_ask_next_for_are_never_asked() {
+    fn rows_with_no_screen_to_ask_for_are_never_asked() {
         let mut list = three();
         list.push(entry(
             "0123456789abcdef0123456789abcdef",

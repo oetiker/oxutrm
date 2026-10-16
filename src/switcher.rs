@@ -140,13 +140,11 @@ async fn asked(
 /// own bound on its loop or its sibling, [`crate::door::SIBLING_TIMEOUT`],
 /// and the round trip on top. The QUIC idle timeout is off, so without it
 /// a request sent into a path that has just gone dark would wait for ever.
-#[allow(dead_code)] // wired into the session by the next commit
 pub(crate) const PREVIEW_WITHIN: Duration = Duration::from_secs(5);
 
 /// Ask for session `id`'s screen over a fresh control stream of `conn`
 /// (preview spec §3.4): its window as the host cut it, or why there is
 /// none. Unchecked: the caller validates what it keeps.
-#[allow(dead_code)] // wired into the session by the next commit
 pub(crate) async fn preview(conn: quinn::Connection, id: SessionId) -> Result<ScreenState, String> {
     let asked = async {
         use anyhow::Context as _;
