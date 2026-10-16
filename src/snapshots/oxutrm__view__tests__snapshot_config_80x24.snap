@@ -19,6 +19,7 @@ expression: "text.join(\"\\n\")"
 │   birthday          on                         next attempt          │
 ├ terminal ────────────────────────────────────────────────────────────┤
 │   clipboard         on                                               │
+│   hyperlinks        on                                               │
 ├──────────────────────────────────────────────────────────────────────┤
 │ silence before an ssh rebuild starts · 5s–10m                        │
 │ ↑↓ move  ⏎ edit  x reset  w save  Esc back                           │

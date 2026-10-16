@@ -60,6 +60,8 @@ pub(crate) struct Settings {
     pub(crate) birthday: bool,
     /// Write a remote program's OSC 52 copy to the local terminal.
     pub(crate) clipboard: bool,
+    /// Paint a remote program's OSC 8 hyperlinks as links.
+    pub(crate) hyperlinks: bool,
 }
 
 impl Default for Settings {
@@ -80,6 +82,7 @@ impl Default for Settings {
             port_mapping: net.enable_port_mapping,
             birthday: net.enable_birthday,
             clipboard: true,
+            hyperlinks: true,
         }
     }
 }
@@ -415,6 +418,25 @@ pub(crate) static SETTINGS: &[Setting] = &[
         set: |s, v| {
             if let Value::Bool(b) = v {
                 s.clipboard = b;
+            }
+        },
+    },
+    Setting {
+        section: "terminal",
+        name: "hyperlinks",
+        shape: Shape::Bool,
+        applies: Applies::Now,
+        help: "show remote hyperlinks as links (OSC 8)",
+        doc: "A link reaches the local terminal unchanged, `file://` links \
+              included: those name the remote host, and the local terminal \
+              decides what to do with them. A link with a URI longer than 2083 \
+              bytes or with characters other than printable ASCII is shown as \
+              plain text. Turn this off for a terminal that prints OSC 8 \
+              instead of ignoring it.",
+        get: |s| Value::Bool(s.hyperlinks),
+        set: |s, v| {
+            if let Value::Bool(b) = v {
+                s.hyperlinks = b;
             }
         },
     },
