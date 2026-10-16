@@ -11322,4 +11322,37 @@ mod tests {
         assert!(task.is_finished(), "the request outlived the selector");
         assert!(slot.rx.try_recv().is_err(), "an aborted request answered");
     }
+
+    /// The selector cannot be closed and opened again between two laps,
+    /// which is what lets the lap find a close by the mode alone: a read
+    /// ends at the key that closes it, so `s` in the same read is dropped,
+    /// and every read is followed by a lap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_and_an_open_in_one_read_close_the_selector() {
+        use crate::selector::fixtures::{LOGS, three};
+        let (_host, link) = crate::link::fixtures::link_pair().await;
+        let mut client = client_on(link, BUILD_ID);
+        let mut slot = PreviewSlot::new();
+        type_in(&mut client, &[crate::ui::PREFIX]);
+        type_in(&mut client, b"s");
+        assert_eq!(client.take_ask(), Some(crate::switcher::Ask::Sessions));
+        client
+            .answered(crate::switcher::Answered::Sessions(three()), Instant::now())
+            .unwrap();
+        type_in(&mut client, b"j");
+        client.preview_lap(Instant::now(), &mut slot);
+        assert_eq!(client.previews.out(), Some(id_of(LOGS)));
+        let task = slot.task.as_ref().expect("a request out").0.clone();
+
+        type_in(&mut client, b"qs");
+        assert_ne!(
+            client.ui.mode(),
+            Mode::Sessions,
+            "s in the read reopened it"
+        );
+        client.preview_lap(Instant::now(), &mut slot);
+        assert_eq!(client.previews.out(), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(task.is_finished(), "the request outlived the selector");
+    }
 }

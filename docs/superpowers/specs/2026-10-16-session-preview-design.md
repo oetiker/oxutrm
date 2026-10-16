@@ -267,8 +267,9 @@ enum Reply {
 
 ### 4.2 The client's check
 
-`Previews::answered` keeps a shot only if `validate()` passes and
-`rows ≤ 18`, `cols ≤ 68`; anything else is the note in §3.5, never a repaired
+`Previews::answered` keeps a shot only if `validate()` passes,
+`rows ≤ 18`, `cols ≤ 68`, and every cell's text measures at most two
+columns (§10 item 13); anything else is the note in §3.5, never a repaired
 screen. Only `cells`, `rows`, `cols` and `cursor` are used; title, modes,
 bell and scrollback are never applied to anything.
 
@@ -477,3 +478,14 @@ folded into the section named.
 11. **One bound for the whole client request** (§5): `PREVIEW_WITHIN` covers
     opening the stream, writing and reading, which bounds each of those
     waits too.
+12. **A close is found by the mode, once a lap** (§3.4). The selector
+    cannot close and open again between two laps: a read ends at the key
+    that closes it (the rest of the read is dropped), and every read is
+    followed by a lap, which then sees it closed. So no counter of
+    openings is kept; a test pins the premise.
+13. **A preview cell may measure at most two columns** (§4.2). I8 bounds a
+    cell's bytes, not its width, and a forged cell of 32 letters would
+    push the box's border out. A two-column glyph without its `WIDE_CONT`
+    is not refused but left to `repair_wide_pairs`, as on the main screen,
+    so a real screen from an emulator with another width table still
+    shows.
