@@ -10852,6 +10852,111 @@ mod tests {
         );
     }
 
+    /// The clipboard serial only ever goes up as well (I9), across the same
+    /// kill into the lobby and `New` out of it. The lobby carries no text,
+    /// and the next shell's copy is newer than anything the client has seen
+    /// of this session, so it is written, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_after_a_kill_into_the_lobby_and_a_new_shell_is_written_once() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        /// `turn_until`, keeping what the client wrote to its terminal.
+        async fn turn_into(
+            client: &mut ClientSession,
+            mut input: &[u8],
+            out: &mut Vec<u8>,
+            what: &str,
+            done: impl Fn(&ClientSession) -> bool,
+        ) {
+            let begun = Instant::now();
+            while !done(client) {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(10),
+                    "{what}: {} frames rejected",
+                    client.rejected_total()
+                );
+                client.turn(input, out).unwrap();
+                input = b"";
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        const ONE: &[u8] = b"\x1b]52;c;b25l\x07";
+        const TWO: &[u8] = b"\x1b]52;c;dHdv\x07";
+
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+        let mut out = Vec::new();
+
+        // A first state before the copy: the relay's baseline.
+        turn_into(
+            &mut client,
+            b"echo up-$((6*7))\r",
+            &mut out,
+            "the shell never answered",
+            |c| text_of(c).contains("up-42"),
+        )
+        .await;
+        turn_into(
+            &mut client,
+            b"printf '\\033]52;c;b25l\\007'\r",
+            &mut out,
+            "the first copy never arrived",
+            |c| c.screen().clipboard.serial >= 1,
+        )
+        .await;
+        assert_eq!(count(&out, ONE), 1, "the control");
+
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Kill {
+                    id: id_of(BUILD_ID)
+                }
+            )
+            .await
+        );
+        assert!(client.in_lobby());
+        turn_into(
+            &mut client,
+            b"",
+            &mut out,
+            "the lobby's blank screen never came",
+            |c| text_of(c).trim().is_empty(),
+        )
+        .await;
+        assert_eq!(client.rejected_total(), 0, "the lobby's screen was refused");
+        assert_eq!(client.screen().clipboard.copy, None, "no text in the lobby");
+        let lobby = client.screen().clipboard.serial;
+
+        let again = oxutrm_proto::Name::parse("again").unwrap();
+        assert!(!ask_now(&mut client, crate::switcher::Ask::New { name: Some(again) }).await);
+        turn_into(
+            &mut client,
+            b"printf '\\033]52;c;dHdv\\007'; echo fresh-$((6*7))\r",
+            &mut out,
+            "the new shell's copy never came",
+            |c| text_of(c).contains("fresh-42") && c.screen().clipboard.serial > lobby,
+        )
+        .await;
+        assert_eq!(
+            client.rejected_total(),
+            0,
+            "the new shell's screen was refused"
+        );
+        assert_eq!(count(&out, TWO), 1, "the new shell's copy, once");
+        assert_eq!(count(&out, ONE), 1, "the old copy, not again");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn quitting_in_a_lobby_ends_the_lobby_with_the_link() {
         use crate::serve::Begin;

@@ -158,16 +158,19 @@ pub struct HostSession {
     detach_after: Duration,
 }
 
-/// A lobby's blank screen at `size`, keeping the bell and scrollback counts
-/// of `last`, the screen before it on the same link.
+/// A lobby's blank screen at `size`, keeping the bell, scrollback and
+/// clipboard counts of `last`, the screen before it on the same link.
 ///
-/// Both counters only ever go up across the states a client applies (I5, I6),
-/// so a blank that started them at zero again would have every frame from here
-/// on refused, and the client would sit on the dead shell's screen.
+/// All three only ever go up across the states a client applies (I5, I6,
+/// I9), so a blank that started them at zero again would have every frame
+/// from here on refused, and the client would sit on the dead shell's screen.
+/// The clipboard keeps its serial but not its text: a lobby has copied
+/// nothing.
 fn lobby_screen(size: TermSize, last: &ScreenState) -> Result<ScreenState> {
     let mut blank = ScreenState::blank(size.rows, size.cols)?;
     blank.bell = last.bell;
     blank.scrollback_len = last.scrollback_len;
+    blank.clipboard = last.clipboard.without_text();
     Ok(blank)
 }
 
@@ -1151,11 +1154,12 @@ mod tests {
         }
     }
 
-    /// The bell is a counter the client holds across the lobby (I5): the
-    /// lobby's blank, a lobby resized, and the next shell all count on from
-    /// the dead shell's number rather than from zero.
+    /// The bell and the clipboard serial are counters the client holds across
+    /// the lobby (I5, I9): the lobby's blank, a lobby resized, and the next
+    /// shell all count on from the dead shell's numbers rather than from
+    /// zero. The copy's text stays behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_lobby_and_the_next_shell_count_on_from_the_last_bell() {
+    async fn the_lobby_and_the_next_shell_count_on_from_the_last_bell_and_copy() {
         let (host_link, _client) = link_pair().await;
         let mut host = HostSession::spawn(
             "/bin/sh",
@@ -1165,9 +1169,11 @@ mod tests {
             host_link,
         )
         .unwrap();
-        host.term_mut().write_input(b"printf '\\a'\n").unwrap();
+        host.term_mut()
+            .write_input(b"printf '\\a\\033]52;c;eA==\\007'\n")
+            .unwrap();
         let begun = Instant::now();
-        while host.term_mut().snapshot(1).bell == 0 {
+        while host.term_mut().snapshot(1).clipboard.serial == 0 {
             assert!(begun.elapsed() < Duration::from_secs(10), "no bell");
             host.term_mut().poll().unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1176,13 +1182,24 @@ mod tests {
 
         host.become_lobby().unwrap();
         assert_eq!(host.screen().bell, rang, "the lobby's blank");
+        let copied = oxutrm_proto::Clipboard {
+            serial: 1,
+            copy: None,
+        };
+        assert_eq!(host.screen().clipboard, copied, "a serial, no text");
         let smaller = TermSize { cols: 80, rows: 24 };
         host.resize(smaller).unwrap();
         assert_eq!(host.screen().rows, 24);
         assert_eq!(host.screen().bell, rang, "the lobby resized");
+        assert_eq!(host.screen().clipboard, copied, "the lobby resized");
 
         host.start_shell().unwrap();
         assert_eq!(host.term_mut().snapshot(1).bell, rang, "the next shell");
+        assert_eq!(
+            host.term_mut().snapshot(1).clipboard,
+            copied,
+            "the next shell"
+        );
     }
 
     /// A "shell" that ignores SIGHUP, as a script file the session runs. It

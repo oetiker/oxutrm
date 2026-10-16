@@ -115,16 +115,22 @@ impl HostTerm {
         })
     }
 
-    /// Count on from `prior`'s bell and scrollback rather than from zero.
+    /// Count on from `prior`'s bell, scrollback and clipboard serial rather
+    /// than from zero.
     ///
-    /// For a shell that replaces another on the same link: both counters are
-    /// monotonic across every state the client has applied (I5, I6), not
+    /// For a shell that replaces another on the same link: the counters are
+    /// monotonic across every state the client has applied (I5, I6, I9), not
     /// just across this shell's, and a client handed a lower number refuses
     /// the frame. Lines below `prior`'s count are not in this shell's
     /// history, and [`HostTerm::scrollback`] returns nothing for them.
+    /// `prior`'s copy text is not taken over: this shell's first copy is the
+    /// next serial, and the client writes it.
     pub fn count_on_from(&mut self, prior: &ScreenState) {
         self.bell = self.bell.max(prior.bell);
         self.scrollback_len = self.scrollback_len.max(prior.scrollback_len);
+        if prior.clipboard.serial > self.clipboard.serial {
+            self.clipboard = prior.clipboard.without_text();
+        }
     }
 
     /// Write user input to the PTY.
