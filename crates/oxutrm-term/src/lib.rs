@@ -50,6 +50,7 @@ mod exit_wake;
 mod grid;
 mod host;
 mod listener;
+mod marks;
 mod palette;
 mod pty;
 

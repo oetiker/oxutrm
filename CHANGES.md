@@ -7,6 +7,10 @@
 ### Changed
 
 ### Fixed
+- A program that printed accents or other combining marks without end, such
+  as a `cat` of a file of stacked diacritics, made the memory of its session
+  on the host grow until the system killed it. A character now keeps only as
+  many marks as fit in what the screen shows of it, and the rest are dropped.
 
 ## 0.3.0 - 2026-10-15
 ### New
