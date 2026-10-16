@@ -32,6 +32,7 @@ fn client_hello() -> Signal {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_string(),
         },
         size: TermSize { cols: 80, rows: 24 },

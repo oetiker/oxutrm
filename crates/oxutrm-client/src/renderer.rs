@@ -10,10 +10,13 @@
 //! screen and then undone with [`Renderer::invalidate`], without the host ever
 //! learning that anything happened.
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use oxutrm_proto::{
     Attrs, Cell, Color, Cursor, CursorShape, Modes, MouseMode, ScreenState, TermSize, TerminalCaps,
+    check_link_uri,
 };
 
 use crate::color::down_convert;
@@ -26,7 +29,14 @@ struct Painted {
     modes: Modes,
     title: String,
     bell: u32,
+    /// The link table the cells were painted with. A cell whose id now
+    /// resolves to another URI is not the cell that is painted, although it
+    /// compares equal: the host frees ids and reuses them.
+    links: BTreeMap<u16, Arc<str>>,
 }
+
+/// The OSC 8 that ends a hyperlink. BEL-terminated, like the title.
+const LINK_CLOSE: &[u8] = b"\x1b]8;;\x07";
 
 pub struct Renderer {
     size: TermSize,
@@ -41,6 +51,13 @@ pub struct Renderer {
     /// cell buffer and **never** into a `ScreenState`: the authoritative state
     /// is what the sync engine acks and diffs, and layer 1 must not reach it.
     overlay: Option<Overlay>,
+    /// `terminal.hyperlinks`. OSC 8 is written only when this and
+    /// `caps.osc8` are both on.
+    hyperlinks: bool,
+    /// A pass with links on began and no write has completed since, so the
+    /// terminal may hold a link that pass opened and never closed. Kept
+    /// apart from `hyperlinks`, which can be turned off in between.
+    link_may_be_open: bool,
 }
 
 impl Renderer {
@@ -50,7 +67,24 @@ impl Renderer {
             caps,
             painted: None,
             overlay: None,
+            hyperlinks: true,
+            link_may_be_open: false,
         }
+    }
+
+    /// Turn hyperlinks on or off (`terminal.hyperlinks`). A change repaints
+    /// everything at the next render, so links already painted go away, or
+    /// cells painted plain come back as links.
+    pub fn set_hyperlinks(&mut self, on: bool) {
+        if self.hyperlinks != on {
+            self.hyperlinks = on;
+            self.painted = None;
+        }
+    }
+
+    /// Is OSC 8 written at all?
+    fn links_on(&self) -> bool {
+        self.hyperlinks && self.caps.osc8
     }
 
     /// The user's window changed size. Nothing painted survives that, so the
@@ -134,7 +168,10 @@ impl Renderer {
             },
         };
 
-        self.write_cells(&mut out, &cells, s.rows, s.cols, full);
+        self.write_cells(&mut out, &cells, &s.links, s.rows, s.cols, full);
+        if self.links_on() {
+            self.link_may_be_open = true;
+        }
         self.write_cursor(&mut out, cursor, full);
         if ring {
             out.push(0x07);
@@ -164,12 +201,15 @@ impl Renderer {
         // rejected frame must cost a repaint, never a session.
         match w.write_all(&out) {
             Ok(()) => {
+                // Every run ends with its link closed.
+                self.link_may_be_open = false;
                 self.painted = Some(Painted {
                     cells: cells.into_owned(),
                     cursor,
                     modes: s.modes,
                     title: s.title.clone(),
                     bell: s.bell,
+                    links: s.links.clone(),
                 });
                 Ok(())
             }
@@ -181,6 +221,10 @@ impl Renderer {
     }
 
     /// The screen with layer 1 stamped on top, clipped to the screen.
+    ///
+    /// An overlay cell never carries a link, whatever the overlay was built
+    /// from: a cell copied from another session's state would resolve its id
+    /// against this state's table and point at the wrong URL.
     ///
     /// Clipping rather than asserting: a window can shrink between a popup
     /// being laid out and being painted, and a resize is not a reason to panic
@@ -204,7 +248,10 @@ impl Renderer {
                 }
                 let from = r as usize * o.cols as usize + c as usize;
                 let to = screen_row as usize * cols + screen_col as usize;
-                cells[to] = o.cells[from].clone();
+                cells[to] = Cell {
+                    link: 0,
+                    ..o.cells[from].clone()
+                };
             }
             repair_wide_pairs(&mut cells, cols, screen_row as usize);
         }
@@ -293,10 +340,32 @@ impl Renderer {
 
     // ---- cells -------------------------------------------------------------
 
-    fn write_cells(&self, out: &mut Vec<u8>, cells: &[Cell], rows: u16, cols: u16, full: bool) {
+    /// Paint the cells that changed, run by run.
+    ///
+    /// The open hyperlink is tracked like the pen: an OSC 8 opens where a
+    /// cell's link differs from the one open, and every run ends with the
+    /// link closed, so a link never spans a cursor move. A link over several
+    /// runs or rows is several open/close pairs with the same `id=`, which
+    /// the terminal treats as one link.
+    fn write_cells(
+        &self,
+        out: &mut Vec<u8>,
+        cells: &[Cell],
+        links: &BTreeMap<u16, Arc<str>>,
+        rows: u16,
+        cols: u16,
+        full: bool,
+    ) {
+        let links_on = self.links_on();
         if full {
+            // A link an interrupted earlier write left open must not attach
+            // itself to the repaint.
+            if self.caps.osc8 && (links_on || self.link_may_be_open) {
+                out.extend_from_slice(LINK_CLOSE);
+            }
             out.extend_from_slice(b"\x1b[H\x1b[2J");
         }
+        let painted_links = self.painted.as_ref().map(|p| &p.links);
 
         let cols = cols as usize;
         // The pen is tracked across the whole pass but never across passes: a
@@ -315,14 +384,43 @@ impl Renderer {
                 }
             });
 
-            for (start, end) in changed_runs(desired, previous, full) {
+            // A cell is unchanged only if its link still resolves to what
+            // was painted. Without links on, the URI is never painted, so
+            // it cannot be stale.
+            let relinked = |col: usize| {
+                links_on
+                    && desired[col].link != 0
+                    && painted_links.map(|p| p.get(&desired[col].link))
+                        != Some(links.get(&desired[col].link))
+            };
+
+            for (start, end) in changed_runs(desired, previous, full, relinked) {
                 out.extend_from_slice(format!("\x1b[{};{}H", row + 1, start + 1).as_bytes());
+                let mut open = 0u16;
                 for cell in &desired[start..end] {
                     // The right-hand half of a double-width character. The
                     // preceding glyph already occupies this column; emitting
                     // anything here would shift every column after it.
                     if cell.attrs.contains(Attrs::WIDE_CONT) {
                         continue;
+                    }
+                    if links_on && cell.link != open {
+                        if open != 0 {
+                            out.extend_from_slice(LINK_CLOSE);
+                        }
+                        // `validate` guarantees the id is in the table and
+                        // its URI is printable ASCII. The renderer checks
+                        // again, as it is what writes the URI into an escape
+                        // sequence: a cell whose link fails is painted plain.
+                        open = match links.get(&cell.link) {
+                            Some(uri) if check_link_uri(cell.link, uri).is_ok() => {
+                                out.extend_from_slice(
+                                    format!("\x1b]8;id={};{uri}\x07", cell.link).as_bytes(),
+                                );
+                                cell.link
+                            }
+                            _ => 0,
+                        };
                     }
                     let want = self.sgr_for(cell);
                     if pen.as_deref() != Some(want.as_slice()) {
@@ -340,6 +438,9 @@ impl Renderer {
                     } else {
                         out.extend_from_slice(cell.text.as_bytes());
                     }
+                }
+                if open != 0 {
+                    out.extend_from_slice(LINK_CLOSE);
                 }
             }
         }
@@ -539,13 +640,21 @@ fn repair_wide_pairs(cells: &mut [Cell], cols: usize, row: usize) {
 /// so the double-width glyph is always redrawn as a unit. Repositioning onto
 /// the second half of a wide character and painting from there would leave the
 /// terminal showing half a glyph.
-fn changed_runs(desired: &[Cell], previous: Option<&[Cell]>, full: bool) -> Vec<(usize, usize)> {
+///
+/// `relinked(col)` says a cell that compares equal is still stale: its link
+/// id now resolves to another URI.
+fn changed_runs(
+    desired: &[Cell],
+    previous: Option<&[Cell]>,
+    full: bool,
+    relinked: impl Fn(usize) -> bool,
+) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut start: Option<usize> = None;
 
     for col in 0..desired.len() {
         let dirty = match previous {
-            Some(prev) if !full => desired[col] != prev[col],
+            Some(prev) if !full => desired[col] != prev[col] || relinked(col),
             // On a full repaint the screen was just cleared, so only cells
             // that differ from blank need writing at all.
             _ => desired[col] != Cell::blank(),
@@ -580,6 +689,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "test".to_string(),
         }
     }
@@ -955,7 +1065,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &third),
             format!(
-                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}]8;;\u{07}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mA\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -969,7 +1079,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &s),
             format!(
-                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}]8;;\u{07}\u{1b}[H\u{1b}[2J\u{1b}[2;3H\u{1b}[0mQ\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
     }
@@ -1004,7 +1114,7 @@ mod tests {
         assert_eq!(
             render(&mut r, &wider),
             format!(
-                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
+                "\u{1b}[?2026h{MODES_ALL_OFF}\u{1b}]8;;\u{07}\u{1b}[H\u{1b}[2J\u{1b}[1;1H\u{1b}[0mW\u{1b}[2 q\u{1b}[1;1H\u{1b}[?25h\u{1b}[?2026l"
             )
         );
         assert_eq!(r.size(), TermSize { cols: 8, rows: 3 });
@@ -1278,6 +1388,7 @@ mod tests {
                 fg: Color::Idx(1),
                 bg: Color::Default,
                 attrs: Attrs::empty(),
+                link: 0,
             })
             .collect::<Vec<_>>();
         crate::Overlay {
@@ -1515,6 +1626,257 @@ mod tests {
             out.is_empty(),
             "wrote {:?} for an unchanged screen",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    // ---- OSC 8 hyperlinks ---------------------------------------------------
+
+    /// `text` from cell `at`, every cell of it linked to `id` = `uri`.
+    fn put_link(s: &mut ScreenState, at: usize, text: &str, id: u16, uri: &str) {
+        s.links.insert(id, uri.into());
+        for (i, ch) in text.chars().enumerate() {
+            s.cells[at + i] = Cell {
+                link: id,
+                ..cell(&ch.to_string())
+            };
+        }
+    }
+
+    fn open(id: u16, uri: &str) -> String {
+        format!("\u{1b}]8;id={id};{uri}\u{07}")
+    }
+
+    const CLOSE: &str = "\u{1b}]8;;\u{07}";
+
+    #[test]
+    fn a_linked_word_is_opened_once_and_closed_once() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 0, "ab", 1, "https://example.org/");
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;1H{}\u{1b}[0mab{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                open(1, "https://example.org/")
+            )
+        );
+    }
+
+    #[test]
+    fn two_adjacent_links_close_the_first_before_opening_the_second() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 0, "ab", 1, "http://a");
+        put_link(&mut next, 2, "cd", 2, "http://b");
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;1H{}\u{1b}[0mab{CLOSE}{}cd{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                open(1, "http://a"),
+                open(2, "http://b")
+            )
+        );
+    }
+
+    /// A link that reaches the right edge is closed before the cursor moves
+    /// to the next row, and goes on there as a second pair with the same id.
+    #[test]
+    fn a_link_to_the_last_column_is_closed_before_the_next_row() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 3, "defg", 1, "http://a");
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;4H{o}\u{1b}[0mde{CLOSE}\u{1b}[2;1H{o}fg{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                o = open(1, "http://a")
+            )
+        );
+    }
+
+    #[test]
+    fn a_change_inside_a_long_link_repaints_only_the_change_in_its_own_pair() {
+        let mut base = blank_state();
+        put_link(&mut base, 0, "abcde", 1, "http://a");
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        next.cells[2].text = "X".into();
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;3H{}\u{1b}[0mX{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                open(1, "http://a")
+            )
+        );
+    }
+
+    #[test]
+    fn a_full_repaint_begins_with_a_close() {
+        let mut base = blank_state();
+        put_link(&mut base, 0, "ab", 1, "http://a");
+        let mut r = primed(caps(16_777_216), &base);
+        r.invalidate();
+        let out = render(&mut r, &base);
+        assert!(
+            out.starts_with(&format!(
+                "\u{1b}[?2026h{MODES_ALL_OFF}{CLOSE}\u{1b}[H\u{1b}[2J"
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// The host freed id 1 and gave it to another link. The cells compare
+    /// equal, and they are not what is on the screen.
+    #[test]
+    fn a_reused_id_with_a_new_uri_repaints_its_cells() {
+        let mut base = blank_state();
+        put_link(&mut base, 0, "ab", 1, "http://a");
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        next.links.insert(1, "http://b".into());
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;1H{}\u{1b}[0mab{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                open(1, "http://b")
+            )
+        );
+    }
+
+    /// Overlay cells never carry a link, even one built from cells that had
+    /// one, and they close the link beneath them.
+    #[test]
+    fn an_overlay_over_a_link_carries_no_link() {
+        let mut screen = ScreenState::blank(3, 8).unwrap();
+        put_link(&mut screen, 8, "abcdefgh", 1, "http://a");
+        let mut r = Renderer::new(TermSize { cols: 8, rows: 3 }, caps(16_777_216));
+        r.render(&mut Vec::new(), &screen).unwrap();
+
+        let mut o = test_overlay(1, 2, "XYZ");
+        for c in &mut o.cells {
+            c.link = 1;
+        }
+        r.set_overlay(Some(o));
+        let out = render(&mut r, &screen);
+        assert!(out.contains("XYZ"), "{out:?}");
+        assert!(
+            !out.contains("\u{1b}]8;id"),
+            "a link inside the overlay: {out:?}"
+        );
+
+        // Taking it away paints the link back over exactly those cells.
+        r.set_overlay(None);
+        let out = render(&mut r, &screen);
+        assert!(
+            out.contains(&format!("{}\u{1b}[0mcde{CLOSE}", open(1, "http://a"))),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn with_hyperlinks_off_no_osc_8_is_written() {
+        let mut s = blank_state();
+        put_link(&mut s, 0, "abcdefg", 1, "http://a");
+
+        let mut r = Renderer::new(size(), caps(16_777_216));
+        r.set_hyperlinks(false);
+        let out = render(&mut r, &s);
+        assert!(out.contains("abcde"), "{out:?}");
+        assert!(!out.contains("\u{1b}]8"), "{out:?}");
+
+        let mut c = caps(16_777_216);
+        c.osc8 = false;
+        let out = render(&mut Renderer::new(size(), c), &s);
+        assert!(!out.contains("\u{1b}]8"), "{out:?}");
+    }
+
+    /// A write that failed with links on may have left a link open on the
+    /// terminal. Turning links off before the next render must not let that
+    /// link cover the repaint.
+    #[test]
+    fn a_link_left_open_by_a_failed_write_is_closed_after_turning_links_off() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 0, "ab", 1, "http://a");
+        assert!(r.render(&mut FailingWriter, &next).is_err(), "write failed");
+
+        r.set_hyperlinks(false);
+        let out = render(&mut r, &next);
+        assert!(
+            out.contains(&format!("{CLOSE}\u{1b}[H\u{1b}[2J")),
+            "the repaint does not close the link first: {out:?}"
+        );
+        assert!(!out.contains(&open(1, "http://a")), "{out:?}");
+
+        // Once a write went out whole, nothing is open any more.
+        r.invalidate();
+        let out = render(&mut r, &next);
+        assert!(!out.contains("\u{1b}]8"), "{out:?}");
+    }
+
+    /// `validate` refuses a state whose URI could end the OSC 8 early, but
+    /// the renderer does not lean on it: a URI it could not write safely is
+    /// not written, and its cells are painted plain.
+    #[test]
+    fn a_link_with_a_bad_uri_is_painted_plain() {
+        let mut s = blank_state();
+        put_link(&mut s, 0, "ab", 1, "http://a/\u{7}\u{1b}]52;c;AAAA\u{7}");
+        put_link(&mut s, 3, "cd", 2, "http://ä/");
+        put_link(&mut s, 6, "ef", 3, "http://ok");
+        assert!(s.validate().is_err(), "the state is one validate refuses");
+
+        let out = render(&mut Renderer::new(size(), caps(16_777_216)), &s);
+        assert!(!out.contains("]52"), "{out:?}");
+        assert!(!out.contains('ä'), "{out:?}");
+        assert!(!out.contains("id=1;") && !out.contains("id=2;"), "{out:?}");
+        assert!(out.contains(&open(3, "http://ok")), "{out:?}");
+        assert!(out.contains("ab") && out.contains("cd"), "{out:?}");
+    }
+
+    /// Turning the setting off takes effect at the next render: the links
+    /// already on the screen are painted over plain.
+    #[test]
+    fn turning_hyperlinks_off_repaints_without_them() {
+        let mut s = blank_state();
+        put_link(&mut s, 0, "ab", 1, "http://a");
+        let mut r = primed(caps(16_777_216), &s);
+        r.set_hyperlinks(false);
+        let out = render(&mut r, &s);
+        assert!(out.contains("\u{1b}[2J"), "a full repaint: {out:?}");
+        assert!(!out.contains("\u{1b}]8"), "{out:?}");
+        r.set_hyperlinks(false);
+        assert_eq!(render(&mut r, &s), "", "no change, no repaint");
+    }
+
+    #[test]
+    fn a_wide_glyph_in_a_link_is_one_open_and_no_output_for_its_right_half() {
+        let base = blank_state();
+        let mut r = primed(caps(16_777_216), &base);
+        let mut next = base.clone();
+        next.seq = 2;
+        put_link(&mut next, 0, "世 !", 1, "http://a");
+        next.cells[1] = Cell {
+            text: CellText::from(""),
+            attrs: Attrs::WIDE_CONT,
+            link: 1,
+            ..Cell::blank()
+        };
+        assert_eq!(
+            render(&mut r, &next),
+            format!(
+                "\u{1b}[?2026h\u{1b}[1;1H{}\u{1b}[0m世!{CLOSE}\u{1b}[1;1H\u{1b}[?2026l",
+                open(1, "http://a")
+            )
         );
     }
 }

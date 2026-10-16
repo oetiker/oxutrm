@@ -209,7 +209,7 @@ impl Loopback {
 #[cfg(test)]
 impl Loopback {
     /// The screen the host believes in.
-    pub fn host_screen(&self) -> ScreenState {
+    pub fn host_screen(&mut self) -> ScreenState {
         self.host.snapshot(self.screen_tx.current().seq)
     }
 
@@ -304,6 +304,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_owned(),
         }
     }

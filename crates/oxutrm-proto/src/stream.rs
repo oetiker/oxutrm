@@ -40,6 +40,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: false,
+            osc8: false,
             term_name: "screen-256color".to_string(),
         }
     }

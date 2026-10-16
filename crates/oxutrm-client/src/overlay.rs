@@ -51,6 +51,7 @@ pub fn overlay_from_buffer(buf: &Buffer, row: u16, col: u16) -> Overlay {
                     fg,
                     bg,
                     attrs: Attrs::WIDE_CONT,
+                    link: 0,
                 });
                 continue;
             }
@@ -73,6 +74,7 @@ pub fn overlay_from_buffer(buf: &Buffer, row: u16, col: u16) -> Overlay {
                 fg,
                 bg,
                 attrs: attrs_of(c.modifier),
+                link: 0,
             });
         }
     }

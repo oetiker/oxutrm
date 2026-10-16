@@ -1007,6 +1007,7 @@ impl ClientSession {
         }
         self.standby_wanted = s.standby;
         self.clipboard_on = s.clipboard;
+        self.renderer.set_hyperlinks(s.hyperlinks);
     }
 
     /// `Some(on)` when `network.standby` asks for something the standby is
@@ -2928,6 +2929,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_owned(),
         }
     }
@@ -3674,6 +3676,157 @@ mod tests {
             .await
         );
         assert_eq!(count(&out, b"\x1b]52;"), 0);
+    }
+
+    /// Every OSC 8 in `out`: `(params, uri)` of each `ESC ] 8 ; params ;
+    /// uri BEL`. Panics on one that is not terminated by BEL before the next
+    /// ESC, which is what a malformed sequence would look like.
+    fn osc8s(out: &[u8]) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut rest = out;
+        while let Some(at) = rest.windows(4).position(|w| w == b"\x1b]8;") {
+            let body = &rest[at + 4..];
+            let end = body
+                .iter()
+                .position(|&b| b == 0x07 || b == 0x1b)
+                .expect("an OSC 8 that never ends");
+            assert_eq!(body[end], 0x07, "an OSC 8 not ended by BEL");
+            let body = std::str::from_utf8(&body[..end]).expect("ASCII");
+            let (params, uri) = body.split_once(';').expect("params ; uri");
+            found.push((params.to_string(), uri.to_string()));
+            rest = &rest[at + 4 + end..];
+        }
+        found
+    }
+
+    /// The end-to-end promise over real QUIC: a link a remote program prints
+    /// reaches the local terminal as exactly one well-formed OSC 8 around
+    /// its text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_hyperlink_reaches_the_terminal_around_its_text() {
+        let (mut host, mut client) = pair(
+            "clear; printf '\\033]8;;https://example.org\\033\\\\link\\033]8;;\\033\\\\ plain\\n'\n",
+        )
+        .await;
+        let mut out = Vec::new();
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("link plain")
+            )
+            .await,
+            "the link never arrived: {:?}",
+            text(client.screen())
+        );
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            Duration::from_secs(2),
+            |h, c| c.screen().seq == h.screen().seq,
+        )
+        .await;
+
+        let opens: Vec<_> = osc8s(&out)
+            .into_iter()
+            .filter(|(_, uri)| !uri.is_empty())
+            .collect();
+        assert_eq!(
+            opens,
+            [("id=1".to_string(), "https://example.org".to_string())],
+            "exactly one open"
+        );
+        for (params, uri) in osc8s(&out) {
+            assert!(
+                (params.as_str(), uri.as_str()) == ("id=1", "https://example.org")
+                    || (params.is_empty() && uri.is_empty()),
+                "an OSC 8 that is neither the open nor a close"
+            );
+        }
+        // The open, the pen, the text, the close: nothing else in between.
+        let open = b"\x1b]8;id=1;https://example.org\x07";
+        let at = out
+            .windows(open.len())
+            .position(|w| w == open)
+            .expect("the open");
+        let after = &out[at + open.len()..];
+        let text_at = after.windows(4).position(|w| w == b"link").expect("text");
+        let between = &after[..text_at];
+        assert!(
+            between.is_empty()
+                || (between.starts_with(b"\x1b[")
+                    && between.ends_with(b"m")
+                    && count(between, b"\x1b") == 1),
+            "only an SGR between the open and the text: {:?}",
+            String::from_utf8_lossy(between)
+        );
+        assert!(
+            after[text_at + 4..].starts_with(b"\x1b]8;;\x07"),
+            "the close right after the text: {:?}",
+            String::from_utf8_lossy(&after[text_at..text_at + 16])
+        );
+        assert_eq!(client.screen().validate(), Ok(()));
+    }
+
+    /// A link whose URI the client could not write safely never reaches the
+    /// terminal; its text does. (A control byte cannot get this far: the
+    /// emulator ends the sequence at ESC and BEL and drops other C0 bytes
+    /// from it, so the units of I10 cover those.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hostile_link_never_reaches_the_terminal() {
+        let long = "a".repeat(3000);
+        let (mut host, mut client) = pair(&format!(
+            "printf '\\033]8;;http://b\\303\\274cher/\\033\\\\umlaut\\033]8;;\\033\\\\ \
+             \\033]8;;http://{long}\\033\\\\long\\033]8;;\\033\\\\ done\\n'\n"
+        ))
+        .await;
+        let mut out = Vec::new();
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("umlaut long done")
+            )
+            .await,
+            "the text never arrived: {:?}",
+            text(client.screen())
+        );
+        assert!(
+            osc8s(&out).iter().all(|(_, uri)| uri.is_empty()),
+            "a link was written: {:?}",
+            osc8s(&out)
+        );
+        assert!(client.screen().links.is_empty());
+    }
+
+    /// `terminal.hyperlinks = false`: the link still arrives in the state,
+    /// and no OSC 8 is written at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_is_not_written_with_the_setting_off() {
+        let (mut host, mut client) =
+            pair("printf '\\033]8;;https://example.org\\033\\\\link\\033]8;;\\033\\\\\\n'\n").await;
+        client.apply(&crate::config::Settings {
+            hyperlinks: false,
+            ..crate::config::Settings::default()
+        });
+        let mut out = Vec::new();
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| !c.screen().links.is_empty()
+            )
+            .await,
+            "the link never reached the state"
+        );
+        assert_eq!(count(&out, b"\x1b]8"), 0);
     }
 
     /// A lost datagram costs a pacing interval, not the copy.
@@ -11846,6 +11999,84 @@ mod tests {
             "the control: logs still holds the copy nobody took"
         );
         assert_eq!(count(&out, b"\x1b]52;"), 0, "a copy older than the client");
+    }
+
+    /// A sibling whose shell printed a link. Its preview carries no link,
+    /// neither an id in a cell nor a table, and painting it writes no OSC 8:
+    /// the ids are the sibling's, and would resolve against this session's
+    /// table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn previewing_a_sibling_that_printed_a_link_writes_no_osc_8() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let script = scripts.path().join("linking");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '\\033]8;;https://example.org\\033\\\\Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey\\033]8;;\\033\\\\\\r\\n$ '\nexec sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linking = crate::serve::Shell {
+            program: script.to_str().unwrap().to_string(),
+            start: oxutrm_term::Start::default(),
+            sibling: None,
+        };
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        let _logs = process(
+            dir.path(),
+            LOGS_ID,
+            Some("logs"),
+            Begin::Session { name: None },
+            linking,
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID, LOGS_ID]).await;
+        has_printed(build.client.sink.connection(), LOGS_ID).await;
+
+        let mut client = client_on(build.client, BUILD_ID);
+        let mut out = Vec::new();
+        type_in(&mut client, &[crate::ui::PREFIX]);
+        type_in(&mut client, b"s");
+        let a = client.take_ask().expect("the list asked for");
+        let conn = client.link.sink.connection().clone();
+        let list = crate::switcher::ask(conn, a, client.size, &client.net.clone()).await;
+        client.answered(list, Instant::now()).unwrap();
+        let rows = client.ui.selector().rows();
+        let at = |id: &str| rows.iter().position(|e| e.id == id_of(id)).unwrap();
+        let key: &[u8] = if at(LOGS_ID) > at(BUILD_ID) {
+            b"j"
+        } else {
+            b"k"
+        };
+        type_in(&mut client, key);
+
+        let mut slot = PreviewSlot::new();
+        client.preview_lap(Instant::now(), &mut slot);
+        let (id, shot) = tokio::time::timeout(Duration::from_secs(10), slot.rx.recv())
+            .await
+            .expect("the preview never came")
+            .expect("the slot closed");
+        let shown = shot.clone().expect("a screen");
+        assert!(
+            text(&shown).contains("Accepted publickey"),
+            "the control: the linked text is in the preview: {:?}",
+            text(&shown)
+        );
+        assert!(shown.links.is_empty(), "a preview carries no link table");
+        assert!(shown.cells.iter().all(|c| c.link == 0), "nor any cell's id");
+        client.previewed(&mut slot, id, shot, Instant::now());
+        client.turn(&[], &mut out).unwrap();
+        assert_eq!(count(&out, b"\x1b]8;id"), 0, "the preview wrote a link");
     }
 
     /// A preview request lives exactly as long as someone waits for it: an

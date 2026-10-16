@@ -87,6 +87,7 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGH
 /// |---|---|
 /// | `\x1b[?2026l` | an unfinished synchronized update — FIRST, so nothing after it is held back |
 /// | `\x1b[?1049l` | the alternate screen buffer — before the modes, so everything after it lands on the screen the user keeps |
+/// | `\x1b]8;;\x07` | an open OSC 8 hyperlink, so the prompt that follows is not part of it |
 /// | `\x1b[?1003l` | any-motion mouse tracking |
 /// | `\x1b[?1002l` | button-motion mouse tracking |
 /// | `\x1b[?1000l` | press/release mouse tracking |
@@ -108,6 +109,7 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGH
 /// emulator gives up waiting.
 pub const TERMINAL_RESTORE: &[u8] = b"\x1b[?2026l\
                                       \x1b[?1049l\
+                                      \x1b]8;;\x07\
                                       \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\
                                       \x1b[?2004l\
                                       \x1b[?25h\
@@ -734,6 +736,7 @@ mod tests {
         for (undoes, bytes) in [
             ("an unfinished synchronized update", &b"\x1b[?2026l"[..]),
             ("the alternate screen buffer", b"\x1b[?1049l"),
+            ("an open hyperlink", b"\x1b]8;;\x07"),
             ("any-motion mouse tracking", b"\x1b[?1003l"),
             ("button-motion mouse tracking", b"\x1b[?1002l"),
             ("press/release mouse tracking", b"\x1b[?1000l"),

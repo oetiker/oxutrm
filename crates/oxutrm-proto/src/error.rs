@@ -149,4 +149,28 @@ pub enum ApplyError {
         len: usize,
         max: usize,
     },
+
+    /// **I10.** The state holds more than [`MAX_LINKS`] hyperlinks, or a
+    /// diff carries more link changes than two full tables could need.
+    ///
+    /// [`MAX_LINKS`]: crate::types::MAX_LINKS
+    #[error("{len} links, over the maximum of {max}")]
+    TooManyLinks { len: usize, max: usize },
+
+    /// **I10.** Link id 0 means "no link" in a cell, so it is never a key of
+    /// the link table.
+    #[error("link id 0 is reserved for \"no link\"")]
+    LinkIdZero,
+
+    /// **I10.** A hyperlink URI is empty or holds a byte outside
+    /// `0x20..=0x7E`. The client writes the URI inside an OSC 8 between `;`
+    /// and BEL, so any other byte -- ESC, BEL, C1 in UTF-8 form -- could end
+    /// the sequence early and start a command stream of its own. `byte` is
+    /// `None` for an empty URI.
+    #[error("link {id} has a bad URI byte {byte:?}")]
+    BadLinkUri { id: u16, byte: Option<u8> },
+
+    /// **I10.** A cell points at a link id the state's table does not hold.
+    #[error("a cell refers to link {id}, which the state does not hold")]
+    UnknownLink { id: u16 },
 }

@@ -68,6 +68,9 @@ Durations are strings such as `"20s"`, `"1m"` or `"1m 30s"`.
   which may still ask or refuse by its own settings.
   Copies over 256 KiB are dropped.
   A remote program can never read the local clipboard.
+- `terminal.hyperlinks = true`: Show a remote program's hyperlinks (OSC 8) as links in the local terminal. A link with a URI longer than 2083 bytes or with characters other than printable ASCII, or past the 512th link on one screen, is shown as plain text.
+  `file://` links name the remote host and are passed on unchanged.
+  A link whose URI is longer than 2083 bytes or holds anything but printable ASCII is shown as plain text.
 
 Settings without a note take effect at once.
 The config screen (see **KEYS**) changes a setting for the running session and saves it to this file,

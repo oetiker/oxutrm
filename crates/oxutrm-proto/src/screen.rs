@@ -1,5 +1,8 @@
 //! The authoritative picture of a terminal, and the rules it must obey.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ApplyError, Cell, Clipboard};
@@ -76,6 +79,10 @@ pub struct ScreenState {
     /// The latest OSC 52 copy and how many there have been. See
     /// [`crate::clipboard`].
     pub clipboard: Clipboard,
+    /// The OSC 8 hyperlinks the cells refer to: link id to URI. Exactly the
+    /// ids some cell holds, on the host; at most [`crate::MAX_LINKS`] (**I10**).
+    /// See [`crate::link`].
+    pub links: BTreeMap<u16, Arc<str>>,
 }
 
 impl ScreenState {
@@ -106,6 +113,7 @@ impl ScreenState {
             bell: 0,
             scrollback_len: 0,
             clipboard: Clipboard::default(),
+            links: BTreeMap::new(),
         };
         state.validate()?;
         Ok(state)
@@ -149,8 +157,11 @@ impl ScreenState {
     /// program that hides its cursor keeps its header.
     ///
     /// Only the cells and the cursor are carried: the title, the modes, the
-    /// bell, the scrollback count and the clipboard are a session's, not a picture's, and
-    /// nothing that shows a window may act on them. A wide glyph whose right
+    /// bell, the scrollback count and the clipboard are a session's, not a
+    /// picture's, and nothing that shows a window may act on them. Links are
+    /// dropped too, every cell's and the table: a picture shown inside
+    /// another session's screen must not resolve its ids against that
+    /// session's table, and a preview is no place to click. A wide glyph whose right
     /// half falls outside the cut becomes a space in its own colours, as the
     /// renderer's `repair_wide_pairs` makes it: half a glyph is not a glyph.
     ///
@@ -173,7 +184,10 @@ impl ScreenState {
         let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
         for r in top..top + rows {
             let row = self.row(r);
-            cells.extend_from_slice(&row[..usize::from(cols)]);
+            cells.extend(row[..usize::from(cols)].iter().map(|c| Cell {
+                link: 0,
+                ..c.clone()
+            }));
             let cut_pair = cols > 0
                 && cols < self.cols
                 && row[usize::from(cols)]
@@ -207,12 +221,14 @@ impl ScreenState {
             bell: 0,
             scrollback_len: 0,
             clipboard: Clipboard::default(),
+            links: BTreeMap::new(),
         }
     }
 
     /// Check every invariant that one state can carry on its own: **I1**
     /// (exact length), **I2** (cursor in bounds), **I3** (sequence not the
-    /// sentinel) and **I8** (painted text is text, not control).
+    /// sentinel), **I8** (painted text is text, not control) and **I10**
+    /// (links are printable and exist).
     ///
     /// Called by every constructor, and by the sync layer after it applies a
     /// diff. A comment is not a constraint anyone checks; this is.
@@ -276,6 +292,15 @@ impl ScreenState {
         }
         crate::check_title(&self.title)?;
         crate::check_clipboard(&self.clipboard)?;
+
+        // I10. The table first, so a cell's id is only ever looked up in a
+        // table that is itself acceptable.
+        crate::check_links(&self.links)?;
+        for cell in &self.cells {
+            if cell.link != 0 && !self.links.contains_key(&cell.link) {
+                return Err(ApplyError::UnknownLink { id: cell.link });
+            }
+        }
 
         Ok(())
     }
@@ -469,6 +494,49 @@ mod tests {
     }
 
     #[test]
+    fn a_window_carries_no_links() {
+        let mut s = shell(30);
+        s.links.insert(1, "https://example.org/".into());
+        let prompt = usize::from(30u16) * 120;
+        for cell in &mut s.cells[prompt..prompt + 8] {
+            cell.link = 1;
+        }
+        s.validate().unwrap();
+        let w = s.window(PANE);
+        assert!(w.links.is_empty(), "no table");
+        assert!(w.cells.iter().all(|c| c.link == 0), "no cell keeps an id");
+        assert!(line(&w, 12).starts_with("oetiker@"), "the text stays");
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn a_cell_whose_link_is_not_in_the_table_is_refused() {
+        let mut s = ScreenState::blank(2, 4).unwrap();
+        s.cells[5].link = 3;
+        assert_eq!(s.validate(), Err(ApplyError::UnknownLink { id: 3 }));
+        s.links.insert(3, "http://a".into());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_state_with_a_bad_link_table_is_refused() {
+        let mut s = ScreenState::blank(2, 4).unwrap();
+        s.links.insert(0, "http://a".into());
+        assert_eq!(s.validate(), Err(ApplyError::LinkIdZero));
+        let mut s = ScreenState::blank(2, 4).unwrap();
+        s.links.insert(1, "http://a\x1b\\".into());
+        assert!(matches!(
+            s.validate(),
+            Err(ApplyError::BadLinkUri { id: 1, .. })
+        ));
+        let mut s = ScreenState::blank(2, 4).unwrap();
+        for k in 1..=crate::MAX_LINKS as u16 + 1 {
+            s.links.insert(k, "http://a".into());
+        }
+        assert!(matches!(s.validate(), Err(ApplyError::TooManyLinks { .. })));
+    }
+
+    #[test]
     fn a_wide_glyph_cut_in_half_becomes_a_space_in_its_colours() {
         let mut s = ScreenState::blank(4, 80).unwrap();
         // "構築" from column 66: its second glyph straddles the cut at 68.
@@ -479,12 +547,14 @@ mod tests {
                 fg: Color::Idx(2),
                 bg: Color::Rgb(0, 0, 64),
                 attrs: Attrs::BOLD,
+                link: 0,
             };
             s.cells[at + 1] = Cell {
                 text: CellText::const_new(""),
                 fg: Color::Idx(2),
                 bg: Color::Rgb(0, 0, 64),
                 attrs: Attrs::WIDE_CONT,
+                link: 0,
             };
         }
         // Column 67 is the first glyph's right half: inside, kept whole.

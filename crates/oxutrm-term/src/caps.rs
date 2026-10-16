@@ -38,6 +38,7 @@ fn caps_from(term: &str, colorterm: &str) -> TerminalCaps {
         bracketed_paste: term != "dumb",
         mouse_sgr: term != "dumb",
         osc52: term != "dumb",
+        osc8: term != "dumb",
         term_name: term.to_owned(),
     }
 }
@@ -105,6 +106,7 @@ mod tests {
         assert!(!caps.bracketed_paste);
         assert!(!caps.mouse_sgr);
         assert!(!caps.osc52);
+        assert!(!caps.osc8, "a dumb terminal is sent no hyperlinks");
     }
 
     #[test]
@@ -114,7 +116,7 @@ mod tests {
         // breaking. Assuming them is safer than assuming their absence.
         let caps = caps_from("screen", "");
         assert_eq!(caps.colors, 16);
-        assert!(caps.bracketed_paste && caps.mouse_sgr && caps.osc52);
+        assert!(caps.bracketed_paste && caps.mouse_sgr && caps.osc52 && caps.osc8);
     }
 
     #[test]

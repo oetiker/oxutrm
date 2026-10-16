@@ -15,6 +15,10 @@
   reconnect. The `terminal.clipboard` setting turns it off; a remote program
   can never read the local clipboard.
 
+- Hyperlinks printed by remote programs (`ls --hyperlink`, compiler
+  messages, OSC 8) are now clickable in terminals that support them. The
+  `terminal.hyperlinks` setting turns them off.
+
 ### Changed
 - **Host sessions started by an older oxutrm cannot be reached by this
   one.** This release changes the protocol version: the client refuses

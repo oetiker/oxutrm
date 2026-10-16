@@ -283,6 +283,7 @@ mod tests {
             fg: Color::Rgb(255, 255, 255),
             bg: Color::Rgb(255, 255, 255),
             attrs: Attrs::all(),
+            link: 0,
         });
         s.validate().unwrap();
         let line = encode_line(&Reply::Preview(s)).unwrap();

@@ -265,6 +265,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_string(),
         }
     }
@@ -484,7 +485,7 @@ mod tests {
                 r#"{{"t":"ClientHello","proto":99,"cert_spki_sha256":"{}","#,
                 r#""candidates":[],"nat_type":"Unknown","#,
                 r#""caps":{{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
-                r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"}},"#,
+                r#""mouse_sgr":false,"osc52":false,"osc8":false,"term_name":"xterm"}},"#,
                 r#""size":{{"cols":80,"rows":24}}}}"#,
                 "\n"
             ),
@@ -630,7 +631,7 @@ mod tests {
         s.push_str(concat!(
             r#","candidates":[],"nat_type":"Unknown","#,
             r#""caps":{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
-            r#""mouse_sgr":false,"osc52":false,"term_name":"xterm"},"#,
+            r#""mouse_sgr":false,"osc52":false,"osc8":false,"term_name":"xterm"},"#,
             r#""size":{"cols":80,"rows":24}}"#,
         ));
         s.push('\n');

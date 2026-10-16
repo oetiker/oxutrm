@@ -49,6 +49,7 @@ mod caps;
 mod exit_wake;
 mod grid;
 mod host;
+mod links;
 mod listener;
 mod marks;
 mod osc_guard;

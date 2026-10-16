@@ -1,4 +1,4 @@
-//! The eight `ScreenState` invariants, each proved by its **rejection**.
+//! The `ScreenState` invariants I1 to I10, each proved by its **rejection**.
 //!
 //! An invariant that is only documented is not an invariant. Every test here
 //! builds a state that breaks one rule and asserts the exact error, because a
@@ -7,8 +7,8 @@
 
 use oxutrm_proto::{
     ApplyError, Attrs, Cell, CellText, Clipboard, ClipboardCopy, ClipboardTarget, Color, Cursor,
-    CursorShape, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, Modes,
-    MouseMode, ScreenState, TermSize, TextField,
+    CursorShape, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI, MAX_LINKS, MAX_SCREEN_CELLS,
+    MAX_SCREEN_DIM, MAX_TITLE, Modes, MouseMode, ScreenState, TermSize, TextField,
 };
 
 /// A valid 3x4 state, for tests that then break exactly one thing about it.
@@ -209,6 +209,7 @@ fn i4_the_struct_has_no_icon_field() {
         bell: 0,
         scrollback_len: 0,
         clipboard: Clipboard::default(),
+        links: Default::default(),
     };
     assert_eq!(s.validate(), Ok(()));
 }
@@ -866,7 +867,9 @@ fn a_screen_state_survives_a_postcard_round_trip() {
         fg: Color::Rgb(1, 2, 3),
         bg: Color::Idx(42),
         attrs: Attrs::BOLD | Attrs::WIDE_CONT,
+        link: 7,
     };
+    s.links.insert(7, "https://example.org/".into());
     s.modes = Modes {
         alt_screen: true,
         mouse: MouseMode::AnyMotion,
@@ -935,4 +938,115 @@ fn i9_a_delivered_copy_may_lose_its_text_but_not_its_serial() {
     after.seq = 2;
     after.clipboard = before.clipboard.without_text();
     assert_eq!(after.validate_transition(&before), Ok(()));
+}
+
+// ---------------------------------------------------------------- I10
+
+/// A valid state with `uri` as link `id` on the first cell.
+fn with_link(id: u16, uri: &str) -> ScreenState {
+    let mut s = good();
+    s.links.insert(id, uri.into());
+    s.cells[0].link = id;
+    s
+}
+
+#[test]
+fn i10_an_ordinary_link_is_valid() {
+    assert_eq!(
+        with_link(1, "https://example.org/a?b=c#d").validate(),
+        Ok(())
+    );
+}
+
+#[test]
+fn i10_a_cell_whose_link_is_not_in_the_table_is_rejected() {
+    let mut s = with_link(1, "http://a");
+    s.cells[1].link = 2;
+    assert_eq!(s.validate(), Err(ApplyError::UnknownLink { id: 2 }));
+}
+
+#[test]
+fn i10_a_table_entry_no_cell_holds_is_allowed() {
+    let mut s = with_link(1, "http://a");
+    s.cells[0].link = 0;
+    assert_eq!(s.validate(), Ok(()));
+}
+
+#[test]
+fn i10_link_id_zero_is_never_a_key() {
+    let mut s = good();
+    s.links.insert(0, "http://a".into());
+    assert_eq!(s.validate(), Err(ApplyError::LinkIdZero));
+}
+
+#[test]
+fn i10_a_uri_that_can_close_the_renderer_s_osc_is_rejected() {
+    for (uri, byte) in [
+        ("http://a/\x07\x1b]52;c;AAAA\x07", 0x07),
+        ("http://a/\x1b\\", 0x1b),
+        ("http://a/\x7f", 0x7f),
+        ("http://\u{e4}/", 0xc3),
+    ] {
+        assert_eq!(
+            with_link(3, uri).validate(),
+            Err(ApplyError::BadLinkUri {
+                id: 3,
+                byte: Some(byte)
+            }),
+            "{uri:?}"
+        );
+    }
+}
+
+#[test]
+fn i10_an_empty_uri_is_rejected() {
+    assert_eq!(
+        with_link(3, "").validate(),
+        Err(ApplyError::BadLinkUri { id: 3, byte: None })
+    );
+}
+
+#[test]
+fn i10_an_over_long_uri_is_rejected_and_the_longest_fits() {
+    let longest = "a".repeat(MAX_LINK_URI);
+    assert_eq!(with_link(1, &longest).validate(), Ok(()));
+    let over = "a".repeat(MAX_LINK_URI + 1);
+    assert_eq!(
+        with_link(1, &over).validate(),
+        Err(ApplyError::TextTooLong {
+            field: TextField::LinkUri,
+            len: MAX_LINK_URI + 1,
+            max: MAX_LINK_URI
+        })
+    );
+}
+
+#[test]
+fn i10_the_table_is_capped() {
+    let mut s = good();
+    for id in 1..=MAX_LINKS as u16 {
+        s.links.insert(id, "http://a".into());
+    }
+    assert_eq!(s.validate(), Ok(()), "MAX_LINKS entries fit");
+    s.links.insert(MAX_LINKS as u16 + 1, "http://a".into());
+    assert_eq!(
+        s.validate(),
+        Err(ApplyError::TooManyLinks {
+            len: MAX_LINKS + 1,
+            max: MAX_LINKS
+        })
+    );
+}
+
+/// I10 rides `validate`, so it is on the transition path the receiver takes.
+#[test]
+fn i10_reaches_the_transition_check_as_well() {
+    let before = with_link(1, "http://a");
+    let mut after = before.clone();
+    after.seq = 2;
+    after.links.remove(&1);
+    assert_eq!(
+        after.validate_transition(&before),
+        Err(ApplyError::UnknownLink { id: 1 })
+    );
 }

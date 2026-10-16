@@ -27,7 +27,7 @@
 //!
 //! # The screen invariants
 //!
-//! [`ScreenState`] carries eight rules that are **enforced rather than
+//! [`ScreenState`] carries ten rules that are **enforced rather than
 //! documented**:
 //!
 //! | | Rule | Enforced by |
@@ -40,6 +40,8 @@
 //! | I6 | `scrollback_len` never shrinks | [`ScreenState::validate_transition`] |
 //! | I7 | the screen fits inside the cell and side caps | [`TermSize::check_bounds`] |
 //! | I8 | painted text is text, not control, and bounded | [`text::check_cell_text`] |
+//! | I9 | the clipboard serial never goes backwards | [`ScreenState::validate_transition`] |
+//! | I10 | a link URI is printable ASCII and bounded, and every cell's link exists | [`link::check_links`], [`ScreenState::validate`] |
 //!
 //! I1 to I3 are properties of one state, so [`ScreenState::validate`] can see
 //! them and every constructor calls it. I5 and I6 are properties of a
@@ -95,6 +97,7 @@ pub mod error;
 pub mod frame;
 pub mod ids;
 pub mod keymat;
+pub mod link;
 pub mod name;
 pub mod open;
 pub mod screen;
@@ -109,6 +112,7 @@ pub use error::ApplyError;
 pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
 pub use keymat::{ClientSpki, HostSpki, Psk, SpkiSha256, WIRE_KEY_B64_LEN, WIRE_KEY_LEN};
+pub use link::{check_link_uri, check_links};
 pub use name::{MAX_NAME, Name};
 pub use open::{
     Answer, Attached, OfferEntry, Open, PREVIEW_MAX, Reply, Request, Role, SessionEntry,
@@ -119,8 +123,9 @@ pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
-    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_SCREEN_CELLS, MAX_SCREEN_DIM,
-    MAX_TITLE, NatType, PathDescription, Rung, TermSize, TerminalCaps, TextField,
+    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI, MAX_LINKS,
+    MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType, PathDescription, Rung, TermSize,
+    TerminalCaps, TextField,
 };
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,
@@ -145,7 +150,11 @@ pub use types::{
 ///
 /// **5**: `ScreenState` and its diff gained `clipboard` (OSC 52 copy). No
 /// compatibility with 4.
-pub const PROTO_VERSION: u32 = 5;
+///
+/// **6**: `Cell` gained `link`, `ScreenState` and its diff gained the link
+/// table (OSC 8 hyperlinks), and `TerminalCaps` gained `osc8`. No
+/// compatibility with 5.
+pub const PROTO_VERSION: u32 = 6;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";

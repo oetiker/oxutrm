@@ -22,6 +22,7 @@ The config screen (`c` in the status popup) changes a setting for the running se
 | `network.port_mapping` | `true` | true or false | next rebuild attempt or standby search | ask the router for a port mapping (UPnP / NAT-PMP / PCP) |
 | `network.birthday` | `true` | true or false | next rebuild attempt or standby search | the birthday-paradox NAT punch, at both ends |
 | `terminal.clipboard` | `true` | true or false | now | let remote programs copy to the local clipboard (OSC 52) |
+| `terminal.hyperlinks` | `true` | true or false | now | show remote hyperlinks as links (OSC 8) |
 
 **`popup.key`** -- ctrl-h, ctrl-i, ctrl-j and ctrl-m are refused: they are Backspace, Tab, line feed and Enter. `off` leaves the popup reachable only by opening by itself during an outage, and the config screen with it; `off` together with `popup.auto_open_after = "off"` is refused.
 
@@ -38,6 +39,8 @@ The config screen (`c` in the status popup) changes a setting for the running se
 **`network.birthday`** -- `false` asks the host not to blast either; a host older than this client ignores the request, so only this side's half stops. Behind a symmetric NAT the blast is the last rung that can work: there, `false` means a connect that cannot punch through fails.
 
 **`terminal.clipboard`** -- A copy reaches the local terminal, which may still ask or refuse by its own settings. Copies over 256 KiB are dropped. A remote program can never read the local clipboard.
+
+**`terminal.hyperlinks`** -- A link reaches the local terminal unchanged, `file://` links included: those name the remote host, and the local terminal decides what to do with them. A link with a URI longer than 2083 bytes or with characters other than printable ASCII, or past the 512th link on one screen, is shown as plain text. Turn this off for a terminal that prints OSC 8 instead of ignoring it.
 
 ## Example
 
