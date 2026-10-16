@@ -115,6 +115,18 @@ impl HostTerm {
         })
     }
 
+    /// Count on from `prior`'s bell and scrollback rather than from zero.
+    ///
+    /// For a shell that replaces another on the same link: both counters are
+    /// monotonic across every state the client has applied (I5, I6), not
+    /// just across this shell's, and a client handed a lower number refuses
+    /// the frame. Lines below `prior`'s count are not in this shell's
+    /// history, and [`HostTerm::scrollback`] returns nothing for them.
+    pub fn count_on_from(&mut self, prior: &ScreenState) {
+        self.bell = self.bell.max(prior.bell);
+        self.scrollback_len = self.scrollback_len.max(prior.scrollback_len);
+    }
+
     /// Write user input to the PTY.
     pub fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.pty.write_input(bytes)

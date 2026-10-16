@@ -22,6 +22,10 @@
   before connecting with this release.
 
 ### Fixed
+- **Killing the session you were in from the session selector no longer
+  freezes the screen.** If that shell had ever rung the bell or scrolled text
+  off the top, the client stayed on its last picture instead of showing the
+  blank lobby, and a new session started from there stayed frozen too.
 
 ## 0.3.0 - 2026-10-15
 ### New
