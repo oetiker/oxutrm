@@ -36,6 +36,7 @@ mod link;
 mod linkstate;
 mod listener;
 mod loopback;
+mod preview;
 mod quality;
 mod rebuild;
 mod roam;

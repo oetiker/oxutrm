@@ -182,6 +182,9 @@ rustix = { workspace = true, features = ["event", "pty", "time"] }
 quinn.workspace = true
 jiff.workspace = true
 toml_edit.workspace = true
+# src/preview.rs measures a received preview's cells: one wider than a
+# wide glyph would push the selector's border out.
+unicode-width.workspace = true
 
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]`, which src/accept.rs

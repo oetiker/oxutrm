@@ -498,6 +498,8 @@ pub(crate) struct SessionsFacts<'a> {
     /// `now` on the wall clock, which decides what "today" is.
     pub(crate) wall: SystemTime,
     pub(crate) zone: &'a TimeZone,
+    /// What the preview pane shows; `None` leaves it out.
+    pub(crate) preview: Option<oxutrm_client::PreviewPane>,
 }
 
 /// The session selector: a row per session -- name, shell, start, size,
@@ -563,6 +565,7 @@ pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
         question: sel.question().is_some(),
         keys: sessions_keys(sel, f.lobby, f.phase == Phase::Live),
         small: format!("oxutrm sessions \u{b7} {selected}"),
+        preview: f.preview.clone(),
     }
 }
 
@@ -2316,6 +2319,7 @@ mod tests {
             now: t,
             wall: wall(),
             zone: &UTC,
+            preview: None,
         }
     }
 

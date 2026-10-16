@@ -671,6 +671,166 @@ mod tests {
         );
     }
 
+    fn shot(a: Answer) -> oxutrm_proto::ScreenState {
+        match a {
+            Answer::Reply(Reply::Preview(s)) => s,
+            other => panic!("not a preview: {other:?}"),
+        }
+    }
+
+    fn text_of(s: &oxutrm_proto::ScreenState) -> String {
+        s.cells.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// A shell that prints a C1 CSI, an OSC 52 clipboard write and then a
+    /// line and a prompt, and sleeps -- as a script in `dir`.
+    fn hostile_shell(dir: &std::path::Path) -> Shell {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("hostile");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '\\302\\23331m\\033]52;c;aGk=\\007tail -f /var/log/syslog\\r\\n$ '\nexec sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Shell {
+            program: script.to_str().unwrap().to_string(),
+            start: oxutrm_term::Start::default(),
+            sibling: None,
+        }
+    }
+
+    /// Ask `conn` for a preview of `of` until its screen says `marker`.
+    async fn preview_saying(
+        conn: &quinn::Connection,
+        of: &str,
+        marker: &str,
+    ) -> oxutrm_proto::ScreenState {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let s = shot(ask_over(conn, Request::Preview { id: id(of) }).await);
+            if text_of(&s).contains(marker) {
+                return s;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the preview never said {marker:?}: {:?}",
+                text_of(&s).trim_end()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_siblings_preview_shows_its_screen_and_nothing_it_printed_is_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
+        let _logs = process(
+            dir.path(),
+            LOGS,
+            Some("logs"),
+            Begin::Session { name: None },
+            hostile_shell(scripts.path()),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD, LOGS]).await;
+        let sock = oxutrm_host::Registry::socket_path_in(dir.path(), LOGS);
+        let before = entry(crate::door::fixtures::ask(&sock, Request::Myself).await);
+
+        let s = preview_saying(me.client.sink.connection(), LOGS, "tail -f /var/log/syslog").await;
+        s.validate().unwrap();
+        assert!(
+            s.cols <= oxutrm_proto::PREVIEW_MAX.cols && s.rows <= oxutrm_proto::PREVIEW_MAX.rows
+        );
+        assert!(
+            s.cells
+                .iter()
+                .all(|c| !c.text.chars().any(oxutrm_proto::is_control_scalar)),
+            "a control scalar reached a cell"
+        );
+        // The OSC 52 was consumed by the emulator: none of it is text.
+        assert!(
+            !text_of(&s).contains("52;c;"),
+            "{:?}",
+            text_of(&s).trim_end()
+        );
+        assert_eq!(s.title, "");
+
+        // Looking changed nothing the sibling says about itself.
+        let after = entry(crate::door::fixtures::ask(&sock, Request::Myself).await);
+        assert_eq!(after.attached, before.attached);
+        assert_eq!(after.size, before.size);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn this_sessions_own_preview_comes_over_its_control_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let me = process(
+            dir.path(),
+            BUILD,
+            None,
+            Begin::Session { name: None },
+            hostile_shell(scripts.path()),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD]).await;
+        let s = preview_saying(
+            me.client.sink.connection(),
+            BUILD,
+            "tail -f /var/log/syslog",
+        )
+        .await;
+        assert_eq!(s.cursor.row, 1, "the window ends on the prompt's row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_previews_a_sibling_and_has_none_of_its_own() {
+        const LOBBY: &str = "5d2e8a7c1b9f40e3a6c8d1f2b3e4a5c6";
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let _logs = process(
+            dir.path(),
+            LOGS,
+            Some("logs"),
+            Begin::Session { name: None },
+            hostile_shell(scripts.path()),
+        )
+        .await;
+        let lobby = process(dir.path(), LOBBY, None, Begin::Lobby, sh()).await;
+        registry_holds(dir.path(), &[LOGS]).await;
+        preview_saying(
+            lobby.client.sink.connection(),
+            LOGS,
+            "tail -f /var/log/syslog",
+        )
+        .await;
+        let why = refused(
+            ask_over(
+                lobby.client.sink.connection(),
+                Request::Preview { id: id(LOBBY) },
+            )
+            .await,
+        );
+        assert_eq!(why, "this session has no shell");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_preview_of_a_session_that_is_not_there_is_refused_with_its_short_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = process(dir.path(), BUILD, None, Begin::Session { name: None }, sh()).await;
+        registry_holds(dir.path(), &[BUILD]).await;
+        let why = refused(
+            ask_over(
+                me.client.sink.connection(),
+                Request::Preview { id: id(LOGS) },
+            )
+            .await,
+        );
+        assert!(why.contains("a3f9c01e"), "{why}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rename_here_and_on_a_sibling_and_a_taken_name_is_refused() {
         let dir = tempfile::tempdir().unwrap();

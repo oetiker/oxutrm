@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use oxutrm_proto::{Frame, ScreenState, TermSize};
+use oxutrm_proto::{Frame, PREVIEW_MAX, ScreenState, TermSize};
 use oxutrm_sync::{InputState, Receiver};
 use oxutrm_term::HostTerm;
 
@@ -104,6 +104,11 @@ pub(crate) enum LoopCmd {
         end: bool,
         reply: tokio::sync::oneshot::Sender<Result<i32, String>>,
         written: tokio::sync::oneshot::Receiver<()>,
+    },
+    /// Reply with a window of the screen for a preview ([`HostSession::preview`]),
+    /// or why there is none.
+    Preview {
+        reply: tokio::sync::oneshot::Sender<Result<ScreenState, String>>,
     },
 }
 
@@ -763,6 +768,9 @@ impl HostSession {
                         }
                     }
                 }
+                HostWake::Cmd(LoopCmd::Preview { reply }) => {
+                    let _ = reply.send(self.preview());
+                }
                 HostWake::Cmd(LoopCmd::Kill {
                     end,
                     reply,
@@ -782,6 +790,18 @@ impl HostSession {
                     }
                 },
             }
+        }
+    }
+
+    /// The screen as a preview shows it (preview spec §3.6): a fresh
+    /// snapshot of the emulator, cut by `ScreenState::window`. `&self`, so
+    /// nothing the attached client is sent -- the sender's state, the
+    /// stale flag, the presence -- can move for it. A detached session's
+    /// emulator is fed all the same, so the picture is current either way.
+    pub(crate) fn preview(&self) -> Result<ScreenState, String> {
+        match self.term.as_ref() {
+            Some(term) => Ok(term.snapshot(1).window(PREVIEW_MAX)),
+            None => Err("this session has no shell".to_string()),
         }
     }
 
@@ -1440,6 +1460,69 @@ mod tests {
         assert!(
             client.screen().cells.iter().all(|c| c.text.as_str() == " "),
             "a lobby's screen is blank"
+        );
+    }
+
+    /// A "shell" that prints `text` and then sleeps, as a script file.
+    fn printing_shell(dir: &std::path::Path, text: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("printer");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '{text}'\nexec sleep 300\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_preview_is_a_window_of_the_shells_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = printing_shell(dir.path(), "make: building oxutrm-term\\r\\n$ ");
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            &shell,
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let shot = loop {
+            host.turn().unwrap();
+            let shot = host.preview().unwrap();
+            let text: String = shot.cells.iter().map(|c| c.text.as_str()).collect();
+            if text.contains("make: building oxutrm-term") {
+                break shot;
+            }
+            assert!(Instant::now() < deadline, "the shell's output never showed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // A 120x40 screen, cut to the preview's largest, ending at the
+        // cursor: the prompt's row.
+        assert_eq!((shot.cols, shot.rows), (PREVIEW_MAX.cols, PREVIEW_MAX.rows));
+        assert_eq!(shot.cursor.row, 1);
+        assert_eq!(shot.title, "");
+        shot.validate().unwrap();
+        host.close(0);
+    }
+
+    #[tokio::test]
+    async fn a_lobby_has_no_preview() {
+        let (host_link, _client) = link_pair().await;
+        let lobby = HostSession::lobby(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        assert_eq!(
+            lobby.preview(),
+            Err("this session has no shell".to_string())
         );
     }
 

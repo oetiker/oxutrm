@@ -138,6 +138,73 @@ impl ScreenState {
         &self.cells[start..start + width]
     }
 
+    /// At most `max` of this screen, cut the way the session preview shows
+    /// it (preview spec §3.2): the leftmost columns, and the rows ending at
+    /// the cursor's row while the cursor is visible -- in a shell, the prompt
+    /// and the output above it -- else the top rows, where a full-screen
+    /// program that hides its cursor keeps its header.
+    ///
+    /// Only the cells and the cursor are carried: the title, the modes, the
+    /// bell and the scrollback count are a session's, not a picture's, and
+    /// nothing that shows a window may act on them. A wide glyph whose right
+    /// half falls outside the cut becomes a space in its own colours, as the
+    /// renderer's `repair_wide_pairs` makes it: half a glyph is not a glyph.
+    ///
+    /// The window of a state that validates validates.
+    #[must_use]
+    pub fn window(&self, max: crate::TermSize) -> ScreenState {
+        let rows = self.rows.min(max.rows);
+        let cols = self.cols.min(max.cols);
+        let top = if self.cursor.visible {
+            // Saturating: a screen with no cells is exempt from I2, so its
+            // cursor can sit at u16::MAX and still validate.
+            self.cursor
+                .row
+                .saturating_add(1)
+                .saturating_sub(rows)
+                .min(self.rows - rows)
+        } else {
+            0
+        };
+        let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+        for r in top..top + rows {
+            let row = self.row(r);
+            cells.extend_from_slice(&row[..usize::from(cols)]);
+            let cut_pair = cols > 0
+                && cols < self.cols
+                && row[usize::from(cols)]
+                    .attrs
+                    .contains(crate::Attrs::WIDE_CONT);
+            if cut_pair && let Some(last) = cells.last_mut() {
+                last.text = crate::CellText::const_new(" ");
+                last.attrs = crate::Attrs::empty();
+            }
+        }
+        let (row, col) = if rows == 0 || cols == 0 {
+            (0, 0)
+        } else {
+            (
+                self.cursor.row.saturating_sub(top).min(rows - 1),
+                self.cursor.col.min(cols - 1),
+            )
+        };
+        ScreenState {
+            seq: 1,
+            rows,
+            cols,
+            cells,
+            cursor: Cursor {
+                row,
+                col,
+                ..self.cursor
+            },
+            modes: Modes::default(),
+            title: String::new(),
+            bell: 0,
+            scrollback_len: 0,
+        }
+    }
+
     /// Check every invariant that one state can carry on its own: **I1**
     /// (exact length), **I2** (cursor in bounds), **I3** (sequence not the
     /// sentinel) and **I8** (painted text is text, not control).
@@ -248,5 +315,195 @@ impl ScreenState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Attrs, CellText, Color, TermSize};
+
+    const PANE: TermSize = TermSize { cols: 68, rows: 13 };
+
+    /// A 120x40 shell: a log line on every row, the prompt on `prompt`.
+    fn shell(prompt: u16) -> ScreenState {
+        let mut s = ScreenState::blank(40, 120).unwrap();
+        for r in 0..40 {
+            let text = if r == prompt {
+                "oetiker@thinlinc:~$ journalctl -f -u ssh".to_string()
+            } else {
+                format!("Oct 16 11:41:{r:02} thinlinc sshd[4121]: Accepted publickey for oetiker")
+            };
+            put(&mut s, r, 0, &text);
+        }
+        s.cursor.row = prompt;
+        s.cursor.col = 41;
+        s
+    }
+
+    fn put(s: &mut ScreenState, row: u16, col: u16, text: &str) {
+        let cols = usize::from(s.cols);
+        for (i, ch) in text.chars().enumerate() {
+            let at = usize::from(row) * cols + usize::from(col) + i;
+            s.cells[at].text = CellText::new(ch.to_string());
+        }
+    }
+
+    fn line(s: &ScreenState, row: u16) -> String {
+        s.row(row)
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn the_window_ends_on_the_cursors_row() {
+        let w = shell(30).window(PANE);
+        assert_eq!((w.rows, w.cols), (13, 68));
+        assert!(
+            line(&w, 12).starts_with("oetiker@thinlinc:~$"),
+            "{}",
+            line(&w, 12)
+        );
+        assert!(
+            line(&w, 0).starts_with("Oct 16 11:41:18"),
+            "{}",
+            line(&w, 0)
+        );
+        assert_eq!((w.cursor.row, w.cursor.col), (12, 41));
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn a_cursor_near_the_top_keeps_the_top_rows() {
+        let w = shell(3).window(PANE);
+        assert!(
+            line(&w, 0).starts_with("Oct 16 11:41:00"),
+            "{}",
+            line(&w, 0)
+        );
+        assert_eq!(w.cursor.row, 3);
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn a_cursor_on_the_last_row_shows_the_bottom() {
+        let w = shell(39).window(PANE);
+        assert!(line(&w, 12).starts_with("oetiker@thinlinc:~$"));
+        assert!(
+            line(&w, 0).starts_with("Oct 16 11:41:27"),
+            "{}",
+            line(&w, 0)
+        );
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn a_hidden_cursor_shows_the_top() {
+        let mut s = shell(30);
+        s.cursor.visible = false;
+        let w = s.window(PANE);
+        assert!(
+            line(&w, 0).starts_with("Oct 16 11:41:00"),
+            "{}",
+            line(&w, 0)
+        );
+        assert!(!w.cursor.visible);
+        assert_eq!(
+            w.cursor.row, 12,
+            "a hidden cursor is clamped into the window"
+        );
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn a_screen_smaller_than_the_window_is_copied_whole() {
+        let mut s = ScreenState::blank(10, 40).unwrap();
+        put(&mut s, 9, 0, "$ make check");
+        s.cursor.row = 9;
+        s.cursor.col = 12;
+        let w = s.window(PANE);
+        assert_eq!((w.rows, w.cols), (10, 40));
+        assert_eq!(w.cells, s.cells);
+        assert_eq!((w.cursor.row, w.cursor.col), (9, 12));
+    }
+
+    #[test]
+    fn only_the_cells_and_the_cursor_are_carried() {
+        let mut s = shell(30);
+        s.title = "vim notes.md".to_string();
+        s.bell = 4;
+        s.scrollback_len = 900;
+        s.seq = 77;
+        s.modes.alt_screen = true;
+        s.modes.bracketed_paste = true;
+        let w = s.window(PANE);
+        assert_eq!(w.title, "");
+        assert_eq!((w.seq, w.bell, w.scrollback_len), (1, 0, 0));
+        assert_eq!(w.modes, Modes::default());
+    }
+
+    #[test]
+    fn a_wide_glyph_cut_in_half_becomes_a_space_in_its_colours() {
+        let mut s = ScreenState::blank(4, 80).unwrap();
+        // "構築" from column 66: its second glyph straddles the cut at 68.
+        for (col, glyph) in [(66u16, "構"), (68, "築")] {
+            let at = usize::from(col);
+            s.cells[at] = Cell {
+                text: CellText::new(glyph),
+                fg: Color::Idx(2),
+                bg: Color::Rgb(0, 0, 64),
+                attrs: Attrs::BOLD,
+            };
+            s.cells[at + 1] = Cell {
+                text: CellText::const_new(""),
+                fg: Color::Idx(2),
+                bg: Color::Rgb(0, 0, 64),
+                attrs: Attrs::WIDE_CONT,
+            };
+        }
+        // Column 67 is the first glyph's right half: inside, kept whole.
+        let w = s.window(TermSize { cols: 67, rows: 4 });
+        assert_eq!(
+            w.cell(0, 66).text.as_str(),
+            " ",
+            "a lead cut from its right half"
+        );
+        assert_eq!(w.cell(0, 66).bg, Color::Rgb(0, 0, 64));
+        assert_eq!(w.cell(0, 66).attrs, Attrs::empty());
+        let w = s.window(TermSize { cols: 68, rows: 4 });
+        assert_eq!(w.cell(0, 66).text.as_str(), "構", "a whole pair is kept");
+        assert!(w.cell(0, 67).attrs.contains(Attrs::WIDE_CONT));
+        w.validate().unwrap();
+    }
+
+    #[test]
+    fn an_empty_screen_or_window_is_empty_and_valid() {
+        let s = ScreenState::blank(0, 0).unwrap();
+        let w = s.window(PANE);
+        assert_eq!((w.rows, w.cols, w.cells.len()), (0, 0, 0));
+        w.validate().unwrap();
+        let w = shell(30).window(TermSize { cols: 0, rows: 0 });
+        assert_eq!((w.rows, w.cols, w.cursor.row, w.cursor.col), (0, 0, 0, 0));
+        w.validate().unwrap();
+    }
+
+    /// A screen with no cells is exempt from the cursor bound (I2), so a
+    /// peer can send one with its cursor anywhere at all: the window of it
+    /// is still empty and valid.
+    #[test]
+    fn a_screen_with_no_cells_and_its_cursor_at_the_end_has_an_empty_window() {
+        for (rows, cols) in [(0, 0), (0, 80), (24, 0)] {
+            let mut s = ScreenState::blank(rows, cols).unwrap();
+            s.cursor.row = u16::MAX;
+            s.cursor.col = u16::MAX;
+            s.cursor.visible = true;
+            s.validate().unwrap();
+            let w = s.window(PANE);
+            assert_eq!(w.cells.len(), 0, "{rows}x{cols}");
+            w.validate().unwrap();
+        }
     }
 }

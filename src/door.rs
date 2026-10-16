@@ -29,8 +29,8 @@ use oxutrm_host::registry::{Registry, RegistryGuard, SessionMeta};
 use oxutrm_host::signalling::{read_answer_async, read_line_async, write_line_async};
 use oxutrm_net::NetConfig;
 use oxutrm_proto::{
-    Answer, Attached, Name, Open, PROTO_VERSION, ProtoError, Reply, Request, Role, SessionEntry,
-    SessionId,
+    Answer, Attached, Name, Open, PREVIEW_MAX, PROTO_VERSION, ProtoError, Reply, Request, Role,
+    SessionEntry, SessionId,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
@@ -371,6 +371,25 @@ impl Door {
         let _ = write_line_async(writer, &reply).await;
     }
 
+    /// `Preview` of this session: its loop cuts it from the screen. A lobby's
+    /// loop has no screen to cut and says so.
+    async fn preview_self(&self) -> Reply {
+        let Some(to_loop) = &self.to_loop else {
+            return Reply::Refused("this session cannot show its screen".to_string());
+        };
+        let (reply, shot) = tokio::sync::oneshot::channel();
+        let asked = async {
+            to_loop.cmds.send(LoopCmd::Preview { reply }).await.ok()?;
+            shot.await.ok()
+        };
+        match tokio::time::timeout(SIBLING_TIMEOUT, asked).await {
+            Ok(Some(Ok(s))) => Reply::Preview(s),
+            Ok(Some(Err(why))) => Reply::Refused(why),
+            Ok(None) => Reply::Refused("the session ended".to_string()),
+            Err(_) => Reply::Refused("the session did not answer in time".to_string()),
+        }
+    }
+
     /// `Rename` of this session, under the registry's name lock.
     fn rename_self(&self, via: Via, name: Option<Name>) -> Reply {
         let renamed = {
@@ -588,9 +607,15 @@ async fn relay_attach<CR, CW, TR, TW>(
 /// the shell's grace and its reaping.
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Ask sibling `id` to do `req` -- a `Kill` or a `Rename` -- and bring back
-/// its one reply. Every failure is a refusal with a reason for the user.
-async fn forward(registry: &std::path::Path, id: SessionId, req: Request) -> Reply {
+/// Ask sibling `id` to do `req` -- a `Kill`, a `Rename` or a `Preview` --
+/// and bring back its one reply within `bound`. Every failure is a refusal
+/// with a reason for the user.
+async fn forward(
+    registry: &std::path::Path,
+    id: SessionId,
+    req: Request,
+    bound: Duration,
+) -> Reply {
     let live = Registry::list_in(registry).unwrap_or_default();
     let Some(m) = live.iter().find(|m| m.session_id == id.to_string()) else {
         return Reply::Refused(format!("no session {} on this host", id.short()));
@@ -608,7 +633,7 @@ async fn forward(registry: &std::path::Path, id: SessionId, req: Request) -> Rep
         write_line_async(&mut w, &Open::new(req)).await?;
         read_line_async::<_, Reply>(&mut tokio::io::BufReader::new(r)).await
     };
-    match tokio::time::timeout(FORWARD_TIMEOUT, asked).await {
+    match tokio::time::timeout(bound, asked).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(ProtoError::Malformed(_) | ProtoError::VersionMismatch { .. })) => {
             Reply::Refused(format!(
@@ -679,7 +704,7 @@ where
             door.kill_self(via, &mut writer).await;
         }
         Request::Kill { id } => {
-            let reply = forward(&door.registry, id, Request::Kill { id }).await;
+            let reply = forward(&door.registry, id, Request::Kill { id }, FORWARD_TIMEOUT).await;
             let _ = write_line_async(&mut writer, &reply).await;
         }
         Request::Rename { id, name } if id.to_string() == door.id() => {
@@ -687,7 +712,17 @@ where
             let _ = write_line_async(&mut writer, &reply).await;
         }
         Request::Rename { id, name } => {
-            let reply = forward(&door.registry, id, Request::Rename { id, name }).await;
+            let reply = forward(
+                &door.registry,
+                id,
+                Request::Rename { id, name },
+                FORWARD_TIMEOUT,
+            )
+            .await;
+            let _ = write_line_async(&mut writer, &reply).await;
+        }
+        Request::Preview { id } => {
+            let reply = preview(&door, id).await;
             let _ = write_line_async(&mut writer, &reply).await;
         }
         // Only a session's own client switches or starts a sibling: a
@@ -701,6 +736,29 @@ where
         }
         Request::Switch { to } => switch(&door, to, reader, writer).await,
         Request::New { name } => new_sibling(&door, name, reader, writer).await,
+    }
+}
+
+/// `Preview` (preview spec §3.6): this session's screen from its own loop,
+/// a sibling's through its socket -- each within [`SIBLING_TIMEOUT`], since
+/// a preview is as cheap to answer as `Myself`. A sibling's answer larger
+/// than [`PREVIEW_MAX`] is refused here rather than passed on.
+async fn preview(door: &Door, id: SessionId) -> Reply {
+    if id.to_string() == door.id() {
+        return door.preview_self().await;
+    }
+    match forward(&door.registry, id, Request::Preview { id }, SIBLING_TIMEOUT).await {
+        Reply::Preview(s) if s.rows > PREVIEW_MAX.rows || s.cols > PREVIEW_MAX.cols => {
+            Reply::Refused(format!(
+                "session {} sent a preview of {}\u{d7}{}, more than {}\u{d7}{}",
+                id.short(),
+                s.cols,
+                s.rows,
+                PREVIEW_MAX.cols,
+                PREVIEW_MAX.rows
+            ))
+        }
+        reply => reply,
     }
 }
 
@@ -1002,6 +1060,61 @@ mod tests {
         assert_eq!(by_id(LOGS).name.as_ref().unwrap().as_str(), "logs");
         assert_eq!(by_id(GONE).attached, Attached::Unknown);
         assert_eq!(by_id(OLD).attached, Attached::OtherVersion);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_preview_of_a_sibling_that_never_answers_is_refused_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (me, _inbox, _) = registered(dir.path(), meta(BUILD, None));
+        let (_gone, _gone_inbox, _) = registered(dir.path(), meta(GONE, None));
+        let _deaf =
+            tokio::net::UnixListener::bind(Registry::socket_path_in(dir.path(), GONE)).unwrap();
+        let begun = Instant::now();
+        let reply = preview(&me, GONE.parse().unwrap()).await;
+        assert!(
+            begun.elapsed() < SIBLING_TIMEOUT + Duration::from_secs(1),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert_eq!(
+            reply,
+            Reply::Refused("session 5d2e8a7c did not answer in time".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_siblings_preview_larger_than_the_most_is_refused() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (me, _inbox, _) = registered(dir.path(), meta(BUILD, None));
+        let (_big, _big_inbox, _) = registered(dir.path(), meta(LOGS, None));
+        let big =
+            tokio::net::UnixListener::bind(Registry::socket_path_in(dir.path(), LOGS)).unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = big.accept().await {
+                let screen = oxutrm_proto::ScreenState::blank(40, 120).unwrap();
+                let line = oxutrm_proto::encode_line(&Reply::Preview(screen)).unwrap();
+                let mut s = s;
+                let _ = s.write_all(&line).await;
+            }
+        });
+        let reply = preview(&me, LOGS.parse().unwrap()).await;
+        assert_eq!(
+            reply,
+            Reply::Refused(
+                "session a3f9c01e sent a preview of 120\u{d7}40, more than 68\u{d7}18".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_door_with_no_loop_has_no_screen_to_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let (me, _inbox, _) = registered(dir.path(), meta(BUILD, None));
+        assert_eq!(
+            preview(&me, BUILD.parse().unwrap()).await,
+            Reply::Refused("this session cannot show its screen".to_string())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

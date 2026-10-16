@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use oxutrm_host::signalling::{read_answer_async, write_line_async};
 use oxutrm_net::NetConfig;
-use oxutrm_proto::{Answer, Name, Open, Reply, Request, SessionEntry, SessionId, TermSize};
+use oxutrm_proto::{
+    Answer, Name, Open, Reply, Request, ScreenState, SessionEntry, SessionId, TermSize,
+};
 
 use crate::connect::Established;
 
@@ -132,4 +134,106 @@ async fn asked(
             }
         )),
     })
+}
+
+/// How long a preview may take to come back (preview spec §1.1): a door's
+/// own bound on its loop or its sibling, [`crate::door::SIBLING_TIMEOUT`],
+/// and the round trip on top. The QUIC idle timeout is off, so without it
+/// a request sent into a path that has just gone dark would wait for ever.
+pub(crate) const PREVIEW_WITHIN: Duration = Duration::from_secs(5);
+
+/// Ask for session `id`'s screen over a fresh control stream of `conn`
+/// (preview spec §3.4): its window as the host cut it, or why there is
+/// none. Unchecked: the caller validates what it keeps.
+pub(crate) async fn preview(conn: quinn::Connection, id: SessionId) -> Result<ScreenState, String> {
+    let asked = async {
+        use anyhow::Context as _;
+        let (mut send, recv) = conn.open_bi().await.context("opening a control stream")?;
+        write_line_async(&mut send, &Open::new(Request::Preview { id }))
+            .await
+            .context("asking the host")?;
+        read_answer_async(&mut tokio::io::BufReader::new(recv))
+            .await
+            .context("reading the host's answer")
+    };
+    match tokio::time::timeout(PREVIEW_WITHIN, asked).await {
+        Ok(Ok(Answer::Reply(Reply::Preview(s)))) => Ok(s),
+        Ok(Ok(Answer::Reply(Reply::Refused(why)))) => Err(why),
+        Ok(Ok(Answer::Reply(r))) => Err(format!("the host answered a preview with {r:?}")),
+        Ok(Ok(Answer::Signal(_))) => {
+            Err("the host answered a preview with an attach exchange".to_string())
+        }
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err("the host did not answer in time".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::fixtures::link_pair;
+    use oxutrm_host::signalling::read_line_async;
+    use std::time::Instant;
+
+    const LOGS: &str = "5d2e8a7c1b9f40e3a6c8d1f2b3e4a5c6";
+
+    /// A host end that reads one request and answers it with `reply`, or
+    /// never answers when there is none. Returns what it was asked.
+    fn host(conn: quinn::Connection, reply: Option<Reply>) -> tokio::task::JoinHandle<Request> {
+        tokio::spawn(async move {
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let open: Open = read_line_async(&mut tokio::io::BufReader::new(recv))
+                .await
+                .unwrap();
+            match reply {
+                Some(r) => write_line_async(&mut send, &r).await.unwrap(),
+                None => std::future::pending::<()>().await,
+            }
+            open.req
+        })
+    }
+
+    #[tokio::test]
+    async fn a_preview_brings_back_the_screen_the_host_sent() {
+        let (h, c) = link_pair().await;
+        let shot = ScreenState::blank(18, 68).unwrap();
+        let asked = host(
+            h.sink.connection().clone(),
+            Some(Reply::Preview(shot.clone())),
+        );
+        let id: SessionId = LOGS.parse().unwrap();
+        assert_eq!(preview(c.sink.connection().clone(), id).await, Ok(shot));
+        assert_eq!(asked.await.unwrap(), Request::Preview { id });
+    }
+
+    #[tokio::test]
+    async fn a_refused_preview_says_why() {
+        let (h, c) = link_pair().await;
+        let _asked = host(
+            h.sink.connection().clone(),
+            Some(Reply::Refused(
+                "no session 5d2e8a7c on this host".to_string(),
+            )),
+        );
+        assert_eq!(
+            preview(c.sink.connection().clone(), LOGS.parse().unwrap()).await,
+            Err("no session 5d2e8a7c on this host".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_the_host_never_answers_fails_in_time() {
+        let (h, c) = link_pair().await;
+        let _asked = host(h.sink.connection().clone(), None);
+        let begun = Instant::now();
+        assert_eq!(
+            preview(c.sink.connection().clone(), LOGS.parse().unwrap()).await,
+            Err("the host did not answer in time".to_string())
+        );
+        let took = begun.elapsed();
+        assert!(
+            took >= PREVIEW_WITHIN && took < PREVIEW_WITHIN + Duration::from_secs(2),
+            "{took:?}"
+        );
+    }
 }

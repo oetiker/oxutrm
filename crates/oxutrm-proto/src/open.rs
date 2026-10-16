@@ -15,7 +15,14 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::{Name, PROTO_VERSION, ProtoError, SessionId, Signal, TermSize};
+use crate::{Name, PROTO_VERSION, ProtoError, ScreenState, SessionId, Signal, TermSize};
+
+/// The most of a session's screen a [`Reply::Preview`] carries (preview
+/// spec §2): the selector's widest box less its frame, by its tallest box
+/// less the border, the key bar, the rule, the preview's rule and one row
+/// of the list. 68x18 = 1224 cells, which bounds the reply's line well
+/// under [`crate::MAX_SIGNAL_LINE`].
+pub const PREVIEW_MAX: TermSize = TermSize { cols: 68, rows: 18 };
 
 /// What an attach is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -68,6 +75,9 @@ pub enum Request {
     Kill { id: SessionId },
     /// Answered [`Reply::Entry`]; `None` clears the name.
     Rename { id: SessionId, name: Option<Name> },
+    /// Answered [`Reply::Preview`]: at most [`PREVIEW_MAX`] of the session's
+    /// screen, cut by [`ScreenState::window`].
+    Preview { id: SessionId },
 }
 
 /// The one answer to a request that does not run an attach exchange.
@@ -83,6 +93,8 @@ pub enum Reply {
     ProbeAck {
         nonce: u64,
     },
+    /// The answer to [`Request::Preview`].
+    Preview(ScreenState),
 }
 
 /// Whether a session has a client, as seen by whoever asked.
@@ -238,6 +250,7 @@ mod tests {
                 id: id(),
                 name: None,
             },
+            Request::Preview { id: id() },
         ] {
             round(&Open::new(req));
         }
@@ -252,9 +265,32 @@ mod tests {
             Reply::Done,
             Reply::Refused("no session a3f9c01e here".to_string()),
             Reply::ProbeAck { nonce: 9 },
+            Reply::Preview(ScreenState::blank(18, 68).unwrap()),
         ] {
             round(&reply);
         }
+    }
+
+    /// The largest reply a preview can be: every cell as long as I8 lets
+    /// it be, in characters JSON has to escape, in colours and attributes
+    /// that take the most room. It still fits a line any reader takes.
+    #[test]
+    fn the_largest_preview_fits_one_line() {
+        use crate::{Attrs, Cell, CellText, Color, MAX_CELL_TEXT, MAX_SIGNAL_LINE};
+        let mut s = ScreenState::blank(PREVIEW_MAX.rows, PREVIEW_MAX.cols).unwrap();
+        s.cells.fill(Cell {
+            text: CellText::new("\"".repeat(MAX_CELL_TEXT)),
+            fg: Color::Rgb(255, 255, 255),
+            bg: Color::Rgb(255, 255, 255),
+            attrs: Attrs::all(),
+        });
+        s.validate().unwrap();
+        let line = encode_line(&Reply::Preview(s)).unwrap();
+        assert!(
+            line.len() < MAX_SIGNAL_LINE,
+            "{} bytes, the limit is {MAX_SIGNAL_LINE}",
+            line.len()
+        );
     }
 
     #[test]

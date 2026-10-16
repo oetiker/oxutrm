@@ -193,6 +193,16 @@ A session that cannot be reattached and one of another version are dimmed,
 and choosing one shows why instead of switching.
 Rows are in order of start, oldest first, followed by `+ new session`.
 
+Where the terminal has room, a pane under the list shows the selected session's screen:
+its leftmost columns and the rows ending at its cursor, or its top rows when the cursor is hidden,
+in its own colours and at most 68 columns by 18 rows.
+The screen is fetched when the selection arrives on a row and again on a return after 2 seconds,
+not while the selection rests, and is forgotten when the selector closes.
+The row of this client's session shows its own screen.
+A row with no screen to show, such as `+ new session`, says why in the pane.
+The pane needs a terminal of at least 38 columns, and with three sessions 15 rows;
+on a smaller one the selector has no pane.
+
 A switch uses the live link and no ssh.
 The new link is built while the client stays in the old session,
 and a switch that fails leaves the client where it was, with the reason under the list.
