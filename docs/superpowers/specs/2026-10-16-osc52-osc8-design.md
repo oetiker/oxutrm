@@ -515,6 +515,9 @@ contradict an earlier section, that section has been corrected.
   screen.
 - `oxutrm loopback` does not write copies; it has no client session. The
   manual says so under `loopback`.
+- Client OSC 52 writes have no rate limit, on purpose. A hostile host can
+  already paint anything on the screen, so a limit would buy no safety, and
+  the I8 cap (`MAX_CLIPBOARD`) bounds the size of each write.
 - The end-to-end tests let the client apply a first state before the shell
   copies (`read go`), because of the baseline rule above.
 - For D2: a preview `window()` returns `Clipboard::default()` (clearing a
