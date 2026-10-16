@@ -124,7 +124,7 @@ oxutrm-client = { path = "crates/oxutrm-client" }
 
 [package]
 name = "oxutrm"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
