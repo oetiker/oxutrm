@@ -1,4 +1,4 @@
-//! The eight `ScreenState` invariants, each proved by its **rejection**.
+//! The `ScreenState` invariants I1 to I10, each proved by its **rejection**.
 //!
 //! An invariant that is only documented is not an invariant. Every test here
 //! builds a state that breaks one rule and asserts the exact error, because a
