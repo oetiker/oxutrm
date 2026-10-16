@@ -406,6 +406,135 @@ fn a_state_the_sender_has_forgotten_falls_back_to_a_full_state() {
     assert_eq!(rx.state(), tx.current());
 }
 
+// ---- I10: the link table ----
+
+/// A 3x4 screen whose first cell carries link 1.
+fn linked_screen() -> ScreenState {
+    let mut s = screen(3, 4);
+    s.links.insert(1, "http://a".into());
+    s.cells[0].link = 1;
+    s
+}
+
+/// A patch that paints row 0 with `cell`, so a rejection has something to
+/// roll back besides the table.
+fn paint_row_0(d: &mut ScreenDiff, cell: Cell) {
+    d.rows.push(RowPatch {
+        row: 0,
+        runs: vec![Run {
+            start_col: 0,
+            repeat: 3,
+            cells: vec![cell],
+        }],
+    });
+}
+
+#[test]
+fn a_link_uri_that_could_end_its_osc_8_is_rejected() {
+    let mut rx = Receiver::new(linked_screen());
+    let mut d = empty_diff();
+    paint_row_0(&mut d, Cell::blank());
+    d.links
+        .push((2, Some("http://b/\x07\x1b]52;c;AAAA\x07".into())));
+    let f = frame_of(2, 1, &d);
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::BadLinkUri { id: 2, .. }),
+        "bad link uri",
+    );
+}
+
+#[test]
+fn a_link_with_id_zero_is_rejected() {
+    let mut rx = Receiver::new(linked_screen());
+    let mut d = empty_diff();
+    paint_row_0(&mut d, Cell::blank());
+    d.links.push((0, Some("http://b".into())));
+    let f = frame_of(2, 1, &d);
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::LinkIdZero),
+        "link id zero",
+    );
+}
+
+#[test]
+fn removing_a_link_a_cell_still_holds_is_rejected() {
+    let mut rx = Receiver::new(linked_screen());
+    let mut d = empty_diff();
+    paint_row_0(
+        &mut d,
+        Cell {
+            text: "x".into(),
+            ..Cell::blank()
+        },
+    );
+    // Row 1 keeps a cell on link 1 while the diff removes it.
+    d.rows.push(RowPatch {
+        row: 1,
+        runs: vec![Run {
+            start_col: 0,
+            repeat: 0,
+            cells: vec![Cell {
+                link: 1,
+                ..Cell::blank()
+            }],
+        }],
+    });
+    d.links.push((1, None));
+    let f = frame_of(2, 1, &d);
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::UnknownLink { id: 1 }),
+        "removed link still held",
+    );
+}
+
+/// A full state builds on nothing, its link table included: a link the
+/// receiver held before is not there to be referred to.
+#[test]
+fn a_full_state_does_not_inherit_the_old_link_table() {
+    let mut rx = Receiver::new(linked_screen());
+    let mut d = empty_diff();
+    d.resize = Some(TermSize { cols: 4, rows: 3 });
+    paint_row_0(
+        &mut d,
+        Cell {
+            link: 1,
+            ..Cell::blank()
+        },
+    );
+    let f = frame_of(2, 0, &d);
+    assert_rejected(
+        &mut rx,
+        &f,
+        |e| matches!(e, ApplyError::UnknownLink { id: 1 }),
+        "full state with a stale link",
+    );
+}
+
+#[test]
+fn a_full_state_replaces_the_link_table() {
+    let mut rx = Receiver::new(linked_screen());
+    let mut d = empty_diff();
+    d.resize = Some(TermSize { cols: 4, rows: 3 });
+    paint_row_0(
+        &mut d,
+        Cell {
+            link: 2,
+            ..Cell::blank()
+        },
+    );
+    d.links.push((2, Some("http://b".into())));
+    let f = frame_of(2, 0, &d);
+    assert_eq!(rx.on_frame(&f), Ok(true));
+    assert_eq!(rx.state().links.len(), 1, "link 1 is gone");
+    assert_eq!(rx.state().links.get(&2).map(|u| &**u), Some("http://b"));
+}
+
 // ---- I5 and I6: the invariants that only exist BETWEEN two states ----
 //
 // These belong here rather than in `oxutrm-proto`'s `tests/invariants.rs`,

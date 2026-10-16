@@ -32,15 +32,44 @@ use proptest::prelude::*;
 /// One thing that can happen to a terminal between two states.
 #[derive(Clone, Debug)]
 enum Edit {
-    Write { row: u16, col: u16, ch: char },
-    FillRow { row: u16, ch: char },
-    MoveCursor { row: u16, col: u16 },
-    Resize { rows: u16, cols: u16 },
+    Write {
+        row: u16,
+        col: u16,
+        ch: char,
+    },
+    FillRow {
+        row: u16,
+        ch: char,
+    },
+    MoveCursor {
+        row: u16,
+        col: u16,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     Bell,
     Title(String),
     Scroll(u16),
     ToggleAltScreen,
-    Recolour { row: u16, col: u16 },
+    Recolour {
+        row: u16,
+        col: u16,
+    },
+    /// Put link `id` on a cell, setting or replacing its URI. The ids are
+    /// few, so they are reused, and a new URI under an old id relinks every
+    /// cell that holds it.
+    Link {
+        row: u16,
+        col: u16,
+        id: u16,
+        uri: u8,
+    },
+    /// Take link `id` off every cell, which takes it out of the table.
+    Unlink(u16),
+    /// Every link keeps its id and gets a new URI: the whole table changes.
+    ReplaceLinks(u8),
 }
 
 /// What the transport does to a frame.
@@ -68,6 +97,14 @@ fn edit_strategy() -> impl Strategy<Value = Edit> {
         (1u16..40).prop_map(Edit::Scroll),
         Just(Edit::ToggleAltScreen),
         (0u16..8, 0u16..8).prop_map(|(row, col)| Edit::Recolour { row, col }),
+        (0u16..8, 0u16..8, 1u16..5, 0u8..3).prop_map(|(row, col, id, uri)| Edit::Link {
+            row,
+            col,
+            id,
+            uri
+        }),
+        (1u16..5).prop_map(Edit::Unlink),
+        (0u8..3).prop_map(Edit::ReplaceLinks),
     ]
 }
 
@@ -160,6 +197,7 @@ fn apply_edit(s: &ScreenState, e: &Edit) -> ScreenState {
             resized.bell = next.bell;
             resized.scrollback_len = next.scrollback_len;
             resized.modes = next.modes;
+            resized.links = next.links.clone();
             resized.cursor = Cursor {
                 row: next.cursor.row.min(rows.saturating_sub(1)),
                 col: next.cursor.col.min(cols.saturating_sub(1)),
@@ -181,7 +219,32 @@ fn apply_edit(s: &ScreenState, e: &Edit) -> ScreenState {
                 next.cells[idx].attrs = Attrs::BOLD | Attrs::UNDERLINE;
             }
         }
+        Edit::Link { row, col, id, uri } => {
+            if next.rows > 0 && next.cols > 0 {
+                let r = row % next.rows;
+                let c = col % next.cols;
+                let idx = r as usize * next.cols as usize + c as usize;
+                next.cells[idx].link = *id;
+                next.links.insert(*id, format!("http://h{uri}/").into());
+            }
+        }
+        Edit::Unlink(id) => {
+            for cell in &mut next.cells {
+                if cell.link == *id {
+                    cell.link = 0;
+                }
+            }
+        }
+        Edit::ReplaceLinks(n) => {
+            for (id, uri) in next.links.iter_mut() {
+                *uri = format!("http://r{n}/{id}").into();
+            }
+        }
     }
+    // The table holds exactly the links some cell holds, as the host's does:
+    // a link that scrolled or was resized away is removed from it.
+    let held: std::collections::BTreeSet<u16> = next.cells.iter().map(|c| c.link).collect();
+    next.links.retain(|id, _| held.contains(id));
     next
 }
 
@@ -813,8 +876,9 @@ fn every_screen_field_survives_a_round_trip() {
         fg: Color::Rgb(1, 2, 3),
         bg: Color::Idx(200),
         attrs: Attrs::BOLD | Attrs::WIDE_CONT,
-        link: 0,
+        link: 3,
     };
+    next.links.insert(3, "https://example.org/".into());
     tx.update(next);
 
     let f = tx.make_frame(rx.ack()).expect("make_frame").expect("frame");
