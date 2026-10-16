@@ -90,6 +90,7 @@
 //! disagree about where the caret is.
 
 pub mod cell;
+pub mod clipboard;
 pub mod error;
 pub mod frame;
 pub mod ids;
@@ -103,6 +104,7 @@ pub mod text;
 pub mod types;
 
 pub use cell::{Attrs, Cell, CellText, Color};
+pub use clipboard::{Clipboard, ClipboardCopy, ClipboardTarget, check_clipboard};
 pub use error::ApplyError;
 pub use frame::{FLAG_ZSTD, Frame};
 pub use ids::SessionId;
@@ -117,8 +119,8 @@ pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
-    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType,
-    PathDescription, Rung, TermSize, TerminalCaps, TextField,
+    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_SCREEN_CELLS, MAX_SCREEN_DIM,
+    MAX_TITLE, NatType, PathDescription, Rung, TermSize, TerminalCaps, TextField,
 };
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,
@@ -140,7 +142,10 @@ pub use types::{
 /// **4**: the session preview. [`Request::Preview`] and [`Reply::Preview`]
 /// carry a window of a session's screen; a door of version 3 cannot parse
 /// either.
-pub const PROTO_VERSION: u32 = 4;
+///
+/// **5**: `ScreenState` and its diff gained `clipboard` (OSC 52 copy). No
+/// compatibility with 4.
+pub const PROTO_VERSION: u32 = 5;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";

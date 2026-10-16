@@ -397,6 +397,7 @@ pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
         title: fit_title(meta.title),
         bell: meta.bell,
         scrollback_len: meta.scrollback_len,
+        clipboard: oxutrm_proto::Clipboard::default(),
     }
 }
 
