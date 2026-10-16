@@ -5,12 +5,13 @@ use alacritty_terminal::Term;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell as VteCell, Flags};
-use alacritty_terminal::term::{Config, Osc52, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Osc52, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as VteCursorShape, Processor, Rgb};
 
 use oxutrm_proto::{
-    Attrs, Cell, CellText, Cursor, CursorShape, MAX_CELL_TEXT, Modes, MouseMode, ScreenState,
-    TermSize, fit_cell_text, fit_title, is_control_scalar,
+    Attrs, Cell, CellText, Clipboard, ClipboardCopy, ClipboardTarget, Cursor, CursorShape,
+    MAX_CELL_TEXT, MAX_CLIPBOARD, Modes, MouseMode, ScreenState, TermSize, fit_cell_text,
+    fit_title, is_control_scalar,
 };
 
 use crate::blink::{BlinkPlane, BlinkTap};
@@ -60,6 +61,13 @@ pub struct HostTerm {
     /// source instead, in [`crate::blink::BlinkTap`].
     scrollback_len: u64,
 
+    /// The latest OSC 52 copy and the running count. The text stays until
+    /// [`HostTerm::clipboard_delivered`] says the client has it.
+    clipboard: Clipboard,
+    /// The length of the last copy refused for size, until
+    /// [`HostTerm::take_dropped_copy`] collects it for the host's log.
+    dropped_copy: Option<usize>,
+
     exited: Option<i32>,
 }
 
@@ -90,14 +98,7 @@ impl HostTerm {
         let dims = GridSize::new(size, scrollback)?;
         let pty = Pty::spawn_with(shell, args, env, size, start)?;
         let events = EventSink::new();
-        let config = Config {
-            scrolling_history: scrollback,
-            // Accept paste requests as well as copies; the default is
-            // OnlyCopy, which silently drops half of OSC 52.
-            osc52: Osc52::CopyPaste,
-            ..Config::default()
-        };
-        let term = Term::new(config, &dims, events.clone());
+        let term = Term::new(term_config(scrollback), &dims, events.clone());
 
         Ok(HostTerm {
             pty,
@@ -112,6 +113,8 @@ impl HostTerm {
             bell: 0,
             title: String::new(),
             scrollback_len: 0,
+            clipboard: Clipboard::default(),
+            dropped_copy: None,
             exited: None,
         })
     }
@@ -194,6 +197,13 @@ impl HostTerm {
             self.bell = self.bell.saturating_add(signals.bells);
             changed = true;
         }
+        for (kind, text) in signals.clipboard {
+            match record_copy(&mut self.clipboard, kind, text) {
+                Ok(()) => changed = true,
+                // Not printed here; see `take_dropped_copy`.
+                Err(len) => self.dropped_copy = Some(len),
+            }
+        }
         if let Some(code) = signals.child_exit {
             self.exited = Some(code);
         }
@@ -229,8 +239,31 @@ impl HostTerm {
                 title: self.title.clone(),
                 bell: self.bell,
                 scrollback_len: self.scrollback_len,
+                clipboard: self.clipboard.clone(),
             },
         )
+    }
+
+    /// The length of a clipboard copy refused for size since the last call,
+    /// for the host's log. The emulator does not print it itself: in
+    /// `oxutrm loopback` it runs inside the client, whose stderr is the
+    /// painted terminal.
+    pub fn take_dropped_copy(&mut self) -> Option<usize> {
+        self.dropped_copy.take()
+    }
+
+    /// The client has acknowledged a state carrying copy number `serial`:
+    /// drop its text, keep the count.
+    ///
+    /// Returns whether anything changed, so the caller knows a fresh snapshot
+    /// is owed. A `serial` that is no longer the latest changes nothing: a
+    /// newer copy has not been delivered just because an older one was.
+    pub fn clipboard_delivered(&mut self, serial: u32) -> bool {
+        if self.clipboard.serial != serial || self.clipboard.copy.is_none() {
+            return false;
+        }
+        self.clipboard.copy = None;
+        true
     }
 
     /// Scrollback lines `[from, to)` as rendered cell rows.
@@ -341,6 +374,40 @@ pub(crate) struct StateMeta {
     pub title: String,
     pub bell: u32,
     pub scrollback_len: u64,
+    pub clipboard: Clipboard,
+}
+
+/// The emulator's configuration.
+///
+/// OSC 52 reads are refused here, in the emulator, and never answered: the
+/// answer would be the user's local clipboard, sent to the remote host.
+fn term_config(scrollback: usize) -> Config {
+    Config {
+        scrolling_history: scrollback,
+        osc52: Osc52::OnlyCopy,
+        ..Config::default()
+    }
+}
+
+/// Fold one OSC 52 copy into `clipboard`. `Err` carries the length of a
+/// copy that was refused.
+///
+/// A copy over [`MAX_CLIPBOARD`] is dropped whole and the serial does not
+/// move: a truncated paste is silent data corruption, and the client would
+/// refuse the state anyway.
+fn record_copy(clipboard: &mut Clipboard, kind: ClipboardType, text: String) -> Result<(), usize> {
+    if text.len() > MAX_CLIPBOARD {
+        return Err(text.len());
+    }
+    clipboard.serial = clipboard.serial.saturating_add(1);
+    clipboard.copy = Some(ClipboardCopy {
+        target: match kind {
+            ClipboardType::Clipboard => ClipboardTarget::Clipboard,
+            ClipboardType::Selection => ClipboardTarget::Selection,
+        },
+        text: text.into(),
+    });
+    Ok(())
 }
 
 pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
@@ -397,7 +464,7 @@ pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
         title: fit_title(meta.title),
         bell: meta.bell,
         scrollback_len: meta.scrollback_len,
-        clipboard: oxutrm_proto::Clipboard::default(),
+        clipboard: meta.clipboard,
     }
 }
 
@@ -1363,5 +1430,134 @@ mod tests {
             t.poll().expect("poll");
         }
         assert!(started.elapsed() < Duration::from_secs(1), "poll blocked");
+    }
+
+    // ---- OSC 52 ------------------------------------------------------------
+
+    #[test]
+    fn the_emulator_is_configured_to_refuse_clipboard_reads() {
+        // A read would be answered with the user's LOCAL clipboard, sent to
+        // the remote host. Refused in the emulator, so nothing downstream can
+        // forget to refuse it.
+        assert_eq!(term_config(100).osc52, Osc52::OnlyCopy);
+    }
+
+    #[test]
+    fn a_copy_counts_up_and_keeps_the_latest_text_and_target() {
+        let mut c = Clipboard::default();
+        assert_eq!(
+            record_copy(&mut c, ClipboardType::Clipboard, "a".into()),
+            Ok(())
+        );
+        assert_eq!(
+            record_copy(&mut c, ClipboardType::Selection, "b".into()),
+            Ok(())
+        );
+        assert_eq!(
+            c.serial, 2,
+            "every copy counts, even one superseded at once"
+        );
+        let copy = c.copy.expect("a copy");
+        assert_eq!(&*copy.text, "b");
+        assert_eq!(copy.target, ClipboardTarget::Selection);
+    }
+
+    #[test]
+    fn an_over_cap_copy_is_dropped_whole_and_leaves_the_serial_alone() {
+        let mut c = Clipboard::default();
+        record_copy(&mut c, ClipboardType::Clipboard, "kept".into()).unwrap();
+        assert_eq!(
+            record_copy(
+                &mut c,
+                ClipboardType::Clipboard,
+                "x".repeat(MAX_CLIPBOARD + 1)
+            ),
+            Err(MAX_CLIPBOARD + 1)
+        );
+        assert_eq!(c.serial, 1);
+        assert_eq!(c.copy.map(|c| c.text.to_string()).as_deref(), Some("kept"));
+        let mut exact = Clipboard::default();
+        assert_eq!(
+            record_copy(
+                &mut exact,
+                ClipboardType::Clipboard,
+                "x".repeat(MAX_CLIPBOARD)
+            ),
+            Ok(()),
+            "exactly the cap is fine"
+        );
+    }
+
+    #[test]
+    fn a_copy_from_the_child_reaches_the_snapshot() {
+        // "aGVsbG8=" is base64 for "hello"; the emulator decodes it.
+        let mut t = sh("printf '\\033]52;c;aGVsbG8=\\007'; sleep 5", size());
+        assert!(
+            poll_until(&mut t, Duration::from_secs(10), |t| t
+                .snapshot(1)
+                .clipboard
+                .serial
+                == 1),
+            "got {:?}",
+            t.snapshot(1).clipboard
+        );
+        let c = t.snapshot(1).clipboard;
+        let copy = c.copy.expect("the text is there until delivered");
+        assert_eq!(&*copy.text, "hello");
+        assert_eq!(copy.target, ClipboardTarget::Clipboard);
+    }
+
+    #[test]
+    fn an_over_cap_copy_from_the_child_is_reported_once() {
+        // MAX_CLIPBOARD + 3 bytes, base64'd in the shell: 'x' * 262147.
+        let mut t = sh(
+            "printf '\\033]52;c;'; head -c 262147 /dev/zero | tr '\\0' x | base64 | tr -d '\\n'; \
+             printf '\\007'; printf done; sleep 5",
+            size(),
+        );
+        assert!(
+            poll_until(&mut t, Duration::from_secs(20), |t| {
+                row_text(&t.snapshot(1), 0).contains("done")
+            }),
+            "the shell never finished: {:?}",
+            row_text(&t.snapshot(1), 0)
+        );
+        assert_eq!(t.take_dropped_copy(), Some(MAX_CLIPBOARD + 3));
+        assert_eq!(t.take_dropped_copy(), None, "taken once");
+        assert_eq!(t.snapshot(1).clipboard, Clipboard::default());
+    }
+
+    #[test]
+    fn a_copy_that_is_not_utf8_never_reaches_the_state() {
+        // "/w==" is base64 for the single byte 0xFF. The emulator drops a
+        // copy that does not decode to UTF-8; the later "hello" still counts.
+        let mut t = sh(
+            "printf '\\033]52;c;/w==\\007'; printf '\\033]52;c;aGVsbG8=\\007'; sleep 5",
+            size(),
+        );
+        assert!(poll_until(&mut t, Duration::from_secs(10), |t| t
+            .snapshot(1)
+            .clipboard
+            .serial
+            >= 1));
+        let c = t.snapshot(1).clipboard;
+        assert_eq!(c.serial, 1, "the 0xFF copy was not counted");
+        assert_eq!(c.copy.map(|c| c.text.to_string()).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn delivery_drops_the_text_and_keeps_the_serial() {
+        let mut t = sh("printf '\\033]52;c;aGVsbG8=\\007'; sleep 5", size());
+        assert!(poll_until(&mut t, Duration::from_secs(10), |t| t
+            .snapshot(1)
+            .clipboard
+            .serial
+            == 1));
+        assert!(!t.clipboard_delivered(0), "not the current copy");
+        assert!(t.snapshot(1).clipboard.copy.is_some());
+        assert!(t.clipboard_delivered(1));
+        assert_eq!(t.snapshot(1).clipboard.serial, 1);
+        assert_eq!(t.snapshot(1).clipboard.copy, None);
+        assert!(!t.clipboard_delivered(1), "nothing left to drop");
     }
 }

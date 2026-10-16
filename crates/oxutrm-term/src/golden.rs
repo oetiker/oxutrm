@@ -69,6 +69,7 @@ fn render(rows: u16, cols: u16, bytes: &[u8]) -> (ScreenState, String) {
             title,
             bell: signals.bells,
             scrollback_len: scrolled,
+            clipboard: oxutrm_proto::Clipboard::default(),
         },
     );
     let text = describe(&state);
@@ -337,6 +338,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             title: String::new(),
             bell: 0,
             scrollback_len: 0,
+            clipboard: oxutrm_proto::Clipboard::default(),
         },
     );
 
@@ -353,6 +355,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             title: String::new(),
             bell: 0,
             scrollback_len: 0,
+            clipboard: oxutrm_proto::Clipboard::default(),
         },
     );
 
@@ -367,6 +370,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             title: String::new(),
             bell: 0,
             scrollback_len: 0,
+            clipboard: oxutrm_proto::Clipboard::default(),
         },
     );
 
