@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use oxutrm_proto::{ApplyError, Cell, Cursor, Modes, ScreenState, TermSize};
+use oxutrm_proto::{ApplyError, Cell, Clipboard, Cursor, Modes, ScreenState, TermSize};
 
 use crate::SyncState;
 
@@ -48,6 +48,9 @@ pub struct ScreenDiff {
     pub title: Option<String>,
     pub bell: Option<u32>,
     pub scrollback_len: Option<u64>,
+    /// The whole clipboard, when it differs from the base. Comparing it is
+    /// cheap: `Arc<str>` equality checks the pointer before the bytes.
+    pub clipboard: Option<Clipboard>,
 }
 
 /// Turn one row's worth of cells into runs, emitting only what changed.
@@ -189,6 +192,7 @@ impl SyncState for ScreenState {
             bell: (self.bell != base.bell).then_some(self.bell),
             scrollback_len: (self.scrollback_len != base.scrollback_len)
                 .then_some(self.scrollback_len),
+            clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
         }
     }
 
@@ -213,6 +217,7 @@ impl SyncState for ScreenState {
             title: Some(self.title.clone()),
             bell: Some(self.bell),
             scrollback_len: Some(self.scrollback_len),
+            clipboard: Some(self.clipboard.clone()),
         }
     }
 
@@ -234,6 +239,10 @@ impl SyncState for ScreenState {
         // ordering.
         if let Some(t) = &d.title {
             oxutrm_proto::check_title(t)?;
+        }
+        // I8 for the clipboard, for the same reason and in the same place.
+        if let Some(c) = &d.clipboard {
+            oxutrm_proto::check_clipboard(c)?;
         }
 
         // The resize comes first, because every row index below is relative to
@@ -318,6 +327,9 @@ impl SyncState for ScreenState {
         if let Some(s) = d.scrollback_len {
             self.scrollback_len = s;
         }
+        if let Some(c) = &d.clipboard {
+            self.clipboard.clone_from(c);
+        }
 
         self.seq = target;
         Ok(())
@@ -363,6 +375,7 @@ mod tests {
             title: None,
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
         let err = s
             .apply(1, 2, &d)
@@ -402,6 +415,7 @@ mod tests {
             title: None,
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -426,6 +440,7 @@ mod tests {
             title: None,
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
         s.apply(1, 2, &d).expect("a 400x120 terminal is ordinary");
         assert_eq!(s.cells.len(), 400 * 120);
@@ -471,6 +486,7 @@ mod tests {
             title: None,
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
 
         let err = s
@@ -513,6 +529,7 @@ mod tests {
             title: None,
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -545,6 +562,7 @@ mod tests {
             title: Some("vim\x07\x1b]52;c;AAAA\x07".to_owned()),
             bell: None,
             scrollback_len: None,
+            clipboard: None,
         };
         assert!(matches!(
             s.apply(1, 2, &d),
@@ -620,6 +638,7 @@ mod tests {
                 title: None,
                 bell: None,
                 scrollback_len: None,
+                clipboard: None,
             };
             s.apply(1, 2, &d).expect("apply");
             let painted: String = s
@@ -765,5 +784,86 @@ mod tests {
         got.apply(1, 2, &d).expect("apply");
         assert_eq!(got.cells.len(), 4);
         assert_eq!(got, target);
+    }
+
+    fn copied(serial: u32, text: &str) -> Clipboard {
+        Clipboard {
+            serial,
+            copy: Some(oxutrm_proto::ClipboardCopy {
+                target: oxutrm_proto::ClipboardTarget::Clipboard,
+                text: text.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_diff_carries_the_clipboard_only_when_it_changed() {
+        let mut base = ScreenState::blank(2, 2).expect("blank");
+        base.clipboard = copied(1, "old");
+        let mut same = base.clone();
+        same.seq = 2;
+        assert_eq!(same.diff_from(&base).clipboard, None);
+
+        let mut next = base.clone();
+        next.seq = 2;
+        next.clipboard = copied(2, "new");
+        assert_eq!(next.diff_from(&base).clipboard, Some(copied(2, "new")));
+
+        // Delivery drops the text and keeps the serial: that is a change too,
+        // or the receiver would hold the text for ever.
+        let mut delivered = base.clone();
+        delivered.seq = 2;
+        delivered.clipboard = base.clipboard.without_text();
+        assert_eq!(
+            delivered.diff_from(&base).clipboard,
+            Some(base.clipboard.without_text())
+        );
+    }
+
+    #[test]
+    fn a_full_state_always_carries_the_clipboard() {
+        let blank = ScreenState::blank(2, 2).expect("blank");
+        assert_eq!(blank.full_diff().clipboard, Some(Clipboard::default()));
+
+        let mut s = blank.clone();
+        s.clipboard = copied(3, "x");
+        let mut got = ScreenState::blank(2, 2).expect("blank");
+        got.apply(0, 1, &s.full_diff()).expect("apply");
+        assert_eq!(got.clipboard, copied(3, "x"));
+    }
+
+    /// Same promise as the title's: `ApplyError` means nothing was applied.
+    #[test]
+    fn an_over_cap_copy_is_refused_before_any_row_is_painted() {
+        let mut s = ScreenState::blank(1, 4).expect("blank");
+        let d = ScreenDiff {
+            resize: None,
+            rows: vec![RowPatch {
+                row: 0,
+                runs: vec![Run {
+                    start_col: 0,
+                    repeat: 0,
+                    cells: vec![cell("h"), cell("i")],
+                }],
+            }],
+            cursor: None,
+            modes: None,
+            title: None,
+            bell: None,
+            scrollback_len: None,
+            clipboard: Some(copied(1, &"x".repeat(oxutrm_proto::MAX_CLIPBOARD + 1))),
+        };
+        assert!(matches!(
+            s.apply(1, 2, &d),
+            Err(ApplyError::TextTooLong {
+                field: oxutrm_proto::TextField::Clipboard,
+                ..
+            })
+        ));
+        assert!(
+            s.row(0).iter().all(|c| *c == Cell::blank()),
+            "a refused diff must leave the screen exactly as it was"
+        );
+        assert_eq!(s.clipboard, Clipboard::default());
     }
 }
