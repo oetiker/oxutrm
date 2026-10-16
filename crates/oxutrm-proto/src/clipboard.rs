@@ -60,8 +60,8 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    /// The same clipboard, minus its text. What a state shows once the copy
-    /// has been delivered, and what a preview of another session must show.
+    /// The same clipboard, minus its text: what a state shows once the
+    /// client has acknowledged the copy. Tests use it to build that state.
     pub fn without_text(&self) -> Clipboard {
         Clipboard {
             serial: self.serial,
