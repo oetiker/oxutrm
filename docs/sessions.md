@@ -94,20 +94,20 @@ Where the terminal has room, the selector shows the selected session's screen
 under the list, below a rule titled `preview`:
 
 ```
-╭ sessions on thinlinc ─────────────────────────────────────────────╮
-│   a3f9c01e  fish  Oct 05  80×24   in use                          │
-│   build     bash  09:14   120×40  this                            │
-│ ▸ logs      zsh   11:02   120×40                                  │
-│   + new session                                                   │
-├ preview ──────────────────────────────────────────────────────────┤
-│ Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetike│
-│ Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): sess │
-│ Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian│
-│ ^C                                                                │
-│ oetiker@thinlinc:~$ journalctl -f -u ssh                          │
-├───────────────────────────────────────────────────────────────────┤
-│ ⏎ switch  n new  r rename  x kill  q back                         │
-╰───────────────────────────────────────────────────────────────────╯
+╭ sessions on thinlinc ────────────────────────────────────────────────╮
+│   a3f9c01e  fish  Oct 05  80×24   in use                             │
+│   build     bash  09:14   120×40  this                               │
+│ ▸ logs      zsh   11:02   120×40                                     │
+│   + new session                                                      │
+├ preview ─────────────────────────────────────────────────────────────┤
+│ Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetiker  │
+│ Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): session │
+│ Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian-s │
+│ ^C                                                                   │
+│ oetiker@thinlinc:~$ journalctl -f -u ssh                             │
+├──────────────────────────────────────────────────────────────────────┤
+│ ⏎ switch  n new  r rename  x kill  q back                            │
+╰──────────────────────────────────────────────────────────────────────╯
 ```
 
 The pane shows the session's own cells in its colours, cut and never scaled:

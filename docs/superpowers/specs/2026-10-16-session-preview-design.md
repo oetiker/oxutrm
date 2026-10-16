@@ -90,20 +90,20 @@ size: the request carries none.
 (Shortened: on an 80×24 terminal the pane has 13 rows.)
 
 ```
-╭ sessions on thinlinc ─────────────────────────────────────────────╮
-│   a3f9c01e  fish  Oct 05  80×24   in use                          │
-│   build     bash  09:14   120×40  this                            │
-│ ▸ logs      zsh   11:02   120×40                                  │
-│   + new session                                                   │
-├ preview ──────────────────────────────────────────────────────────┤
-│ Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetike│
-│ Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): sess │
-│ Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian│
-│ ^C                                                                │
-│ oetiker@thinlinc:~$ journalctl -f -u ssh                          │
-├───────────────────────────────────────────────────────────────────┤
-│ ⏎ switch  n new  r rename  x kill  q back                         │
-╰───────────────────────────────────────────────────────────────────╯
+╭ sessions on thinlinc ────────────────────────────────────────────────╮
+│   a3f9c01e  fish  Oct 05  80×24   in use                             │
+│   build     bash  09:14   120×40  this                               │
+│ ▸ logs      zsh   11:02   120×40                                     │
+│   + new session                                                      │
+├ preview ─────────────────────────────────────────────────────────────┤
+│ Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetiker  │
+│ Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): session │
+│ Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian-s │
+│ ^C                                                                   │
+│ oetiker@thinlinc:~$ journalctl -f -u ssh                             │
+├──────────────────────────────────────────────────────────────────────┤
+│ ⏎ switch  n new  r rename  x kill  q back                            │
+╰──────────────────────────────────────────────────────────────────────╯
 ```
 
 Top to bottom inside the box: the header (an outage, as in D1), the list, the
