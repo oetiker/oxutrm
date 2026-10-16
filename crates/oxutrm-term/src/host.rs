@@ -472,6 +472,7 @@ pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
         bell: meta.bell,
         scrollback_len: meta.scrollback_len,
         clipboard: meta.clipboard,
+        links: Default::default(),
     }
 }
 
@@ -487,6 +488,7 @@ pub(crate) fn convert_cell(
         fg: to_proto_color(cell.fg, overrides, palette),
         bg: to_proto_color(cell.bg, overrides, palette),
         attrs: attrs_of(cell.flags) | blink_of(blink, point),
+        link: 0,
     }
 }
 

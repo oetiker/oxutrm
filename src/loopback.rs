@@ -304,6 +304,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_owned(),
         }
     }

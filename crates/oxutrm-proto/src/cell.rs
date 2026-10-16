@@ -63,6 +63,10 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// The OSC 8 hyperlink this cell belongs to: a key of
+    /// [`ScreenState::links`](crate::ScreenState::links), or 0 for none
+    /// (**I10**). One varint byte on the wire for an unlinked cell.
+    pub link: u16,
 }
 
 impl Cell {
@@ -73,6 +77,7 @@ impl Cell {
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::empty(),
+            link: 0,
         }
     }
 }

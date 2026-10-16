@@ -209,6 +209,7 @@ fn i4_the_struct_has_no_icon_field() {
         bell: 0,
         scrollback_len: 0,
         clipboard: Clipboard::default(),
+        links: Default::default(),
     };
     assert_eq!(s.validate(), Ok(()));
 }
@@ -866,6 +867,7 @@ fn a_screen_state_survives_a_postcard_round_trip() {
         fg: Color::Rgb(1, 2, 3),
         bg: Color::Idx(42),
         attrs: Attrs::BOLD | Attrs::WIDE_CONT,
+        link: 0,
     };
     s.modes = Modes {
         alt_screen: true,

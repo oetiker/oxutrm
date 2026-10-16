@@ -2565,12 +2565,14 @@ mod tests {
                 fg: Color::Default,
                 bg: Color::Default,
                 attrs: Attrs::empty(),
+                link: 0,
             };
             s.cells[at + 1] = Cell {
                 text: CellText::const_new(""),
                 fg: Color::Default,
                 bg: Color::Default,
                 attrs: Attrs::WIDE_CONT,
+                link: 0,
             };
         }
         s.cursor.row = 0;

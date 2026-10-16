@@ -135,12 +135,14 @@ pub fn splash(elapsed: Duration, size: TermSize, seed: u64, caption: &str) -> Ov
                     fg: Color::Default,
                     bg: Color::Default,
                     attrs: Attrs::empty(),
+                    link: 0,
                 },
                 None => Cell {
                     text: braille(v),
                     fg: Color::Default,
                     bg: Color::Default,
                     attrs,
+                    link: 0,
                 },
             });
         }

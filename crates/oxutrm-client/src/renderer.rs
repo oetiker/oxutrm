@@ -570,6 +570,7 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "test".to_string(),
         }
     }
@@ -1190,6 +1191,7 @@ mod tests {
                 fg: Color::Idx(1),
                 bg: Color::Default,
                 attrs: Attrs::empty(),
+                link: 0,
             })
             .collect::<Vec<_>>();
         crate::Overlay {

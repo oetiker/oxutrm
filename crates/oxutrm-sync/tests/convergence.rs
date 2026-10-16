@@ -813,6 +813,7 @@ fn every_screen_field_survives_a_round_trip() {
         fg: Color::Rgb(1, 2, 3),
         bg: Color::Idx(200),
         attrs: Attrs::BOLD | Attrs::WIDE_CONT,
+        link: 0,
     };
     tx.update(next);
 

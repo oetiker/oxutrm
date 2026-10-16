@@ -62,6 +62,19 @@ pub const MAX_TITLE: usize = 512;
 /// truncated: a truncated paste is silent data corruption.
 pub const MAX_CLIPBOARD: usize = 256 * 1024;
 
+/// The most bytes one hyperlink URI (OSC 8) may carry -- the bound of
+/// **I10**, beside the I8 bounds above.
+///
+/// VTE's own limit, and VTE is the most common local terminal: a longer URI
+/// would be dropped there anyway.
+pub const MAX_LINK_URI: usize = 2083;
+
+/// The most hyperlinks one state may hold (**I10**).
+///
+/// Far above any real screen, and it bounds a state's link table to about
+/// 1 MiB. On the host a link that does not fit is dropped; its text stays.
+pub const MAX_LINKS: usize = 512;
+
 /// Which piece of text an **I8** rejection is about.
 ///
 /// The two fields obey the same rule with different bounds, and an error that
@@ -75,6 +88,8 @@ pub enum TextField {
     Title,
     /// The text of [`ScreenState::clipboard`](crate::ScreenState::clipboard).
     Clipboard,
+    /// A URI in [`ScreenState::links`](crate::ScreenState::links) (**I10**).
+    LinkUri,
 }
 
 impl TextField {
@@ -84,6 +99,7 @@ impl TextField {
             TextField::CellText => MAX_CELL_TEXT,
             TextField::Title => MAX_TITLE,
             TextField::Clipboard => MAX_CLIPBOARD,
+            TextField::LinkUri => MAX_LINK_URI,
         }
     }
 }
@@ -94,6 +110,7 @@ impl std::fmt::Display for TextField {
             TextField::CellText => f.write_str("cell text"),
             TextField::Title => f.write_str("title"),
             TextField::Clipboard => f.write_str("clipboard"),
+            TextField::LinkUri => f.write_str("link URI"),
         }
     }
 }
@@ -188,6 +205,9 @@ pub struct TerminalCaps {
     pub bracketed_paste: bool,
     pub mouse_sgr: bool,
     pub osc52: bool,
+    /// The terminal is worth sending OSC 8 hyperlinks to. A terminal without
+    /// them ignores the sequence, so only `dumb` is off.
+    pub osc8: bool,
     /// The client's own `$TERM`, for diagnosis only. Never propagated.
     pub term_name: String,
 }
@@ -284,13 +304,16 @@ mod tests {
             bracketed_paste: true,
             mouse_sgr: true,
             osc52: true,
+            osc8: true,
             term_name: "xterm-256color".to_string(),
         };
         let back: TerminalCaps =
             serde_json::from_str(&serde_json::to_string(&caps).expect("encode")).expect("decode");
         assert_eq!(back.colors, 16_777_216);
         assert_eq!(back.term_name, "xterm-256color");
-        assert!(back.truecolor && back.bracketed_paste && back.mouse_sgr && back.osc52);
+        assert!(
+            back.truecolor && back.bracketed_paste && back.mouse_sgr && back.osc52 && back.osc8
+        );
     }
 
     #[test]
