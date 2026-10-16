@@ -209,7 +209,7 @@ impl Loopback {
 #[cfg(test)]
 impl Loopback {
     /// The screen the host believes in.
-    pub fn host_screen(&self) -> ScreenState {
+    pub fn host_screen(&mut self) -> ScreenState {
         self.host.snapshot(self.screen_tx.current().seq)
     }
 

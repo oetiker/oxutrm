@@ -267,7 +267,7 @@ impl HostSession {
         // The shell's own counters, not the sender's: those may lag a shell
         // that moved while nobody was attached.
         let last = match self.term.take() {
-            Some(term) => term.snapshot(1),
+            Some(mut term) => term.snapshot(1),
             None => self.screen_tx.current().clone(),
         };
         self.screen_tx.update(lobby_screen(self.size, &last)?);
@@ -811,13 +811,14 @@ impl HostSession {
     }
 
     /// The screen as a preview shows it (preview spec §3.6): a fresh
-    /// snapshot of the emulator, cut by `ScreenState::window`. `&self`, so
+    /// picture of the emulator, cut by `ScreenState::window`. A picture
+    /// carries no links, so the ids the attached client holds do not move. `&self`, so
     /// nothing the attached client is sent -- the sender's state, the
     /// stale flag, the presence -- can move for it. A detached session's
     /// emulator is fed all the same, so the picture is current either way.
     pub(crate) fn preview(&self) -> Result<ScreenState, String> {
         match self.term.as_ref() {
-            Some(term) => Ok(term.snapshot(1).window(PREVIEW_MAX)),
+            Some(term) => Ok(term.picture(1).window(PREVIEW_MAX)),
             None => Err("this session has no shell".to_string()),
         }
     }

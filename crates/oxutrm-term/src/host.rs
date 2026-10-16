@@ -16,6 +16,7 @@ use oxutrm_proto::{
 
 use crate::blink::{BlinkPlane, BlinkTap};
 use crate::grid::{GridSize, cell_at};
+use crate::links::LinkTable;
 use crate::listener::EventSink;
 use crate::palette::{PALETTE_LEN, palette, to_proto_color};
 use crate::pty::Pty;
@@ -65,6 +66,10 @@ pub struct HostTerm {
     /// [`HostTerm::clipboard_delivered`] says the client has it.
     clipboard: Clipboard,
 
+    /// The wire ids of the hyperlinks on screen. Updated by every
+    /// [`HostTerm::snapshot`], which is why that takes `&mut self`.
+    links: LinkTable,
+
     exited: Option<i32>,
 }
 
@@ -111,6 +116,7 @@ impl HostTerm {
             title: String::new(),
             scrollback_len: 0,
             clipboard: Clipboard::default(),
+            links: LinkTable::default(),
             exited: None,
         })
     }
@@ -243,20 +249,45 @@ impl HostTerm {
     }
 
     /// Build a state carrying the given sequence number.
-    pub fn snapshot(&self, seq: u64) -> ScreenState {
+    ///
+    /// `&mut self` because the hyperlinks on screen are interned here: a
+    /// link keeps its wire id while some cell holds it, and an id no cell
+    /// holds any more is freed for the next link.
+    pub fn snapshot(&mut self, seq: u64) -> ScreenState {
+        let meta = self.meta(seq);
         screen_state_of(
             &self.term,
             &self.blink,
             &self.palette,
             self.size,
-            StateMeta {
-                seq,
-                title: self.title.clone(),
-                bell: self.bell,
-                scrollback_len: self.scrollback_len,
-                clipboard: self.clipboard.clone(),
-            },
+            meta,
+            Some(&mut self.links),
         )
+    }
+
+    /// [`HostTerm::snapshot`] without any hyperlink: every cell's `link` is
+    /// 0 and the table is empty. For a picture of the screen that is not
+    /// sent to this session's client, the session preview, which must not
+    /// move the ids that client holds.
+    pub fn picture(&self, seq: u64) -> ScreenState {
+        screen_state_of(
+            &self.term,
+            &self.blink,
+            &self.palette,
+            self.size,
+            self.meta(seq),
+            None,
+        )
+    }
+
+    fn meta(&self, seq: u64) -> StateMeta {
+        StateMeta {
+            seq,
+            title: self.title.clone(),
+            bell: self.bell,
+            scrollback_len: self.scrollback_len,
+            clipboard: self.clipboard.clone(),
+        }
     }
 
     /// The client has acknowledged a state carrying copy number `serial`:
@@ -274,6 +305,9 @@ impl HostTerm {
     }
 
     /// Scrollback lines `[from, to)` as rendered cell rows.
+    ///
+    /// Without hyperlinks: every cell's `link` is 0. A scrollback row travels
+    /// on its own, with no link table to resolve an id against.
     ///
     /// Scrollback is native and O(1): `Line` is signed and negative reaches
     /// history, with `Line(-1)` the most recently scrolled-off line. Nothing
@@ -417,29 +451,58 @@ fn record_copy(clipboard: &mut Clipboard, kind: ClipboardType, text: String) -> 
     Ok(())
 }
 
+/// `links` is `None` for a state that carries no hyperlinks at all.
 pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
     term: &Term<T>,
     blink: &BlinkPlane,
     palette: &[Rgb; PALETTE_LEN],
     size: TermSize,
     meta: StateMeta,
+    links: Option<&mut LinkTable>,
 ) -> ScreenState {
     let rows = size.rows;
     let cols = size.cols;
     let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+    let mut found = Vec::new();
+    if links.is_some() {
+        found.reserve(cells.capacity());
+    }
 
     for row in 0..rows {
         for col in 0..cols {
             let point = Point::new(Line(row as i32), Column(col as usize));
-            cells.push(match cell_at(term, point) {
+            let vte = cell_at(term, point);
+            cells.push(match vte {
                 Some(c) => convert_cell(c, point, blink, term.colors(), palette),
                 // Outside the emulator's grid: the sizes disagree, which can
                 // happen for one poll after a resize. A blank keeps the length
                 // invariant, which matters more than the cell.
                 None => Cell::blank(),
             });
+            if links.is_some() {
+                // The right half of a wide glyph belongs to its left half's
+                // link, whatever the emulator stored there.
+                let link = match vte {
+                    Some(c) if c.flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 => {
+                        found.last().cloned().flatten()
+                    }
+                    Some(c) => c.hyperlink(),
+                    None => None,
+                };
+                found.push(link);
+            }
         }
     }
+
+    let table = match links {
+        Some(links) => {
+            for (cell, id) in cells.iter_mut().zip(links.assign(&found)) {
+                cell.link = id;
+            }
+            links.table()
+        }
+        None => Default::default(),
+    };
 
     let cursor_point = term.grid().cursor.point;
     let cursor = Cursor {
@@ -472,7 +535,7 @@ pub(crate) fn screen_state_of<T: alacritty_terminal::event::EventListener>(
         bell: meta.bell,
         scrollback_len: meta.scrollback_len,
         clipboard: meta.clipboard,
-        links: Default::default(),
+        links: table,
     }
 }
 
@@ -704,6 +767,128 @@ mod tests {
         }
     }
 
+    /// A state of `term`, its links interned in `links`.
+    fn linked_state(term: &Term<EventSink>, links: &mut LinkTable) -> ScreenState {
+        let size = TermSize {
+            rows: term.screen_lines() as u16,
+            cols: term.columns() as u16,
+        };
+        screen_state_of(
+            term,
+            &BlinkPlane::default(),
+            &palette(),
+            size,
+            StateMeta {
+                seq: 1,
+                title: String::new(),
+                bell: 0,
+                scrollback_len: 0,
+                clipboard: Clipboard::default(),
+            },
+            Some(links),
+        )
+    }
+
+    #[test]
+    fn a_hyperlink_reaches_the_state_as_an_id_and_one_table_entry() {
+        let term = crate::testing::term_with(4, 20, b"\x1b]8;;http://a\x1b\\x\x1b]8;;\x1b\\y");
+        let s = linked_state(&term, &mut LinkTable::default());
+        assert_eq!((s.cell(0, 0).text.as_str(), s.cell(0, 0).link), ("x", 1));
+        assert_eq!((s.cell(0, 1).text.as_str(), s.cell(0, 1).link), ("y", 0));
+        assert_eq!(s.links.len(), 1);
+        assert_eq!(s.links.get(&1).map(|u| &**u), Some("http://a"));
+        s.validate().expect("valid");
+    }
+
+    #[test]
+    fn one_uri_printed_twice_without_an_id_is_two_links() {
+        let term = crate::testing::term_with(
+            4,
+            20,
+            b"\x1b]8;;http://a\x1b\\x\x1b]8;;\x1b\\ \x1b]8;;http://a\x1b\\y\x1b]8;;\x1b\\",
+        );
+        let s = linked_state(&term, &mut LinkTable::default());
+        assert_eq!((s.cell(0, 0).link, s.cell(0, 2).link), (1, 2));
+        assert_eq!(s.links.len(), 2);
+    }
+
+    #[test]
+    fn a_link_with_a_non_ascii_uri_is_dropped_and_its_text_kept() {
+        let term = crate::testing::term_with(
+            4,
+            20,
+            "\x1b]8;;http://bücher.example/\x1b\\x\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let s = linked_state(&term, &mut LinkTable::default());
+        assert_eq!((s.cell(0, 0).text.as_str(), s.cell(0, 0).link), ("x", 0));
+        assert!(s.links.is_empty());
+        s.validate().expect("valid");
+    }
+
+    #[test]
+    fn a_wide_glyph_in_a_link_is_linked_in_both_halves() {
+        let term =
+            crate::testing::term_with(4, 20, "\x1b]8;;http://a\x1b\\世\x1b]8;;\x1b\\".as_bytes());
+        let s = linked_state(&term, &mut LinkTable::default());
+        assert!(s.cell(0, 1).attrs.contains(Attrs::WIDE_CONT));
+        assert_eq!((s.cell(0, 0).link, s.cell(0, 1).link), (1, 1));
+    }
+
+    #[test]
+    fn a_link_scrolled_off_the_screen_frees_its_id() {
+        let mut term = crate::testing::term_with(3, 20, b"\x1b]8;;http://a\x1b\\x\x1b]8;;\x1b\\");
+        let mut links = LinkTable::default();
+        assert_eq!(linked_state(&term, &mut links).links.len(), 1);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            b"\r\n\r\n\r\n\x1b]8;;http://b\x1b\\y\x1b]8;;\x1b\\",
+        );
+        let s = linked_state(&term, &mut links);
+        assert_eq!(s.links.len(), 1, "a's entry is gone");
+        assert_eq!(
+            s.links.get(&1).map(|u| &**u),
+            Some("http://b"),
+            "and b reuses 1"
+        );
+    }
+
+    /// A picture carries no link: it is for a preview, which must neither
+    /// show one nor move the ids this session's client holds.
+    #[test]
+    fn a_picture_carries_no_links() {
+        let mut t = sh(
+            "printf '\\033]8;;http://a\\033\\\\x\\033]8;;\\033\\\\'; sleep 5",
+            size(),
+        );
+        assert!(poll_until(&mut t, Duration::from_secs(5), |t| {
+            t.picture(1).cell(0, 0).text == "x"
+        }));
+        let p = t.picture(1);
+        assert_eq!(p.cell(0, 0).link, 0);
+        assert!(p.links.is_empty());
+        let s = t.snapshot(1);
+        assert_eq!(s.cell(0, 0).link, 1, "the snapshot has it");
+    }
+
+    #[test]
+    fn scrollback_rows_carry_no_links() {
+        let mut t = sh(
+            "printf '\\033]8;;http://a\\033\\\\x\\033]8;;\\033\\\\\\n'; seq 30; sleep 5",
+            TermSize { cols: 20, rows: 5 },
+        );
+        assert!(poll_until(&mut t, Duration::from_secs(5), |t| {
+            t.picture(1).scrollback_len >= 20
+        }));
+        let total = t.picture(1).scrollback_len;
+        let rows = t.scrollback(0, total);
+        assert!(
+            rows.iter().any(|r| r[0].text == "x"),
+            "the linked row scrolled off"
+        );
+        assert!(rows.iter().flatten().all(|c| c.link == 0));
+    }
+
     fn sh(script: &str, size: TermSize) -> HostTerm {
         HostTerm::spawn(
             "/bin/sh",
@@ -886,7 +1071,7 @@ mod tests {
 
     /// Poll until `f` is satisfied, or give up. There is a real process on
     /// the other end, so nothing here may assume it has already run.
-    fn poll_until(t: &mut HostTerm, budget: Duration, f: impl Fn(&HostTerm) -> bool) -> bool {
+    fn poll_until(t: &mut HostTerm, budget: Duration, f: impl Fn(&mut HostTerm) -> bool) -> bool {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             t.poll().expect("poll");
@@ -936,7 +1121,7 @@ mod tests {
 
     #[test]
     fn the_sequence_number_is_whatever_the_caller_asked_for() {
-        let t = sh("exit 0", size());
+        let mut t = sh("exit 0", size());
         assert_eq!(t.snapshot(42).seq, 42);
     }
 

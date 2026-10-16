@@ -71,6 +71,7 @@ fn render(rows: u16, cols: u16, bytes: &[u8]) -> (ScreenState, String) {
             scrollback_len: scrolled,
             clipboard: oxutrm_proto::Clipboard::default(),
         },
+        Some(&mut crate::links::LinkTable::default()),
     );
     let text = describe(&state);
     (state, text)
@@ -340,6 +341,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             scrollback_len: 0,
             clipboard: oxutrm_proto::Clipboard::default(),
         },
+        Some(&mut crate::links::LinkTable::default()),
     );
 
     // Narrow, then widen back.
@@ -357,6 +359,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             scrollback_len: 0,
             clipboard: oxutrm_proto::Clipboard::default(),
         },
+        Some(&mut crate::links::LinkTable::default()),
     );
 
     term.resize(GridSize::new(size_wide, 100).expect("test size is legal"));
@@ -372,6 +375,7 @@ fn a_reflow_shrinks_and_grows_back_losslessly() {
             scrollback_len: 0,
             clipboard: oxutrm_proto::Clipboard::default(),
         },
+        Some(&mut crate::links::LinkTable::default()),
     );
 
     assert_eq!(before.validate(), Ok(()));
