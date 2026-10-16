@@ -1187,7 +1187,10 @@ mod tests {
             .unwrap();
         let begun = Instant::now();
         while host.term_mut().snapshot(1).clipboard.serial == 0 {
-            assert!(begun.elapsed() < Duration::from_secs(10), "no bell");
+            assert!(
+                begun.elapsed() < Duration::from_secs(10),
+                "the copy never raised the clipboard serial"
+            );
             host.term_mut().poll().unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

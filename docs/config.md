@@ -40,7 +40,7 @@ The config screen (`c` in the status popup) changes a setting for the running se
 
 **`terminal.clipboard`** -- A copy reaches the local terminal, which may still ask or refuse by its own settings. Copies over 256 KiB are dropped. A remote program can never read the local clipboard.
 
-**`terminal.hyperlinks`** -- A link reaches the local terminal unchanged, `file://` links included: those name the remote host, and the local terminal decides what to do with them. A link with a URI longer than 2083 bytes or with characters other than printable ASCII is shown as plain text. Turn this off for a terminal that prints OSC 8 instead of ignoring it.
+**`terminal.hyperlinks`** -- A link reaches the local terminal unchanged, `file://` links included: those name the remote host, and the local terminal decides what to do with them. A link with a URI longer than 2083 bytes or with characters other than printable ASCII, or past the 512th link on one screen, is shown as plain text. Turn this off for a terminal that prints OSC 8 instead of ignoring it.
 
 ## Example
 

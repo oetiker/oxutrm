@@ -430,8 +430,8 @@ pub(crate) static SETTINGS: &[Setting] = &[
         doc: "A link reaches the local terminal unchanged, `file://` links \
               included: those name the remote host, and the local terminal \
               decides what to do with them. A link with a URI longer than 2083 \
-              bytes or with characters other than printable ASCII is shown as \
-              plain text. Turn this off for a terminal that prints OSC 8 \
+              bytes or with characters other than printable ASCII, or past the \
+              512th link on one screen, is shown as plain text. Turn this off for a terminal that prints OSC 8 \
               instead of ignoring it.",
         get: |s| Value::Bool(s.hyperlinks),
         set: |s, v| {
