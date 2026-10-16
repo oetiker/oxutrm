@@ -256,6 +256,7 @@ The client starts it over ssh; it is not normally typed by hand.
 **oxutrm loopback** runs the host and the client in one process with no network between them:
 a shell on a pty, the terminal emulator, the screen differences encoded and decoded, and the renderer.
 It needs a terminal.
+It does not pass a remote program's clipboard copies (OSC 52) to the local terminal.
 
 - `shell`: The program to run. The default is `$SHELL`, else `/bin/sh`.
 - `-h, --help`: Print a usage summary of **oxutrm loopback** and exit.

@@ -513,7 +513,8 @@ contradict an earlier section, that section has been corrected.
   of a session (§3.5).
 - `terminal.clipboard` adds a fourth section, `terminal`, to the config
   screen.
-- `oxutrm loopback` does not write copies; it has no client session.
+- `oxutrm loopback` does not write copies; it has no client session. The
+  manual says so under `loopback`.
 - The end-to-end tests let the client apply a first state before the shell
   copies (`read go`), because of the baseline rule above.
 - For D2: a preview `window()` returns `Clipboard::default()` (clearing a
