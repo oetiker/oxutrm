@@ -88,6 +88,61 @@ still does.
 While the link is down the selector stays open, says so in its header, and
 refuses its actions until the link is back.
 
+## Preview
+
+Where the terminal has room, the selector shows the selected session's screen
+under the list, below a rule titled `preview`:
+
+```
+╭ sessions on thinlinc ─────────────────────────────────────────────╮
+│   a3f9c01e  fish  Oct 05  80×24   in use                          │
+│   build     bash  09:14   120×40  this                            │
+│ ▸ logs      zsh   11:02   120×40                                  │
+│   + new session                                                   │
+├ preview ──────────────────────────────────────────────────────────┤
+│ Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetike│
+│ Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): sess │
+│ Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian│
+│ ^C                                                                │
+│ oetiker@thinlinc:~$ journalctl -f -u ssh                          │
+├───────────────────────────────────────────────────────────────────┤
+│ ⏎ switch  n new  r rename  x kill  q back                         │
+╰───────────────────────────────────────────────────────────────────╯
+```
+
+The pane shows the session's own cells in its colours, cut and never scaled:
+the leftmost columns, and the rows that end at the cursor's row. A program
+that hides its cursor (`htop`, `top`) shows its top rows instead. At most
+68 columns by 18 rows are shown.
+
+The screen is fetched when the selection arrives on a row, one request at a
+time; while one is out, the row you moved to last is asked next. Coming back
+to a row shows the screen fetched before, and fetches it again behind it
+when it is older than 2 seconds. The preview is not refreshed while the
+selection rests, and everything fetched is forgotten when the selector
+closes. The row of the session you are in shows your own screen, live.
+
+Looking at a session changes nothing in it: a session `in use` elsewhere is
+previewed too, and its other client is not told.
+
+Where there is no screen to show, the pane says why:
+
+| Row | Pane |
+|---|---|
+| `+ new session` | `a new login shell in your home directory` |
+| `old version` | `another version of oxutrm: no preview` |
+| cannot be reattached | `no preview: it dies with its ssh` |
+| being fetched | `asking logs for its screen…` |
+| refused or failed | the reason, for example `session 5d2e8a7c did not answer in time` |
+| sent a screen that breaks the protocol's rules | `logs sent a screen that is not valid` |
+| link down, nothing fetched yet | `the link is down` |
+
+The pane needs 30 columns and 4 rows inside the box after the list (at most
+8 rows of it, scrolling beyond that), the line under the list and the key
+bar. With three sessions that is a terminal of at least 38 columns and 15
+rows; below that the selector looks as it does without a preview. There is
+no key or setting to turn the preview off.
+
 ## Names
 
 A name is 1 to 24 characters, printable, with no space at either end, and at
