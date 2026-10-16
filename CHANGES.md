@@ -7,6 +7,10 @@
 ### Changed
 
 ### Fixed
+- A program that printed the start of a terminal control sequence and never
+  ended it, such as a `cat` of a damaged file, made the memory of its session
+  on the host grow until the system killed it. Such a sequence is now dropped
+  once it passes 512 KiB, and the output that follows it shows as usual.
 
 ## 0.3.0 - 2026-10-15
 ### New
