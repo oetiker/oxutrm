@@ -3735,19 +3735,23 @@ mod tests {
         let (mut host, mut client) = pair("read go; printf '\\033]52;c;aGVsbG8=\\007'\n").await;
         let mut out = Vec::new();
         baseline_then_go(&mut host, &mut client, &mut out).await;
-        assert!(
-            drive(
-                &mut host,
-                &mut client,
-                &mut out,
-                Duration::from_secs(20),
-                |h, c| c.screen().clipboard.serial == 1 && h.screen().clipboard.copy.is_none()
-            )
-            .await
-        );
+        // Only the client's inbound side turns: it applies and writes the
+        // copy but never acknowledges it, so the host still holds the text
+        // when the client comes back.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while client.screen().clipboard.serial != 1 {
+            assert!(Instant::now() < deadline, "the copy never arrived");
+            host.turn().expect("host turn");
+            client
+                .take_frames(None, &mut out, &mut Turn::default())
+                .expect("client frames");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
         assert_eq!(count(&out, HELLO_OSC52), 1);
+        assert!(host.screen().clipboard.copy.is_some(), "the text is held");
 
-        // The same client, on a new link: a full state of the same session.
+        // The same client, on a new link: a full state of the same session,
+        // text and all.
         let (host_side, client_side) = crate::link::fixtures::link_pair().await;
         host.adopt(host_side, size()).expect("the host adopts");
         client
@@ -3763,6 +3767,17 @@ mod tests {
             )
             .await,
             "the reattached client never got a state"
+        );
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(10),
+                |h, _| h.screen().clipboard.copy.is_none()
+            )
+            .await,
+            "the reattached client never acknowledged the copy"
         );
         assert_eq!(count(&out, HELLO_OSC52), 1, "not written a second time");
     }
