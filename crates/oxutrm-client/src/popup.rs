@@ -891,6 +891,8 @@ pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
 /// session's own, colours and attributes and all; the renderer repairs a
 /// wide glyph that a hostile screen left broken at the edge, as it does
 /// for every row it composites.
+/// A cell with no text that is not a wide glyph's right half becomes a
+/// space.
 fn stamp(o: &mut Overlay, at: Rect, s: &ScreenState) {
     let w = s.window(TermSize {
         cols: at.width,
@@ -900,7 +902,15 @@ fn stamp(o: &mut Overlay, at: Rect, s: &ScreenState) {
     for r in 0..w.rows {
         for c in 0..w.cols {
             let to = usize::from(at.y + r) * stride + usize::from(at.x + c);
-            o.cells[to] = w.cell(r, c).clone();
+            let mut cell = w.cell(r, c).clone();
+            // The cell a tab started in has no text: the host's emulator
+            // stores `\t` there and the host drops the control. Written as
+            // it is, it would write nothing and pull the rest of the row,
+            // the box's border with it, one column left.
+            if cell.text.is_empty() && !cell.attrs.contains(oxutrm_proto::Attrs::WIDE_CONT) {
+                cell.text = oxutrm_proto::CellText::const_new(" ");
+            }
+            o.cells[to] = cell;
         }
     }
 }
@@ -2653,6 +2663,30 @@ mod tests {
                 "the pane under the session: {text}"
             );
         }
+    }
+
+    /// A tab leaves the cell it started in with no text at all (the host's
+    /// emulator stores `\t` there and the host drops the control): drawn as
+    /// it is, it would write nothing and pull the rest of its row, the
+    /// box's border with it, one column left. In the pane it is a space.
+    #[test]
+    fn a_cell_a_tab_left_empty_is_a_space_in_the_pane() {
+        use oxutrm_proto::{CellText, ScreenState};
+        let mut s = ScreenState::blank(2, 40).unwrap();
+        for (c, ch) in "a".chars().chain("b".chars()).enumerate() {
+            s.cells[c * 8].text = CellText::new(ch.to_string());
+        }
+        s.cells[1].text = CellText::const_new("");
+        s.cursor.row = 1;
+        let v = SessionsView {
+            preview: Some(PreviewPane::Screen(s)),
+            ..preview_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let r = rule_row(&o, Some("preview")).unwrap() + 1;
+        let line = row(&o, r);
+        assert!(line.starts_with("\u{2502} a       b"), "{line:?}");
+        assert_eq!(line.chars().count(), usize::from(o.cols), "{line:?}");
     }
 
     /// Every note of preview spec §3.5 is one dimmed line in the middle of
