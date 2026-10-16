@@ -20,6 +20,8 @@ rustix = { workspace = true, features = ["pty"] }
 # binding. Nothing else in this crate touches libc.
 libc.workspace = true
 anyhow.workspace = true
+# OSC 52 carries the copy base64-encoded (`clipboard.rs`).
+base64.workspace = true
 oxutrm-proto.workspace = true
 # ratatui as a LAYOUT AND WIDGET library only. `default-features = false` is
 # what drops `crossterm`: the default feature set includes it, and taking it

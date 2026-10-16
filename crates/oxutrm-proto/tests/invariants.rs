@@ -6,8 +6,9 @@
 //! deletes the check.
 
 use oxutrm_proto::{
-    ApplyError, Attrs, Cell, CellText, Color, Cursor, CursorShape, MAX_CELL_TEXT, MAX_SCREEN_CELLS,
-    MAX_SCREEN_DIM, MAX_TITLE, Modes, MouseMode, ScreenState, TermSize, TextField,
+    ApplyError, Attrs, Cell, CellText, Clipboard, ClipboardCopy, ClipboardTarget, Color, Cursor,
+    CursorShape, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, Modes,
+    MouseMode, ScreenState, TermSize, TextField,
 };
 
 /// A valid 3x4 state, for tests that then break exactly one thing about it.
@@ -207,6 +208,7 @@ fn i4_the_struct_has_no_icon_field() {
         title: String::new(),
         bell: 0,
         scrollback_len: 0,
+        clipboard: Clipboard::default(),
     };
     assert_eq!(s.validate(), Ok(()));
 }
@@ -875,4 +877,62 @@ fn a_screen_state_survives_a_postcard_round_trip() {
     let back: ScreenState = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, s);
     assert_eq!(back.validate(), Ok(()));
+}
+
+// ---------------------------------------------------------------- I9
+
+/// A state holding one copy of `text` at `serial`.
+fn with_copy(serial: u32, text: &str) -> ScreenState {
+    let mut s = good();
+    s.clipboard = Clipboard {
+        serial,
+        copy: Some(ClipboardCopy {
+            target: ClipboardTarget::Clipboard,
+            text: text.into(),
+        }),
+    };
+    s
+}
+
+#[test]
+fn i8_a_clipboard_copy_over_the_cap_is_rejected() {
+    assert_eq!(with_copy(1, &"x".repeat(MAX_CLIPBOARD)).validate(), Ok(()));
+    assert_eq!(
+        with_copy(1, &"x".repeat(MAX_CLIPBOARD + 1)).validate(),
+        Err(ApplyError::TextTooLong {
+            field: TextField::Clipboard,
+            len: MAX_CLIPBOARD + 1,
+            max: MAX_CLIPBOARD,
+        })
+    );
+}
+
+#[test]
+fn i8_a_clipboard_copy_may_hold_controls_because_it_is_never_painted() {
+    // The client base64-encodes the text into one OSC 52, so ESC and BEL in
+    // it are data, not commands. Refusing them would refuse copies of
+    // ordinary terminal output.
+    assert_eq!(with_copy(1, "a\x1b[31mred\x07\n").validate(), Ok(()));
+}
+
+#[test]
+fn i9_a_clipboard_serial_that_goes_backwards_is_rejected() {
+    let before = with_copy(5, "new");
+    let mut after = with_copy(4, "old");
+    after.seq = 2;
+    assert_eq!(after.validate(), Ok(()), "it is a legal state on its own");
+    assert_eq!(
+        after.validate_transition(&before),
+        Err(ApplyError::ClipboardWentBackwards { was: 5, now: 4 }),
+        "but not a legal successor"
+    );
+}
+
+#[test]
+fn i9_a_delivered_copy_may_lose_its_text_but_not_its_serial() {
+    let before = with_copy(5, "text");
+    let mut after = before.clone();
+    after.seq = 2;
+    after.clipboard = before.clipboard.without_text();
+    assert_eq!(after.validate_transition(&before), Ok(()));
 }

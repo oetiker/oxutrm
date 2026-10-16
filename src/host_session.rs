@@ -158,16 +158,19 @@ pub struct HostSession {
     detach_after: Duration,
 }
 
-/// A lobby's blank screen at `size`, keeping the bell and scrollback counts
-/// of `last`, the screen before it on the same link.
+/// A lobby's blank screen at `size`, keeping the bell, scrollback and
+/// clipboard counts of `last`, the screen before it on the same link.
 ///
-/// Both counters only ever go up across the states a client applies (I5, I6),
-/// so a blank that started them at zero again would have every frame from here
-/// on refused, and the client would sit on the dead shell's screen.
+/// All three only ever go up across the states a client applies (I5, I6,
+/// I9), so a blank that started them at zero again would have every frame
+/// from here on refused, and the client would sit on the dead shell's screen.
+/// The clipboard keeps its serial but not its text: a lobby has copied
+/// nothing.
 fn lobby_screen(size: TermSize, last: &ScreenState) -> Result<ScreenState> {
     let mut blank = ScreenState::blank(size.rows, size.cols)?;
     blank.bell = last.bell;
     blank.scrollback_len = last.scrollback_len;
+    blank.clipboard = last.clipboard.without_text();
     Ok(blank)
 }
 
@@ -345,6 +348,20 @@ impl HostSession {
                     }
                 }
             }
+        }
+
+        // ---- delivered clipboard copies ------------------------------------
+        // Once the client has acknowledged a state carrying a copy, the copy
+        // has reached it: the emulator drops the text and keeps the count, so
+        // later full states stay small and a later client is never handed
+        // stale clipboard content. The snapshot that says so is owed even if
+        // the pty is quiet, hence `screen_stale`.
+        self.screen_tx.on_ack(self.input_rx.peer_ack());
+        if let (Some(term), Some(acked)) = (self.term.as_mut(), self.screen_tx.acked())
+            && acked.clipboard.copy.is_some()
+            && term.clipboard_delivered(acked.clipboard.serial)
+        {
+            self.screen_stale = true;
         }
 
         // The client's requested size arrives on the input diff. This has to
@@ -956,8 +973,20 @@ impl HostSession {
         // is blank and `screen_stale` forces the snapshot that fills it.
         // Built from `self.size`, which the resize above has just made current
         // (and which `resize` leaves untouched when the size did not change).
+        // A lobby has no emulator for `screen_stale` to snapshot: its screen
+        // is the blank it was given, and that blank carries the counters the
+        // next shell counts on from (`lobby_screen`). Kept across the new
+        // generation, or a shell started here numbers its copies from 0 again
+        // and a client that saw the dead shell's drops them.
+        let lobby = match self.term {
+            None => Some(lobby_screen(self.size, self.screen_tx.current())?),
+            Some(_) => None,
+        };
         let blank = ScreenState::blank(self.size.rows, self.size.cols)?;
         self.screen_tx = oxutrm_sync::Sender::new(blank);
+        if let Some(lobby) = lobby {
+            self.screen_tx.update(lobby);
+        }
         self.input_rx = Receiver::new(InputState {
             seq: 1,
             pending: Vec::new(),
@@ -1137,11 +1166,12 @@ mod tests {
         }
     }
 
-    /// The bell is a counter the client holds across the lobby (I5): the
-    /// lobby's blank, a lobby resized, and the next shell all count on from
-    /// the dead shell's number rather than from zero.
+    /// The bell and the clipboard serial are counters the client holds across
+    /// the lobby (I5, I9): the lobby's blank, a lobby resized, and the next
+    /// shell all count on from the dead shell's numbers rather than from
+    /// zero. The copy's text stays behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_lobby_and_the_next_shell_count_on_from_the_last_bell() {
+    async fn the_lobby_and_the_next_shell_count_on_from_the_last_bell_and_copy() {
         let (host_link, _client) = link_pair().await;
         let mut host = HostSession::spawn(
             "/bin/sh",
@@ -1151,9 +1181,11 @@ mod tests {
             host_link,
         )
         .unwrap();
-        host.term_mut().write_input(b"printf '\\a'\n").unwrap();
+        host.term_mut()
+            .write_input(b"printf '\\a\\033]52;c;eA==\\007'\n")
+            .unwrap();
         let begun = Instant::now();
-        while host.term_mut().snapshot(1).bell == 0 {
+        while host.term_mut().snapshot(1).clipboard.serial == 0 {
             assert!(begun.elapsed() < Duration::from_secs(10), "no bell");
             host.term_mut().poll().unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1162,13 +1194,173 @@ mod tests {
 
         host.become_lobby().unwrap();
         assert_eq!(host.screen().bell, rang, "the lobby's blank");
+        let copied = oxutrm_proto::Clipboard {
+            serial: 1,
+            copy: None,
+        };
+        assert_eq!(host.screen().clipboard, copied, "a serial, no text");
         let smaller = TermSize { cols: 80, rows: 24 };
         host.resize(smaller).unwrap();
         assert_eq!(host.screen().rows, 24);
         assert_eq!(host.screen().bell, rang, "the lobby resized");
+        assert_eq!(host.screen().clipboard, copied, "the lobby resized");
 
         host.start_shell().unwrap();
         assert_eq!(host.term_mut().snapshot(1).bell, rang, "the next shell");
+        assert_eq!(
+            host.term_mut().snapshot(1).clipboard,
+            copied,
+            "the next shell"
+        );
+    }
+
+    /// A lobby reattached keeps its counters too: a client that comes back
+    /// to a lobby on a new link (a reattach, a failover onto the standby)
+    /// and starts a shell there must see that shell's copies numbered past
+    /// the dead shell's, or its relay, which keeps the session's baseline,
+    /// drops them as already written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lobby_adopted_on_a_new_link_keeps_its_counters() {
+        let (host_link, _client) = link_pair().await;
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        host.term_mut()
+            .write_input(b"printf '\\a\\033]52;c;eA==\\007'\n")
+            .unwrap();
+        let begun = Instant::now();
+        while host.term_mut().snapshot(1).clipboard.serial == 0 {
+            assert!(begun.elapsed() < Duration::from_secs(10), "no copy");
+            host.term_mut().poll().unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rang = host.term_mut().snapshot(1).bell;
+        host.become_lobby().unwrap();
+
+        let (again, _client_again) = link_pair().await;
+        host.adopt_as(again, size(), TAKEN_OVER).unwrap();
+        let copied = oxutrm_proto::Clipboard {
+            serial: 1,
+            copy: None,
+        };
+        assert_eq!(host.screen().clipboard, copied, "the adopted lobby");
+        assert_eq!(host.screen().bell, rang, "the adopted lobby");
+
+        host.start_shell().unwrap();
+        assert_eq!(
+            host.term_mut().snapshot(1).clipboard,
+            copied,
+            "the next shell"
+        );
+    }
+
+    /// The same, end to end: a client that saw the dead shell's copy, and
+    /// comes back to the lobby on a new link, writes the next shell's copy,
+    /// once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_after_a_lobby_reattach_and_a_new_shell_is_written_once() {
+        const ONE: &[u8] = b"\x1b]52;c;b25l\x07";
+        const TWO: &[u8] = b"\x1b]52;c;dHdv\x07";
+        let count =
+            |out: &[u8], needle: &[u8]| out.windows(needle.len()).filter(|w| *w == needle).count();
+        let caps = oxutrm_proto::TerminalCaps {
+            truecolor: true,
+            colors: 16_777_216,
+            bracketed_paste: true,
+            mouse_sgr: true,
+            osc52: true,
+            term_name: "xterm-256color".to_owned(),
+        };
+        async fn drive(
+            host: &mut HostSession,
+            client: &mut crate::session::ClientSession,
+            out: &mut Vec<u8>,
+            what: &str,
+            done: impl Fn(&HostSession, &crate::session::ClientSession, &[u8]) -> bool,
+        ) {
+            let begun = Instant::now();
+            while !done(host, client, out) {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(10),
+                    "{what}: {} frames rejected",
+                    client.rejected_total()
+                );
+                host.turn().unwrap();
+                client.turn(&[], out).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        let (host_link, client_link) = link_pair().await;
+        let mut host = HostSession::spawn(
+            "/bin/sh",
+            &oxutrm_term::Start::default(),
+            size(),
+            200,
+            host_link,
+        )
+        .unwrap();
+        let mut client =
+            crate::session::ClientSession::new(size(), caps, client_link, None).unwrap();
+        let mut out = Vec::new();
+        // A first state before the copy: the relay's baseline.
+        host.term_mut().write_input(b"echo up\n").unwrap();
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            "no first state",
+            |_, c, _| c.screen().seq > 1,
+        )
+        .await;
+        host.term_mut()
+            .write_input(b"printf '\\033]52;c;b25l\\007'\n")
+            .unwrap();
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            "the first copy",
+            |_, _, o| count(o, ONE) == 1,
+        )
+        .await;
+
+        host.become_lobby().unwrap();
+        let (host_again, client_again) = link_pair().await;
+        host.adopt_as(host_again, size(), TAKEN_OVER).unwrap();
+        client
+            .swap_in_as(client_again, Instant::now(), crate::session::REBUILT)
+            .unwrap();
+        // Until the client has applied the lobby's state on the new link.
+        let begun = Instant::now();
+        loop {
+            assert!(begun.elapsed() < Duration::from_secs(10), "the lobby");
+            host.turn().unwrap();
+            if client.turn(&[], &mut out).unwrap().applied > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        host.start_shell().unwrap();
+        host.term_mut()
+            .write_input(b"printf '\\033]52;c;dHdv\\007'\n")
+            .unwrap();
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            "the next shell's copy",
+            |_, _, o| count(o, TWO) == 1,
+        )
+        .await;
+        assert_eq!(count(&out, ONE), 1, "the old copy, not again");
+        assert_eq!(client.rejected_total(), 0);
     }
 
     /// A "shell" that ignores SIGHUP, as a script file the session runs. It

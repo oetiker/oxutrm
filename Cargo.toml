@@ -64,7 +64,9 @@ tokio = { version = "1", features = [
     "io-std",
 ] }
 postcard = { version = "1", features = ["use-std"] }
-serde = { version = "1", features = ["derive"] }
+# `rc` for the `Arc<str>` in `ClipboardCopy`: the sender's ring of states
+# shares one copy of the text instead of cloning it 32 times.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # 0.9 needs rustc 1.87 and is now within the floor; the pin stays at 0.8 until
 # somebody has a reason to move it, not because it is blocked.

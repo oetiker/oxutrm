@@ -43,6 +43,7 @@ fn empty_diff() -> ScreenDiff {
         title: None,
         bell: None,
         scrollback_len: None,
+        clipboard: None,
     }
 }
 

@@ -64,6 +64,10 @@ Durations are strings such as `"20s"`, `"1m"` or `"1m 30s"`.
   `false` also asks the host not to send its half; a host older than the client ignores the request.
   Behind a symmetric NAT, `false` makes a connect that cannot punch through fail.
   Takes effect at the next rebuild attempt or standby search.
+- `terminal.clipboard = true`: Pass a remote program's clipboard copy (OSC 52) to the local terminal,
+  which may still ask or refuse by its own settings.
+  Copies over 256 KiB are dropped.
+  A remote program can never read the local clipboard.
 
 Settings without a note take effect at once.
 The config screen (see **KEYS**) changes a setting for the running session and saves it to this file,
@@ -252,6 +256,7 @@ The client starts it over ssh; it is not normally typed by hand.
 **oxutrm loopback** runs the host and the client in one process with no network between them:
 a shell on a pty, the terminal emulator, the screen differences encoded and decoded, and the renderer.
 It needs a terminal.
+It does not pass a remote program's clipboard copies (OSC 52) to the local terminal.
 
 - `shell`: The program to run. The default is `$SHELL`, else `/bin/sh`.
 - `-h, --help`: Print a usage summary of **oxutrm loopback** and exit.

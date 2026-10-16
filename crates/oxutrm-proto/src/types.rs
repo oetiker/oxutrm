@@ -54,6 +54,14 @@ pub const MAX_CELL_TEXT: usize = 32;
 /// OSC sequence written to the user's real terminal.
 pub const MAX_TITLE: usize = 512;
 
+/// The most bytes of text one clipboard copy (OSC 52) may carry -- the third
+/// bound of **I8**, beside [`MAX_CELL_TEXT`] and [`MAX_TITLE`].
+///
+/// Enough for a vim yank of a large source file; after zstd about the size of
+/// one truecolor full state. A larger copy is dropped whole on the host, never
+/// truncated: a truncated paste is silent data corruption.
+pub const MAX_CLIPBOARD: usize = 256 * 1024;
+
 /// Which piece of text an **I8** rejection is about.
 ///
 /// The two fields obey the same rule with different bounds, and an error that
@@ -65,6 +73,8 @@ pub enum TextField {
     CellText,
     /// [`ScreenState::title`](crate::ScreenState::title).
     Title,
+    /// The text of [`ScreenState::clipboard`](crate::ScreenState::clipboard).
+    Clipboard,
 }
 
 impl TextField {
@@ -73,6 +83,7 @@ impl TextField {
         match self {
             TextField::CellText => MAX_CELL_TEXT,
             TextField::Title => MAX_TITLE,
+            TextField::Clipboard => MAX_CLIPBOARD,
         }
     }
 }
@@ -82,6 +93,7 @@ impl std::fmt::Display for TextField {
         match self {
             TextField::CellText => f.write_str("cell text"),
             TextField::Title => f.write_str("title"),
+            TextField::Clipboard => f.write_str("clipboard"),
         }
     }
 }

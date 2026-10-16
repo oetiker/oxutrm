@@ -91,6 +91,18 @@ impl<S: SyncState> Sender<S> {
             .expect("the ring always holds at least one state")
     }
 
+    /// The state the peer has acknowledged, while the ring still holds it.
+    ///
+    /// `None` before the first acknowledgement and after the acknowledged
+    /// state has fallen out of the ring. What the host reads to learn that a
+    /// clipboard copy has been delivered.
+    pub fn acked(&self) -> Option<&S> {
+        if self.peer_saw == 0 {
+            return None;
+        }
+        self.ring.iter().find(|s| s.seq() == self.peer_saw)
+    }
+
     /// The frame to send, or `None` when the peer is already up to date.
     ///
     /// `ack_state` is what *we* are telling the peer about *its* states — it
@@ -966,5 +978,53 @@ mod tests {
             "a diff refused by `validate_transition` was counted as applied"
         );
         assert_eq!(rx.state().bell, 5, "the refusal must change nothing");
+    }
+
+    #[test]
+    fn acked_is_the_state_the_peer_saw_while_the_ring_holds_it() {
+        let mut tx = Sender::new(screen());
+        assert!(tx.acked().is_none(), "nothing is acknowledged at the start");
+        tx.update(screen());
+        tx.update(screen());
+        tx.on_ack(2);
+        assert_eq!(tx.acked().map(|s| s.seq), Some(2));
+        for _ in 0..STATE_RING {
+            tx.update(screen());
+        }
+        assert!(tx.acked().is_none(), "seq 2 has left the ring");
+    }
+
+    /// The reason the clipboard is a state field: a lost frame costs
+    /// nothing, because the next diff from the same base carries the copy.
+    #[test]
+    fn a_copy_in_a_lost_frame_arrives_with_the_next_one() {
+        use oxutrm_proto::{Clipboard, ClipboardCopy, ClipboardTarget};
+        let mut tx = Sender::new(screen());
+        let mut rx = Receiver::new(screen());
+        let f = tx.make_frame(0).unwrap().unwrap();
+        rx.on_frame(&f).unwrap();
+        tx.on_ack(rx.ack());
+
+        let mut copied = screen();
+        copied.clipboard = Clipboard {
+            serial: 1,
+            copy: Some(ClipboardCopy {
+                target: ClipboardTarget::Clipboard,
+                text: "hello".into(),
+            }),
+        };
+        tx.update(copied.clone());
+        let _lost = tx.make_frame(0).unwrap().unwrap();
+
+        let mut later = copied;
+        later.cells[0].text = "x".into();
+        tx.update(later);
+        let f = tx.make_frame(0).unwrap().unwrap();
+        assert_eq!(rx.on_frame(&f), Ok(true));
+        assert_eq!(rx.state().clipboard.serial, 1);
+        assert_eq!(
+            rx.state().clipboard.copy.as_ref().map(|c| &*c.text),
+            Some("hello")
+        );
     }
 }

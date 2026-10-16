@@ -21,6 +21,7 @@ The config screen (`c` in the status popup) changes a setting for the running se
 | `network.stun_servers` | `["stun.cloudflare.com:3478", "stun.l.google.com:19302", "stun.nextcloud.com:443", "stun.sipgate.net:3478"]` | 0–16 host:port | next rebuild attempt or standby search | STUN servers that tell this side its public address |
 | `network.port_mapping` | `true` | true or false | next rebuild attempt or standby search | ask the router for a port mapping (UPnP / NAT-PMP / PCP) |
 | `network.birthday` | `true` | true or false | next rebuild attempt or standby search | the birthday-paradox NAT punch, at both ends |
+| `terminal.clipboard` | `true` | true or false | now | let remote programs copy to the local clipboard (OSC 52) |
 
 **`popup.key`** -- ctrl-h, ctrl-i, ctrl-j and ctrl-m are refused: they are Backspace, Tab, line feed and Enter. `off` leaves the popup reachable only by opening by itself during an outage, and the config screen with it; `off` together with `popup.auto_open_after = "off"` is refused.
 
@@ -35,6 +36,8 @@ The config screen (`c` in the status popup) changes a setting for the running se
 **`network.stun_servers`** -- `host:port` or `[v6]:port`, at most 16. An empty list is allowed: no public address is learned, and only paths that need none can work.
 
 **`network.birthday`** -- `false` asks the host not to blast either; a host older than this client ignores the request, so only this side's half stops. Behind a symmetric NAT the blast is the last rung that can work: there, `false` means a connect that cannot punch through fails.
+
+**`terminal.clipboard`** -- A copy reaches the local terminal, which may still ask or refuse by its own settings. Copies over 256 KiB are dropped. A remote program can never read the local clipboard.
 
 ## Example
 

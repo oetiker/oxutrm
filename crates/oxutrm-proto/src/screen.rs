@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyError, Cell};
+use crate::{ApplyError, Cell, Clipboard};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CursorShape {
@@ -73,6 +73,9 @@ pub struct ScreenState {
     /// travel in a datagram — they are fetched on a stream — so this number is
     /// the client's only way to know how much history exists.
     pub scrollback_len: u64,
+    /// The latest OSC 52 copy and how many there have been. See
+    /// [`crate::clipboard`].
+    pub clipboard: Clipboard,
 }
 
 impl ScreenState {
@@ -102,6 +105,7 @@ impl ScreenState {
             title: String::new(),
             bell: 0,
             scrollback_len: 0,
+            clipboard: Clipboard::default(),
         };
         state.validate()?;
         Ok(state)
@@ -145,7 +149,7 @@ impl ScreenState {
     /// program that hides its cursor keeps its header.
     ///
     /// Only the cells and the cursor are carried: the title, the modes, the
-    /// bell and the scrollback count are a session's, not a picture's, and
+    /// bell, the scrollback count and the clipboard are a session's, not a picture's, and
     /// nothing that shows a window may act on them. A wide glyph whose right
     /// half falls outside the cut becomes a space in its own colours, as the
     /// renderer's `repair_wide_pairs` makes it: half a glyph is not a glyph.
@@ -202,6 +206,7 @@ impl ScreenState {
             title: String::new(),
             bell: 0,
             scrollback_len: 0,
+            clipboard: Clipboard::default(),
         }
     }
 
@@ -270,6 +275,7 @@ impl ScreenState {
             crate::check_cell_text(&cell.text)?;
         }
         crate::check_title(&self.title)?;
+        crate::check_clipboard(&self.clipboard)?;
 
         Ok(())
     }
@@ -311,6 +317,15 @@ impl ScreenState {
             return Err(ApplyError::ScrollbackShrank {
                 was: previous.scrollback_len,
                 now: self.scrollback_len,
+            });
+        }
+
+        // I9. The client writes a copy when the serial rises. Going backwards
+        // and up again would write a copy it has already written.
+        if self.clipboard.serial < previous.clipboard.serial {
+            return Err(ApplyError::ClipboardWentBackwards {
+                was: previous.clipboard.serial,
+                now: self.clipboard.serial,
             });
         }
 
@@ -439,10 +454,18 @@ mod tests {
         s.seq = 77;
         s.modes.alt_screen = true;
         s.modes.bracketed_paste = true;
+        s.clipboard = Clipboard {
+            serial: 3,
+            copy: Some(crate::ClipboardCopy {
+                target: crate::ClipboardTarget::Clipboard,
+                text: "hunter2".into(),
+            }),
+        };
         let w = s.window(PANE);
         assert_eq!(w.title, "");
         assert_eq!((w.seq, w.bell, w.scrollback_len), (1, 0, 0));
         assert_eq!(w.modes, Modes::default());
+        assert_eq!(w.clipboard, Clipboard::default(), "no copy, no serial");
     }
 
     #[test]

@@ -80,6 +80,12 @@ pub enum ApplyError {
     #[error("bell went backwards: was {was}, now {now}")]
     BellWentBackwards { was: u32, now: u32 },
 
+    /// **I9.** The clipboard serial is a monotonic counter and the client
+    /// writes a copy when it rises, so a decrease would either hide copies or,
+    /// on the way back up, write a stale one again.
+    #[error("clipboard serial went backwards: was {was}, now {now}")]
+    ClipboardWentBackwards { was: u32, now: u32 },
+
     /// **I6.** Lines that have scrolled off do not come back.
     #[error("scrollback shrank: was {was}, now {now}")]
     ScrollbackShrank { was: u64, now: u64 },

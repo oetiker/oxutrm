@@ -26,6 +26,7 @@
 //! `alacritty_terminal` is `oxutrm-term`'s business. Phase C's speculative echo
 //! will revisit that, by holding a second emulator — but not yet.
 
+pub mod clipboard;
 pub mod color;
 pub mod guard;
 pub mod overlay;
@@ -34,6 +35,7 @@ pub mod renderer;
 pub mod splash;
 pub mod status;
 
+pub use clipboard::ClipboardRelay;
 pub use color::down_convert;
 pub use guard::{RawGuard, TERMINAL_RESTORE};
 pub use overlay::{Overlay, overlay_from_buffer};
