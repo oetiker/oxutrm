@@ -144,8 +144,8 @@ needs serde's `rc` feature in the workspace.
 
 `ScreenDiff` gets `pub clipboard: Option<Clipboard>`: `Some` when the field
 differs from the base (`diff_from`), always `Some` in `full_diff`. The diff
-compares `serial` and whether `copy` is present, not the text, so an
-unchanged copy costs nothing to compare.
+compares the whole `Clipboard`; `Arc<str>` equality checks the pointer
+before the bytes, so an unchanged copy costs nothing to compare.
 
 No `Cell` changes. The text never enters a cell, so the I8 rule that keeps
 OSC 52 out of cells (`crates/oxutrm-proto/src/text.rs`) stays as it is.
@@ -166,9 +166,12 @@ OSC 52 out of cells (`crates/oxutrm-proto/src/text.rs`) stays as it is.
 `HostTerm` keeps `clipboard: Clipboard`. In `poll`, for each entry of
 `signals.clipboard`, in order:
 
-- text longer than `MAX_CLIPBOARD`: dropped, one line on stderr
-  (`oxutrm: host dropped a 300000-byte clipboard copy (limit 262144)`); the
-  serial does not move.
+- text longer than `MAX_CLIPBOARD`: dropped, the serial does not move.
+  `HostTerm` records the length (`take_dropped_copy`) and the host session
+  writes one line on the host's stderr
+  (`oxutrm: host dropped a 300000-byte clipboard copy (limit 262144)`).
+  `HostTerm` itself never prints: `oxutrm loopback` runs it inside the
+  client, whose stderr is the painted terminal.
 - otherwise: `serial += 1` (saturating), `copy = Some(...)`, and `poll`
   reports a change so a frame goes out.
 
@@ -179,8 +182,10 @@ still counts all of them. `snapshot` copies `clipboard` into the state
 **Ack-driven clearing.** `HostTerm::clipboard_delivered(serial)` sets
 `copy = None` when `serial` is still the current one. The host session's
 sender loop calls it when the client's ack reaches a state whose
-`clipboard.copy` is `Some` with that serial (the sender's ring holds the
-acked state; the plan picks the exact hook). From then on, states carry
+`clipboard.copy` is `Some` with that serial: `Sender::acked()` returns the
+acknowledged state while the ring holds it, `HostSession::turn_at` checks it
+right after taking inbound frames, and sets `screen_stale` so the text-less
+snapshot goes out even on a quiet pty. From then on, states carry
 the serial and no text. Consequences:
 
 - A copy is repeated by every diff until the client acks it. A lost
@@ -198,17 +203,22 @@ also paints things that must never write the clipboard, §4.8):
 
 ```rust
 impl ClipboardRelay {
+    pub fn new(osc52: bool) -> ClipboardRelay;
     /// Bytes to write to the terminal for this newly applied state, if any.
-    pub fn on_state(&mut self, session: &SessionId, c: &Clipboard, enabled: bool) -> Option<Vec<u8>>;
+    pub fn on_state(&mut self, session: Option<SessionId>, c: &Clipboard, enabled: bool) -> Option<Vec<u8>>;
 }
 ```
+
+`session` is `None` for a session with no identity (test fixtures).
 
 It is built with the terminal's `caps.osc52` and holds
 `HashMap<SessionId, u32>`: the last serial seen per session, for the life of
 the client process.
 
 - First state of a session in this process: remember `c.serial`, write
-  nothing. (Row 4: a copy older than this client is stale.)
+  nothing. (Row 4: a copy older than this client is stale.) A consequence:
+  a copy made before the client's first state of a session arrives, such as
+  one in the first milliseconds of a brand-new session, is not written.
 - `c.serial > remembered`: remember it; if `c.copy` is `Some` and `enabled`
   and `caps.osc52`, return
   `ESC ] 52 ; <c|p> ; <base64(text)> BEL`.
@@ -220,8 +230,8 @@ setting on later does not replay an old copy.
 The client session calls `on_state` each time `Receiver::on_frame` applies
 a new state, and writes the bytes straight to the terminal, before the next
 render. This happens whether or not the popup, config screen or selector is
-open (row 10). A write error is handled like a render write error: the
-session continues.
+open (row 10). A write error is handled like the render write error next
+to it.
 
 A session switch changes the session id passed in; the map makes switching
 back free of replays (row 11).
@@ -484,3 +494,29 @@ Each item works as decided above unless the owner says otherwise.
 | Remote `file://` links | Passed through unchanged; the local terminal decides. |
 | Links in scrollback rows | Dropped. |
 | `MAX_LINKS` / `MAX_LINK_URI` | 512 entries / 2083 bytes. |
+
+---
+
+## 10. Changes after the scratch build (2026-10-16)
+
+PR 1 was built for real in a throwaway worktree before its plan was written
+(`docs/superpowers/plans/2026-10-16-osc52-copy.md`). These points changed
+or settled the text above:
+
+- The ack hook (§3.4) is `Sender::acked()` read in `HostSession::turn_at`.
+- serde's `rc` feature is on workspace-wide, for `Arc<str>`.
+- The diff compares the whole `Clipboard` (§3.2), not serial and presence.
+- The over-cap log line is printed by the host session, not by `HostTerm`
+  (§3.4).
+- `ClipboardRelay` takes `Option<SessionId>` and is built with
+  `caps.osc52` (§3.5).
+- A clipboard write error is handled like the render write error beside it
+  (§3.5).
+- The first-state baseline drops a copy made before the client's first state
+  of a session (§3.5).
+- `terminal.clipboard` adds a fourth section, `terminal`, to the config
+  screen.
+- `oxutrm loopback` does not write copies; it has no client session.
+- For D2: a preview `window()` returns `Clipboard::default()`, and only the
+  client session's own applied states feed `ClipboardRelay` (§4.8 applies to
+  the clipboard as well as to links).
