@@ -10,6 +10,11 @@
   none. The preview needs a terminal of at least 38 columns and, with a
   few sessions, 15 rows, and is left out below that.
 
+- Text a remote program copies to the clipboard (vim, tmux `set-clipboard`,
+  OSC 52) now reaches the local clipboard, once, also after a lost packet or a
+  reconnect. The `terminal.clipboard` setting turns it off; a remote program
+  can never read the local clipboard.
+
 ### Changed
 - **Host sessions started by an older oxutrm cannot be reached by this
   one.** This release changes the protocol version: the client refuses

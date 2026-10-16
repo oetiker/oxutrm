@@ -443,6 +443,11 @@ pub struct ClientSession {
     sessions: Vec<oxutrm_proto::SessionEntry>,
     /// What an attach exchange of the switcher's runs with: `apply`'s.
     net: oxutrm_net::NetConfig,
+    /// Which OSC 52 copies reach the terminal. Fed only states this session
+    /// applied from its own link -- never a preview of another session.
+    clipboard: oxutrm_client::ClipboardRelay,
+    /// `terminal.clipboard` as last applied.
+    clipboard_on: bool,
     /// A connect-time lobby's selector is still to open: once the splash
     /// is down (switcher spec §3.1).
     open_selector: bool,
@@ -574,6 +579,8 @@ impl ClientSession {
         Ok(ClientSession {
             screen_rx: Receiver::new(blank),
             input_tx: Sender::new(empty),
+            clipboard: oxutrm_client::ClipboardRelay::new(caps.osc52),
+            clipboard_on: true,
             renderer: Renderer::new(size, caps),
             link,
             size,
@@ -999,6 +1006,7 @@ impl ClientSession {
             st.set_cfg(cfg);
         }
         self.standby_wanted = s.standby;
+        self.clipboard_on = s.clipboard;
     }
 
     /// `Some(on)` when `network.standby` asks for something the standby is
@@ -1219,6 +1227,17 @@ impl ClientSession {
                     if applied {
                         turn.applied += 1;
                         painted = true;
+                        // Straight to the terminal, popup or not: it changes
+                        // nothing on the screen, and holding it would delay a
+                        // copy the user just made.
+                        let here = self.here();
+                        if let Some(osc) = self.clipboard.on_state(
+                            here,
+                            &self.screen_rx.state().clipboard,
+                            self.clipboard_on,
+                        ) {
+                            out.write_all(&osc).context("writing the clipboard")?;
+                        }
                     }
                     // The host was heard, whether or not the frame changed
                     // anything. `Ok(false)` is what an ACK-ONLY frame reports
@@ -3576,6 +3595,191 @@ mod tests {
         );
         assert_eq!(host.screen().clipboard.serial, 1);
         assert_eq!(client.screen().clipboard.serial, 1);
+    }
+
+    /// What the client writes for `printf '\033]52;c;aGVsbG8=\007'`.
+    const HELLO_OSC52: &[u8] = b"\x1b]52;c;aGVsbG8=\x07";
+
+    /// Let the client apply its first state -- which sets its clipboard
+    /// baseline: a copy older than the client is stale -- and then release a
+    /// shell waiting in `read go`.
+    async fn baseline_then_go(
+        host: &mut HostSession,
+        client: &mut ClientSession,
+        out: &mut Vec<u8>,
+    ) {
+        assert!(
+            drive(host, client, out, Duration::from_secs(10), |_, c| c
+                .screen_rx
+                .applied_kinds()
+                != (0, 0))
+            .await,
+            "the client never applied a first state"
+        );
+        assert_eq!(host.screen().clipboard.serial, 0, "no copy before the go");
+        host.term_mut().write_input(b"\n").unwrap();
+    }
+
+    /// How many times `needle` occurs in `hay`.
+    fn count(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    /// The end-to-end promise: a remote program's copy reaches the local
+    /// terminal exactly once, however many frames follow it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_copy_reaches_the_terminal_exactly_once() {
+        let (mut host, mut client) = pair(
+            "read go; printf '\\033]52;c;aGVsbG8=\\007'; \
+             i=0; while [ $i -lt 20 ]; do echo tick$i; sleep 0.02; i=$((i+1)); done\n",
+        )
+        .await;
+        let mut out = Vec::new();
+        baseline_then_go(&mut host, &mut client, &mut out).await;
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |_, c| text(c.screen()).contains("tick19")
+            )
+            .await,
+            "the shell never finished: {:?}",
+            text(client.screen())
+        );
+        assert_eq!(count(&out, HELLO_OSC52), 1);
+        assert_eq!(count(&out, b"\x1b]52;"), 1, "and no other OSC 52 at all");
+    }
+
+    /// `terminal.clipboard = false`: the copy still arrives in the state, and
+    /// nothing is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_is_not_written_with_the_setting_off() {
+        let (mut host, mut client) = pair("read go; printf '\\033]52;c;aGVsbG8=\\007'\n").await;
+        client.apply(&crate::config::Settings {
+            clipboard: false,
+            ..crate::config::Settings::default()
+        });
+        let mut out = Vec::new();
+        baseline_then_go(&mut host, &mut client, &mut out).await;
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(10),
+                |_, c| c.screen().clipboard.serial == 1
+            )
+            .await
+        );
+        assert_eq!(count(&out, b"\x1b]52;"), 0);
+    }
+
+    /// A lost datagram costs a pacing interval, not the copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_survives_a_blackholed_path_and_arrives_once() {
+        let (mut host, mut client, relay) =
+            pair_through_relay("read go; printf '\\033]52;c;aGVsbG8=\\007'\n").await;
+        let mut out = Vec::new();
+        baseline_then_go(&mut host, &mut client, &mut out).await;
+        relay.blackhole(true);
+        // Long enough for the copy to be made and its frames lost, short of
+        // `recovery.silent_after`.
+        drive(
+            &mut host,
+            &mut client,
+            &mut out,
+            Duration::from_millis(1200),
+            |_, _| false,
+        )
+        .await;
+        assert_eq!(host.screen().clipboard.serial, 1, "the copy was made");
+        assert_eq!(count(&out, HELLO_OSC52), 0, "and nothing got through");
+        relay.blackhole(false);
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(10),
+                |h, _| h.screen().clipboard.copy.is_none()
+            )
+            .await,
+            "the copy was never acknowledged"
+        );
+        assert_eq!(count(&out, HELLO_OSC52), 1);
+    }
+
+    /// A client that reattaches in the same process does not write a copy it
+    /// has already written; a fresh client never writes one made before it
+    /// arrived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reattach_never_replays_a_copy() {
+        let (mut host, mut client) = pair("read go; printf '\\033]52;c;aGVsbG8=\\007'\n").await;
+        let mut out = Vec::new();
+        baseline_then_go(&mut host, &mut client, &mut out).await;
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(20),
+                |h, c| c.screen().clipboard.serial == 1 && h.screen().clipboard.copy.is_none()
+            )
+            .await
+        );
+        assert_eq!(count(&out, HELLO_OSC52), 1);
+
+        // The same client, on a new link: a full state of the same session.
+        let (host_side, client_side) = crate::link::fixtures::link_pair().await;
+        host.adopt(host_side, size()).expect("the host adopts");
+        client
+            .swap_in(client_side, Instant::now())
+            .expect("the client swaps in");
+        assert!(
+            drive(
+                &mut host,
+                &mut client,
+                &mut out,
+                Duration::from_secs(10),
+                |_, c| c.screen().clipboard.serial == 1
+            )
+            .await,
+            "the reattached client never got a state"
+        );
+        assert_eq!(count(&out, HELLO_OSC52), 1, "not written a second time");
+    }
+
+    /// A copy the host still holds because nobody acknowledged it is stale
+    /// to a client that arrives afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_client_never_writes_a_copy_made_before_it_arrived() {
+        let (mut host, _gone) = pair("printf '\\033]52;c;aGVsbG8=\\007'\n").await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // Only the host turns: the first client never acknowledges anything.
+        while host.screen().clipboard.serial != 1 && Instant::now() < deadline {
+            host.turn().expect("host turn");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert!(host.screen().clipboard.copy.is_some(), "the text is held");
+
+        let (host_side, client_side) = crate::link::fixtures::link_pair().await;
+        host.adopt(host_side, size()).expect("the host adopts");
+        let mut fresh = ClientSession::new(size(), caps(), client_side, None).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            drive(
+                &mut host,
+                &mut fresh,
+                &mut out,
+                Duration::from_secs(10),
+                |_, c| c.screen().clipboard.serial == 1
+            )
+            .await,
+            "the fresh client never got a state"
+        );
+        assert_eq!(count(&out, b"\x1b]52;"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

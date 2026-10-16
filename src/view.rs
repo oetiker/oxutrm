@@ -1977,7 +1977,7 @@ mod tests {
             Instant::now(),
         ));
         let names: Vec<&str> = v.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["popup", "recovery", "network"]);
+        assert_eq!(names, ["popup", "recovery", "network", "terminal"]);
         assert_eq!(
             v.sections.iter().map(|s| s.rows.len()).sum::<usize>(),
             SETTINGS.len()

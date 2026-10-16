@@ -58,6 +58,8 @@ pub(crate) struct Settings {
     pub(crate) stun_servers: Vec<String>,
     pub(crate) port_mapping: bool,
     pub(crate) birthday: bool,
+    /// Write a remote program's OSC 52 copy to the local terminal.
+    pub(crate) clipboard: bool,
 }
 
 impl Default for Settings {
@@ -77,6 +79,7 @@ impl Default for Settings {
             stun_servers: net.stun_servers,
             port_mapping: net.enable_port_mapping,
             birthday: net.enable_birthday,
+            clipboard: true,
         }
     }
 }
@@ -396,6 +399,22 @@ pub(crate) static SETTINGS: &[Setting] = &[
         set: |s, v| {
             if let Value::Bool(b) = v {
                 s.birthday = b;
+            }
+        },
+    },
+    Setting {
+        section: "terminal",
+        name: "clipboard",
+        shape: Shape::Bool,
+        applies: Applies::Now,
+        help: "let remote programs copy to the local clipboard (OSC 52)",
+        doc: "A copy reaches the local terminal, which may still ask or refuse \
+              by its own settings. Copies over 256 KiB are dropped. A remote \
+              program can never read the local clipboard.",
+        get: |s| Value::Bool(s.clipboard),
+        set: |s, v| {
+            if let Value::Bool(b) = v {
+                s.clipboard = b;
             }
         },
     },

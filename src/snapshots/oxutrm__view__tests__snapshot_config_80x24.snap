@@ -17,6 +17,8 @@ expression: "text.join(\"\\n\")"
 │   stun_servers      stun.cloudflare.…          next attempt          │
 │   port_mapping      on                         next attempt          │
 │   birthday          on                         next attempt          │
+├ terminal ────────────────────────────────────────────────────────────┤
+│   clipboard         on                                               │
 ├──────────────────────────────────────────────────────────────────────┤
 │ silence before an ssh rebuild starts · 5s–10m                        │
 │ ↑↓ move  ⏎ edit  x reset  w save  Esc back                           │

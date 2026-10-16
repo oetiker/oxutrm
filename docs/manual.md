@@ -64,6 +64,10 @@ Durations are strings such as `"20s"`, `"1m"` or `"1m 30s"`.
   `false` also asks the host not to send its half; a host older than the client ignores the request.
   Behind a symmetric NAT, `false` makes a connect that cannot punch through fail.
   Takes effect at the next rebuild attempt or standby search.
+- `terminal.clipboard = true`: Pass a remote program's clipboard copy (OSC 52) to the local terminal,
+  which may still ask or refuse by its own settings.
+  Copies over 256 KiB are dropped.
+  A remote program can never read the local clipboard.
 
 Settings without a note take effect at once.
 The config screen (see **KEYS**) changes a setting for the running session and saves it to this file,
