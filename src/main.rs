@@ -36,6 +36,8 @@ mod link;
 mod linkstate;
 mod listener;
 mod loopback;
+#[allow(dead_code)] // wired into the session by the next commit
+mod preview;
 mod quality;
 mod rebuild;
 mod roam;
