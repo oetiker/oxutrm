@@ -10489,6 +10489,97 @@ mod tests {
         registry_holds(dir.path(), &[BUILD_ID]).await;
     }
 
+    /// Turn `client` until `done` holds, or fail after ten seconds saying
+    /// `what` never happened.
+    async fn turn_until(
+        client: &mut ClientSession,
+        mut input: &[u8],
+        what: &str,
+        done: impl Fn(&ClientSession) -> bool,
+    ) {
+        let begun = Instant::now();
+        let mut out = Vec::new();
+        while !done(client) {
+            assert!(
+                begun.elapsed() < Duration::from_secs(10),
+                "{what}: {} frames rejected",
+                client.rejected_total()
+            );
+            client.turn(input, &mut out).unwrap();
+            input = b"";
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn text_of(c: &ClientSession) -> String {
+        c.screen().cells.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// The bell and the scrollback count only ever go up (I5, I6), and a
+    /// kill into the lobby and a `New` out of it happen on the same link.
+    /// A shell that rang and scrolled before the kill must not leave the
+    /// client refusing the lobby's screen, nor the next shell's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_after_a_bell_and_scrolling_still_shows_the_lobby_and_the_next_shell() {
+        use crate::serve::Begin;
+        use crate::serve::fixtures::{process, registry_holds, sh};
+        let dir = tempfile::tempdir().unwrap();
+        let build = process(
+            dir.path(),
+            BUILD_ID,
+            Some("build"),
+            Begin::Session { name: None },
+            sh(),
+        )
+        .await;
+        registry_holds(dir.path(), &[BUILD_ID]).await;
+        let mut client = client_on(build.client, BUILD_ID);
+        client.rebuild = Some(Rebuild::new("thinlinc".to_owned(), BUILD_ID.to_owned()));
+
+        turn_until(
+            &mut client,
+            b"printf '\\a'; seq 1 200; echo rang-and-scrolled\r",
+            "the shell never rang and scrolled",
+            |c| c.screen().bell >= 1 && c.screen().scrollback_len > 0,
+        )
+        .await;
+        assert_eq!(client.rejected_total(), 0, "the control");
+
+        assert!(
+            ask_now(
+                &mut client,
+                crate::switcher::Ask::Kill {
+                    id: id_of(BUILD_ID)
+                }
+            )
+            .await
+        );
+        assert!(client.in_lobby());
+        turn_until(
+            &mut client,
+            b"",
+            "the lobby's blank screen never came",
+            |c| text_of(c).trim().is_empty(),
+        )
+        .await;
+        assert_eq!(client.rejected_total(), 0, "the lobby's screen was refused");
+
+        let again = oxutrm_proto::Name::parse("again").unwrap();
+        assert!(!ask_now(&mut client, crate::switcher::Ask::New { name: Some(again) }).await);
+        turn_until(
+            &mut client,
+            b"echo fresh-$((6*7))\r",
+            "the new shell's output never came",
+            |c| text_of(c).contains("fresh-42"),
+        )
+        .await;
+        assert_eq!(
+            client.rejected_total(),
+            0,
+            "the new shell's screen was refused"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn quitting_in_a_lobby_ends_the_lobby_with_the_link() {
         use crate::serve::Begin;
