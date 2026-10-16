@@ -9,9 +9,9 @@
 // or it lands raw on the painted raw-mode terminal.
 #![cfg_attr(not(test), deny(clippy::print_stderr, clippy::print_stdout))]
 
-use oxutrm_proto::TermSize;
+use oxutrm_proto::{ScreenState, TermSize};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -676,7 +676,32 @@ pub struct SessionsView {
     pub keys: Vec<KeyHint>,
     /// What a screen below [`MIN_BOX`] shows on its one line.
     pub small: String,
+    /// The selected row's preview, drawn under the list where there is
+    /// room for it (preview spec §3.3); `None` lays the selector out as
+    /// without one.
+    pub preview: Option<PreviewPane>,
 }
+
+/// What the selector's preview pane shows (preview spec §3.1).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PreviewPane {
+    /// At most `oxutrm_proto::PREVIEW_MAX` of a session's screen. Checked
+    /// by whoever built the view: it must validate.
+    Screen(ScreenState),
+    /// Why there is no screen to show, as one dimmed line.
+    Note(String),
+}
+
+/// The least room the preview pane is drawn in: narrower or shorter, the
+/// selector is laid out as without one.
+pub const PREVIEW_MIN: TermSize = TermSize { cols: 30, rows: 4 };
+
+/// The most rows the list keeps while a preview is shown under it; a
+/// longer list scrolls.
+const LIST_ROWS_WITH_PREVIEW: usize = 8;
+
+/// The title of the rule above the preview pane.
+const PREVIEW_RULE: &str = "preview";
 
 /// The widest the selector's name column grows: a name's own limit.
 const SESSION_NAME_COLS: usize = 24;
@@ -778,6 +803,11 @@ impl SessionCols {
 /// the key bar. When the rows do not fit, the list scrolls so the cursor's
 /// row is in view; when they are too wide, their columns give way, the
 /// mark last. Below [`MIN_BOX`], one reverse-video line.
+///
+/// With a preview and room for it (preview spec §3.3), the box takes its
+/// cap, the list keeps at most [`LIST_ROWS_WITH_PREVIEW`] rows, and the
+/// pane under a `preview` rule gets what is left -- if that is at least
+/// [`PREVIEW_MIN`]. Otherwise the selector is laid out as without one.
 pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
     if size.cols < MIN_BOX.cols || size.rows < MIN_BOX.rows {
         return reversed_line(v.small.clone(), size);
@@ -824,8 +854,55 @@ pub fn layout_sessions(v: &SessionsView, size: TermSize) -> Overlay {
         .unwrap_or(u16::MAX)
         .saturating_add(2)
         .min(cap);
-    let buf = draw_sessions(v, &lines, box_cols, box_rows);
+    if let Some(p) = &v.preview {
+        let full = (size.cols - 4).min(MAX_BOX.cols);
+        let width = full - FRAME_COLS;
+        // The border, the plain rule and the key bar, the header, the line
+        // under the list, the list as far as it is kept, the preview's rule.
+        let list = lines.len().min(LIST_ROWS_WITH_PREVIEW);
+        let taken = 4
+            + u16::from(!v.header.is_empty())
+            + line_rows(v, width, cap)
+            + u16::try_from(list).unwrap_or(u16::MAX)
+            + 1;
+        let pane = cap.saturating_sub(taken);
+        if width >= PREVIEW_MIN.cols && pane >= PREVIEW_MIN.rows {
+            let cols = SessionCols::of(&v.rows).fitted(usize::from(width));
+            let mut lines: Vec<String> = v
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| cols.line(r, i == v.cursor))
+                .collect();
+            lines.push(format!("{new_marker} {}", v.new_row));
+            let (buf, at) = draw_sessions(v, &lines, full, cap, Some((p, pane)));
+            let mut o = overlay_from_buffer(&buf, (size.rows - cap) / 2, (size.cols - full) / 2);
+            if let (PreviewPane::Screen(s), Some(at)) = (p, at) {
+                stamp(&mut o, at, s);
+            }
+            return o;
+        }
+    }
+    let (buf, _) = draw_sessions(v, &lines, box_cols, box_rows, None);
     overlay_from_buffer(&buf, (size.rows - box_rows) / 2, (size.cols - box_cols) / 2)
+}
+
+/// `s`, windowed to `at`, over the cells of `o` there. The cells are the
+/// session's own, colours and attributes and all; the renderer repairs a
+/// wide glyph that a hostile screen left broken at the edge, as it does
+/// for every row it composites.
+fn stamp(o: &mut Overlay, at: Rect, s: &ScreenState) {
+    let w = s.window(TermSize {
+        cols: at.width,
+        rows: at.height,
+    });
+    let stride = usize::from(o.cols);
+    for r in 0..w.rows {
+        for c in 0..w.cols {
+            let to = usize::from(at.y + r) * stride + usize::from(at.x + c);
+            o.cells[to] = w.cell(r, c).clone();
+        }
+    }
 }
 
 /// How many rows the line under the list takes wrapped at `width`, capped
@@ -839,10 +916,18 @@ fn line_rows(v: &SessionsView, width: u16, height: u16) -> u16 {
 
 /// The selector in a box `cols` by `rows`, at least 4 rows: the key bar
 /// and a plain rule from the bottom, the header from the top, the line
-/// under the list above the rule, and the list in what is left. A
-/// question under the list is what the next key answers: on a short
-/// screen it keeps its row before the rule, the header or the list do.
-fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Buffer {
+/// under the list above the rule, the preview's `pane` rows and their
+/// rule above the line, and the list in what is left. A question under
+/// the list is what the next key answers: on a short screen it keeps its
+/// row before the rule, the header or the list do. Returns the pane's
+/// area, for a screen to be stamped into once the buffer is cells.
+fn draw_sessions(
+    v: &SessionsView,
+    lines: &[String],
+    cols: u16,
+    rows: u16,
+    preview: Option<(&PreviewPane, u16)>,
+) -> (Buffer, Option<Rect>) {
     let keys = fitted_key_line(&v.keys, cols.saturating_sub(FRAME_COLS));
     let (mut buf, mut body) = framed(&v.title, keys, cols, rows);
     let ask = v.question && !v.line.is_empty();
@@ -882,6 +967,37 @@ fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Bu
         let room = body.height - 1;
         put_line(&mut body, &mut buf, room);
     }
+    let pane = preview.map(|(p, pane)| {
+        let area = Rect {
+            y: body.bottom() - pane,
+            height: pane,
+            ..body
+        };
+        rule(&mut buf, area.y - 1, cols, Some(PREVIEW_RULE));
+        body.height -= pane + 1;
+        if let PreviewPane::Note(note) = p {
+            // Wrapped, and centred both ways: a note says why there is no
+            // screen, so it sits where the screen would be.
+            let note = Line::from(Span::styled(
+                note.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            let used =
+                wrapped_row_count(std::slice::from_ref(&note), area.width, area.height).max(1);
+            Paragraph::new(note)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .render(
+                    Rect {
+                        y: area.y + (area.height - used) / 2,
+                        height: used,
+                        ..area
+                    },
+                    &mut buf,
+                );
+        }
+        area
+    });
     let height = usize::from(body.height);
     let at = v.cursor.min(lines.len().saturating_sub(1));
     // Scrolled just enough for the cursor's row to be the last one shown.
@@ -904,7 +1020,7 @@ fn draw_sessions(v: &SessionsView, lines: &[String], cols: u16, rows: u16) -> Bu
             &mut buf,
         );
     }
-    buf
+    (buf, pane)
 }
 
 /// The config screen's column widths: the name, then the value.
@@ -2167,6 +2283,7 @@ mod tests {
             question: false,
             keys: session_keys("back"),
             small: "oxutrm sessions \u{b7} build".to_string(),
+            preview: None,
         }
     }
 
@@ -2308,6 +2425,270 @@ mod tests {
         insta::assert_snapshot!(text_of(&layout_sessions(
             &v,
             TermSize { cols: 40, rows: 12 }
+        )));
+    }
+
+    // ---- the preview (preview spec §3.1, §3.3) ----------------------------
+
+    /// `logs`' screen as the host sends it: a 120x40 shell following the
+    /// ssh log, cut to the preview's largest, the prompt on the last row.
+    fn logs_screen() -> oxutrm_proto::ScreenState {
+        use oxutrm_proto::{CellText, ScreenState};
+        let mut s = ScreenState::blank(40, 120).unwrap();
+        let lines = [
+            "Oct 16 11:41:07 thinlinc sshd[4121]: Accepted publickey for oetiker from 10.0.0.7",
+            "Oct 16 11:41:07 thinlinc sshd[4121]: pam_unix(sshd:session): session opened",
+            "Oct 16 11:42:13 thinlinc CRON[4188]: (root) CMD (command -v debian-sa1 > /dev/null)",
+            "^C",
+            "oetiker@thinlinc:~$ journalctl -f -u ssh",
+        ];
+        for (r, text) in lines.iter().enumerate() {
+            for (c, ch) in text.chars().enumerate() {
+                s.cells[(30 + r) * 120 + c].text = CellText::new(ch.to_string());
+            }
+        }
+        s.cursor.row = 34;
+        s.cursor.col = 40;
+        s.window(oxutrm_proto::PREVIEW_MAX)
+    }
+
+    /// The spec's picture with the selection on `logs` and its preview.
+    fn preview_view() -> SessionsView {
+        SessionsView {
+            cursor: 2,
+            preview: Some(PreviewPane::Screen(logs_screen())),
+            ..sessions_view()
+        }
+    }
+
+    /// The pane's size in an overlay with no line under the list: between
+    /// the `preview` rule and the plain rule, inside the frame. `None`
+    /// without a `preview` rule.
+    fn pane_of(o: &Overlay) -> Option<(u16, u16)> {
+        let top = rule_row(o, Some("preview"))?;
+        let bottom = (top + 1..o.rows)
+            .find(|&r| is_rule(&row(o, r), None))
+            .expect("a plain rule under the pane");
+        Some((o.cols - FRAME_COLS, bottom - top - 1))
+    }
+
+    #[test]
+    fn the_pane_takes_what_the_box_has_left_and_goes_below_its_least() {
+        for (cols, rows, pane) in [
+            (80, 24, Some((68, 13))),
+            (120, 40, Some((68, 15))),
+            (40, 24, Some((32, 13))),
+            (38, 24, Some((30, 13))),
+            (37, 24, None),
+            (80, 16, Some((68, 5))),
+            (80, 15, Some((68, 4))),
+            (80, 14, None),
+        ] {
+            let size = TermSize { cols, rows };
+            let o = layout_sessions(&preview_view(), size);
+            assert_eq!(pane_of(&o), pane, "{cols}x{rows}:\n{}", text_of(&o));
+            if pane.is_none() {
+                let without = SessionsView {
+                    preview: None,
+                    ..preview_view()
+                };
+                assert_eq!(o, layout_sessions(&without, size), "{cols}x{rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_pane_shows_the_sessions_last_rows_down_to_its_prompt() {
+        let o = layout_sessions(&preview_view(), TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        let top = rule_row(&o, Some("preview")).unwrap();
+        // Directly under the list's last row, `+ new session`.
+        assert_eq!(find(&o, "+ new session"), Some(top - 1), "{text}");
+        let prompt = find(&o, "oetiker@thinlinc:~$ journalctl -f -u ssh").unwrap();
+        assert_eq!(
+            prompt,
+            top + 13,
+            "the prompt is the pane's last row:\n{text}"
+        );
+        // Cut at the pane's width, the frame left whole.
+        let cut = row(&o, find(&o, "Accepted publickey").unwrap());
+        assert!(
+            cut.ends_with("Accepted publickey for oetiker  \u{2502}"),
+            "{cut}"
+        );
+        // The box takes its cap, centred.
+        assert_eq!((o.cols, o.rows), (72, 22));
+        assert_eq!((o.col, o.row), (4, 1));
+    }
+
+    #[test]
+    fn the_panes_cells_keep_the_sessions_colours_and_attributes() {
+        use oxutrm_proto::{Attrs, Color};
+        let mut s = logs_screen();
+        let at = 17 * usize::from(s.cols);
+        for cell in &mut s.cells[at..at + 8] {
+            cell.fg = Color::Idx(2);
+            cell.bg = Color::Rgb(0, 0, 64);
+            cell.attrs = Attrs::BOLD;
+        }
+        let v = SessionsView {
+            preview: Some(PreviewPane::Screen(s)),
+            ..preview_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let r = find(&o, "oetiker@thinlinc").unwrap();
+        let c = cell_of(&o, r, "o");
+        assert_eq!((c.fg, c.bg), (Color::Idx(2), Color::Rgb(0, 0, 64)));
+        assert!(c.attrs.contains(Attrs::BOLD));
+    }
+
+    #[test]
+    fn a_wide_glyph_at_the_panes_edge_leaves_the_frame_in_place() {
+        use oxutrm_proto::{Attrs, Cell, CellText, Color, ScreenState};
+        let mut s = ScreenState::blank(4, 80).unwrap();
+        // "構築ログ" from column 64: the pane is 67 wide at 75 columns, so
+        // its second glyph's halves fall either side of the cut.
+        for (i, glyph) in ["構", "築", "ロ", "グ"].into_iter().enumerate() {
+            let at = 64 + 2 * i;
+            s.cells[at] = Cell {
+                text: CellText::new(glyph),
+                fg: Color::Default,
+                bg: Color::Default,
+                attrs: Attrs::empty(),
+            };
+            s.cells[at + 1] = Cell {
+                text: CellText::const_new(""),
+                fg: Color::Default,
+                bg: Color::Default,
+                attrs: Attrs::WIDE_CONT,
+            };
+        }
+        s.cursor.row = 0;
+        let v = SessionsView {
+            preview: Some(PreviewPane::Screen(s)),
+            ..preview_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 75, rows: 24 });
+        let r = rule_row(&o, Some("preview")).unwrap() + 1;
+        let line = row(&o, r);
+        // The cut glyph's lead is a space, then the frame's padding.
+        assert!(line.ends_with("\u{69cb}  \u{2502}"), "{line:?}");
+        assert_eq!(
+            o.cells[usize::from(r) * usize::from(o.cols) + 68]
+                .text
+                .as_str(),
+            " "
+        );
+    }
+
+    #[test]
+    fn a_long_list_keeps_eight_rows_and_the_pane_the_rest() {
+        let mut v = preview_view();
+        v.rows = (0..12)
+            .map(|i| session(&format!("job-{i:02}"), "bash", "09:14", "120\u{d7}40", ""))
+            .collect();
+        v.cursor = 10;
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let text = text_of(&o);
+        assert_eq!(pane_of(&o), Some((68, 9)), "{text}");
+        assert!(find(&o, "\u{25b8} job-10").is_some(), "{text}");
+    }
+
+    #[test]
+    fn a_question_keeps_its_row_and_the_pane_gives_way() {
+        let v = SessionsView {
+            line: "kill logs? y/n".to_string(),
+            question: true,
+            ..preview_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 16 });
+        let text = text_of(&o);
+        // Four rows of the pane, the prompt its last, then the question.
+        let top = rule_row(&o, Some("preview")).expect("a pane");
+        assert_eq!(find(&o, "journalctl -f -u ssh"), Some(top + 4), "{text}");
+        assert_eq!(find(&o, "kill logs? y/n"), Some(top + 5), "{text}");
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 15 });
+        assert_eq!(pane_of(&o), None, "{}", text_of(&o));
+        assert!(find(&o, "kill logs? y/n").is_some());
+    }
+
+    #[test]
+    fn a_note_too_wide_for_the_pane_wraps_and_stays_in_the_middle() {
+        let v = SessionsView {
+            cursor: 3,
+            preview: Some(PreviewPane::Note(
+                "a new login shell in your home directory".to_string(),
+            )),
+            ..sessions_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 40, rows: 24 });
+        let text = text_of(&o);
+        let first = find(&o, "a new login shell").expect("the note's start");
+        assert_eq!(find(&o, "directory"), Some(first + 1), "{text}");
+        let top = rule_row(&o, Some("preview")).unwrap();
+        assert_eq!(first, top + 1 + (13 - 2) / 2, "{text}");
+    }
+
+    #[test]
+    fn a_note_is_one_dimmed_line_in_the_middle_of_the_pane() {
+        let v = SessionsView {
+            cursor: 3,
+            preview: Some(PreviewPane::Note(
+                "a new login shell in your home directory".to_string(),
+            )),
+            ..sessions_view()
+        };
+        let o = layout_sessions(&v, TermSize { cols: 80, rows: 24 });
+        let top = rule_row(&o, Some("preview")).unwrap();
+        let r = find(&o, "a new login shell").unwrap();
+        assert_eq!(r, top + 1 + (13 - 1) / 2, "{}", text_of(&o));
+        assert!(cell_of(&o, r, "a").attrs.contains(oxutrm_proto::Attrs::DIM));
+    }
+
+    #[test]
+    fn a_preview_on_a_screen_below_the_least_box_is_the_one_line() {
+        let size = TermSize { cols: 19, rows: 5 };
+        let without = SessionsView {
+            preview: None,
+            ..preview_view()
+        };
+        assert_eq!(
+            layout_sessions(&preview_view(), size),
+            layout_sessions(&without, size)
+        );
+    }
+
+    #[test]
+    fn snapshot_sessions_preview_80x24() {
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &preview_view(),
+            TermSize { cols: 80, rows: 24 }
+        )));
+    }
+
+    #[test]
+    fn snapshot_sessions_preview_120x40() {
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &preview_view(),
+            TermSize {
+                cols: 120,
+                rows: 40
+            }
+        )));
+    }
+
+    #[test]
+    fn snapshot_sessions_preview_note_40x24() {
+        let v = SessionsView {
+            cursor: 3,
+            preview: Some(PreviewPane::Note(
+                "a new login shell in your home directory".to_string(),
+            )),
+            ..sessions_view()
+        };
+        insta::assert_snapshot!(text_of(&layout_sessions(
+            &v,
+            TermSize { cols: 40, rows: 24 }
         )));
     }
 

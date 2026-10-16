@@ -563,6 +563,7 @@ pub(crate) fn sessions(f: &SessionsFacts<'_>) -> SessionsView {
         question: sel.question().is_some(),
         keys: sessions_keys(sel, f.lobby, f.phase == Phase::Live),
         small: format!("oxutrm sessions \u{b7} {selected}"),
+        preview: None,
     }
 }
 
