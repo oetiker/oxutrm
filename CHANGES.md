@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### New
+
+### Changed
+
+### Fixed
+
+## 0.4.0 - 2026-10-16
+### New
 - **The session selector shows the selected session's screen.** Under the
   list, the last lines of the session's screen up to its cursor appear in
   its colours as you move through the list; `+ new session`, a session of
