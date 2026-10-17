@@ -5,6 +5,9 @@
 ### New
 
 ### Changed
+- **Building oxutrm from source needs the current stable Rust.** oxutrm no
+  longer names an oldest supported Rust version, so an older compiler fails
+  with compile errors instead of a message about the version.
 
 ### Fixed
 

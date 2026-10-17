@@ -225,7 +225,7 @@ be reattached, so it is reported as a warning. The packets are QUIC with ALPN
 
 ## Building
 
-Rust 1.96 or newer (edition 2024).
+The current stable Rust (edition 2024).
 
 ```
 make            # fmt-check, clippy, then tests

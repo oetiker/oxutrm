@@ -43,13 +43,6 @@ jobs:
     with:
       ref: ${{ inputs.ref }}
 
-  # oxutrm's own jobs: the MSRV check.
-  local:
-    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
-    uses: ./.github/workflows/ci-local.yml
-    with:
-      ref: ${{ inputs.ref }}
-
   release-pr-current:
     if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'github-actions[bot]') }}
     uses: oposs/repo-infra/.github/workflows/ri-release-pr-current.yml@v2
@@ -87,7 +80,7 @@ jobs:
   # PR tested exactly the head that carries the release-built status.
   ci-passed:
     if: always()
-    needs: [rust, rust-musl, man, local, release-pr-current, release-verdict]
+    needs: [rust, rust-musl, man, release-pr-current, release-verdict]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
