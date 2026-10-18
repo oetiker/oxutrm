@@ -78,14 +78,15 @@ keys     = ["q"]
 await    = "resumes it"
 hold_cs  = 250
 
-# Second login: no splash, and the selector offers the running session.
+# Second login: no splash, and the selector offers the running session with
+# a preview of its screen.
 [[scene]]
 text    = "oxutrm localhost"
 hold_cs = 40
 [[scene]]
 keys     = ["Enter"]
-await    = "sessions on localhost"
-hold_cs  = 250
+animated = true
+hold_cs  = 450
 [[scene]]
 keys     = ["Enter"]
 await    = "load average"
