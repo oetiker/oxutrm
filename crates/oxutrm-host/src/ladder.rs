@@ -206,7 +206,7 @@ impl LadderPlan {
                     Rung::Punched(family),
                     format!(
                         "the {label} NAT is {kind}, so its external port differs per \
-                         destination and ordinary punching cannot reach it"
+                         destination and ordinary punching is not expected to reach it"
                     ),
                 ));
             }
