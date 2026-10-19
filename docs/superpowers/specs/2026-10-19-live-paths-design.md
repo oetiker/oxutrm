@@ -74,7 +74,10 @@ either side.
 
 ### 5.1 Path classes and rungs
 
-A **path** is one (local address, remote address) pair with a **class**.
+A **path** is one (local interface, local address, remote address) triple
+with a **class**. The interface is part of the identity: two interfaces in the
+same subnet (Wi-Fi and Ethernet, both up) are two paths even when the kernel
+would route everything out of one of them.
 A class is a **family** (IPv4, IPv6) × a **method**:
 
 | method       | what it is                                                     |
@@ -108,6 +111,11 @@ direct", never "punched".
 - **Each end** — client *and* host — keeps an up-to-date list of what it can
   offer: every usable local address per family, its STUN mappings per family,
   its port mappings, and whether each family currently routes at all.
+- **A link change re-checks at once** — a new network, a new address, a new
+  public mapping, an interface appearing or going — on either end, while the
+  current path still looks fine, not after silence. (Observed 2026-10-19:
+  the Mac moved onto thinlinc's site network; the session found its new path
+  only through a 22 s outage and an ssh rebuild.)
 - It **re-checks** when the system reports an address/route change, and
   periodically besides; it refreshes STUN and port mappings before they would
   expire (design spec §5.2/§5.3 "keepalive / re-punch", never built).
@@ -202,6 +210,11 @@ stream, as the last resort when no UDP path validates.
 - **One block per path**: class label; role (● carrying, standby, measured,
   blocked); rtt with range, loss, time on path; both addresses with the
   local interface (`via utun32`); an rtt sparkline.
+- **Same public address on both ends** (both behind one NAT, e.g. at the
+  same site): a punch between the two public addresses needs the NAT to
+  hairpin, which many do not. Such a punched path is tried, and when it fails
+  its reason says so ("both ends share 203.0.113.7 — needs NAT hairpinning");
+  the paths that matter there are the direct ones.
 - **Paths that cannot exist are listed greyed, with the reason**
   ("IPv6 direct — not possible: thinlinc has no global IPv6").
 - Bottom sections **"this end"** and **"<host>"**: what each end currently
@@ -239,6 +252,16 @@ stream, as the last resort when no UDP path validates.
   an advertised mapping is directly valid for a new path and keepalive cost
   is per socket, not per path. The birthday blast, which needs its own
   socket fan, is the exception.
+- **Sockets are bound to their interface**, not only to an address:
+  `IP_BOUND_IF` / `IPV6_BOUND_IF` on macOS, `SO_BINDTODEVICE` (or the
+  equivalent) on Linux. Binding to an address alone does not choose the
+  interface — on macOS a socket bound to en0's address still leaves through
+  en7 when the routing table prefers en7. Without this, a second interface in
+  the same subnet can never carry a path.
+- **The standby filter by source address goes** (`egress::avoiding_source`):
+  paths on different interfaces are different paths by identity, so "a
+  second path that leaves differently" is decided by interface. That is what
+  the standby spec §3.3 asked for in the first place.
 - **Nomination completes before QUIC starts**, per connection
   (`oxutrm-host/src/ladder.rs` docs) — still true per path; the new part is
   that there are many paths over a session's life.
