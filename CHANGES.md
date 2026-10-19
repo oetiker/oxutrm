@@ -18,7 +18,20 @@
   connection ladder was lost; it now keeps every line, joined into one, and
   names the addresses both ends offered. The popup still shows one line.
 
+- **A symmetric IPv4 NAT no longer stops IPv6 punching.** The NAT type is
+  learned for each address family, and a failure report lists every path
+  class once per family, saying which end lacks a family.
+
+- **A client and a host must both be updated.** This release changes the
+  protocol version to 7: the client refuses a host session started by an
+  older oxutrm, and the selector lists it as `old version`.
+
 ### Fixed
+- **The birthday punch aims at an address family both ends can use.** It
+  guessed around the peer's best public address, which could be IPv6 when this
+  end had none, and then could never succeed. It now runs per family, and only
+  for a family where one end's NAT is symmetric or unknown.
+
 - **A machine with a global IPv6 address connects over public IPv4 again.**
   Its STUN queries all went over IPv6, so it never learned its public IPv4
   address, and a host with IPv4 only had nothing to punch towards: the

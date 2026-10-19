@@ -9,6 +9,14 @@
 //! why an HTTP echo service is not an acceptable substitute: it answers over
 //! TCP and reports only the IP, while the port is the hard half.
 //!
+//! # One verdict per address family
+//!
+//! A NAT maps IPv4 and IPv6 independently, and a socket can be behind a
+//! symmetric IPv4 NAT while its IPv6 is not translated at all. The probes
+//! therefore run once per address family and the result is a
+//! [`oxutrm_proto::FamilyNat`], one [`NatType`] for each family, never a
+//! single type for the socket.
+//!
 //! # The probes, and which verdict each one can reach
 //!
 //! | Probe | Destination | What it isolates |

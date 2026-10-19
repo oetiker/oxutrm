@@ -253,17 +253,22 @@ pub struct Ladder<'a> {
     pub admit_remote: Option<oxutrm_net::RemoteFilter>,
 }
 
-/// The peer address the blast guesses around.
+/// The peer address the blast guesses around, in `family`.
+///
+/// The family matters because a blast sends from this end's sockets of that
+/// family: an IPv6 base is unreachable from an IPv4-only end and the other way
+/// round, so the best address overall is not the best address to blast.
 ///
 /// A server-reflexive candidate is the only useful base: it is a real external
 /// mapping a STUN server observed, and rung 3's whole premise is that a
 /// symmetric NAT's next allocation lands *near* the last one. A host candidate
 /// is an interface address behind the NAT and names no mapping at all, so
 /// guessing ports around it aims 65k packets at the wrong machine.
-fn blast_base(remote: &[Candidate]) -> Option<SocketAddr> {
+fn blast_base(remote: &[Candidate], family: Family) -> Option<SocketAddr> {
     remote
         .iter()
         .filter(|c| matches!(c.kind, CandidateKind::ServerReflexive))
+        .filter(|c| Family::of(&c.addr) == family)
         .max_by_key(|c| c.priority)
         .map(|c| c.addr)
 }
@@ -279,6 +284,10 @@ fn blast_base(remote: &[Candidate]) -> Option<SocketAddr> {
 ///
 /// On success the caller gets a socket. On failure it gets [`LadderReport`],
 /// which names every rung (nine: four methods in two families, and the ssh tunnel).
+///
+/// The skip reasons for raced rungs are built only from the hello's
+/// candidates; candidates that trickle in later via `CandidateUpdate` feed the
+/// race but are not considered when the plan explains what it skipped.
 pub async fn nominate(
     socket: Arc<tokio::net::UdpSocket>,
     ladder: Ladder<'_>,
@@ -364,61 +373,18 @@ pub async fn nominate(
         }
     }
 
-    // Rung 3. Reached either because the race produced nothing, or because the
-    // NAT is symmetric and the plan sent us straight here.
-    //
-    // The blast runs once, in the family of its base. Until blasting is built
-    // per family, the other family's birthday rung is skipped with that reason
-    // instead of being blasted a second time at the same base.
+    // Rung 3, once per planned family. Reached either because the race
+    // produced nothing, or because a NAT is symmetric and the plan sent us
+    // straight here. Each `Birthday(f)` the plan admitted is blasted at a base
+    // of its own family, in plan order, and the first win returns at once.
     //
     // Only a birthday rung the plan admitted is run or recorded; the plan's
-    // own skips (and their reasons) stand. A base in a family the plan did not
-    // admit is not blasted at either, and the rungs the plan did admit say so
-    // rather than read as "an earlier rung won".
-    let birthday_rungs: Vec<Rung> = plan
-        .sequential
-        .iter()
-        .copied()
-        .filter(|r| matches!(r, Rung::Birthday(_)))
-        .collect();
-    let base_rung = blast_base(&ladder.remote).map(|base| Rung::Birthday(Family::of(&base)));
-    let base_admitted = base_rung.is_none_or(|rung| birthday_rungs.contains(&rung));
-    if !base_admitted {
-        let base_family = base_rung.and_then(Rung::family).map_or("", Family::label);
-        for rung in &birthday_rungs {
-            report.set(
-                *rung,
-                Verdict::Skipped(format!(
-                    "the only blast base is {base_family}, which the plan does not blast; \
-                     the blast runs in one family until per-family blasting is built"
-                )),
-            );
-        }
-    } else if !birthday_rungs.is_empty() {
-        let result = blast(&ladder, probes).await;
-        // Where the blast's own verdict goes: the base's family. With no base
-        // (or the blast switched off) there is nothing family-specific to say,
-        // so every birthday rung carries the reason.
-        let record = |report: &mut LadderReport, verdict: Verdict| match base_rung {
-            Some(rung) => {
-                for other in birthday_rungs.iter().filter(|r| **r != rung) {
-                    report.set(
-                        *other,
-                        Verdict::Skipped(
-                            "the blast runs in one family until per-family blasting is built"
-                                .to_string(),
-                        ),
-                    );
-                }
-                report.set(rung, verdict);
-            }
-            _ => {
-                for rung in &birthday_rungs {
-                    report.set(*rung, verdict.clone());
-                }
-            }
+    // own skips (and their reasons) stand in the report untouched.
+    for rung in &plan.sequential {
+        let Rung::Birthday(family) = *rung else {
+            continue;
         };
-        match result {
+        match blast(&ladder, family, probes).await {
             // The blast nominates without going through `IceAgent::best_validated`,
             // so it carries its own veto (ruling S5). This falls through to the
             // next rung exactly as a failed blast does, rather than returning
@@ -430,8 +396,8 @@ pub async fn nominate(
                     .as_ref()
                     .is_some_and(|f| !f(nomination.remote)) =>
             {
-                record(
-                    &mut report,
+                report.set(
+                    *rung,
                     Verdict::Failed(format!(
                         "{} is reached the same way as the link this is standing by for",
                         nomination.remote
@@ -439,10 +405,10 @@ pub async fn nominate(
                 );
             }
             Ok(nomination) => {
-                record(&mut report, Verdict::Won);
+                report.set(*rung, Verdict::Won);
                 return Ok(nomination);
             }
-            Err(verdict) => record(&mut report, verdict),
+            Err(verdict) => report.set(*rung, verdict),
         }
     }
 
@@ -557,20 +523,24 @@ async fn race(
     }
 }
 
-/// Rung 3. `Err` carries the verdict to record, because every way this rung
-/// ends short of a path is a reason somebody has to read.
-async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Verdict> {
+/// Rung 3 in one address family. `Err` carries the verdict to record, because
+/// every way this rung ends short of a path is a reason somebody has to read.
+async fn blast(
+    ladder: &Ladder<'_>,
+    family: Family,
+    already_sent: u32,
+) -> Result<Nomination, Verdict> {
     if !ladder.cfg.enable_birthday {
         return Err(Verdict::Skipped(
             "the birthday blast is switched off in this configuration".to_string(),
         ));
     }
-    let Some(base) = blast_base(&ladder.remote) else {
-        return Err(Verdict::Skipped(
-            "the peer offered no server-reflexive candidate, so there is no \
-             observed external port to guess around"
-                .to_string(),
-        ));
+    let Some(base) = blast_base(&ladder.remote, family) else {
+        return Err(Verdict::Skipped(format!(
+            "the peer offered no {} server-reflexive candidate, so there is no \
+             observed external port to guess around",
+            family.label()
+        )));
     };
 
     let result = birthday_blast(ladder.psk, ladder.role, base, ladder.cfg).await;
@@ -609,7 +579,7 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
         socket,
         local,
         remote,
-        rung: Rung::Birthday(Family::of(&remote)),
+        rung: Rung::Birthday(family),
         probes,
     })
 }
@@ -715,9 +685,10 @@ mod tests {
     }
 
     /// Property 4 across families: the plan admits only the IPv6 blast, the
-    /// only base is IPv4, and nothing may read "an earlier rung won".
+    /// only server-reflexive candidate is IPv4, so the IPv6 blast names its
+    /// missing base and nothing may read "an earlier rung won".
     #[tokio::test]
-    async fn an_admitted_blast_with_a_base_in_another_family_is_still_accounted_for() {
+    async fn an_admitted_blast_with_no_base_in_its_family_is_skipped_by_name() {
         let sock = socket().await;
         let (mut rx, tx) = channels();
         let nat = FamilyNat {
@@ -759,7 +730,8 @@ mod tests {
         }
         assert!(
             matches!(report.verdict(Rung::Birthday(Family::V6)),
-                Verdict::Skipped(why) if why.contains("only blast base is IPv4")),
+                Verdict::Skipped(why)
+                    if why.contains("peer offered no IPv6 server-reflexive candidate")),
             "{:?}",
             report.verdict(Rung::Birthday(Family::V6))
         );
@@ -1228,7 +1200,7 @@ mod tests {
             admit_remote: None,
         };
 
-        let verdict = blast(&ladder, 0)
+        let verdict = blast(&ladder, Family::V4, 0)
             .await
             .expect_err("nothing answers at this base");
         let Verdict::Failed(why) = verdict else {
@@ -1325,15 +1297,88 @@ mod tests {
         // A host candidate is an interface address behind the NAT. Guessing
         // ports around it aims the blast at the wrong machine.
         assert_eq!(
-            blast_base(&[candidate("192.168.1.5:443", CandidateKind::Host)]),
+            blast_base(
+                &[candidate("192.168.1.5:443", CandidateKind::Host)],
+                Family::V4
+            ),
             None
         );
         assert_eq!(
-            blast_base(&[
-                candidate("192.168.1.5:443", CandidateKind::Host),
-                candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
-            ]),
+            blast_base(
+                &[
+                    candidate("192.168.1.5:443", CandidateKind::Host),
+                    candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
+                ],
+                Family::V4
+            ),
             Some("203.0.113.7:51234".parse().expect("a literal address"))
+        );
+    }
+
+    #[test]
+    fn the_blast_aims_at_the_family_being_blasted() {
+        let remote = [
+            candidate("[2001:db8::9]:40000", CandidateKind::ServerReflexive),
+            candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
+        ];
+        assert_eq!(
+            blast_base(&remote, Family::V4),
+            Some("203.0.113.7:51234".parse().unwrap())
+        );
+        assert_eq!(
+            blast_base(&remote, Family::V6),
+            Some("[2001:db8::9]:40000".parse().unwrap())
+        );
+        assert_eq!(blast_base(&remote[..1], Family::V4), None);
+    }
+
+    /// Ours: IPv4 only. Theirs: both. Nothing listens, so the IPv4 race fails,
+    /// and the IPv6 rungs say which end lacks the family.
+    #[tokio::test]
+    async fn a_missing_family_is_skipped_by_name_in_the_report() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let nat = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::Unknown,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat,
+                peer_nat: nat,
+                cfg: &cfg(120),
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                remote: vec![
+                    candidate("127.0.0.1:9", CandidateKind::ServerReflexive),
+                    candidate("[2001:db8::9]:9", CandidateKind::ServerReflexive),
+                ],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing listens");
+        for rung in Rung::ALL {
+            assert!(
+                !matches!(report.verdict(rung), Verdict::NotReached),
+                "{rung}: {report}"
+            );
+        }
+        assert!(
+            matches!(report.verdict(Rung::Punched(Family::V6)),
+                Verdict::Skipped(w) if w.contains("this end has no IPv6 address")),
+            "{report}"
+        );
+        assert!(
+            matches!(
+                report.verdict(Rung::Punched(Family::V4)),
+                Verdict::Failed(_)
+            ),
+            "{report}"
         );
     }
 
@@ -1371,7 +1416,8 @@ mod tests {
 
         let v = report.verdict(Rung::Birthday(Family::V4)).clone();
         assert!(
-            matches!(&v, Verdict::Skipped(why) if why.contains("server-reflexive")),
+            matches!(&v, Verdict::Skipped(why)
+                if why.contains("no IPv4 server-reflexive candidate")),
             "got {v:?}"
         );
     }
