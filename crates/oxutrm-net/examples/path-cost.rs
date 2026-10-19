@@ -39,14 +39,22 @@
 //!
 //! 1. Both ends punch: they send a datagram every 200 ms until they hear the
 //!    other side, then five more.
-//! 2. The listener then goes silent after sending one `silent` datagram.
-//! 3. The sender, on hearing `silent` on socket `i`, waits `holds[i]` seconds
+//! 2. The listener then sends `silent` five times, 100 ms apart, and goes silent.
+//! 3. The sender, once the `silent` datagrams on socket `i` have stopped, waits `holds[i]` seconds
 //!    and sends three datagrams 100 ms apart.
 //! 4. The listener prints `hold 60s: arrived` if one of them got through, and
 //!    `hold 60s: lost` if nothing came within `holds[i] + 10 s`.
 //!
-//! Start the listener first, then the sender, within a few seconds of each
-//! other. Run it a second time with the roles swapped to measure the other
+//! `arrived` is unambiguous: the mapping was still open. `lost` is not: the
+//! sender's own NAT sat idle for the same time and may have re-mapped its port,
+//! and packets may simply have been dropped, so `lost` means "the listener's
+//! NAT expired it, or the sender's did, or the packets were dropped". Repeat a
+//! `lost` hold, and swap roles, before drawing a conclusion.
+//!
+//! Start both within about a minute of each other (the sender gives up on a
+//! hold if the listener's `silent` does not come within 60 s of its own
+//! punching). The hold counts from the listener's last `silent`, so the real
+//! idle time is the hold plus up to half a second. Run it a second time with the roles swapped to measure the other
 //! NAT.
 //!
 //! ```text
@@ -62,7 +70,7 @@ use anyhow::{Context, bail};
 use oxutrm_net::{generate_cert, quic_client, quic_server};
 use oxutrm_proto::{ClientSpki, HostSpki};
 use tokio::net::UdpSocket;
-use tokio::time::{Instant, interval, sleep, timeout};
+use tokio::time::{Instant, interval, interval_at, sleep, sleep_until, timeout};
 
 /// UDP + IP header bytes added to every datagram on the wire.
 const HEADER_V4: u64 = 28;
@@ -70,6 +78,9 @@ const HEADER_V6: u64 = 48;
 
 /// Quiet time after the handshake before counting starts.
 const SETTLE: Duration = Duration::from_secs(3);
+
+/// Time after the last ping for its echo and acknowledgement to arrive.
+const DRAIN: Duration = Duration::from_millis(500);
 
 /// The size of one measurement ping.
 const PING_LEN: usize = 16;
@@ -79,6 +90,19 @@ const PUNCH_EVERY: Duration = Duration::from_millis(200);
 
 /// How many punches follow the first one heard from the peer.
 const PUNCHES_AFTER_HEARD: usize = 5;
+
+/// How many times the listener repeats `silent`, and the gap between them, so
+/// one lost datagram cannot strand the sender.
+const SILENT_REPEATS: usize = 5;
+const SILENT_GAP: Duration = Duration::from_millis(100);
+
+/// Once the sender has heard `silent`, this long without another means the
+/// listener has gone quiet for good.
+const SILENT_QUIET: Duration = Duration::from_millis(300);
+
+/// How long the sender waits for the listener's first `silent` after its own
+/// punching is done before it gives up on that hold.
+const SILENT_WAIT: Duration = Duration::from_secs(60);
 
 /// Slack the listener waits beyond a hold time before calling it lost.
 const HOLD_SLACK: Duration = Duration::from_secs(10);
@@ -213,14 +237,18 @@ async fn idle(secs: u64, rates: &[f64]) -> anyhow::Result<()> {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(secs);
         if hz > 0.0 {
-            let mut tick = interval(Duration::from_secs_f64(1.0 / hz));
-            while Instant::now() < deadline {
+            // Exactly hz*secs pings: the first tick is one period away, not
+            // immediate, or the window would hold one ping too many.
+            let period = Duration::from_secs_f64(1.0 / hz);
+            let mut tick = interval_at(start + period, period);
+            for _ in 0..(hz * secs as f64).round() as u64 {
                 tick.tick().await;
                 client.send_datagram(vec![0u8; PING_LEN].into())?;
             }
-        } else {
-            sleep(deadline - Instant::now()).await;
         }
+        sleep_until(deadline).await;
+        // Let the last echo and its acknowledgement land before reading.
+        sleep(DRAIN).await;
         let elapsed = start.elapsed().as_secs_f64();
         let (c1, s1) = (read(&client), read(&server));
         drainer.abort();
@@ -251,6 +279,18 @@ async fn hold(
     peer: SocketAddr,
     holds: &[u64],
 ) -> anyhow::Result<()> {
+    if listen {
+        println!(
+            "measuring the NAT in front of THIS (listening) end: a hold is how long \
+             this end stays silent after its last send before the peer's datagram \
+             still gets through"
+        );
+    } else {
+        println!(
+            "sending end: the listener's NAT is the one being measured; for each \
+             hold I wait that long after the listener's last send, then send"
+        );
+    }
     let mut tasks = Vec::new();
     for (i, &secs) in holds.iter().enumerate() {
         let off = u16::try_from(i)?;
@@ -271,8 +311,23 @@ async fn hold(
             .with_context(|| format!("binding the socket for hold {secs}s"))?;
         tasks.push(tokio::spawn(hold_one(listen, sock, remote, secs)));
     }
-    for t in tasks {
-        t.await??;
+    // Every hold reports its own result; one failing must not hide the rest.
+    let mut failed = 0;
+    for (t, &secs) in tasks.into_iter().zip(holds) {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                failed += 1;
+                println!("hold {secs}s: failed: {e:#}");
+            }
+            Err(e) => {
+                failed += 1;
+                println!("hold {secs}s: failed: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} hold(s) failed");
     }
     Ok(())
 }
@@ -295,13 +350,22 @@ async fn hold_one(
     while !heard || left > 0 {
         tokio::select! {
             _ = tick.tick() => {
-                sock.send_to(b"punch", remote).await?;
+                if let Err(e) = sock.send_to(b"punch", remote).await {
+                    eprintln!("hold {secs}s: send error ({}), continuing", e.kind());
+                }
                 if heard {
                     left -= 1;
                 }
             }
             got = sock.recv_from(&mut buf) => {
-                let (n, _) = got?;
+                let n = match got {
+                    Ok((n, _)) => n,
+                    Err(e) => {
+                        eprintln!("hold {secs}s: receive error ({}), continuing", e.kind());
+                        sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 match &buf[..n] {
                     b"punch" => heard = true,
                     b"silent" => {
@@ -314,8 +378,17 @@ async fn hold_one(
         }
     }
 
+    println!("hold {secs}s: path open");
+
     if listen {
-        sock.send_to(b"silent", remote).await?;
+        // Repeated so one lost datagram cannot strand the sender; the listener
+        // is silent from the last one on, and the hold counts from there.
+        for _ in 0..SILENT_REPEATS {
+            if let Err(e) = sock.send_to(b"silent", remote).await {
+                eprintln!("hold {secs}s: send error ({}), continuing", e.kind());
+            }
+            sleep(SILENT_GAP).await;
+        }
         // Silent from here: only listen, ignoring leftover punches.
         let wait = Duration::from_secs(secs) + HOLD_SLACK;
         let arrived = timeout(wait, async {
@@ -332,17 +405,41 @@ async fn hold_one(
                 res?;
                 println!("hold {secs}s: arrived");
             }
-            Err(_) => println!("hold {secs}s: lost"),
+            Err(_) => println!(
+                "hold {secs}s: lost (the listener's NAT expired the mapping, OR the \
+                 sender's own NAT re-mapped its idle port, OR packets were dropped)"
+            ),
         }
     } else {
-        // Wait for the listener to go silent, then sit idle for the hold time.
-        while !silent {
-            let (n, _) = sock.recv_from(&mut buf).await?;
-            silent = &buf[..n] == b"silent";
+        // Wait for the listener to go silent. Its `silent` repeats; the hold
+        // counts from the last one, so keep reading until it stops coming.
+        let first = timeout(SILENT_WAIT, async {
+            while !silent {
+                let (n, _) = sock.recv_from(&mut buf).await?;
+                silent = &buf[..n] == b"silent";
+            }
+            anyhow::Ok(())
+        })
+        .await;
+        match first {
+            Ok(res) => res?,
+            Err(_) => {
+                println!(
+                    "hold {secs}s: gave up, the listener never sent `silent` \
+                     (is it running with the same --holds?)"
+                );
+                return Ok(());
+            }
         }
+        while let Ok(got) = timeout(SILENT_QUIET, sock.recv_from(&mut buf)).await {
+            got?;
+        }
+        println!("hold {secs}s: waiting");
         sleep(Duration::from_secs(secs)).await;
         for _ in 0..3 {
-            sock.send_to(b"late", remote).await?;
+            if let Err(e) = sock.send_to(b"late", remote).await {
+                eprintln!("hold {secs}s: send error ({}), continuing", e.kind());
+            }
             sleep(Duration::from_millis(100)).await;
         }
     }
