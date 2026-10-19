@@ -309,11 +309,12 @@ impl std::fmt::Display for Rung {
             Rung::PortMapped(_) => "port mapped",
             Rung::Punched(_) => "punched",
             Rung::Birthday(_) => "birthday",
-            Rung::SshTunnel => return f.write_str("SSH tunnel"),
+            Rung::SshTunnel => return f.pad("SSH tunnel"),
         };
+        // `pad`, not `write!`, so a caller's width and fill (`{:<20}`) apply.
         match self.family() {
-            Some(fam) => write!(f, "{} {method}", fam.label()),
-            None => f.write_str(method),
+            Some(fam) => f.pad(&format!("{} {method}", fam.label())),
+            None => f.pad(method),
         }
     }
 }
@@ -366,6 +367,16 @@ pub struct PathDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report lines rung names up in a column, so width and fill must apply.
+    #[test]
+    fn a_rung_honours_the_callers_width() {
+        assert_eq!(
+            format!("{:<14}|", Rung::Birthday(Family::V4)),
+            "IPv4 birthday |"
+        );
+        assert_eq!(format!("{:>12}|", Rung::SshTunnel), "  SSH tunnel|");
+    }
 
     #[test]
     fn term_size_round_trips_through_json() {
