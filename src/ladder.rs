@@ -839,14 +839,14 @@ mod tests {
     fn the_report_lists_both_sides_candidates() {
         let mut report = LadderReport::new();
         report.theirs = candidate_list(&[Candidate {
-            addr: "185.72.67.38:443".parse().unwrap(),
+            addr: "203.0.113.7:443".parse().unwrap(),
             kind: CandidateKind::ServerReflexive,
             priority: 1,
         }]);
         let rendered = report.to_string();
         assert!(rendered.contains("  ours:   none\n"), "{rendered}");
         assert!(
-            rendered.contains("  theirs: srflx 185.72.67.38:443\n"),
+            rendered.contains("  theirs: srflx 203.0.113.7:443\n"),
             "{rendered}"
         );
     }
