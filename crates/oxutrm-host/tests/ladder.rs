@@ -13,9 +13,9 @@
 //! `oxutrm_client::status_line`, which is exercised in
 //! `crates/oxutrm-client/src/status.rs`.
 
-use oxutrm_host::ladder::LadderPlan;
+use oxutrm_host::ladder::{EndFacts, LadderPlan};
 use oxutrm_host::{DetachPermit, SessionMeta, daemonize_session, settle_detachability};
-use oxutrm_proto::{Family, NatType, Rung, TermSize};
+use oxutrm_proto::{Family, FamilyNat, NatType, Rung, TermSize};
 
 fn meta() -> SessionMeta {
     SessionMeta {
@@ -35,9 +35,25 @@ fn meta() -> SessionMeta {
 // The plan
 // ---------------------------------------------------------------------------
 
+fn end(v4: NatType, v6: NatType, has_v4: bool, has_v6: bool) -> EndFacts {
+    EndFacts {
+        nat: FamilyNat { v4, v6 },
+        v4: has_v4,
+        v6: has_v6,
+    }
+}
+
 #[test]
 fn the_cheap_rungs_are_raced_and_the_noisy_one_is_not() {
-    let plan = LadderPlan::for_nat(NatType::EndpointIndependent);
+    // Endpoint-independent on both ends in both families: ordinary punching
+    // covers everything, so the blast is not planned at all.
+    let e = end(
+        NatType::EndpointIndependent,
+        NatType::EndpointIndependent,
+        true,
+        true,
+    );
+    let plan = LadderPlan::for_ends(&e, &e);
     assert_eq!(
         plan.raced,
         vec![
@@ -52,14 +68,14 @@ fn the_cheap_rungs_are_raced_and_the_noisy_one_is_not() {
     );
     assert_eq!(
         plan.sequential,
-        vec![
-            Rung::Birthday(Family::V6),
-            Rung::Birthday(Family::V4),
-            Rung::SshTunnel
-        ],
-        "the blast is deliberately noisy, so it never joins the race"
+        vec![Rung::SshTunnel],
+        "neither NAT is symmetric, so the noisy blast is not planned"
     );
-    assert!(plan.skipped.is_empty());
+    assert_eq!(plan.skipped.len(), 2, "{:?}", plan.skipped);
+    for (r, why) in &plan.skipped {
+        assert!(matches!(r, Rung::Birthday(_)), "{r}");
+        assert!(why.contains("ordinary punching covers it"), "{why}");
+    }
 }
 
 #[test]
@@ -67,63 +83,173 @@ fn a_symmetric_nat_skips_punching_rather_than_failing_at_it() {
     // The three-probe classification already established that rung 2 cannot
     // work. Attempting it anyway burns several seconds to discover something
     // known in advance.
-    let plan = LadderPlan::for_nat(NatType::Symmetric);
+    let ours = end(NatType::Symmetric, NatType::Symmetric, true, true);
+    let theirs = end(
+        NatType::EndpointIndependent,
+        NatType::EndpointIndependent,
+        true,
+        true,
+    );
+    let plan = LadderPlan::for_ends(&ours, &theirs);
     assert!(
         !plan.raced.contains(&Rung::Punched(Family::V6))
             && !plan.raced.contains(&Rung::Punched(Family::V4)),
         "punching a symmetric NAT is hopeless, not merely unlikely"
     );
     assert_eq!(
-        plan.raced,
+        plan.sequential,
         vec![
-            Rung::Direct(Family::V6),
-            Rung::Direct(Family::V4),
-            Rung::PortMapped(Family::V6),
-            Rung::PortMapped(Family::V4),
-        ]
-    );
-    assert!(
-        plan.sequential.first() == Some(&Rung::Birthday(Family::V6)),
+            Rung::Birthday(Family::V6),
+            Rung::Birthday(Family::V4),
+            Rung::SshTunnel
+        ],
         "and the blast comes next, which is what it exists for"
     );
-
-    let skipped: Vec<Rung> = plan.skipped.iter().map(|(r, _)| *r).collect();
-    assert_eq!(
-        skipped,
-        vec![Rung::Punched(Family::V6), Rung::Punched(Family::V4)],
-        "both punch rungs are skipped, and the skip is recorded"
-    );
-    for (_, why) in &plan.skipped {
+    for f in Family::BOTH {
+        let why = &plan
+            .skipped
+            .iter()
+            .find(|(r, _)| *r == Rung::Punched(f))
+            .expect("punch skipped")
+            .1;
         assert!(
-            why.contains("symmetric"),
+            why.contains("symmetric") && why.contains(f.label()),
             "a skipped rung must say why, for the bug report: {why}"
         );
     }
 }
 
 #[test]
-fn an_unknown_nat_type_skips_nothing() {
-    // Guessing wrong towards skipping costs a connection; guessing wrong
-    // towards attempting costs a few seconds.
-    let plan = LadderPlan::for_nat(NatType::Unknown);
-    assert!(plan.skipped.is_empty());
-    assert!(plan.raced.contains(&Rung::Punched(Family::V4)));
+fn a_symmetric_ipv4_nat_does_not_stop_ipv6_punching() {
+    let ours = end(NatType::Symmetric, NatType::EndpointIndependent, true, true);
+    let theirs = end(
+        NatType::EndpointIndependent,
+        NatType::EndpointIndependent,
+        true,
+        true,
+    );
+    let plan = LadderPlan::for_ends(&ours, &theirs);
+    assert!(plan.raced.contains(&Rung::Punched(Family::V6)));
+    assert!(!plan.raced.contains(&Rung::Punched(Family::V4)));
+    assert!(plan.sequential.contains(&Rung::Birthday(Family::V4)));
+    assert!(!plan.sequential.contains(&Rung::Birthday(Family::V6)));
 }
 
 #[test]
-fn the_tunnel_is_always_last() {
-    for nat in [
+fn a_family_one_end_lacks_is_skipped_with_whose_it_is() {
+    let ours = end(NatType::EndpointIndependent, NatType::Unknown, true, false);
+    let theirs = end(NatType::EndpointIndependent, NatType::None, true, true);
+    let plan = LadderPlan::for_ends(&ours, &theirs);
+    for r in [
+        Rung::Direct(Family::V6),
+        Rung::PortMapped(Family::V6),
+        Rung::Punched(Family::V6),
+        Rung::Birthday(Family::V6),
+    ] {
+        let why = &plan
+            .skipped
+            .iter()
+            .find(|(s, _)| *s == r)
+            .expect("skipped")
+            .1;
+        assert!(why.contains("this end has no IPv6 address"), "{r}: {why}");
+    }
+    let plan = LadderPlan::for_ends(&theirs, &ours);
+    let why = &plan
+        .skipped
+        .iter()
+        .find(|(s, _)| *s == Rung::Direct(Family::V6))
+        .unwrap()
+        .1;
+    assert!(why.contains("the peer has no IPv6 address"), "{why}");
+}
+
+#[test]
+fn an_unknown_family_nat_skips_nothing_in_that_family() {
+    // Guessing wrong towards skipping costs a connection; guessing wrong
+    // towards attempting costs a few seconds.
+    let ours = end(NatType::Unknown, NatType::Unknown, true, true);
+    let plan = LadderPlan::for_ends(&ours, &ours);
+    assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+}
+
+#[test]
+fn both_ends_agree_on_which_family_to_blast() {
+    let a = end(NatType::Symmetric, NatType::None, true, true);
+    let b = end(NatType::EndpointIndependent, NatType::None, true, true);
+    let births = |p: &LadderPlan| {
+        p.sequential
+            .iter()
+            .filter(|r| matches!(r, Rung::Birthday(_)))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        births(&LadderPlan::for_ends(&a, &b)),
+        births(&LadderPlan::for_ends(&b, &a))
+    );
+    assert_eq!(
+        births(&LadderPlan::for_ends(&a, &b)),
+        vec![Rung::Birthday(Family::V4)]
+    );
+}
+
+#[test]
+fn facts_come_from_the_candidates_by_family() {
+    use oxutrm_proto::{Candidate, CandidateKind};
+    let cand = |addr: &str| Candidate {
+        kind: CandidateKind::Host,
+        addr: addr.parse().unwrap(),
+        priority: 1,
+    };
+    let facts = EndFacts::from_candidates(FamilyNat::UNKNOWN, &[cand("[2001:db8::1]:4000")]);
+    assert!(facts.has(Family::V6) && !facts.has(Family::V4));
+    let facts = EndFacts::from_candidates(FamilyNat::UNKNOWN, &[cand("192.0.2.1:4000")]);
+    assert!(facts.has(Family::V4) && !facts.has(Family::V6));
+}
+
+#[test]
+fn every_rung_is_accounted_for_exactly_once() {
+    for plan in plans() {
+        for rung in Rung::ALL {
+            let n = plan.raced.iter().filter(|r| **r == rung).count()
+                + plan.sequential.iter().filter(|r| **r == rung).count()
+                + plan.skipped.iter().filter(|(r, _)| *r == rung).count();
+            assert_eq!(n, 1, "{rung} in {plan:?}");
+        }
+    }
+}
+
+/// The plans for a spread of fact combinations.
+fn plans() -> Vec<LadderPlan> {
+    let nats = [
         NatType::None,
         NatType::EndpointIndependent,
         NatType::AddressDependent,
         NatType::Symmetric,
         NatType::Unknown,
-    ] {
-        let plan = LadderPlan::for_nat(nat);
+    ];
+    let mut out = Vec::new();
+    for n4 in nats {
+        for n6 in nats {
+            for (h4, h6) in [(true, true), (true, false), (false, true), (false, false)] {
+                let ours = end(n4, n6, h4, h6);
+                let theirs = end(n6, n4, true, true);
+                out.push(LadderPlan::for_ends(&ours, &theirs));
+                out.push(LadderPlan::for_ends(&theirs, &ours));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_tunnel_is_always_last() {
+    for plan in plans() {
         assert_eq!(
             plan.attempted().last(),
             Some(&Rung::SshTunnel),
-            "the tunnel is the fallback of last resort for {nat:?}"
+            "the tunnel is the fallback of last resort: {plan:?}"
         );
     }
 }

@@ -157,6 +157,7 @@ where
             psk: attach.keys.psk(),
             role: IceRole::Controlled,
             nat,
+            peer_nat: client.nat,
             cfg,
             local: candidates,
             remote: client.candidates,
@@ -268,15 +269,9 @@ fn path_description(
 struct ClientFacts {
     cert_spki_sha256: ClientSpki,
     candidates: Vec<Candidate>,
-    /// The client's own NAT verdict, per family. It does **not** select the
-    /// ladder plan -- `LadderPlan::for_nat` is asked about *ours*, because the
-    /// plan is about what this end can do. Carried because a failed ladder is
-    /// diagnosed from both verdicts and only one of them is on this machine.
-    ///
-    /// Nothing consumes it yet, and the allow says so rather than a fabricated
-    /// call site inventing a use: what is worth knowing here is precisely that
-    /// the diagnosis this field exists for has not been written.
-    #[allow(dead_code)]
+    /// The client's own NAT verdict, per family. The ladder plan reads it next
+    /// to ours, which is what lets both ends reach the same decision about the
+    /// birthday blast.
     nat: FamilyNat,
     /// What the client's terminal can render. Recorded, and **never** used to
     /// pick `TERM`: a `TERM` narrowed to today's client would bake degraded
@@ -1000,8 +995,8 @@ mod tests {
     // ---- no-birthday (config spec §2.4) ----
 
     /// Runs one exchange against `cfg` with a client whose hello carries
-    /// `features` and no candidates, so every raced rung is skipped and the
-    /// ladder goes straight to the blast. Returns the reason the exchange
+    /// `features` and no server-reflexive candidate, so the ladder reaches
+    /// the blast without a base to guess around. Returns the reason the exchange
     /// failed with, which names the blast's verdict.
     async fn ladder_verdict(cfg: &NetConfig, features: Vec<String>) -> String {
         let mut meta = fresh_meta("b1");
@@ -1017,7 +1012,10 @@ mod tests {
                 ..
             } = &mut hello
             {
-                *candidates = vec![];
+                // One address in the host's own family, and not a
+                // server-reflexive one: the plan admits the blast, and the blast
+                // has no base to guess around.
+                *candidates = vec![candidate(6001)];
                 *f = features;
             }
             let _ = oxutrm_host::signalling::write_signal_async(&mut w, &hello).await;

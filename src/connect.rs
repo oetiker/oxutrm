@@ -512,6 +512,7 @@ where
                     psk: &host.psk,
                     role: IceRole::Controlling,
                     nat,
+                    peer_nat: host.nat,
                     cfg,
                     local: candidates,
                     remote: host.candidates,

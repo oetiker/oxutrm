@@ -55,9 +55,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use oxutrm_host::LadderPlan;
+use oxutrm_host::{EndFacts, LadderPlan};
 use oxutrm_net::{BlastOutcome, IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
-use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, NatType, Psk, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, Psk, Rung};
 
 /// The path the ladder settled on, and the socket it belongs to.
 ///
@@ -239,6 +239,10 @@ pub struct Ladder<'a> {
     /// What STUN typing concluded about *our* NAT, per address family. It
     /// selects the plan.
     pub nat: FamilyNat,
+    /// What the peer's hello says about *its* NAT, per address family. The
+    /// plan reads both ends so that each side reaches the same decision about
+    /// the blast.
+    pub peer_nat: FamilyNat,
     pub cfg: &'a NetConfig,
     /// Our own candidates, as offered to the peer.
     pub local: Vec<Candidate>,
@@ -281,14 +285,10 @@ pub async fn nominate(
     inbound: &mut tokio::sync::mpsc::Receiver<Candidate>,
     learned: &tokio::sync::mpsc::Sender<Candidate>,
 ) -> Result<Nomination, LadderReport> {
-    // Interim: the planner still takes one verdict, so hand it the IPv4 one
-    // when that family was classified and the IPv6 one otherwise -- the rule
-    // `stun_discover` used to apply before it returned both.
-    let plan = LadderPlan::for_nat(if ladder.nat.v4 != NatType::Unknown {
-        ladder.nat.v4
-    } else {
-        ladder.nat.v6
-    });
+    let plan = LadderPlan::for_ends(
+        &EndFacts::from_candidates(ladder.nat, &ladder.local),
+        &EndFacts::from_candidates(ladder.peer_nat, &ladder.remote),
+    );
     let mut report = LadderReport::new();
     report.ours = candidate_list(&ladder.local);
     report.theirs = candidate_list(&ladder.remote);
@@ -370,20 +370,27 @@ pub async fn nominate(
     // The blast runs once, in the family of its base. Until blasting is built
     // per family, the other family's birthday rung is skipped with that reason
     // instead of being blasted a second time at the same base.
+    //
+    // Only a birthday rung the plan admitted is run or recorded; the plan's
+    // own skips (and their reasons) stand.
     let birthday_rungs: Vec<Rung> = plan
         .sequential
         .iter()
         .copied()
         .filter(|r| matches!(r, Rung::Birthday(_)))
         .collect();
-    if !birthday_rungs.is_empty() {
-        let blast_rung = blast_base(&ladder.remote).map(|base| Rung::Birthday(Family::of(&base)));
+    //
+    // A base in a family the plan did not admit is not blasted at either.
+    let base_rung = blast_base(&ladder.remote).map(|base| Rung::Birthday(Family::of(&base)));
+    let base_admitted = base_rung.is_none_or(|rung| birthday_rungs.contains(&rung));
+    if !birthday_rungs.is_empty() && base_admitted {
+        let blast_rung = base_rung;
         let result = blast(&ladder, probes).await;
         // Where the blast's own verdict goes: the base's family. With no base
         // (or the blast switched off) there is nothing family-specific to say,
         // so every birthday rung carries the reason.
         let record = |report: &mut LadderReport, verdict: Verdict| match blast_rung {
-            Some(rung) if birthday_rungs.contains(&rung) => {
+            Some(rung) => {
                 for other in birthday_rungs.iter().filter(|r| **r != rung) {
                     report.set(
                         *other,
@@ -612,6 +619,7 @@ pub(crate) fn adopt(socket: std::net::UdpSocket) -> std::io::Result<Arc<tokio::n
 mod tests {
     use super::*;
     use oxutrm_net::ice_priority;
+    use oxutrm_proto::NatType;
     use std::time::Duration;
 
     const PSK: Psk = Psk::new([0x5a; 32]);
@@ -657,6 +665,45 @@ mod tests {
         (rx_in, tx_out)
     }
 
+    /// The plan's skip stands: with neither NAT symmetric the blast is not
+    /// admitted, so it is neither run nor given a verdict of its own, even
+    /// with the blast switched on and a base to guess around.
+    #[tokio::test]
+    async fn a_birthday_rung_the_plan_skipped_keeps_the_plans_reason() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let both = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::EndpointIndependent,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat: both,
+                peer_nat: both,
+                cfg: &NetConfig {
+                    enable_birthday: true,
+                    ..cfg(120)
+                },
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+        let birthday = report.verdict(Rung::Birthday(Family::V4)).clone();
+        assert!(
+            matches!(&birthday, Verdict::Skipped(why) if why.contains("ordinary punching covers it")),
+            "{birthday:?}"
+        );
+    }
+
     // ------------------------------------------------------ property 4
 
     /// The property the deleted `RungRunner` was the only thing testing.
@@ -671,6 +718,10 @@ mod tests {
                 psk: &PSK,
                 role: IceRole::Controlling,
                 nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
@@ -715,8 +766,15 @@ mod tests {
                     v4: NatType::Symmetric,
                     v6: NatType::Symmetric,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &cfg(120),
-                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("[::1]:1", CandidateKind::Host),
+                ],
                 // An IPv6 host candidate gives rung 0 something of its class to
                 // try, so it is genuinely ATTEMPTED and genuinely fails --
                 // while rung 2 is skipped by policy before anything is sent.
@@ -730,7 +788,7 @@ mod tests {
         .expect_err("nothing is listening");
 
         // Symmetric NAT: the plan skips rung 2 before a packet exists.
-        let punch = report.verdict(Rung::Punched(Family::V4)).clone();
+        let punch = report.verdict(Rung::Punched(Family::V6)).clone();
         assert!(
             matches!(&punch, Verdict::Skipped(why) if why.contains("symmetric")),
             "expected a policy skip naming the NAT, got {punch:?}"
@@ -769,6 +827,10 @@ mod tests {
                 psk: &PSK,
                 role: IceRole::Controlling,
                 nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
@@ -819,6 +881,10 @@ mod tests {
                 psk: &PSK,
                 role: IceRole::Controlling,
                 nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
@@ -894,8 +960,12 @@ mod tests {
                             v4: NatType::EndpointIndependent,
                             v6: NatType::EndpointIndependent,
                         },
+                        peer_nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
-                        local: vec![],
+                        local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                         remote: vec![candidate(
                             &client_addr.to_string(),
                             CandidateKind::ServerReflexive,
@@ -919,8 +989,12 @@ mod tests {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate(
                     &host_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1008,6 +1082,10 @@ mod tests {
                     v4: NatType::Symmetric,
                     v6: NatType::Symmetric,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -1015,7 +1093,7 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1073,6 +1151,10 @@ mod tests {
                 v4: NatType::Symmetric,
                 v6: NatType::Symmetric,
             },
+            peer_nat: FamilyNat {
+                v4: NatType::Symmetric,
+                v6: NatType::Symmetric,
+            },
             cfg: &NetConfig {
                 enable_birthday: true,
                 birthday_sockets: 2,
@@ -1080,7 +1162,7 @@ mod tests {
                 birthday_budget: Duration::from_millis(300),
                 ..cfg(120)
             },
-            local: vec![],
+            local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
             remote: vec![candidate(&base.to_string(), CandidateKind::ServerReflexive)],
             admit_remote: None,
         };
@@ -1121,6 +1203,10 @@ mod tests {
                     v4: NatType::Symmetric,
                     v6: NatType::Symmetric,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -1128,7 +1214,7 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1203,11 +1289,15 @@ mod tests {
                     v4: NatType::Symmetric,
                     v6: NatType::Symmetric,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     ..cfg(120)
                 },
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 // Host candidates only: no observed external port anywhere.
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::Host)],
                 admit_remote: None,
@@ -1261,8 +1351,12 @@ mod tests {
                             v4: NatType::EndpointIndependent,
                             v6: NatType::EndpointIndependent,
                         },
+                        peer_nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
-                        local: vec![],
+                        local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                         // Port 9 (discard) on loopback: the host's checks go
                         // nowhere, so the client learns nothing from them.
                         remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -1296,8 +1390,12 @@ mod tests {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
                 admit_remote: None,
             },
@@ -1343,8 +1441,12 @@ mod tests {
                     v4: NatType::EndpointIndependent,
                     v6: NatType::EndpointIndependent,
                 },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(300),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
                 admit_remote: None,
             },
