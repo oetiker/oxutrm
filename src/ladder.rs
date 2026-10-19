@@ -372,24 +372,34 @@ pub async fn nominate(
     // instead of being blasted a second time at the same base.
     //
     // Only a birthday rung the plan admitted is run or recorded; the plan's
-    // own skips (and their reasons) stand.
+    // own skips (and their reasons) stand. A base in a family the plan did not
+    // admit is not blasted at either, and the rungs the plan did admit say so
+    // rather than read as "an earlier rung won".
     let birthday_rungs: Vec<Rung> = plan
         .sequential
         .iter()
         .copied()
         .filter(|r| matches!(r, Rung::Birthday(_)))
         .collect();
-    //
-    // A base in a family the plan did not admit is not blasted at either.
     let base_rung = blast_base(&ladder.remote).map(|base| Rung::Birthday(Family::of(&base)));
     let base_admitted = base_rung.is_none_or(|rung| birthday_rungs.contains(&rung));
-    if !birthday_rungs.is_empty() && base_admitted {
-        let blast_rung = base_rung;
+    if !base_admitted {
+        let base_family = base_rung.and_then(Rung::family).map_or("", Family::label);
+        for rung in &birthday_rungs {
+            report.set(
+                *rung,
+                Verdict::Skipped(format!(
+                    "the only blast base is {base_family}, which the plan does not blast; \
+                     the blast runs in one family until per-family blasting is built"
+                )),
+            );
+        }
+    } else if !birthday_rungs.is_empty() {
         let result = blast(&ladder, probes).await;
         // Where the blast's own verdict goes: the base's family. With no base
         // (or the blast switched off) there is nothing family-specific to say,
         // so every birthday rung carries the reason.
-        let record = |report: &mut LadderReport, verdict: Verdict| match blast_rung {
+        let record = |report: &mut LadderReport, verdict: Verdict| match base_rung {
             Some(rung) => {
                 for other in birthday_rungs.iter().filter(|r| **r != rung) {
                     report.set(
@@ -701,6 +711,57 @@ mod tests {
         assert!(
             matches!(&birthday, Verdict::Skipped(why) if why.contains("ordinary punching covers it")),
             "{birthday:?}"
+        );
+    }
+
+    /// Property 4 across families: the plan admits only the IPv6 blast, the
+    /// only base is IPv4, and nothing may read "an earlier rung won".
+    #[tokio::test]
+    async fn an_admitted_blast_with_a_base_in_another_family_is_still_accounted_for() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let nat = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::Unknown,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat,
+                peer_nat: nat,
+                cfg: &NetConfig {
+                    enable_birthday: true,
+                    ..cfg(120)
+                },
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("[::1]:1", CandidateKind::Host),
+                ],
+                remote: vec![
+                    candidate("127.0.0.1:9", CandidateKind::ServerReflexive),
+                    candidate("[::1]:9", CandidateKind::Host),
+                ],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+        for rung in Rung::ALL {
+            assert!(
+                !matches!(report.verdict(rung), Verdict::NotReached),
+                "{rung} was left unaccounted for:\n{report}"
+            );
+        }
+        assert!(
+            matches!(report.verdict(Rung::Birthday(Family::V6)),
+                Verdict::Skipped(why) if why.contains("only blast base is IPv4")),
+            "{:?}",
+            report.verdict(Rung::Birthday(Family::V6))
         );
     }
 
