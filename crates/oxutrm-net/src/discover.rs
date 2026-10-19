@@ -161,17 +161,56 @@ pub fn classify(
 /// sequential queries with a divided timeout achieve just as well. Doing it in
 /// parallel would mean re-implementing discovery on `stun_codec`, and
 /// `stunclient` is reserved for exactly this job.
+///
+/// # Both families, separately
+///
+/// A dual-stack socket has two public faces, and a peer can only use the one
+/// in its own family. So the probes run once over IPv4 and once over IPv6, and
+/// each family's mappings become candidates. Resolving each name to its first
+/// address alone picked IPv6 on any machine with a global IPv6 address -- the
+/// resolver lists AAAA first -- and such a client never learned its public
+/// IPv4 mapping, leaving an IPv4-only peer nothing to punch towards.
+///
+/// The NAT type is the IPv4 family's when it answered: that is where NAT and
+/// punching happen, while IPv6 is nearly always unNATed and reached on rung 0.
 pub async fn stun_discover(
     socket: &tokio::net::UdpSocket,
     cfg: &NetConfig,
 ) -> (Vec<Candidate>, NatType) {
-    let local = match socket.local_addr() {
-        Ok(a) => unmap(a),
+    let bound = match socket.local_addr() {
+        Ok(a) => a,
         Err(_) => return (Vec::new(), NatType::Unknown),
     };
-    let per_probe = cfg.gather_timeout / 3;
+    let local = unmap(bound);
+    // Up to three probes per family, two families, one gather budget.
+    let per_probe = cfg.gather_timeout / 6;
+    let (v4, mut v6) = resolve_servers(&cfg.stun_servers);
+    // An IPv4 socket cannot send to an IPv6 server at all.
+    if bound.is_ipv4() {
+        v6.clear();
+    }
 
-    let servers = resolve_servers(&cfg.stun_servers);
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let (c4, nat4) = discover_family(socket, &v4, local, per_probe).await;
+    let (c6, nat6) = discover_family(socket, &v6, local, per_probe).await;
+    for c in c4.into_iter().chain(c6) {
+        if !candidates.iter().any(|have| have.addr == c.addr) {
+            candidates.push(c);
+        }
+    }
+    candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.addr.cmp(&b.addr)));
+
+    let nat = if nat4 == NatType::Unknown { nat6 } else { nat4 };
+    (candidates, nat)
+}
+
+/// [`stun_discover`] for the servers of one address family.
+async fn discover_family(
+    socket: &tokio::net::UdpSocket,
+    servers: &[SocketAddr],
+    local: SocketAddr,
+    per_probe: std::time::Duration,
+) -> (Vec<Candidate>, NatType) {
     let Some(&first) = servers.first() else {
         return (Vec::new(), NatType::Unknown);
     };
@@ -220,8 +259,6 @@ pub async fn stun_discover(
             priority: ice_priority(CandidateKind::ServerReflexive, &mapped.ip()),
         });
     }
-    candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.addr.cmp(&b.addr)));
-
     (candidates, nat)
 }
 
@@ -249,22 +286,27 @@ async fn probe(
 
 /// Resolve the configured `host:port` strings. An entry that does not resolve
 /// is skipped rather than fatal: a STUN server list is a list of hopes.
-fn resolve_servers(servers: &[String]) -> Vec<SocketAddr> {
+/// The servers' addresses, split by family: `(IPv4, IPv6)`.
+fn resolve_servers(servers: &[String]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
     use std::net::ToSocketAddrs;
-    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut v4: Vec<SocketAddr> = Vec::new();
+    let mut v6: Vec<SocketAddr> = Vec::new();
     for s in servers {
         let Ok(addrs) = s.to_socket_addrs() else {
             continue;
         };
-        // One address per name: the point of the list is distinct operators,
-        // and a second A record for the same host proves nothing.
-        if let Some(a) = addrs.into_iter().next()
-            && !out.contains(&a)
-        {
-            out.push(a);
+        let addrs: Vec<SocketAddr> = addrs.collect();
+        // One address per name and family: the point of the list is distinct
+        // operators, and a second A record for the same host proves nothing.
+        for (want_v4, out) in [(true, &mut v4), (false, &mut v6)] {
+            if let Some(&a) = addrs.iter().find(|a| a.is_ipv4() == want_v4)
+                && !out.contains(&a)
+            {
+                out.push(a);
+            }
         }
     }
-    out
+    (v4, v6)
 }
 
 /// Our own addresses, so a mapping identical to one of them means no NAT.
@@ -739,7 +781,55 @@ mod tests {
             "this-host-does-not-exist.invalid:3478".to_string(),
             "127.0.0.2:3478".to_string(),
         ]);
-        assert_eq!(got.len(), 2, "a bad entry must be skipped, not fatal");
+        assert_eq!(
+            got,
+            (vec![a("127.0.0.1:3478"), a("127.0.0.2:3478")], Vec::new()),
+            "a bad entry must be skipped, not fatal"
+        );
+    }
+
+    #[test]
+    fn servers_are_split_by_family() {
+        let got = resolve_servers(&["[::1]:3478".to_string(), "127.0.0.1:3478".to_string()]);
+        assert_eq!(got, (vec![a("127.0.0.1:3478")], vec![a("[::1]:3478")]));
+    }
+
+    /// One server name with both an AAAA and an A record, on a dual-stack
+    /// socket: both public faces are learned. Taking the name's first
+    /// address left a machine with global IPv6 without its IPv4 mapping,
+    /// and an IPv4-only peer with nothing to punch towards.
+    #[tokio::test]
+    async fn a_dual_stack_socket_learns_a_mapping_in_each_family() {
+        const NAME: &str = "a_dual_stack_socket_learns_a_mapping_in_each_family";
+        use std::net::ToSocketAddrs;
+        let both = "localhost:1"
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !(both.iter().any(SocketAddr::is_ipv4) && both.iter().any(SocketAddr::is_ipv6)) {
+            eprintln!("SKIP {NAME}: localhost does not resolve in both families here");
+            return;
+        }
+        let Ok(v6) = StunResponder::start_on(a("[::1]:0"), MappingBehaviour::Truthful).await else {
+            eprintln!("SKIP {NAME}: no IPv6 loopback");
+            return;
+        };
+        let port = v6.addr().port();
+        let Ok(_v4) =
+            StunResponder::start_on(a(&format!("127.0.0.1:{port}")), MappingBehaviour::Truthful)
+                .await
+        else {
+            eprintln!("SKIP {NAME}: port {port} is taken on IPv4");
+            return;
+        };
+        let sock = tokio::net::UdpSocket::bind("[::]:0").await.expect("bind");
+        let cfg = NetConfig {
+            stun_servers: vec![format!("localhost:{port}")],
+            ..NetConfig::default()
+        };
+        let (cands, _nat) = stun_discover(&sock, &cfg).await;
+        assert!(cands.iter().any(|c| c.addr.is_ipv4()), "{cands:?}");
+        assert!(cands.iter().any(|c| c.addr.is_ipv6()), "{cands:?}");
     }
 
     /// Discovery must query the session socket itself: a mapping learned on
