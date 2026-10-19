@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Candidate, ClientSpki, HostSpki, Name, NatType, OfferEntry, PROTO_VERSION, PathDescription,
+    Candidate, ClientSpki, FamilyNat, HostSpki, Name, OfferEntry, PROTO_VERSION, PathDescription,
     ProtoError, Psk, SessionId, TermSize, TerminalCaps,
 };
 
@@ -80,7 +80,9 @@ pub enum Signal {
         /// the other belonged used to type-check.
         psk: Psk,
         candidates: Vec<Candidate>,
-        nat_type: NatType,
+        /// The NAT type of each family, learned by STUN before this hello
+        /// was written. The peer plans each family's rungs on its own half.
+        nat: FamilyNat,
         bound_port: u16,
         /// The host's INTENT, not the outcome. `HostHello` is written BEFORE
         /// the ladder runs — the candidates travel in it — so at this point
@@ -132,7 +134,8 @@ pub enum Signal {
         /// Anything that completed the handshake reached `Command::new(shell)`.
         cert_spki_sha256: ClientSpki,
         candidates: Vec<Candidate>,
-        nat_type: NatType,
+        /// See `HostHello.nat`.
+        nat: FamilyNat,
         caps: TerminalCaps,
         size: TermSize,
         /// What this client can do beyond the base exchange. Absent on a
@@ -253,8 +256,8 @@ pub fn read_signal<R: std::io::BufRead>(r: &mut R) -> Result<Signal, ProtoError>
 mod tests {
     use super::*;
     use crate::{
-        Candidate, CandidateKind, FEATURE_STANDBY, Family, NatType, PROTO_VERSION, PathDescription,
-        ProtoError, Rung, TermSize, TerminalCaps,
+        Candidate, CandidateKind, FEATURE_STANDBY, Family, FamilyNat, NatType, PROTO_VERSION,
+        PathDescription, ProtoError, Rung, TermSize, TerminalCaps,
     };
     use std::io::BufReader;
 
@@ -286,7 +289,10 @@ mod tests {
                 cert_spki_sha256: HostSpki::new(*b"abcdefghijklmnopqrstuvwxyz123456"),
                 psk: Psk::new(*b"0123456789abcdef0123456789abcdef"),
                 candidates: vec![cand.clone()],
-                nat_type: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 bound_port: 443,
                 detachable: true,
                 features: vec![],
@@ -298,7 +304,10 @@ mod tests {
                 // two fields are distinct values.
                 cert_spki_sha256: ClientSpki::new(*b"654321zyxwvutsrqponmlkjihgfedcba"),
                 candidates: vec![cand.clone()],
-                nat_type: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 caps: caps(),
                 size: TermSize {
                     cols: 120,
@@ -439,7 +448,7 @@ mod tests {
             concat!(
                 r#"{{"t":"HostHello","proto":{},"session_id":"00112233445566778899aabbccddeeff","#,
                 r#""attach_id":1,"cert_spki_sha256":"{}","psk":"{}","candidates":[],"#,
-                r#""nat_type":"Unknown","bound_port":443,"detachable":true}}"#,
+                r#""nat":{{"v4":"Unknown","v6":"Unknown"}},"bound_port":443,"detachable":true}}"#,
                 "\n"
             ),
             proto, GOOD_32, GOOD_32
@@ -483,7 +492,7 @@ mod tests {
         let line = format!(
             concat!(
                 r#"{{"t":"ClientHello","proto":99,"cert_spki_sha256":"{}","#,
-                r#""candidates":[],"nat_type":"Unknown","#,
+                r#""candidates":[],"nat":{{"v4":"Unknown","v6":"Unknown"}},"#,
                 r#""caps":{{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
                 r#""mouse_sgr":false,"osc52":false,"osc8":false,"term_name":"xterm"}},"#,
                 r#""size":{{"cols":80,"rows":24}}}}"#,
@@ -531,7 +540,7 @@ mod tests {
         s.push_str(GOOD_32);
         s.push_str(r#"","psk":""#);
         s.push_str(psk);
-        s.push_str(r#"","candidates":[],"nat_type":"Unknown","bound_port":443,"detachable":true}"#);
+        s.push_str(r#"","candidates":[],"nat":{"v4":"Unknown","v6":"Unknown"},"bound_port":443,"detachable":true}"#);
         s.push('\n');
         s
     }
@@ -629,7 +638,7 @@ mod tests {
             s.push('"');
         }
         s.push_str(concat!(
-            r#","candidates":[],"nat_type":"Unknown","#,
+            r#","candidates":[],"nat":{"v4":"Unknown","v6":"Unknown"},"#,
             r#""caps":{"truecolor":false,"colors":16,"bracketed_paste":false,"#,
             r#""mouse_sgr":false,"osc52":false,"osc8":false,"term_name":"xterm"},"#,
             r#""size":{"cols":80,"rows":24}}"#,
@@ -1080,7 +1089,7 @@ mod tests {
             cert_spki_sha256: HostSpki::new([7; 32]),
             psk: Psk::new([9; 32]),
             candidates: vec![],
-            nat_type: NatType::Unknown,
+            nat: FamilyNat::UNKNOWN,
             bound_port: 443,
             detachable: true,
             features: vec![FEATURE_STANDBY.to_string()],

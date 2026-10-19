@@ -123,9 +123,9 @@ pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
-    Candidate, CandidateKind, Family, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI, MAX_LINKS,
-    MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType, PathDescription, Rung, TermSize,
-    TerminalCaps, TextField,
+    Candidate, CandidateKind, Family, FamilyNat, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI,
+    MAX_LINKS, MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType, PathDescription, Rung,
+    TermSize, TerminalCaps, TextField,
 };
 
 /// The wire protocol version. Checked at handshake; a mismatch is a hard,
@@ -154,7 +154,11 @@ pub use types::{
 /// **6**: `Cell` gained `link`, `ScreenState` and its diff gained the link
 /// table (OSC 8 hyperlinks), and `TerminalCaps` gained `osc8`. No
 /// compatibility with 5.
-pub const PROTO_VERSION: u32 = 6;
+///
+/// **7**: `HostHello` and `ClientHello` carry `nat: FamilyNat` (one NAT type
+/// per address family) in place of the single `nat_type`. No compatibility
+/// with 6.
+pub const PROTO_VERSION: u32 = 7;
 
 /// The host serves a control stream on every link (spec §2).
 pub const FEATURE_CONTROL: &str = "control";

@@ -29,7 +29,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use oxutrm_proto::{Candidate, ClientSpki, NatType, PROTO_VERSION, Signal, TermSize, TerminalCaps};
+use oxutrm_proto::{
+    Candidate, ClientSpki, FamilyNat, NatType, PROTO_VERSION, Signal, TermSize, TerminalCaps,
+};
 
 /// Generous on purpose. The host gathers candidates against real STUN servers
 /// with `NetConfig`'s three-second budget, and this test must not fail on a
@@ -41,7 +43,10 @@ fn a_client_hello(candidates: Vec<Candidate>) -> Signal {
         proto: PROTO_VERSION,
         cert_spki_sha256: ClientSpki::new([3u8; 32]),
         candidates,
-        nat_type: NatType::Symmetric,
+        nat: FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::Symmetric,
+        },
         caps: TerminalCaps {
             truecolor: true,
             colors: 16_777_216,

@@ -11,7 +11,7 @@
 //! hour on their network.
 
 use oxutrm_host::ssh::{BootstrapError, SshChannel, SshLauncher};
-use oxutrm_proto::{ClientSpki, NatType, PROTO_VERSION, Signal, TermSize, TerminalCaps};
+use oxutrm_proto::{ClientSpki, FamilyNat, PROTO_VERSION, Signal, TermSize, TerminalCaps};
 
 fn fake(mode: &str) -> SshLauncher {
     SshLauncher::command(env!("CARGO_BIN_EXE_oxutrm-fake-ssh")).env("OXUTRM_FAKE_SSH_MODE", mode)
@@ -25,7 +25,7 @@ fn client_hello() -> Signal {
         // without it is a client the host has nothing to authenticate.
         cert_spki_sha256: ClientSpki::new([0x11; 32]),
         candidates: vec![],
-        nat_type: NatType::Unknown,
+        nat: FamilyNat::UNKNOWN,
         caps: TerminalCaps {
             truecolor: true,
             colors: 16_777_216,

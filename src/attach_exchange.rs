@@ -19,7 +19,8 @@ use oxutrm_host::registry::SessionMeta;
 use oxutrm_host::signalling::write_signal_async;
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, ClientSpki, HostSpki, NatType, PathDescription, Signal, TermSize, TerminalCaps,
+    Candidate, ClientSpki, FamilyNat, HostSpki, NatType, PathDescription, Signal, TermSize,
+    TerminalCaps,
 };
 use tokio::io::AsyncWrite;
 
@@ -230,11 +231,16 @@ where
 /// `mtu` field to copy. A constant here would render as a plausible status
 /// line that is simply not true of this path.
 ///
+/// `nat_type` is the NAT of the nominated rung's family: that is the NAT the
+/// path actually crossed. The ssh tunnel crosses none and has no family, so it
+/// reports `Unknown` rather than borrowing a verdict about a path it did not
+/// take.
+///
 /// Everything else is the ladder's own finding, copied unchanged, because the
 /// connection knows nothing about which rung won or what it cost.
 fn path_description(
     nomination: &crate::ladder::Nomination,
-    nat: NatType,
+    nat: FamilyNat,
     conn: &quinn::Connection,
 ) -> PathDescription {
     PathDescription {
@@ -242,7 +248,10 @@ fn path_description(
         local: nomination.local,
         remote: nomination.remote,
         probes_sent: nomination.probes,
-        nat_type: nat,
+        nat_type: nomination
+            .rung
+            .family()
+            .map_or(NatType::Unknown, |f| nat.get(f)),
         // Saturating rather than wrapping: a link slow enough to overflow a
         // u32 of milliseconds is one the status line should report as very
         // slow, not as very fast.
@@ -259,16 +268,16 @@ fn path_description(
 struct ClientFacts {
     cert_spki_sha256: ClientSpki,
     candidates: Vec<Candidate>,
-    /// The client's own NAT verdict. It does **not** select the ladder plan --
-    /// `LadderPlan::for_nat` is asked about *ours*, because the plan is about
-    /// what this end can do. Carried because a failed ladder is diagnosed from
-    /// both verdicts and only one of them is on this machine.
+    /// The client's own NAT verdict, per family. It does **not** select the
+    /// ladder plan -- `LadderPlan::for_nat` is asked about *ours*, because the
+    /// plan is about what this end can do. Carried because a failed ladder is
+    /// diagnosed from both verdicts and only one of them is on this machine.
     ///
     /// Nothing consumes it yet, and the allow says so rather than a fabricated
     /// call site inventing a use: what is worth knowing here is precisely that
     /// the diagnosis this field exists for has not been written.
     #[allow(dead_code)]
-    nat_type: NatType,
+    nat: FamilyNat,
     /// What the client's terminal can render. Recorded, and **never** used to
     /// pick `TERM`: a `TERM` narrowed to today's client would bake degraded
     /// output into the authoritative screen for the life of the session, which
@@ -309,7 +318,7 @@ fn host_hello(
     session_id: &str,
     attach: &oxutrm_host::Attach,
     candidates: Vec<Candidate>,
-    nat_type: NatType,
+    nat: FamilyNat,
     bound_port: u16,
 ) -> Signal {
     Signal::HostHello {
@@ -319,7 +328,7 @@ fn host_hello(
         cert_spki_sha256: attach.keys.cert_spki_sha256(),
         psk: attach.keys.psk().clone(),
         candidates,
-        nat_type,
+        nat,
         bound_port,
         detachable: true,
         features: vec![
@@ -357,7 +366,7 @@ where
         Signal::ClientHello {
             cert_spki_sha256,
             candidates,
-            nat_type,
+            nat,
             caps,
             size,
             features,
@@ -365,7 +374,7 @@ where
         } => Ok(ClientFacts {
             cert_spki_sha256,
             candidates,
-            nat_type,
+            nat,
             caps,
             size,
             features,
@@ -716,12 +725,18 @@ mod tests {
         (meta, attach)
     }
 
+    /// The same verdict for both families, for tests that are not about the
+    /// difference between them.
+    fn both(n: NatType) -> FamilyNat {
+        FamilyNat { v4: n, v6: n }
+    }
+
     fn a_client_hello() -> Signal {
         Signal::ClientHello {
             proto: oxutrm_proto::PROTO_VERSION,
             cert_spki_sha256: ClientSpki::new([9u8; 32]),
             candidates: vec![candidate(6001)],
-            nat_type: NatType::AddressDependent,
+            nat: both(NatType::AddressDependent),
             caps: oxutrm_term::detect_caps(),
             size: TermSize {
                 cols: 132,
@@ -760,7 +775,13 @@ mod tests {
         });
 
         let (_meta, attach) = attach_of("d1e5");
-        let hello = host_hello("d1e5", &attach, vec![candidate(3001)], NatType::None, 4433);
+        let hello = host_hello(
+            "d1e5",
+            &attach,
+            vec![candidate(3001)],
+            both(NatType::None),
+            4433,
+        );
 
         let facts = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -771,7 +792,7 @@ mod tests {
         .expect("the exchange must succeed against a well-behaved client");
 
         assert_eq!(facts.size.cols, 132);
-        assert_eq!(facts.nat_type, NatType::AddressDependent);
+        assert_eq!(facts.nat, both(NatType::AddressDependent));
         assert_eq!(facts.candidates.len(), 1);
         client.abort();
     }
@@ -783,7 +804,13 @@ mod tests {
     #[test]
     fn the_offer_carries_this_attachs_own_generation_and_port() {
         let (_meta, attach) = attach_of("beef");
-        let hello = host_hello("beef", &attach, vec![candidate(3001)], NatType::None, 4433);
+        let hello = host_hello(
+            "beef",
+            &attach,
+            vec![candidate(3001)],
+            both(NatType::None),
+            4433,
+        );
 
         match hello {
             Signal::HostHello {
@@ -792,7 +819,7 @@ mod tests {
                 attach_id,
                 bound_port,
                 candidates,
-                nat_type,
+                nat,
                 cert_spki_sha256,
                 ..
             } => {
@@ -801,7 +828,7 @@ mod tests {
                 assert_eq!(attach_id, attach.attach_id, "a stale generation");
                 assert_eq!(bound_port, 4433);
                 assert_eq!(candidates.len(), 1);
-                assert_eq!(nat_type, NatType::None);
+                assert_eq!(nat, both(NatType::None));
                 assert_eq!(cert_spki_sha256, attach.keys.cert_spki_sha256());
             }
             other => panic!("host_hello composed something else: {other:?}"),
@@ -815,7 +842,7 @@ mod tests {
     #[test]
     fn the_offer_states_the_intent_to_detach_because_the_outcome_is_not_known_yet() {
         let (_meta, attach) = attach_of("beef");
-        let hello = host_hello("beef", &attach, Vec::new(), NatType::Symmetric, 0);
+        let hello = host_hello("beef", &attach, Vec::new(), both(NatType::Symmetric), 0);
         match hello {
             Signal::HostHello { detachable, .. } => assert!(
                 detachable,
@@ -834,7 +861,7 @@ mod tests {
         let mut our_r = tokio::io::BufReader::new(&mut our_r);
 
         let (_meta, attach) = attach_of("dead");
-        let hello = host_hello("dead", &attach, Vec::new(), NatType::None, 4433);
+        let hello = host_hello("dead", &attach, Vec::new(), both(NatType::None), 4433);
 
         let peer = tokio::spawn(async move {
             let mut r = tokio::io::BufReader::new(&mut theirs);
@@ -899,7 +926,7 @@ mod tests {
         let (conn, _alive) = connected().await;
         let nom = nomination(Rung::Punched(Family::V4), 12).await;
 
-        let path = path_description(&nom, NatType::EndpointIndependent, &conn);
+        let path = path_description(&nom, both(NatType::EndpointIndependent), &conn);
 
         assert_eq!(
             path.mtu, PINNED_MTU,
@@ -914,7 +941,7 @@ mod tests {
         let (conn, _alive) = connected().await;
         let nom = nomination(Rung::Punched(Family::V4), 12).await;
 
-        let path = path_description(&nom, NatType::EndpointIndependent, &conn);
+        let path = path_description(&nom, both(NatType::EndpointIndependent), &conn);
 
         assert_eq!(
             u128::from(path.rtt_ms),
@@ -930,13 +957,44 @@ mod tests {
         let (conn, _alive) = connected().await;
         let nom = nomination(Rung::Birthday(Family::V4), 312).await;
 
-        let path = path_description(&nom, NatType::Symmetric, &conn);
+        let nat = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::None,
+        };
+        let path = path_description(&nom, nat, &conn);
 
         assert_eq!(path.rung, Rung::Birthday(Family::V4));
         assert_eq!(path.probes_sent, 312, "the blast's cost must be reported");
         assert_eq!(path.local, nom.local);
         assert_eq!(path.remote, nom.remote);
         assert_eq!(path.nat_type, NatType::Symmetric);
+    }
+
+    /// The two families have different NATs, so the one the status line shows
+    /// must be the one the nominated rung actually crossed.
+    #[tokio::test]
+    async fn the_nat_type_is_that_of_the_nominated_rungs_family() {
+        let (conn, _alive) = connected().await;
+        let nat = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::None,
+        };
+
+        let v4 = nomination(Rung::Birthday(Family::V4), 1).await;
+        assert_eq!(
+            path_description(&v4, nat, &conn).nat_type,
+            NatType::Symmetric
+        );
+
+        let v6 = nomination(Rung::Direct(Family::V6), 1).await;
+        assert_eq!(path_description(&v6, nat, &conn).nat_type, NatType::None);
+
+        // The tunnel crosses no NAT of ours, whatever the probes found.
+        let tunnel = nomination(Rung::SshTunnel, 0).await;
+        assert_eq!(
+            path_description(&tunnel, nat, &conn).nat_type,
+            NatType::Unknown
+        );
     }
 
     // ---- no-birthday (config spec §2.4) ----

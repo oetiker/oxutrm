@@ -63,7 +63,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use oxutrm_proto::{Candidate, CandidateKind, NatType};
+use oxutrm_proto::{Candidate, CandidateKind, FamilyNat, NatType};
 
 use crate::{NetConfig, ice_priority, to_socket_family, unmap};
 
@@ -171,15 +171,18 @@ pub fn classify(
 /// resolver lists AAAA first -- and such a client never learned its public
 /// IPv4 mapping, leaving an IPv4-only peer nothing to punch towards.
 ///
-/// The NAT type is the IPv4 family's when it answered: that is where NAT and
-/// punching happen, while IPv6 is nearly always unNATed and reached on rung 0.
+/// Each family is classified on its own and returned side by side: a host
+/// whose IPv6 is unNATed can still sit behind a symmetric IPv4 NAT, and the
+/// ladder plans each family's rungs from that family's verdict. A family with
+/// no usable server, or none that is reachable from this socket (an IPv4
+/// socket cannot probe IPv6), is `Unknown`.
 pub async fn stun_discover(
     socket: &tokio::net::UdpSocket,
     cfg: &NetConfig,
-) -> (Vec<Candidate>, NatType) {
+) -> (Vec<Candidate>, FamilyNat) {
     let bound = match socket.local_addr() {
         Ok(a) => a,
-        Err(_) => return (Vec::new(), NatType::Unknown),
+        Err(_) => return (Vec::new(), FamilyNat::UNKNOWN),
     };
     let local = unmap(bound);
     // Up to three probes per family, two families, one gather budget.
@@ -200,8 +203,7 @@ pub async fn stun_discover(
     }
     candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.addr.cmp(&b.addr)));
 
-    let nat = if nat4 == NatType::Unknown { nat6 } else { nat4 };
-    (candidates, nat)
+    (candidates, FamilyNat { v4: nat4, v6: nat6 })
 }
 
 /// [`stun_discover`] for the servers of one address family.
@@ -461,7 +463,7 @@ mod tests {
         };
         let (_cands, nat) = stun_discover(&sock, &cfg).await;
         assert_eq!(
-            nat,
+            nat.v4,
             NatType::Symmetric,
             "a per-destination mapping must be detectable from the servers the \
              default configuration actually has"
@@ -580,7 +582,12 @@ mod tests {
         let (cands, nat) = stun_discover(&sock, &cfg).await;
 
         // Every probe saw our real address, so nothing rewrites it.
-        assert_eq!(nat, NatType::None, "a truthful loopback path has no NAT");
+        assert_eq!(nat.v4, NatType::None, "a truthful loopback path has no NAT");
+        assert_eq!(
+            nat.v6,
+            NatType::Unknown,
+            "an IPv4 socket learns nothing about IPv6"
+        );
         assert!(!cands.is_empty(), "discovery produced no candidate at all");
         for c in &cands {
             assert_eq!(c.kind, CandidateKind::ServerReflexive);
@@ -649,7 +656,7 @@ mod tests {
         };
         let (cands, nat) = stun_discover(&sock, &cfg).await;
         assert_eq!(
-            nat,
+            nat.v4,
             NatType::Unknown,
             "two servers on one IP cannot show whether the destination IP \
              moves the mapping, so nothing above EndpointIndependent is provable"
@@ -679,7 +686,7 @@ mod tests {
         };
         let (_cands, nat) = stun_discover(&sock, &cfg).await;
         assert_eq!(
-            nat,
+            nat.v4,
             NatType::Symmetric,
             "a mapping that changes with the destination port is symmetric, \
              and symmetric is what sends the ladder to rung 3"
@@ -731,7 +738,7 @@ mod tests {
         };
         let (_cands, nat) = stun_discover(&sock, &cfg).await;
         assert_eq!(
-            nat,
+            nat.v4,
             NatType::AddressDependent,
             "without the configured alternate port this merges into Symmetric \
              and rung 2 is skipped for nothing"
@@ -756,7 +763,7 @@ mod tests {
             ..NetConfig::default()
         };
         let (cands, nat) = stun_discover(&sock, &cfg).await;
-        assert_eq!(nat, NatType::Unknown);
+        assert_eq!(nat, FamilyNat::UNKNOWN);
         assert!(cands.is_empty(), "a silent server produced a candidate");
     }
 
@@ -770,7 +777,7 @@ mod tests {
             ..NetConfig::default()
         };
         let (cands, nat) = stun_discover(&sock, &cfg).await;
-        assert_eq!(nat, NatType::Unknown);
+        assert_eq!(nat, FamilyNat::UNKNOWN);
         assert!(cands.is_empty());
     }
 
@@ -866,6 +873,6 @@ mod tests {
             .expect("bind");
         let (cands, nat) = stun_discover(&sock, &NetConfig::default()).await;
         assert!(!cands.is_empty(), "no public server answered");
-        assert_ne!(nat, NatType::Unknown, "could not classify the NAT");
+        assert_ne!(nat, FamilyNat::UNKNOWN, "could not classify the NAT");
     }
 }

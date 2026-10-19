@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use oxutrm_host::LadderPlan;
 use oxutrm_net::{BlastOutcome, IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
-use oxutrm_proto::{Candidate, CandidateKind, Family, NatType, Psk, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, NatType, Psk, Rung};
 
 /// The path the ladder settled on, and the socket it belongs to.
 ///
@@ -236,8 +236,9 @@ pub struct Ladder<'a> {
     /// The client is always `Controlling`; the host is always `Controlled`.
     /// Only the controlling side nominates — see `oxutrm_net::ice`.
     pub role: IceRole,
-    /// What STUN typing concluded about *our* NAT. It selects the plan.
-    pub nat: NatType,
+    /// What STUN typing concluded about *our* NAT, per address family. It
+    /// selects the plan.
+    pub nat: FamilyNat,
     pub cfg: &'a NetConfig,
     /// Our own candidates, as offered to the peer.
     pub local: Vec<Candidate>,
@@ -280,7 +281,14 @@ pub async fn nominate(
     inbound: &mut tokio::sync::mpsc::Receiver<Candidate>,
     learned: &tokio::sync::mpsc::Sender<Candidate>,
 ) -> Result<Nomination, LadderReport> {
-    let plan = LadderPlan::for_nat(ladder.nat);
+    // Interim: the planner still takes one verdict, so hand it the IPv4 one
+    // when that family was classified and the IPv6 one otherwise -- the rule
+    // `stun_discover` used to apply before it returned both.
+    let plan = LadderPlan::for_nat(if ladder.nat.v4 != NatType::Unknown {
+        ladder.nat.v4
+    } else {
+        ladder.nat.v6
+    });
     let mut report = LadderReport::new();
     report.ours = candidate_list(&ladder.local);
     report.theirs = candidate_list(&ladder.remote);
@@ -662,7 +670,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -700,7 +711,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 // An IPv6 host candidate gives rung 0 something of its class to
@@ -754,7 +768,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 // IPv4 server-reflexive only: no IPv6 host candidate, and no
@@ -801,7 +818,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -870,7 +890,10 @@ mod tests {
                     Ladder {
                         psk: &PSK,
                         role: IceRole::Controlled,
-                        nat: NatType::EndpointIndependent,
+                        nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
                         local: vec![],
                         remote: vec![candidate(
@@ -892,7 +915,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
                 local: vec![],
                 remote: vec![candidate(
@@ -978,7 +1004,10 @@ mod tests {
                 // Symmetric sends the plan straight past rung 2, and the only
                 // candidate is server-reflexive, so rungs 0 and 1 have nothing
                 // of their class. The race is therefore never entered at all.
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -1040,7 +1069,10 @@ mod tests {
         let ladder = Ladder {
             psk: &PSK,
             role: IceRole::Controlling,
-            nat: NatType::Symmetric,
+            nat: FamilyNat {
+                v4: NatType::Symmetric,
+                v6: NatType::Symmetric,
+            },
             cfg: &NetConfig {
                 enable_birthday: true,
                 birthday_sockets: 2,
@@ -1085,7 +1117,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -1164,7 +1199,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     ..cfg(120)
@@ -1219,7 +1257,10 @@ mod tests {
                     Ladder {
                         psk: &PSK,
                         role: IceRole::Controlled,
-                        nat: NatType::EndpointIndependent,
+                        nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
                         local: vec![],
                         // Port 9 (discard) on loopback: the host's checks go
@@ -1251,7 +1292,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
                 local: vec![],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -1295,7 +1339,10 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(300),
                 local: vec![],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],

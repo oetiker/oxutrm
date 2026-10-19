@@ -169,6 +169,36 @@ pub enum NatType {
     Unknown,
 }
 
+/// The NAT type of each address family, side by side.
+///
+/// The two families are classified separately because they fail separately:
+/// IPv6 is usually unNATed (`None`) while the same host's IPv4 sits behind a
+/// symmetric NAT, and a single verdict would hide one behind the other. Each
+/// rung of the ladder belongs to one family, so the planner asks for the NAT
+/// of the family it is planning, never for a merged answer. A family nobody
+/// probed (no socket in that family, no server answered) is `Unknown`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FamilyNat {
+    pub v4: NatType,
+    pub v6: NatType,
+}
+
+impl FamilyNat {
+    /// Nothing is known about either family.
+    pub const UNKNOWN: FamilyNat = FamilyNat {
+        v4: NatType::Unknown,
+        v6: NatType::Unknown,
+    };
+
+    /// The NAT type of one family.
+    pub fn get(self, f: Family) -> NatType {
+        match f {
+            Family::V4 => self.v4,
+            Family::V6 => self.v6,
+        }
+    }
+}
+
 /// An address family. Every rung of the ladder except the ssh tunnel exists
 /// once per family, because the two families fail independently: a host can
 /// have a working IPv6 path while its IPv4 NAT is symmetric, or the reverse.
@@ -325,6 +355,9 @@ pub struct PathDescription {
     pub local: std::net::SocketAddr,
     pub remote: std::net::SocketAddr,
     pub probes_sent: u32,
+    /// The NAT of the nominated rung's family, or `Unknown` for the ssh
+    /// tunnel, which crosses none. Not a merged verdict: the other family's
+    /// NAT was not on this path.
     pub nat_type: NatType,
     pub rtt_ms: u32,
     pub mtu: u16,
@@ -343,6 +376,21 @@ mod tests {
         let text = serde_json::to_string(&s).expect("encode");
         assert_eq!(text, r#"{"cols":132,"rows":43}"#);
         assert_eq!(serde_json::from_str::<TermSize>(&text).expect("decode"), s);
+    }
+
+    #[test]
+    fn the_nat_type_travels_per_family() {
+        let n = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::None,
+        };
+        assert_eq!(
+            serde_json::to_string(&n).unwrap(),
+            r#"{"v4":"Symmetric","v6":"None"}"#
+        );
+        assert_eq!(n.get(Family::V4), NatType::Symmetric);
+        assert_eq!(n.get(Family::V6), NatType::None);
+        assert_eq!(FamilyNat::UNKNOWN.get(Family::V6), NatType::Unknown);
     }
 
     #[test]
