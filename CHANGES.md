@@ -24,7 +24,8 @@
 
 - **A client and a host must both be updated.** This release changes the
   protocol version to 7: the client refuses a host session started by an
-  older oxutrm, and the selector lists it as `old version`.
+  older oxutrm, and the selector lists it as `old version`. End such
+  sessions, and update the client and the host together, before connecting.
 
 ### Fixed
 - **The birthday punch aims at an address family both ends can use.** It

@@ -403,12 +403,19 @@ pub async fn nominate(
                         nomination.remote
                     )),
                 );
+                // The veto is still a blast that fired its packets. The
+                // nomination's total already includes `probes`, so only the
+                // blast's own share is added.
+                probes = nomination.probes;
             }
             Ok(nomination) => {
                 report.set(*rung, Verdict::Won);
                 return Ok(nomination);
             }
-            Err(verdict) => report.set(*rung, verdict),
+            Err((verdict, sent)) => {
+                report.set(*rung, verdict);
+                probes = probes.saturating_add(sent);
+            }
         }
     }
 
@@ -524,23 +531,31 @@ async fn race(
 }
 
 /// Rung 3 in one address family. `Err` carries the verdict to record, because
-/// every way this rung ends short of a path is a reason somebody has to read.
+/// every way this rung ends short of a path is a reason somebody has to read,
+/// and the number of probes this blast itself sent, so that a later family's
+/// win still reports the cost of the misses before it.
 async fn blast(
     ladder: &Ladder<'_>,
     family: Family,
     already_sent: u32,
-) -> Result<Nomination, Verdict> {
+) -> Result<Nomination, (Verdict, u32)> {
     if !ladder.cfg.enable_birthday {
-        return Err(Verdict::Skipped(
-            "the birthday blast is switched off in this configuration".to_string(),
+        return Err((
+            Verdict::Skipped(
+                "the birthday blast is switched off in this configuration".to_string(),
+            ),
+            0,
         ));
     }
     let Some(base) = blast_base(&ladder.remote, family) else {
-        return Err(Verdict::Skipped(format!(
-            "the peer offered no {} server-reflexive candidate, so there is no \
-             observed external port to guess around",
-            family.label()
-        )));
+        return Err((
+            Verdict::Skipped(format!(
+                "the peer offered no {} server-reflexive candidate, so there is no \
+                 observed external port to guess around",
+                family.label()
+            )),
+            0,
+        ));
     };
 
     let result = birthday_blast(ladder.psk, ladder.role, base, ladder.cfg).await;
@@ -549,8 +564,15 @@ async fn blast(
         // The miss carries its own numbers now: this text is the
         // rung's verdict, printed at connect time before any session owns a
         // screen, so showing them here is still safe.
-        Ok(BlastOutcome::Miss(miss)) => return Err(Verdict::Failed(miss.to_string())),
-        Err(e) => return Err(Verdict::Failed(format!("the blast could not start: {e}"))),
+        Ok(BlastOutcome::Miss(miss)) => {
+            return Err((Verdict::Failed(miss.to_string()), miss.probes));
+        }
+        Err(e) => {
+            return Err((
+                Verdict::Failed(format!("the blast could not start: {e}")),
+                0,
+            ));
+        }
     };
 
     // Property 2 in the concrete: the mapping belongs to THIS socket, so this
@@ -558,20 +580,25 @@ async fn blast(
     // mapping names a hole the peer never reached.
     let probes = already_sent.saturating_add(found.probes);
     let remote = found.remote;
+    let found_probes = found.probes;
     let socket = match adopt(found.socket) {
         Ok(s) => s,
         Err(e) => {
-            return Err(Verdict::Failed(format!(
-                "the blast punched a hole but its socket could not be adopted: {e}"
-            )));
+            return Err((
+                Verdict::Failed(format!(
+                    "the blast punched a hole but its socket could not be adopted: {e}"
+                )),
+                found_probes,
+            ));
         }
     };
     let local = match socket.local_addr() {
         Ok(a) => a,
         Err(e) => {
-            return Err(Verdict::Failed(format!(
-                "the blast's socket has no local address: {e}"
-            )));
+            return Err((
+                Verdict::Failed(format!("the blast's socket has no local address: {e}")),
+                found_probes,
+            ));
         }
     };
 
@@ -1200,9 +1227,10 @@ mod tests {
             admit_remote: None,
         };
 
-        let verdict = blast(&ladder, Family::V4, 0)
+        let (verdict, sent) = blast(&ladder, Family::V4, 0)
             .await
             .expect_err("nothing answers at this base");
+        assert!(sent > 0, "a miss must hand back the probes it sent");
         let Verdict::Failed(why) = verdict else {
             panic!("a miss must read as failed, got {verdict:?}");
         };
@@ -1315,6 +1343,63 @@ mod tests {
         );
     }
 
+    /// The guardrail is that the blast's cost is reported, not hidden: when
+    /// the IPv6 blast misses and the IPv4 blast wins, the win's total carries
+    /// the probes the miss sent too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_win_after_a_missed_blast_counts_the_misses_probes() {
+        let (_peer, peer_addr) = lurking_peer().await;
+        let sym = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::Symmetric,
+        };
+        let cfg = NetConfig {
+            enable_birthday: true,
+            birthday_sockets: 4,
+            birthday_ports: 8,
+            birthday_budget: Duration::from_millis(1500),
+            ..cfg(120)
+        };
+        let ladder = Ladder {
+            psk: &PSK,
+            role: IceRole::Controlling,
+            nat: sym,
+            peer_nat: sym,
+            cfg: &cfg,
+            local: vec![
+                candidate("127.0.0.1:1", CandidateKind::Host),
+                candidate("[::1]:1", CandidateKind::Host),
+            ],
+            remote: vec![
+                candidate("[::1]:9", CandidateKind::ServerReflexive),
+                candidate(&peer_addr.to_string(), CandidateKind::ServerReflexive),
+            ],
+            admit_remote: None,
+        };
+        // What the IPv6 blast alone sends before it gives up.
+        let (_, missed) = blast(&ladder, Family::V6, 0)
+            .await
+            .expect_err("nothing answers on IPv6");
+        assert!(missed > 0);
+        // What the IPv4 blast alone reports for its win.
+        let alone = blast(&ladder, Family::V4, 0)
+            .await
+            .expect("the lurking peer answers on IPv4")
+            .probes;
+
+        let (mut rx, tx) = channels();
+        let got = nominate(socket().await, ladder, &mut rx, &tx)
+            .await
+            .expect("the IPv4 blast wins after the IPv6 one missed");
+        assert_eq!(got.rung, Rung::Birthday(Family::V4));
+        // Without the carry the total is just `alone`, far below `missed`.
+        assert!(
+            got.probes > missed,
+            "total {} must include the miss's {missed} (win alone: {alone})",
+            got.probes
+        );
+    }
+
     #[test]
     fn the_blast_aims_at_the_family_being_blasted() {
         let remote = [
@@ -1323,11 +1408,11 @@ mod tests {
         ];
         assert_eq!(
             blast_base(&remote, Family::V4),
-            Some("203.0.113.7:51234".parse().unwrap())
+            Some("203.0.113.7:51234".parse().expect("a literal address"))
         );
         assert_eq!(
             blast_base(&remote, Family::V6),
-            Some("[2001:db8::9]:40000".parse().unwrap())
+            Some("[2001:db8::9]:40000".parse().expect("a literal address"))
         );
         assert_eq!(blast_base(&remote[..1], Family::V4), None);
     }
