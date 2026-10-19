@@ -1015,7 +1015,7 @@ mod tests {
             } = &mut hello
             {
                 // One server-reflexive address in the host's own family, with
-                // a NAT that changes its port per destination: the plan admits
+                // the address-dependent NAT `a_client_hello` reports: the plan admits
                 // the blast, and nothing answers it.
                 *candidates = vec![Candidate {
                     kind: CandidateKind::ServerReflexive,
