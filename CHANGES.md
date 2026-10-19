@@ -9,7 +9,17 @@
   longer names an oldest supported Rust version, so an older compiler fails
   with compile errors instead of a message about the version.
 
+- **`client.log` keeps the whole reason a path search failed.** The file
+  used to keep only the first line, so the verdict of each rung of the
+  connection ladder was lost; it now keeps every line, joined into one, and
+  names the addresses both ends offered. The popup still shows one line.
+
 ### Fixed
+- **A machine with a global IPv6 address connects over public IPv4 again.**
+  Its STUN queries all went over IPv6, so it never learned its public IPv4
+  address, and a host with IPv4 only had nothing to punch towards: the
+  session took a VPN or other private path, or none at all. Both address
+  families are now queried.
 
 ## 0.4.0 - 2026-10-16
 ### New

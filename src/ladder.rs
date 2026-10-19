@@ -129,6 +129,11 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LadderReport {
     entries: Vec<(Rung, Verdict)>,
+    /// Both sides' candidates, as the race saw them. "No validated path after
+    /// 31 probes" says nothing about *which* addresses were probed, and that is
+    /// the first thing anyone reading a failure needs.
+    ours: String,
+    theirs: String,
 }
 
 /// Every rung, in ladder order. The report walks this rather than the plan, so
@@ -171,6 +176,8 @@ impl LadderReport {
                 .iter()
                 .map(|r| (*r, Verdict::NotReached))
                 .collect(),
+            ours: candidate_list(&[]),
+            theirs: candidate_list(&[]),
         }
     }
 
@@ -218,6 +225,8 @@ impl fmt::Display for LadderReport {
                 verdict.detail()
             )?;
         }
+        writeln!(f, "  ours:   {}", self.ours)?;
+        writeln!(f, "  theirs: {}", self.theirs)?;
         write!(
             f,
             "A rung marked `skipped` was never put on the wire; one marked \
@@ -227,6 +236,26 @@ impl fmt::Display for LadderReport {
 }
 
 impl std::error::Error for LadderReport {}
+
+/// `kind addr` per candidate, comma-separated, or `none`.
+fn candidate_list(cands: &[Candidate]) -> String {
+    if cands.is_empty() {
+        return "none".to_string();
+    }
+    cands
+        .iter()
+        .map(|c| {
+            let kind = match c.kind {
+                CandidateKind::Host => "host",
+                CandidateKind::PortMapped => "mapped",
+                CandidateKind::ServerReflexive => "srflx",
+                CandidateKind::PeerReflexive => "prflx",
+            };
+            format!("{kind} {}", c.addr)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Everything the ladder needs that is not the socket.
 ///
@@ -302,6 +331,8 @@ pub async fn nominate(
 ) -> Result<Nomination, LadderReport> {
     let plan = LadderPlan::for_nat(ladder.nat);
     let mut report = LadderReport::new();
+    report.ours = candidate_list(&ladder.local);
+    report.theirs = candidate_list(&ladder.remote);
 
     // The plan's own skips first: these are decisions taken from the NAT type
     // before a packet exists, and they carry the reason with them.
@@ -801,6 +832,23 @@ mod tests {
             );
             assert!(rendered.contains(rung_name(rung)), "{rendered}");
         }
+    }
+
+    /// A failure names the addresses that were probed, on both sides.
+    #[test]
+    fn the_report_lists_both_sides_candidates() {
+        let mut report = LadderReport::new();
+        report.theirs = candidate_list(&[Candidate {
+            addr: "185.72.67.38:443".parse().unwrap(),
+            kind: CandidateKind::ServerReflexive,
+            priority: 1,
+        }]);
+        let rendered = report.to_string();
+        assert!(rendered.contains("  ours:   none\n"), "{rendered}");
+        assert!(
+            rendered.contains("  theirs: srflx 185.72.67.38:443\n"),
+            "{rendered}"
+        );
     }
 
     // ------------------------------------------------------ property 1
