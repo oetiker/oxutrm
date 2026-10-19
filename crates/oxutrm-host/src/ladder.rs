@@ -31,11 +31,14 @@
 //! The plan reads **both ends'** facts, and that is deliberate. A family one
 //! end has no address in is hopeless for every method, and the reason says
 //! whose address is missing. The birthday blast is worth its noise only when
-//! at least one end's NAT in that family is symmetric or unclassified; that
-//! rule depends on the unordered pair of NATs, so client and host, each
-//! planning from its own point of view, reach the same decision about which
-//! family to blast. Were one end to blast while the other sat waiting, the
-//! blast would be aimed at nobody.
+//! at least one end's NAT in that family changes its port per destination —
+//! symmetric, address-dependent, or unclassified — and it is possible only
+//! when **both** ends offered a server-reflexive candidate in that family,
+//! because each end guesses around the other's. Both rules depend on the
+//! unordered pair of facts, so client and host, each planning from its own
+//! point of view, reach the same decision about which family to blast. Were
+//! one end to blast while the other sat waiting, the blast would be aimed at
+//! nobody, and every later family's blast would fall out of step.
 //!
 //! # This module is policy only, and the mechanism is not a seam
 //!
@@ -74,7 +77,7 @@
 //! framing rules and for the same reason. Read them before writing it. Nothing
 //! here is a seam waiting for an implementor — this module ends at the plan.
 
-use oxutrm_proto::{Candidate, Family, FamilyNat, NatType, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, NatType, Rung};
 
 /// What one end of the connection knows about itself, as far as planning is
 /// concerned.
@@ -90,18 +93,31 @@ pub struct EndFacts {
     pub v4: bool,
     /// Whether this end has any IPv6 address to offer.
     pub v6: bool,
+    /// Whether this end offered an IPv4 server-reflexive candidate: the
+    /// observed external port the peer's blast guesses around.
+    pub srflx_v4: bool,
+    /// Whether this end offered an IPv6 server-reflexive candidate.
+    pub srflx_v6: bool,
 }
 
 impl EndFacts {
     /// Facts for an end offering `candidates`: a family is present when any
-    /// candidate is in it.
+    /// candidate is in it, and has a server-reflexive candidate when one of
+    /// those is.
     #[must_use]
     pub fn from_candidates(nat: FamilyNat, candidates: &[Candidate]) -> EndFacts {
         let has = |f: Family| candidates.iter().any(|c| Family::of(&c.addr) == f);
+        let srflx = |f: Family| {
+            candidates.iter().any(|c| {
+                matches!(c.kind, CandidateKind::ServerReflexive) && Family::of(&c.addr) == f
+            })
+        };
         EndFacts {
             nat,
             v4: has(Family::V4),
             v6: has(Family::V6),
+            srflx_v4: srflx(Family::V4),
+            srflx_v6: srflx(Family::V6),
         }
     }
 
@@ -111,6 +127,15 @@ impl EndFacts {
         match f {
             Family::V4 => self.v4,
             Family::V6 => self.v6,
+        }
+    }
+
+    /// Whether this end offered a server-reflexive candidate in `f`.
+    #[must_use]
+    pub fn has_srflx(&self, f: Family) -> bool {
+        match f {
+            Family::V4 => self.srflx_v4,
+            Family::V6 => self.srflx_v6,
         }
     }
 }
@@ -162,33 +187,67 @@ impl LadderPlan {
                 continue;
             }
 
-            // Rung 2 cannot work behind a symmetric NAT: the external port
-            // differs per destination, so the address it learned names a
-            // mapping the peer will never reach. Only *our* NAT is consulted:
-            // the peer's own plan skips its punch rung for its own symmetry.
-            if ours.nat.get(family) == NatType::Symmetric {
+            // Rung 2 cannot work behind a NAT whose mapping changes per
+            // destination: the address it learned names a mapping the peer
+            // will never reach. Symmetric does that per destination address
+            // and port, address-dependent per destination address alone, and
+            // a peer is always a different address from the STUN server, so
+            // the two are equally hopeless here (see `oxutrm_net::discover`).
+            // Only *our* NAT is consulted: the peer's own plan skips its punch
+            // rung for its own NAT.
+            let nat = ours.nat.get(family);
+            if matches!(nat, NatType::Symmetric | NatType::AddressDependent) {
+                let kind = if nat == NatType::Symmetric {
+                    "symmetric"
+                } else {
+                    "address-dependent"
+                };
                 skipped.push((
                     Rung::Punched(family),
                     format!(
-                        "the {label} NAT is symmetric, so its external port differs per \
+                        "the {label} NAT is {kind}, so its external port differs per \
                          destination and ordinary punching cannot reach it"
                     ),
                 ));
             }
 
             // The blast is noisy, so it is planned only when ordinary punching
-            // might not do: some end's NAT in this family is symmetric, or
-            // unclassified and so possibly symmetric. This reads the unordered
-            // pair, so both ends decide alike.
-            let might_need_blast = |n: NatType| matches!(n, NatType::Symmetric | NatType::Unknown);
-            if !might_need_blast(ours.nat.get(family)) && !might_need_blast(theirs.nat.get(family))
+            // might not do: some end's NAT in this family changes its port per
+            // destination, or is unclassified and so possibly does. And it is
+            // possible only when both ends offered a server-reflexive
+            // candidate in this family, because each end guesses around the
+            // other's observed port: with one missing, only one end could
+            // blast, and it would spend its whole budget at nobody. Both rules
+            // read the unordered pair, so both ends decide alike.
+            let might_need_blast = |n: NatType| {
+                matches!(
+                    n,
+                    NatType::Symmetric | NatType::AddressDependent | NatType::Unknown
+                )
+            };
+            let no_blast = if !might_need_blast(ours.nat.get(family))
+                && !might_need_blast(theirs.nat.get(family))
             {
-                skipped.push((
-                    Rung::Birthday(family),
-                    format!(
-                        "neither end's {label} NAT is symmetric, so ordinary punching covers it"
-                    ),
-                ));
+                Some(format!(
+                    "neither end's {label} NAT changes its port per destination, so \
+                     ordinary punching covers it"
+                ))
+            } else if !ours.has_srflx(family) {
+                Some(format!(
+                    "this end offered no {label} server-reflexive candidate, so the peer \
+                     has no observed external port to guess around, and a blast from one \
+                     end alone is aimed at nobody"
+                ))
+            } else if !theirs.has_srflx(family) {
+                Some(format!(
+                    "the peer offered no {label} server-reflexive candidate, so there is \
+                     no observed external port to guess around"
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = no_blast {
+                skipped.push((Rung::Birthday(family), why));
             }
         }
 

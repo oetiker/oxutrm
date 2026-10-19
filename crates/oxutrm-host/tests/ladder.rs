@@ -35,12 +35,34 @@ fn meta() -> SessionMeta {
 // The plan
 // ---------------------------------------------------------------------------
 
+/// An end that offers a server-reflexive candidate in every family it has an
+/// address in, which is what a successful STUN round gives.
 fn end(v4: NatType, v6: NatType, has_v4: bool, has_v6: bool) -> EndFacts {
     EndFacts {
         nat: FamilyNat { v4, v6 },
         v4: has_v4,
         v6: has_v6,
+        srflx_v4: has_v4,
+        srflx_v6: has_v6,
     }
+}
+
+/// The Birthday rungs a plan will run, in order.
+fn births(p: &LadderPlan) -> Vec<Rung> {
+    p.sequential
+        .iter()
+        .filter(|r| matches!(r, Rung::Birthday(_)))
+        .copied()
+        .collect()
+}
+
+/// The Birthday rungs a plan skipped, in order.
+fn birth_skips(p: &LadderPlan) -> Vec<Rung> {
+    p.skipped
+        .iter()
+        .map(|(r, _)| *r)
+        .filter(|r| matches!(r, Rung::Birthday(_)))
+        .collect()
 }
 
 #[test]
@@ -177,13 +199,6 @@ fn an_unknown_family_nat_skips_nothing_in_that_family() {
 fn both_ends_agree_on_which_family_to_blast() {
     let a = end(NatType::Symmetric, NatType::None, true, true);
     let b = end(NatType::EndpointIndependent, NatType::None, true, true);
-    let births = |p: &LadderPlan| {
-        p.sequential
-            .iter()
-            .filter(|r| matches!(r, Rung::Birthday(_)))
-            .copied()
-            .collect::<Vec<_>>()
-    };
     assert_eq!(
         births(&LadderPlan::for_ends(&a, &b)),
         births(&LadderPlan::for_ends(&b, &a))
@@ -192,6 +207,85 @@ fn both_ends_agree_on_which_family_to_blast() {
         births(&LadderPlan::for_ends(&a, &b)),
         vec![Rung::Birthday(Family::V4)]
     );
+}
+
+/// A blast needs both ends spraying at once. An end without a
+/// server-reflexive candidate in a family gives the other end no port to guess
+/// around, so only one end could blast; the plan must say so on both ends,
+/// or the one that does blast spends its budget alone and every later family
+/// falls out of step.
+#[test]
+fn a_blast_needs_both_ends_server_reflexive_candidate_in_its_family() {
+    let mut ours = end(NatType::Symmetric, NatType::Symmetric, true, true);
+    ours.srflx_v4 = false;
+    let theirs = end(NatType::Symmetric, NatType::Symmetric, true, true);
+
+    let plan = LadderPlan::for_ends(&ours, &theirs);
+    assert_eq!(births(&plan), vec![Rung::Birthday(Family::V6)]);
+    let why = &plan
+        .skipped
+        .iter()
+        .find(|(r, _)| *r == Rung::Birthday(Family::V4))
+        .expect("the IPv4 blast is skipped")
+        .1;
+    assert!(
+        why.contains("this end offered no IPv4 server-reflexive candidate"),
+        "{why}"
+    );
+
+    let plan = LadderPlan::for_ends(&theirs, &ours);
+    assert_eq!(births(&plan), vec![Rung::Birthday(Family::V6)]);
+    let why = &plan
+        .skipped
+        .iter()
+        .find(|(r, _)| *r == Rung::Birthday(Family::V4))
+        .expect("the IPv4 blast is skipped")
+        .1;
+    assert!(
+        why.contains("the peer offered no IPv4 server-reflexive candidate"),
+        "{why}"
+    );
+}
+
+/// An address-dependent mapping changes per destination IP, so the
+/// server-reflexive address the peer was given is not the one it will see:
+/// that NAT needs the blast as much as a symmetric one does, and ordinary
+/// punching is as hopeless behind it.
+#[test]
+fn an_address_dependent_nat_on_either_end_admits_the_blast() {
+    let ad = end(NatType::AddressDependent, NatType::None, true, true);
+    let ei = end(NatType::EndpointIndependent, NatType::None, true, true);
+    for (ours, theirs) in [(&ad, &ei), (&ei, &ad)] {
+        let plan = LadderPlan::for_ends(ours, theirs);
+        assert_eq!(births(&plan), vec![Rung::Birthday(Family::V4)], "{plan:?}");
+    }
+    let plan = LadderPlan::for_ends(&ad, &ei);
+    let why = &plan
+        .skipped
+        .iter()
+        .find(|(r, _)| *r == Rung::Punched(Family::V4))
+        .expect("punching behind our address-dependent NAT is skipped")
+        .1;
+    assert!(why.contains("IPv4"), "{why}");
+    assert!(
+        !LadderPlan::for_ends(&ei, &ad)
+            .skipped
+            .iter()
+            .any(|(r, _)| *r == Rung::Punched(Family::V4)),
+        "only our own NAT decides our punch rung"
+    );
+}
+
+/// Client and host each plan from their own side. For the blast to be aimed at
+/// somebody, the two must admit, and skip, exactly the same Birthday rungs.
+#[test]
+fn every_pair_of_ends_agrees_on_the_blast_from_both_sides() {
+    for (a, b) in fact_pairs() {
+        let ab = LadderPlan::for_ends(&a, &b);
+        let ba = LadderPlan::for_ends(&b, &a);
+        assert_eq!(births(&ab), births(&ba), "{a:?} / {b:?}");
+        assert_eq!(birth_skips(&ab), birth_skips(&ba), "{a:?} / {b:?}");
+    }
 }
 
 #[test]
@@ -206,6 +300,21 @@ fn facts_come_from_the_candidates_by_family() {
     assert!(facts.has(Family::V6) && !facts.has(Family::V4));
     let facts = EndFacts::from_candidates(FamilyNat::UNKNOWN, &[cand("192.0.2.1:4000")]);
     assert!(facts.has(Family::V4) && !facts.has(Family::V6));
+    assert!(
+        !facts.has_srflx(Family::V4),
+        "a host candidate is not server-reflexive"
+    );
+
+    let srflx = Candidate {
+        kind: CandidateKind::ServerReflexive,
+        addr: "203.0.113.7:4000".parse().unwrap(),
+        priority: 1,
+    };
+    let facts = EndFacts::from_candidates(
+        FamilyNat::UNKNOWN,
+        &[cand("[2001:db8::1]:4000"), cand("192.0.2.1:4000"), srflx],
+    );
+    assert!(facts.has_srflx(Family::V4) && !facts.has_srflx(Family::V6));
 }
 
 #[test]
@@ -220,8 +329,9 @@ fn every_rung_is_accounted_for_exactly_once() {
     }
 }
 
-/// The plans for a spread of fact combinations.
-fn plans() -> Vec<LadderPlan> {
+/// A spread of fact pairs: every NAT type per family, every combination of
+/// families present, and with a server-reflexive candidate missing in either.
+fn fact_pairs() -> Vec<(EndFacts, EndFacts)> {
     let nats = [
         NatType::None,
         NatType::EndpointIndependent,
@@ -229,18 +339,30 @@ fn plans() -> Vec<LadderPlan> {
         NatType::Symmetric,
         NatType::Unknown,
     ];
+    let flags = [(true, true), (true, false), (false, true), (false, false)];
     let mut out = Vec::new();
     for n4 in nats {
         for n6 in nats {
-            for (h4, h6) in [(true, true), (true, false), (false, true), (false, false)] {
-                let ours = end(n4, n6, h4, h6);
-                let theirs = end(n6, n4, true, true);
-                out.push(LadderPlan::for_ends(&ours, &theirs));
-                out.push(LadderPlan::for_ends(&theirs, &ours));
+            for (h4, h6) in flags {
+                for (s4, s6) in flags {
+                    let mut ours = end(n4, n6, h4, h6);
+                    ours.srflx_v4 = h4 && s4;
+                    ours.srflx_v6 = h6 && s6;
+                    let theirs = end(n6, n4, true, true);
+                    out.push((ours, theirs));
+                }
             }
         }
     }
     out
+}
+
+/// The plans for those pairs, planned from each side.
+fn plans() -> Vec<LadderPlan> {
+    fact_pairs()
+        .into_iter()
+        .flat_map(|(a, b)| [LadderPlan::for_ends(&a, &b), LadderPlan::for_ends(&b, &a)])
+        .collect()
 }
 
 #[test]

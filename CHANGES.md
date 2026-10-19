@@ -30,8 +30,10 @@
 ### Fixed
 - **The birthday punch aims at an address family both ends can use.** It
   guessed around the peer's best public address, which could be IPv6 when this
-  end had none, and then could never succeed. It now runs per family, and only
-  for a family where one end's NAT is symmetric or unknown.
+  end had none, and then could never succeed. It now runs per family, only
+  for a family where one end's NAT is symmetric, address-dependent or
+  unknown, and only when both ends found their public address in that
+  family, so the two ends always blast at the same time.
 
 - **A machine with a global IPv6 address connects over public IPv4 again.**
   Its STUN queries all went over IPv6, so it never learned its public IPv4

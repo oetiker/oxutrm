@@ -995,9 +995,11 @@ mod tests {
     // ---- no-birthday (config spec §2.4) ----
 
     /// Runs one exchange against `cfg` with a client whose hello carries
-    /// `features` and no server-reflexive candidate, so the ladder reaches
-    /// the blast without a base to guess around. Returns the reason the exchange
-    /// failed with, which names the blast's verdict.
+    /// `features` and one server-reflexive candidate nothing answers at. The
+    /// plan admits a blast only when both ends offered a server-reflexive
+    /// candidate, so `cfg` must name a STUN server that gives the host its
+    /// own. Returns the reason the exchange failed with, which names the
+    /// blast's verdict.
     async fn ladder_verdict(cfg: &NetConfig, features: Vec<String>) -> String {
         let mut meta = fresh_meta("b1");
         let (theirs, ours) = tokio::io::duplex(64 * 1024);
@@ -1012,10 +1014,13 @@ mod tests {
                 ..
             } = &mut hello
             {
-                // One address in the host's own family, and not a
-                // server-reflexive one: the plan admits the blast, and the blast
-                // has no base to guess around.
-                *candidates = vec![candidate(6001)];
+                // One server-reflexive address in the host's own family, with
+                // a NAT that changes its port per destination: the plan admits
+                // the blast, and nothing answers it.
+                *candidates = vec![Candidate {
+                    kind: CandidateKind::ServerReflexive,
+                    ..candidate(6001)
+                }];
                 *f = features;
             }
             let _ = oxutrm_host::signalling::write_signal_async(&mut w, &hello).await;
@@ -1041,15 +1046,30 @@ mod tests {
     /// from a client that never heard of the feature is the second case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn no_birthday_switches_the_blast_off_for_that_exchange_only() {
+        // The host's own server-reflexive candidate, from a loopback STUN
+        // server. A short race and a tiny blast keep the exchange well inside
+        // `ladder_verdict`'s timeout.
+        let stun = oxutrm_net::StunResponder::start(oxutrm_net::MappingBehaviour::Truthful)
+            .await
+            .expect("a loopback STUN server");
         let cfg = NetConfig {
             enable_birthday: true,
+            stun_servers: vec![stun.server_string()],
+            gather_timeout: std::time::Duration::from_millis(600),
+            birthday_sockets: 2,
+            birthday_ports: 4,
+            birthday_budget: std::time::Duration::from_millis(300),
             ..stun_free()
         };
         let off = ladder_verdict(&cfg, vec![oxutrm_proto::FEATURE_NO_BIRTHDAY.to_string()]).await;
         assert!(off.contains("switched off in this configuration"), "{off}");
         let on = ladder_verdict(&cfg, vec![]).await;
+        let blast_line = on
+            .lines()
+            .find(|l| l.contains("IPv4 birthday"))
+            .unwrap_or_else(|| panic!("no IPv4 birthday line: {on}"));
         assert!(
-            !on.contains("switched off") && on.contains("server-reflexive"),
+            !on.contains("switched off") && blast_line.contains("failed"),
             "the blast stayed off for the next client: {on}"
         );
         assert!(cfg.enable_birthday, "the shared cfg was changed");

@@ -547,6 +547,9 @@ async fn blast(
             0,
         ));
     }
+    // Defensive only: the plan admits `Birthday(f)` only when both ends
+    // offered a server-reflexive candidate in `f`, so this should be
+    // unreachable. Were it reached, this end would skip while the peer blasts.
     let Some(base) = blast_base(&ladder.remote, family) else {
         return Err((
             Verdict::Skipped(format!(
@@ -711,11 +714,13 @@ mod tests {
         );
     }
 
-    /// Property 4 across families: the plan admits only the IPv6 blast, the
-    /// only server-reflexive candidate is IPv4, so the IPv6 blast names its
-    /// missing base and nothing may read "an earlier rung won".
+    /// Property 4 across families: the IPv6 NAT is unknown, so the blast is
+    /// wanted there, but the peer's only server-reflexive candidate is IPv4.
+    /// The plan skips the IPv6 blast naming whose base is missing -- on both
+    /// ends alike, so neither blasts alone -- and nothing may read "an earlier
+    /// rung won".
     #[tokio::test]
-    async fn an_admitted_blast_with_no_base_in_its_family_is_skipped_by_name() {
+    async fn a_blast_with_no_peer_base_in_its_family_is_skipped_by_name() {
         let sock = socket().await;
         let (mut rx, tx) = channels();
         let nat = FamilyNat {
@@ -736,6 +741,7 @@ mod tests {
                 local: vec![
                     candidate("127.0.0.1:1", CandidateKind::Host),
                     candidate("[::1]:1", CandidateKind::Host),
+                    candidate("[::1]:2", CandidateKind::ServerReflexive),
                 ],
                 remote: vec![
                     candidate("127.0.0.1:9", CandidateKind::ServerReflexive),
@@ -1153,7 +1159,12 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                // Our own server-reflexive candidate is what the peer would
+                // blast around; without one the plan does not admit the blast.
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                ],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1275,7 +1286,12 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                // Our own server-reflexive candidate is what the peer would
+                // blast around; without one the plan does not admit the blast.
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                ],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1369,6 +1385,8 @@ mod tests {
             local: vec![
                 candidate("127.0.0.1:1", CandidateKind::Host),
                 candidate("[::1]:1", CandidateKind::Host),
+                candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                candidate("[::1]:2", CandidateKind::ServerReflexive),
             ],
             remote: vec![
                 candidate("[::1]:9", CandidateKind::ServerReflexive),
