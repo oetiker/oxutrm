@@ -721,7 +721,7 @@ fn established_path(signal: Signal) -> Result<PathDescription> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxutrm_proto::{CandidateKind, Rung};
+    use oxutrm_proto::{CandidateKind, Family, Rung};
 
     /// STUN-free, like every other test in this repo: a test that reaches STUN
     /// makes every timing in it non-deterministic, and an injected bug once
@@ -950,7 +950,7 @@ mod tests {
     fn the_splash_caption_says_which_session_and_how_it_is_reached() {
         let id = "3ff1218f".to_string() + &"0".repeat(24);
         let path = PathDescription {
-            rung: oxutrm_proto::Rung::StunPunch,
+            rung: oxutrm_proto::Rung::Punched(oxutrm_proto::Family::V4),
             local: "127.0.0.1:1".parse().unwrap(),
             remote: "203.0.113.7:443".parse().unwrap(),
             probes_sent: 0,
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn the_path_comes_from_the_hosts_established() {
         let path = PathDescription {
-            rung: Rung::StunPunch,
+            rung: Rung::Punched(Family::V4),
             local: "192.0.2.1:1".parse().expect("a test address"),
             remote: "198.51.100.1:2".parse().expect("a test address"),
             probes_sent: 4,

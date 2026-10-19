@@ -873,7 +873,7 @@ mod tests {
     // MTU the connection could only have got from its own configuration, so a
     // constant of any value fails.
 
-    use oxutrm_proto::Rung;
+    use oxutrm_proto::{Family, Rung};
     use std::sync::Arc;
 
     async fn nomination(rung: Rung, probes: u32) -> crate::ladder::Nomination {
@@ -897,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn the_mtu_comes_from_the_live_connection_and_not_from_a_constant() {
         let (conn, _alive) = connected().await;
-        let nom = nomination(Rung::StunPunch, 12).await;
+        let nom = nomination(Rung::Punched(Family::V4), 12).await;
 
         let path = path_description(&nom, NatType::EndpointIndependent, &conn);
 
@@ -912,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn the_rtt_comes_from_the_live_connection() {
         let (conn, _alive) = connected().await;
-        let nom = nomination(Rung::StunPunch, 12).await;
+        let nom = nomination(Rung::Punched(Family::V4), 12).await;
 
         let path = path_description(&nom, NatType::EndpointIndependent, &conn);
 
@@ -928,11 +928,11 @@ mod tests {
     #[tokio::test]
     async fn the_ladders_own_findings_are_carried_through_unchanged() {
         let (conn, _alive) = connected().await;
-        let nom = nomination(Rung::Birthday, 312).await;
+        let nom = nomination(Rung::Birthday(Family::V4), 312).await;
 
         let path = path_description(&nom, NatType::Symmetric, &conn);
 
-        assert_eq!(path.rung, Rung::Birthday);
+        assert_eq!(path.rung, Rung::Birthday(Family::V4));
         assert_eq!(path.probes_sent, 312, "the blast's cost must be reported");
         assert_eq!(path.local, nom.local);
         assert_eq!(path.remote, nom.remote);

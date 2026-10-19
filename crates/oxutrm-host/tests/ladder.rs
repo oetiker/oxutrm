@@ -15,7 +15,7 @@
 
 use oxutrm_host::ladder::LadderPlan;
 use oxutrm_host::{DetachPermit, SessionMeta, daemonize_session, settle_detachability};
-use oxutrm_proto::{NatType, Rung, TermSize};
+use oxutrm_proto::{Family, NatType, Rung, TermSize};
 
 fn meta() -> SessionMeta {
     SessionMeta {
@@ -40,12 +40,23 @@ fn the_cheap_rungs_are_raced_and_the_noisy_one_is_not() {
     let plan = LadderPlan::for_nat(NatType::EndpointIndependent);
     assert_eq!(
         plan.raced,
-        vec![Rung::Ipv6Direct, Rung::PortMapped, Rung::StunPunch],
-        "rungs 0 to 2 are cheap and race together"
+        vec![
+            Rung::Direct(Family::V6),
+            Rung::Direct(Family::V4),
+            Rung::PortMapped(Family::V6),
+            Rung::PortMapped(Family::V4),
+            Rung::Punched(Family::V6),
+            Rung::Punched(Family::V4),
+        ],
+        "methods 0 to 2 are cheap and race together, per family"
     );
     assert_eq!(
         plan.sequential,
-        vec![Rung::Birthday, Rung::SshTunnel],
+        vec![
+            Rung::Birthday(Family::V6),
+            Rung::Birthday(Family::V4),
+            Rung::SshTunnel
+        ],
         "the blast is deliberately noisy, so it never joins the race"
     );
     assert!(plan.skipped.is_empty());
@@ -58,21 +69,36 @@ fn a_symmetric_nat_skips_punching_rather_than_failing_at_it() {
     // known in advance.
     let plan = LadderPlan::for_nat(NatType::Symmetric);
     assert!(
-        !plan.raced.contains(&Rung::StunPunch),
+        !plan.raced.contains(&Rung::Punched(Family::V6))
+            && !plan.raced.contains(&Rung::Punched(Family::V4)),
         "punching a symmetric NAT is hopeless, not merely unlikely"
     );
-    assert_eq!(plan.raced, vec![Rung::Ipv6Direct, Rung::PortMapped]);
+    assert_eq!(
+        plan.raced,
+        vec![
+            Rung::Direct(Family::V6),
+            Rung::Direct(Family::V4),
+            Rung::PortMapped(Family::V6),
+            Rung::PortMapped(Family::V4),
+        ]
+    );
     assert!(
-        plan.sequential.first() == Some(&Rung::Birthday),
+        plan.sequential.first() == Some(&Rung::Birthday(Family::V6)),
         "and the blast comes next, which is what it exists for"
     );
 
-    let (rung, why) = plan.skipped.first().expect("the skip must be recorded");
-    assert_eq!(*rung, Rung::StunPunch);
-    assert!(
-        why.contains("symmetric"),
-        "a skipped rung must say why, for the bug report: {why}"
+    let skipped: Vec<Rung> = plan.skipped.iter().map(|(r, _)| *r).collect();
+    assert_eq!(
+        skipped,
+        vec![Rung::Punched(Family::V6), Rung::Punched(Family::V4)],
+        "both punch rungs are skipped, and the skip is recorded"
     );
+    for (_, why) in &plan.skipped {
+        assert!(
+            why.contains("symmetric"),
+            "a skipped rung must say why, for the bug report: {why}"
+        );
+    }
 }
 
 #[test]
@@ -81,7 +107,7 @@ fn an_unknown_nat_type_skips_nothing() {
     // towards attempting costs a few seconds.
     let plan = LadderPlan::for_nat(NatType::Unknown);
     assert!(plan.skipped.is_empty());
-    assert!(plan.raced.contains(&Rung::StunPunch));
+    assert!(plan.raced.contains(&Rung::Punched(Family::V4)));
 }
 
 #[test]
@@ -125,12 +151,7 @@ fn a_tunnelled_session_gets_no_permit_and_is_recorded_as_undetachable() {
 
 #[test]
 fn every_other_rung_yields_a_permit() {
-    for rung in [
-        Rung::Ipv6Direct,
-        Rung::PortMapped,
-        Rung::StunPunch,
-        Rung::Birthday,
-    ] {
+    for rung in Rung::ALL.into_iter().filter(|r| *r != Rung::SshTunnel) {
         let mut m = meta();
         m.detachable = false;
         let permit: Option<DetachPermit> = settle_detachability(&mut m, rung);
@@ -147,7 +168,7 @@ fn every_other_rung_yields_a_permit() {
 fn daemonize_session_cannot_be_called_without_settling_the_rung_first() {
     let mut m = meta();
     // The only way to get here is through a nominated rung.
-    let permit = settle_detachability(&mut m, Rung::Ipv6Direct).expect("permit");
+    let permit = settle_detachability(&mut m, Rung::Direct(Family::V6)).expect("permit");
 
     // Deliberately NOT calling daemonize_session: it would fork this test
     // process. What matters is that the signature demands the token, which the

@@ -5,11 +5,6 @@
 //! host is, and — when it matters — what the connection cannot do.
 
 use oxutrm_proto::{NatType, PathDescription, Rung};
-use std::net::SocketAddr;
-
-fn family(a: &SocketAddr) -> &'static str {
-    if a.is_ipv6() { "IPv6" } else { "IPv4" }
-}
 
 fn nat_label(n: NatType) -> &'static str {
     match n {
@@ -21,22 +16,17 @@ fn nat_label(n: NatType) -> &'static str {
     }
 }
 
-/// How the path is described to the user, in one phrase.
+/// How the path is described to the user, in one phrase: the address family
+/// and the method, as `Rung`'s `Display` spells them.
 ///
 /// `PathDescription` records that a router mapping won, but not whether it was
 /// NAT-PMP, PCP or UPnP-IGD, so the phrase says "port mapped" rather than
-/// naming a protocol it cannot actually distinguish.
+/// naming a protocol it cannot actually distinguish. A birthday path adds the
+/// probe count, since that is what tells it apart from a plain punch.
 pub fn rung_label(path: &PathDescription) -> String {
     match path.rung {
-        Rung::Ipv6Direct => "IPv6 direct".to_string(),
-        Rung::PortMapped => format!("{} punched (port mapped)", family(&path.remote)),
-        Rung::StunPunch => format!("{} punched", family(&path.remote)),
-        Rung::Birthday => format!(
-            "{} punched (birthday, {} probes)",
-            family(&path.remote),
-            path.probes_sent
-        ),
-        Rung::SshTunnel => "SSH tunnel".to_string(),
+        Rung::Birthday(_) => format!("{} ({} probes)", path.rung, path.probes_sent),
+        rung => rung.to_string(),
     }
 }
 
@@ -52,7 +42,7 @@ pub fn status_line(path: &PathDescription) -> String {
         ),
         // Rung 3 was entered *because* the NAT is symmetric, so saying so
         // explains the probe count better than an MTU would.
-        Rung::Birthday => format!(
+        Rung::Birthday(_) => format!(
             "oxutrm  {}  \u{b7}  {} ms  \u{b7}  {} NAT",
             rung_label(path),
             path.rtt_ms,
@@ -70,6 +60,7 @@ pub fn status_line(path: &PathDescription) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxutrm_proto::Family;
 
     fn path(
         rung: Rung,
@@ -93,7 +84,7 @@ mod tests {
     #[test]
     fn the_ipv6_direct_line_is_exact() {
         let p = path(
-            Rung::Ipv6Direct,
+            Rung::Direct(Family::V6),
             "[2001:db8::2]:443",
             11,
             1452,
@@ -107,9 +98,26 @@ mod tests {
     }
 
     #[test]
+    fn a_lan_or_vpn_ipv4_path_is_direct_not_punched() {
+        let p = path(
+            Rung::Direct(Family::V4),
+            "192.168.0.11:443",
+            3,
+            1389,
+            0,
+            NatType::None,
+        );
+        assert!(
+            status_line(&p).contains("IPv4 direct"),
+            "{}",
+            status_line(&p)
+        );
+    }
+
+    #[test]
     fn the_port_mapped_line_names_the_address_family() {
         let p = path(
-            Rung::PortMapped,
+            Rung::PortMapped(Family::V4),
             "203.0.113.7:443",
             38,
             1392,
@@ -118,14 +126,14 @@ mod tests {
         );
         assert_eq!(
             status_line(&p),
-            "oxutrm  IPv4 punched (port mapped)  \u{b7}  38 ms  \u{b7}  mtu 1392"
+            "oxutrm  IPv4 port mapped  \u{b7}  38 ms  \u{b7}  mtu 1392"
         );
     }
 
     #[test]
     fn the_plain_punch_line_distinguishes_v4_from_v6() {
         let v4 = path(
-            Rung::StunPunch,
+            Rung::Punched(Family::V4),
             "203.0.113.7:443",
             22,
             1400,
@@ -137,7 +145,7 @@ mod tests {
             "oxutrm  IPv4 punched  \u{b7}  22 ms  \u{b7}  mtu 1400"
         );
         let v6 = path(
-            Rung::StunPunch,
+            Rung::Punched(Family::V6),
             "[2001:db8::2]:443",
             22,
             1400,
@@ -153,7 +161,7 @@ mod tests {
     #[test]
     fn the_birthday_line_reports_probes_and_the_nat_rather_than_the_mtu() {
         let p = path(
-            Rung::Birthday,
+            Rung::Birthday(Family::V4),
             "203.0.113.7:41234",
             61,
             1392,
@@ -162,7 +170,7 @@ mod tests {
         );
         assert_eq!(
             status_line(&p),
-            "oxutrm  IPv4 punched (birthday, 312 probes)  \u{b7}  61 ms  \u{b7}  symmetric NAT"
+            "oxutrm  IPv4 birthday (312 probes)  \u{b7}  61 ms  \u{b7}  symmetric NAT"
         );
     }
 
@@ -188,13 +196,7 @@ mod tests {
 
     #[test]
     fn every_line_is_a_single_line_beginning_with_the_product_name() {
-        for rung in [
-            Rung::Ipv6Direct,
-            Rung::PortMapped,
-            Rung::StunPunch,
-            Rung::Birthday,
-            Rung::SshTunnel,
-        ] {
+        for rung in Rung::ALL {
             let p = path(rung, "203.0.113.7:443", 5, 1400, 1, NatType::Unknown);
             let line = status_line(&p);
             assert!(line.starts_with("oxutrm  "), "{line:?}");

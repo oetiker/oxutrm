@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use oxutrm_host::LadderPlan;
 use oxutrm_net::{BlastOutcome, IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
-use oxutrm_proto::{Candidate, CandidateKind, NatType, Psk, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, NatType, Psk, Rung};
 
 /// The path the ladder settled on, and the socket it belongs to.
 ///
@@ -136,43 +136,10 @@ pub struct LadderReport {
     theirs: String,
 }
 
-/// Every rung, in ladder order. The report walks this rather than the plan, so
-/// a rung the plan never mentioned still appears — with `NotReached` — instead
-/// of vanishing from the account.
-const EVERY_RUNG: [Rung; 5] = [
-    Rung::Ipv6Direct,
-    Rung::PortMapped,
-    Rung::StunPunch,
-    Rung::Birthday,
-    Rung::SshTunnel,
-];
-
-/// Which number the user sees. The spec numbers the ladder from zero and the
-/// status line, the docs and the bug reports all use those numbers.
-fn rung_number(rung: Rung) -> u8 {
-    match rung {
-        Rung::Ipv6Direct => 0,
-        Rung::PortMapped => 1,
-        Rung::StunPunch => 2,
-        Rung::Birthday => 3,
-        Rung::SshTunnel => 4,
-    }
-}
-
-fn rung_name(rung: Rung) -> &'static str {
-    match rung {
-        Rung::Ipv6Direct => "IPv6 direct",
-        Rung::PortMapped => "router port mapping",
-        Rung::StunPunch => "STUN punch",
-        Rung::Birthday => "birthday blast",
-        Rung::SshTunnel => "SSH tunnel",
-    }
-}
-
 impl LadderReport {
     fn new() -> LadderReport {
         LadderReport {
-            entries: EVERY_RUNG
+            entries: Rung::ALL
                 .iter()
                 .map(|r| (*r, Verdict::NotReached))
                 .collect(),
@@ -219,8 +186,8 @@ impl fmt::Display for LadderReport {
             writeln!(
                 f,
                 "  rung {}  {:<20}  {:<11}  {}",
-                rung_number(*rung),
-                rung_name(*rung),
+                rung.method_number(),
+                rung.to_string(),
                 verdict.word(),
                 verdict.detail()
             )?;
@@ -281,22 +248,6 @@ pub struct Ladder<'a> {
     pub admit_remote: Option<oxutrm_net::RemoteFilter>,
 }
 
-/// Which rung a remote candidate belongs to.
-///
-/// **This mirrors `IceAgent::nominated_event`** (`crates/oxutrm-net/src/ice.rs`,
-/// the `match kind` deciding the `Rung`), which is private. The mirror is what
-/// lets the report say "rung 0 was skipped because the peer offered no IPv6
-/// host candidate" instead of blaming a rung that never had anything to try.
-/// If the two ever disagree, the report lies about a rung — so
-/// `the_rung_classification_matches_the_one_ice_nominates_by` pins the rule.
-fn rung_of(remote: &Candidate) -> Rung {
-    match remote.kind {
-        CandidateKind::PortMapped => Rung::PortMapped,
-        CandidateKind::Host if remote.addr.is_ipv6() => Rung::Ipv6Direct,
-        _ => Rung::StunPunch,
-    }
-}
-
 /// The peer address the blast guesses around.
 ///
 /// A server-reflexive candidate is the only useful base: it is a real external
@@ -322,7 +273,7 @@ fn blast_base(remote: &[Candidate]) -> Option<SocketAddr> {
 /// silently stops working.
 ///
 /// On success the caller gets a socket. On failure it gets [`LadderReport`],
-/// which names all five rungs.
+/// which names every rung (nine: four methods in two families, and the ssh tunnel).
 pub async fn nominate(
     socket: Arc<tokio::net::UdpSocket>,
     ladder: Ladder<'_>,
@@ -347,13 +298,17 @@ pub async fn nominate(
         if matches!(report.verdict(*rung), Verdict::Skipped(_)) {
             continue;
         }
-        if !ladder.remote.iter().any(|c| rung_of(c) == *rung) {
+        if !ladder
+            .remote
+            .iter()
+            .any(|c| Rung::of_candidate(c.kind, c.addr) == *rung)
+        {
             report.set(
                 *rung,
                 Verdict::Skipped(format!(
                     "the peer offered no candidate of this class ({} of theirs, none on rung {})",
                     ladder.remote.len(),
-                    rung_number(*rung)
+                    rung
                 )),
             );
         }
@@ -403,8 +358,42 @@ pub async fn nominate(
 
     // Rung 3. Reached either because the race produced nothing, or because the
     // NAT is symmetric and the plan sent us straight here.
-    if plan.sequential.contains(&Rung::Birthday) {
-        match blast(&ladder, probes).await {
+    //
+    // The blast runs once, in the family of its base. Until blasting is built
+    // per family, the other family's birthday rung is skipped with that reason
+    // instead of being blasted a second time at the same base.
+    let birthday_rungs: Vec<Rung> = plan
+        .sequential
+        .iter()
+        .copied()
+        .filter(|r| matches!(r, Rung::Birthday(_)))
+        .collect();
+    if !birthday_rungs.is_empty() {
+        let blast_rung = blast_base(&ladder.remote).map(|base| Rung::Birthday(Family::of(&base)));
+        let result = blast(&ladder, probes).await;
+        // Where the blast's own verdict goes: the base's family. With no base
+        // (or the blast switched off) there is nothing family-specific to say,
+        // so every birthday rung carries the reason.
+        let record = |report: &mut LadderReport, verdict: Verdict| match blast_rung {
+            Some(rung) if birthday_rungs.contains(&rung) => {
+                for other in birthday_rungs.iter().filter(|r| **r != rung) {
+                    report.set(
+                        *other,
+                        Verdict::Skipped(
+                            "the blast runs in one family until per-family blasting is built"
+                                .to_string(),
+                        ),
+                    );
+                }
+                report.set(rung, verdict);
+            }
+            _ => {
+                for rung in &birthday_rungs {
+                    report.set(*rung, verdict.clone());
+                }
+            }
+        };
+        match result {
             // The blast nominates without going through `IceAgent::best_validated`,
             // so it carries its own veto (ruling S5). This falls through to the
             // next rung exactly as a failed blast does, rather than returning
@@ -416,8 +405,8 @@ pub async fn nominate(
                     .as_ref()
                     .is_some_and(|f| !f(nomination.remote)) =>
             {
-                report.set(
-                    Rung::Birthday,
+                record(
+                    &mut report,
                     Verdict::Failed(format!(
                         "{} is reached the same way as the link this is standing by for",
                         nomination.remote
@@ -425,10 +414,10 @@ pub async fn nominate(
                 );
             }
             Ok(nomination) => {
-                report.set(Rung::Birthday, Verdict::Won);
+                record(&mut report, Verdict::Won);
                 return Ok(nomination);
             }
-            Err(verdict) => report.set(Rung::Birthday, verdict),
+            Err(verdict) => record(&mut report, verdict),
         }
     }
 
@@ -595,7 +584,7 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
         socket,
         local,
         remote,
-        rung: Rung::Birthday,
+        rung: Rung::Birthday(Family::of(&remote)),
         probes,
     })
 }
@@ -685,11 +674,11 @@ mod tests {
         .await
         .expect_err("nothing is listening, so nothing can be nominated");
 
-        for rung in EVERY_RUNG {
+        for rung in Rung::ALL {
             assert!(
                 !matches!(report.verdict(rung), Verdict::NotReached),
                 "rung {} has no reason recorded: {report}",
-                rung_number(rung)
+                rung.method_number()
             );
         }
     }
@@ -727,13 +716,13 @@ mod tests {
         .expect_err("nothing is listening");
 
         // Symmetric NAT: the plan skips rung 2 before a packet exists.
-        let punch = report.verdict(Rung::StunPunch).clone();
+        let punch = report.verdict(Rung::Punched(Family::V4)).clone();
         assert!(
             matches!(&punch, Verdict::Skipped(why) if why.contains("symmetric")),
             "expected a policy skip naming the NAT, got {punch:?}"
         );
         // Rung 0 had a candidate, was put on the wire, and did not answer.
-        let direct = report.verdict(Rung::Ipv6Direct).clone();
+        let direct = report.verdict(Rung::Direct(Family::V6)).clone();
         assert!(
             matches!(&direct, Verdict::Failed(_)),
             "rung 0 had an IPv6 candidate and must read as attempted, got {direct:?}"
@@ -780,15 +769,24 @@ mod tests {
         .expect_err("nothing is listening");
 
         assert!(
-            matches!(report.verdict(Rung::Ipv6Direct), Verdict::Skipped(_)),
+            matches!(
+                report.verdict(Rung::Direct(Family::V6)),
+                Verdict::Skipped(_)
+            ),
             "rung 0 had no IPv6 candidate to try: {report}"
         );
         assert!(
-            matches!(report.verdict(Rung::PortMapped), Verdict::Skipped(_)),
+            matches!(
+                report.verdict(Rung::PortMapped(Family::V4)),
+                Verdict::Skipped(_)
+            ),
             "rung 1 had no port-mapped candidate to try: {report}"
         );
         assert!(
-            matches!(report.verdict(Rung::StunPunch), Verdict::Failed(_)),
+            matches!(
+                report.verdict(Rung::Punched(Family::V4)),
+                Verdict::Failed(_)
+            ),
             "rung 2 had a candidate and was actually tried: {report}"
         );
     }
@@ -825,12 +823,12 @@ mod tests {
     #[test]
     fn the_report_names_every_rung_by_number_and_by_name() {
         let rendered = LadderReport::new().to_string();
-        for rung in EVERY_RUNG {
+        for rung in Rung::ALL {
             assert!(
-                rendered.contains(&format!("rung {}", rung_number(rung))),
+                rendered.contains(&format!("rung {}", rung.method_number())),
                 "{rendered}"
             );
-            assert!(rendered.contains(rung_name(rung)), "{rendered}");
+            assert!(rendered.contains(&rung.to_string()), "{rendered}");
         }
     }
 
@@ -914,7 +912,7 @@ mod tests {
             "the nomination must hand back the socket the ladder ran on, not a new one"
         );
         assert_eq!(got.remote, host_addr);
-        assert_eq!(got.rung, Rung::StunPunch);
+        assert_eq!(got.rung, Rung::Punched(Family::V4));
         let _ = host.await;
     }
 
@@ -1001,7 +999,7 @@ mod tests {
         .await
         .expect("the lurking peer sits exactly on the guessed base");
 
-        assert_eq!(got.rung, Rung::Birthday);
+        assert_eq!(got.rung, Rung::Birthday(Family::V4));
         assert_eq!(got.remote, peer_addr);
         assert!(
             !Arc::ptr_eq(&got.socket, &raced_on),
@@ -1108,7 +1106,7 @@ mod tests {
         .await
         .expect_err("a ladder that admits no remote must not nominate the lurking peer");
 
-        let verdict = report.verdict(Rung::Birthday).clone();
+        let verdict = report.verdict(Rung::Birthday(Family::V4)).clone();
         assert!(
             matches!(&verdict, Verdict::Failed(why) if why.contains("reached the same way")),
             "expected the veto's own reason on rung 3, got {verdict:?}"
@@ -1138,45 +1136,6 @@ mod tests {
         );
         // And the guard is not vacuous: it can see the fields that ARE there.
         assert!(body.contains("pub rung: Rung"), "{body}");
-    }
-
-    // ------------------------------------------------------ classification
-
-    /// The report's per-rung skips are only true if this classification agrees
-    /// with the one `IceAgent` nominates by. That function is private, so the
-    /// rule is pinned here instead of inferred.
-    #[test]
-    fn the_rung_classification_matches_the_one_ice_nominates_by() {
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::PortMapped)),
-            Rung::PortMapped
-        );
-        assert_eq!(
-            rung_of(&candidate("[2001:db8::2]:443", CandidateKind::PortMapped)),
-            Rung::PortMapped,
-            "a port mapping is rung 1 in either address family"
-        );
-        assert_eq!(
-            rung_of(&candidate("[2001:db8::2]:443", CandidateKind::Host)),
-            Rung::Ipv6Direct,
-            "an IPv6 host candidate is rung 0"
-        );
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::Host)),
-            Rung::StunPunch,
-            "an IPv4 host candidate is NOT rung 0; ice.rs sends it to rung 2"
-        );
-        assert_eq!(
-            rung_of(&candidate(
-                "203.0.113.7:443",
-                CandidateKind::ServerReflexive
-            )),
-            Rung::StunPunch
-        );
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::PeerReflexive)),
-            Rung::StunPunch
-        );
     }
 
     #[test]
@@ -1221,7 +1180,7 @@ mod tests {
         .await
         .expect_err("nothing is listening");
 
-        let v = report.verdict(Rung::Birthday).clone();
+        let v = report.verdict(Rung::Birthday(Family::V4)).clone();
         assert!(
             matches!(&v, Verdict::Skipped(why) if why.contains("server-reflexive")),
             "got {v:?}"

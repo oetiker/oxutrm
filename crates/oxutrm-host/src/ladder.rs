@@ -62,7 +62,7 @@
 //! framing rules and for the same reason. Read them before writing it. Nothing
 //! here is a seam waiting for an implementor — this module ends at the plan.
 
-use oxutrm_proto::{NatType, Rung};
+use oxutrm_proto::{Family, NatType, Rung};
 
 /// Which rungs to try, grouped by whether they can be raced.
 ///
@@ -94,25 +94,39 @@ impl LadderPlan {
         // something the three-probe classification already established.
         let punch_is_hopeless = matches!(nat, NatType::Symmetric);
         if punch_is_hopeless {
-            skipped.push((
-                Rung::StunPunch,
-                "the NAT is symmetric, so its external port differs per \
-                 destination and ordinary punching cannot reach it"
-                    .to_string(),
-            ));
+            for family in Family::BOTH {
+                skipped.push((
+                    Rung::Punched(family),
+                    "the NAT is symmetric, so its external port differs per \
+                     destination and ordinary punching cannot reach it"
+                        .to_string(),
+                ));
+            }
         }
 
         // `raced` names the candidate classes the one ICE agent should gather
-        // and check together, not three things to spawn. See the module note.
-        let mut raced = vec![Rung::Ipv6Direct, Rung::PortMapped];
+        // and check together, not things to spawn. See the module note. Every
+        // method appears once per family, IPv6 first. (This mechanical form
+        // applies one NAT type to both families; the per-family plan replaces
+        // it.)
+        let mut raced = Vec::new();
+        for family in Family::BOTH {
+            raced.push(Rung::Direct(family));
+        }
+        for family in Family::BOTH {
+            raced.push(Rung::PortMapped(family));
+        }
         if !punch_is_hopeless {
-            raced.push(Rung::StunPunch);
+            for family in Family::BOTH {
+                raced.push(Rung::Punched(family));
+            }
         }
 
         // The blast is deliberately noisy, so it never joins the race. It is
         // reached only when the cheap rungs have produced nothing -- or gone to
         // first when punching is already known to be hopeless.
-        let sequential = vec![Rung::Birthday, Rung::SshTunnel];
+        let mut sequential: Vec<Rung> = Family::BOTH.into_iter().map(Rung::Birthday).collect();
+        sequential.push(Rung::SshTunnel);
 
         LadderPlan {
             raced,

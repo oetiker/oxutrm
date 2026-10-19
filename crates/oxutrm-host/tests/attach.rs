@@ -9,7 +9,7 @@ use std::path::Path;
 use oxutrm_host::attach::{AttachError, connect_to_session, format_session_list, relay_signals};
 use oxutrm_host::{Registry, RegistryGuard, SessionMeta, begin_attach, now_unix};
 use oxutrm_proto::{
-    ClientSpki, HostSpki, NatType, PROTO_VERSION, Psk, Rung, Signal, TermSize, TerminalCaps,
+    ClientSpki, Family, HostSpki, NatType, PROTO_VERSION, Psk, Rung, Signal, TermSize, TerminalCaps,
 };
 use tokio::io::BufReader;
 
@@ -365,7 +365,7 @@ async fn the_relay_refuses_to_carry_garbage_into_a_session() {
 #[test]
 fn the_listing_shows_detachability_rather_than_implying_it() {
     let mut ok = meta("1111111111111111aaaaaaaaaaaaaaaa", 4242);
-    ok.set_detachable(Rung::Ipv6Direct);
+    ok.set_detachable(Rung::Direct(Family::V6));
     let mut tunnelled = meta("2222222222222222bbbbbbbbbbbbbbbb", 4243);
     tunnelled.set_detachable(Rung::SshTunnel);
 

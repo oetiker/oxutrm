@@ -123,7 +123,7 @@ pub use signal::{Choice, MAX_SIGNAL_LINE, Signal, read_signal, write_signal};
 pub use stream::{ControlMsg, ScrollbackReq};
 pub use text::{check_cell_text, check_title, fit_cell_text, fit_title, is_control_scalar};
 pub use types::{
-    Candidate, CandidateKind, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI, MAX_LINKS,
+    Candidate, CandidateKind, Family, MAX_CELL_TEXT, MAX_CLIPBOARD, MAX_LINK_URI, MAX_LINKS,
     MAX_SCREEN_CELLS, MAX_SCREEN_DIM, MAX_TITLE, NatType, PathDescription, Rung, TermSize,
     TerminalCaps, TextField,
 };

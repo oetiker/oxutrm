@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxutrm_proto::{Candidate, CandidateKind, Psk, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, Psk, Rung};
 
 use crate::{
     CheckKind, IceCredentials, IceRole, NetConfig, build_check_request, build_check_response,
@@ -361,11 +361,9 @@ impl IceAgent {
 
     fn nominated_event(&self, local: SocketAddr, remote: SocketAddr) -> IceEvent {
         let kind = self.pairs.get(&remote).and_then(|s| s.kind);
-        let rung = match kind {
-            Some(CandidateKind::PortMapped) => Rung::PortMapped,
-            Some(CandidateKind::Host) if remote.is_ipv6() => Rung::Ipv6Direct,
-            _ => Rung::StunPunch,
-        };
+        let rung = kind.map_or(Rung::Punched(Family::of(&remote)), |k| {
+            Rung::of_candidate(k, remote)
+        });
         IceEvent::Nominated {
             local: unmap(local),
             remote,
@@ -916,6 +914,6 @@ mod tests {
             }
         }
         h.abort();
-        assert_eq!(got, Some(Rung::Ipv6Direct));
+        assert_eq!(got, Some(Rung::Direct(Family::V6)));
     }
 }

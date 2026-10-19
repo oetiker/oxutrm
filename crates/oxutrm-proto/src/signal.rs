@@ -253,7 +253,7 @@ pub fn read_signal<R: std::io::BufRead>(r: &mut R) -> Result<Signal, ProtoError>
 mod tests {
     use super::*;
     use crate::{
-        Candidate, CandidateKind, FEATURE_STANDBY, NatType, PROTO_VERSION, PathDescription,
+        Candidate, CandidateKind, FEATURE_STANDBY, Family, NatType, PROTO_VERSION, PathDescription,
         ProtoError, Rung, TermSize, TerminalCaps,
     };
     use std::io::BufReader;
@@ -311,7 +311,7 @@ mod tests {
             },
             Signal::Established {
                 path: PathDescription {
-                    rung: Rung::Ipv6Direct,
+                    rung: Rung::Direct(Family::V6),
                     local: "[2001:db8::1]:443".parse().unwrap(),
                     remote: "[2001:db8::2]:443".parse().unwrap(),
                     probes_sent: 3,

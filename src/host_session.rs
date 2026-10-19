@@ -1461,7 +1461,7 @@ mod tests {
             .send(crate::attach_exchange::Attached {
                 link: standby_host,
                 path: oxutrm_proto::PathDescription {
-                    rung: oxutrm_proto::Rung::StunPunch,
+                    rung: oxutrm_proto::Rung::Punched(oxutrm_proto::Family::V4),
                     local: "127.0.0.1:1".parse().unwrap(),
                     remote: "203.0.113.7:443".parse().unwrap(),
                     probes_sent: 4,

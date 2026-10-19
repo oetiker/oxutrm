@@ -5,6 +5,10 @@
 ### New
 
 ### Changed
+- **The status line names the address family of every path.** A path over a
+  LAN or VPN address now reads "IPv4 direct" instead of "IPv4 punched", and a
+  router port mapping reads "IPv4 port mapped".
+
 - **Building oxutrm from source needs the current stable Rust.** oxutrm no
   longer names an oldest supported Rust version, so an older compiler fails
   with compile errors instead of a message about the version.

@@ -163,7 +163,7 @@ The result is printed once:
 
 ```
 oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452
-oxutrm  IPv4 punched (birthday, 312 probes)  ·  61 ms  ·  symmetric NAT
+oxutrm  IPv4 birthday (312 probes)  ·  61 ms  ·  symmetric NAT
 ```
 
 A session on rung 4 runs inside the ssh connection: it ends with it and cannot
