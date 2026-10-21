@@ -126,9 +126,9 @@ direct", never "punched".
 
 ### 5.3 Measuring, choosing, switching
 
-- Every candidate path that validates becomes a **measured path**: an
-  established connection kept warm and measured for round-trip time and
-  loss. (Because QUIC cannot repoint a connection at another remote, every
+- Every candidate path that validates becomes a **measured path**, measured
+  for round-trip time and loss. Up to `network.warm_paths` of them are warm
+  (established connections, §5.4); the rest are cold and re-probed. (Because QUIC cannot repoint a connection at another remote, every
   path is its own connection, as the standby is today.)
 - **Better = measured quality**: lower round-trip time and lower loss.
   Measured quality wins over method — a punched path at 12 ms beats a direct
@@ -161,20 +161,32 @@ direct", never "punched".
   session continues on the best path that still answers. If none does, the
   ssh rebuild runs as today.
 
-### 5.4 Background traffic — decided after measuring
+### 5.4 Background traffic — decided (2026-10-21)
 
-Keeping paths warm and measured costs traffic per path. **The user decides
-the budget once real numbers are on the table.** So the first build stage
-includes a spike that measures, on real links (Mac ↔ thinlinc over public
-IPv4, VPN IPv4, IPv6): bytes/s per kept path for keepalive + measurement at a
-few candidate rates, and what NAT mapping lifetimes force as the floor. The
-results go back to the user with a recommendation; the budget then becomes a
-fixed rule (and possibly a `network.*` setting).
+Measured in stage 1 (`docs/superpowers/notes/2026-10-19-path-cost-spike.md`):
+the shortest idle NAT lifetime on the test links is 20–30 s, and a warm path
+costs 19 B/s each way for the keepalive alone, 37 B/s with a measurement ping
+every 5 s (IPv6 on-wire; IPv4 about a quarter less). The user chose this rule:
 
-*Builder's call:* stage 3 does not wait for that decision. Until the budget
-is set it ships behind a provisional limit of about what today's single
-standby costs (one extra warm path), and the limit is one constant to change.
-Running the spike on thinlinc needs the user's go-ahead for ssh at the time.
+- **Keepalive stays at 10 s** on every warm path. It is the floor the NAT
+  lifetimes force (shortest lifetime ÷ 2), not a budget knob.
+- **At most `network.warm_paths` paths are warm, default 4**, the carrying
+  path included. A warm path is an established connection, keepalive plus a
+  **measurement ping every 5 s (0.2 Hz)**. At the default: about 150 B/s and
+  1.7 datagrams/s each way. `warm_paths = 1` is today's cost (carrying path
+  only); the useful upper end is about 8.
+- **Paths beyond the cap are cold**: listed with their last measurement and its
+  age, and **re-probed about once a minute**. A cold direct path (LAN, VPN,
+  unNATed IPv6) is a cheap probe; a cold punched path needs a fresh punch,
+  since its NAT mapping is gone after ~30 s. Which paths are warm follows the
+  comparison rule of §5.3: the best measured ones stay warm, a cold path that
+  re-probes better than the worst warm one takes its place.
+- **Measurement speeds up to 1 Hz on the warm paths while the carrying path is
+  degrading** (rising loss or rtt by the margins of §5.3), and drops back to
+  0.2 Hz once it has recovered or the session has moved.
+- *Builder's call:* align the keepalives and pings of warm paths on the same
+  interface, so a mobile radio wakes once per interval rather than once per
+  path.
 
 ### 5.5 Router port mapping
 
@@ -297,7 +309,6 @@ Each stage ships on its own and leaves the session working.
   re-check interval.
 - Damping beyond the comparison margins of §5.3: how long a margin must
   hold, and how long a new path is distrusted.
-- How many paths are kept warm at once, within the budget the user sets.
 - Measurement method per kept path (QUIC keepalives/pings on each
   connection is the obvious one).
 - Rung numbering in reports; serde names (no compat needed).
