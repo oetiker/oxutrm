@@ -5,6 +5,11 @@
 ### New
 
 ### Changed
+
+### Fixed
+
+## 0.5.0 - 2026-10-23
+### Changed
 - **The status line names the address family of every path.** A path over a
   LAN or VPN address now reads "IPv4 direct" instead of "IPv4 punched", and a
   router port mapping reads "IPv4 port mapped".
