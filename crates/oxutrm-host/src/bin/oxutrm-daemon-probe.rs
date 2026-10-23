@@ -169,8 +169,11 @@ fn run_split(report: &str, held: &[(String, i32)], gate: bool, keep_open: bool) 
         boot: oxutrm_host::boot_token(),
         name: None,
     };
-    let permit = oxutrm_host::settle_detachability(&mut meta, oxutrm_proto::Rung::StunPunch)
-        .expect("a nominated non-tunnel rung must yield a permit");
+    let permit = oxutrm_host::settle_detachability(
+        &mut meta,
+        oxutrm_proto::Rung::Punched(oxutrm_proto::Family::V4),
+    )
+    .expect("a nominated non-tunnel rung must yield a permit");
     oxutrm_host::sever_from_ssh(detached, permit).expect("sever_from_ssh");
 
     // And the other half of the claim: the same writes, now that the sever has

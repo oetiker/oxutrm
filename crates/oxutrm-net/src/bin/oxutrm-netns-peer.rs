@@ -58,7 +58,9 @@ async fn main() -> anyhow::Result<()> {
                 .map(|c| c.addr.to_string())
                 .unwrap_or_else(|| "none".to_string());
             println!(
-                "discover local={local} mapped={mapped} nat={nat:?} candidates={}",
+                "discover local={local} mapped={mapped} nat={:?} nat6={:?} candidates={}",
+                nat.v4,
+                nat.v6,
                 candidates.len()
             );
             Ok(())
@@ -92,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(c) = cands.first() {
                     advertised = c.addr;
                 }
-                println!("mapped addr={advertised} nat={nat:?}");
+                println!(
+                    "mapped addr={advertised} nat={:?} nat6={:?}",
+                    nat.v4, nat.v6
+                );
             }
             // Publish it the way SSH signalling would in the real product.
             if let Some(path) = arg(&args, "--publish") {

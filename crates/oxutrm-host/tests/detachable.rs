@@ -10,7 +10,7 @@
 //! decide — is the whole point, and these tests pin it.
 
 use oxutrm_host::{Registry, RegistryGuard, SessionMeta, detachable_for_rung, now_unix};
-use oxutrm_proto::{Rung, TermSize};
+use oxutrm_proto::{Family, Rung, TermSize};
 
 fn meta(id: &str) -> SessionMeta {
     SessionMeta {
@@ -30,12 +30,7 @@ fn meta(id: &str) -> SessionMeta {
 
 #[test]
 fn every_rung_but_the_ssh_tunnel_can_detach() {
-    for rung in [
-        Rung::Ipv6Direct,
-        Rung::PortMapped,
-        Rung::StunPunch,
-        Rung::Birthday,
-    ] {
+    for rung in Rung::ALL.into_iter().filter(|r| *r != Rung::SshTunnel) {
         assert!(
             detachable_for_rung(rung),
             "{rung:?} carries QUIC on its own UDP socket, which outlives ssh"
@@ -67,7 +62,7 @@ fn settling_on_the_ssh_tunnel_overrides_an_optimistic_intent() {
 fn settling_on_a_direct_rung_confirms_detachability() {
     let mut m = meta("2222222222222222bbbbbbbbbbbbbbbb");
     m.detachable = false;
-    assert!(m.set_detachable(Rung::Ipv6Direct));
+    assert!(m.set_detachable(Rung::Direct(Family::V6)));
     assert!(m.detachable);
 }
 
@@ -76,13 +71,16 @@ fn set_detachable_is_idempotent_and_last_write_wins() {
     // A reattach renegotiates, so the same session may settle differently on a
     // later attach. The recorded outcome must follow the current rung.
     let mut m = meta("3333333333333333cccccccccccccccc");
-    assert!(m.set_detachable(Rung::StunPunch));
-    assert!(m.set_detachable(Rung::StunPunch), "idempotent");
+    assert!(m.set_detachable(Rung::Punched(Family::V4)));
+    assert!(m.set_detachable(Rung::Punched(Family::V4)), "idempotent");
     assert!(
         !m.set_detachable(Rung::SshTunnel),
         "a later attach may differ"
     );
-    assert!(m.set_detachable(Rung::PortMapped), "and differ again");
+    assert!(
+        m.set_detachable(Rung::PortMapped(Family::V4)),
+        "and differ again"
+    );
 }
 
 /// `--list` must show the difference, because "reattach later" is a promise

@@ -195,7 +195,7 @@ pub fn parse_answer(raw: &[u8]) -> Result<Answer, ProtoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HostSpki, NatType, Psk};
+    use crate::{FamilyNat, HostSpki, Psk};
 
     fn id() -> SessionId {
         "3ff1218f5e0c4b7d9a1c2e3f40516273".parse().unwrap()
@@ -315,7 +315,7 @@ mod tests {
             cert_spki_sha256: HostSpki::new([7; 32]),
             psk: Psk::new([9; 32]),
             candidates: vec![],
-            nat_type: NatType::Unknown,
+            nat: FamilyNat::UNKNOWN,
             bound_port: 443,
             detachable: true,
             features: vec![],
@@ -336,7 +336,7 @@ mod tests {
             cert_spki_sha256: HostSpki::new([7; 32]),
             psk: Psk::new([9; 32]),
             candidates: vec![],
-            nat_type: NatType::Unknown,
+            nat: FamilyNat::UNKNOWN,
             bound_port: 443,
             detachable: true,
             features: vec![],

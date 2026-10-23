@@ -24,8 +24,8 @@
 use std::io::{BufRead, Write};
 
 use oxutrm_proto::{
-    Candidate, CandidateKind, HostSpki, NatType, PROTO_VERSION, PathDescription, Psk, Rung, Signal,
-    TermSize, write_signal,
+    Candidate, CandidateKind, Family, FamilyNat, HostSpki, NatType, PROTO_VERSION, PathDescription,
+    Psk, Rung, Signal, TermSize, write_signal,
 };
 
 /// What a real login prints before the command's own output.
@@ -188,7 +188,10 @@ fn host_hello(attach_id: u64, proto: u32) -> Signal {
             kind: CandidateKind::ServerReflexive,
             priority: 1_000,
         }],
-        nat_type: NatType::EndpointIndependent,
+        nat: FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::EndpointIndependent,
+        },
         bound_port: 443,
         // The host's INTENT only. The outcome is settled by the nominated
         // rung, long after this message is written.
@@ -200,7 +203,7 @@ fn host_hello(attach_id: u64, proto: u32) -> Signal {
 fn established() -> Signal {
     Signal::Established {
         path: PathDescription {
-            rung: Rung::StunPunch,
+            rung: Rung::Punched(Family::V4),
             local: "198.51.100.4:51234".parse().expect("literal address"),
             remote: "192.0.2.7:443".parse().expect("literal address"),
             probes_sent: 12,

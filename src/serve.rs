@@ -1110,7 +1110,7 @@ mod tests {
                         r#"{{"t":"HostHello","proto":2,"session_id":"{}","attach_id":1,"#,
                         r#""cert_spki_sha256":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","#,
                         r#""psk":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","#,
-                        r#""candidates":[],"nat_type":"Unknown","bound_port":443,"#,
+                        r#""candidates":[],"nat":{{"v4":"Unknown","v6":"Unknown"}},"bound_port":443,"#,
                         r#""detachable":true}}"#,
                         "\n"
                     ),

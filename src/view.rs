@@ -869,14 +869,14 @@ pub(crate) fn assert_claims_nothing_it_cannot_see(shown: &str) {
 mod tests {
     use super::*;
     use crate::activity::Kind;
-    use oxutrm_proto::{NatType, Rung};
+    use oxutrm_proto::{Family, NatType, Rung};
 
     /// The log's zone in every test that does not name one.
     static UTC: TimeZone = TimeZone::UTC;
 
     fn path() -> PathDescription {
         PathDescription {
-            rung: Rung::StunPunch,
+            rung: Rung::Punched(Family::V4),
             local: "127.0.0.1:1".parse().unwrap(),
             remote: "203.0.113.7:443".parse().unwrap(),
             probes_sent: 0,

@@ -153,17 +153,20 @@ the first path that validates wins:
 
 | Rung | Mechanism | Works when |
 |---|---|---|
-| 0 | IPv6 direct | both ends have global IPv6 |
-| 1 | Router port mapping (NAT-PMP, PCP, UPnP-IGD) | a typical home router |
-| 2 | STUN and hole punch | most NATs |
-| 3 | Birthday-paradox punch | symmetric NAT |
+| 0 | Direct, over IPv6 and IPv4 | both ends share an address family: a LAN, a VPN or global IPv6 |
+| 1 | Router port mapping (NAT-PMP, PCP, UPnP-IGD), per family | a typical home router |
+| 2 | STUN and hole punch, per family | most NATs |
+| 3 | Birthday-paradox punch, per family | a symmetric or unknown NAT in that family |
 | 4 | SSH tunnel | UDP is blocked |
+
+Rungs 0 to 3 run once for each address family both ends have, so a symmetric
+IPv4 NAT does not stop IPv6 punching.
 
 The result is printed once:
 
 ```
 oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452
-oxutrm  IPv4 punched (birthday, 312 probes)  ·  61 ms  ·  symmetric NAT
+oxutrm  IPv4 birthday (312 probes)  ·  61 ms  ·  symmetric NAT
 ```
 
 A session on rung 4 runs inside the ssh connection: it ends with it and cannot

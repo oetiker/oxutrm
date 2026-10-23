@@ -506,7 +506,7 @@ struct OutageNotes {
 }
 
 /// `label` in parentheses, for a summary: a path label that has a
-/// parenthesis of its own (`IPv4 punched (birthday, 412 probes)`) has it
+/// parenthesis of its own (`IPv4 birthday (412 probes)`) has it
 /// turned into a comma, so the summary does not nest them.
 fn in_parens(label: &str) -> String {
     match label.strip_suffix(')').and_then(|l| l.split_once(" (")) {
@@ -2920,7 +2920,7 @@ mod tests {
     use crate::view::words;
     use oxutrm_client::Marker;
     use oxutrm_host::ssh::SshLauncher;
-    use oxutrm_proto::{NatType, Rung};
+    use oxutrm_proto::{Family, NatType, Rung};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -4600,7 +4600,13 @@ mod tests {
         let (_host, mut client) = pair("sleep 30\n").await;
         let mut out = Vec::new();
 
-        let path = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
+        let path = path_of(
+            Rung::Punched(Family::V4),
+            38,
+            1392,
+            0,
+            NatType::EndpointIndependent,
+        );
         assert!(client.announce(&path, &mut out).expect("announce"));
         let first = String::from_utf8(out.clone()).unwrap();
         assert!(first.contains("oxutrm"), "got {first:?}");
@@ -4646,7 +4652,13 @@ mod tests {
         let mut out = Vec::new();
         client
             .announce(
-                &path_of(Rung::Birthday, 61, 1200, 312, NatType::Symmetric),
+                &path_of(
+                    Rung::Birthday(Family::V4),
+                    61,
+                    1200,
+                    312,
+                    NatType::Symmetric,
+                ),
                 &mut out,
             )
             .expect("announce");
@@ -6017,7 +6029,7 @@ mod tests {
     fn standby_attached(link: Link) -> crate::attach_exchange::Attached {
         crate::attach_exchange::Attached {
             link,
-            path: path_of(Rung::StunPunch, 30, 1400, 4, NatType::Unknown),
+            path: path_of(Rung::Punched(Family::V4), 30, 1400, 4, NatType::Unknown),
             client_size: size(),
             role: crate::control::Role::Standby,
         }
@@ -6283,7 +6295,7 @@ mod tests {
     fn standby_established(link: Link) -> crate::connect::Established {
         crate::connect::Established {
             link,
-            path: path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown),
+            path: path_of(Rung::Punched(Family::V4), 38, 1400, 0, NatType::Unknown),
             session_id: String::new(),
             attach_id: 2,
             host_features: vec![],
@@ -6589,7 +6601,7 @@ mod tests {
         let mut out = Vec::new();
         client
             .announce(
-                &path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None),
+                &path_of(Rung::Direct(Family::V6), 11, 1452, 0, NatType::None),
                 &mut out,
             )
             .expect("announce");
@@ -6624,7 +6636,7 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&outside_renderer(&out))
         );
-        let standby = path_of(Rung::StunPunch, 38, 1400, 0, NatType::Unknown);
+        let standby = path_of(Rung::Punched(Family::V4), 38, 1400, 0, NatType::Unknown);
         assert!(
             !client.announce(&standby, &mut out).expect("announce"),
             "the failover did not record the path it switched to"
@@ -6652,7 +6664,13 @@ mod tests {
         let mut out = Vec::new();
         client
             .announce(
-                &path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent),
+                &path_of(
+                    Rung::Punched(Family::V4),
+                    38,
+                    1392,
+                    0,
+                    NatType::EndpointIndependent,
+                ),
                 &mut out,
             )
             .expect("first");
@@ -6664,7 +6682,7 @@ mod tests {
         );
         out.clear();
 
-        let better = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        let better = path_of(Rung::Direct(Family::V6), 11, 1452, 0, NatType::None);
         assert!(client.announce(&better, &mut out).expect("second"));
 
         assert!(
@@ -6687,13 +6705,19 @@ mod tests {
     async fn after_the_banner_only_the_renderer_writes_to_the_terminal() {
         let (_host, mut client) = with_confirming_popup(b"make test\r").await;
         let mut out = Vec::new();
-        let first = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        let first = path_of(Rung::Direct(Family::V6), 11, 1452, 0, NatType::None);
         client.announce(&first, &mut out).expect("the banner");
         let banner = format!("{}\n", status_line(&first));
         assert_eq!(String::from_utf8_lossy(&outside_renderer(&out)), banner);
 
         assert_eq!(answer(&mut client, b"s", &mut out), None);
-        let migrated = path_of(Rung::StunPunch, 38, 1392, 0, NatType::EndpointIndependent);
+        let migrated = path_of(
+            Rung::Punched(Family::V4),
+            38,
+            1392,
+            0,
+            NatType::EndpointIndependent,
+        );
         assert!(client.announce(&migrated, &mut out).expect("a migration"));
         let (_standby_host, standby_client) = crate::link::fixtures::link_pair().await;
         client.standby = Some(standby_holding(standby_client));
@@ -8491,17 +8515,14 @@ mod tests {
     fn a_summary_does_not_nest_parentheses() {
         assert_eq!(in_parens("IPv4 punched"), "(IPv4 punched)");
         assert_eq!(
-            in_parens("IPv4 punched (birthday, 412 probes)"),
-            "(IPv4 punched, birthday, 412 probes)"
+            in_parens("IPv4 birthday (412 probes)"),
+            "(IPv4 birthday, 412 probes)"
         );
-        assert_eq!(
-            in_parens("IPv6 punched (port mapped)"),
-            "(IPv6 punched, port mapped)"
-        );
-        let birthday = path_of(Rung::Birthday, 38, 1400, 412, NatType::Unknown);
+        assert_eq!(in_parens("IPv6 port mapped"), "(IPv6 port mapped)");
+        let birthday = path_of(Rung::Birthday(Family::V4), 38, 1400, 412, NatType::Unknown);
         assert_eq!(
             in_parens(&oxutrm_client::rung_label(&birthday)),
-            "(IPv4 punched, birthday, 412 probes)"
+            "(IPv4 birthday, 412 probes)"
         );
     }
 
@@ -9932,7 +9953,7 @@ mod tests {
         let (mut host, session) = pair_sized("/bin/sh", BIG).await;
         let mut session = session.with_splash(7, "");
         let mut out = Vec::new();
-        let path = path_of(Rung::Ipv6Direct, 11, 1452, 0, NatType::None);
+        let path = path_of(Rung::Direct(Family::V6), 11, 1452, 0, NatType::None);
         session.announce(&path, &mut out).expect("the banner");
 
         for ms in [0, 40, 80, 400, 900] {

@@ -10,8 +10,8 @@ use std::io::Cursor;
 
 use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_proto::{
-    Candidate, CandidateKind, ClientSpki, HostSpki, MAX_SIGNAL_LINE, NatType, PROTO_VERSION,
-    ProtoError, Psk, Signal, TermSize, TerminalCaps,
+    Candidate, CandidateKind, ClientSpki, FamilyNat, HostSpki, MAX_SIGNAL_LINE, NatType,
+    PROTO_VERSION, ProtoError, Psk, Signal, TermSize, TerminalCaps,
 };
 
 fn host_hello(attach_id: u64) -> Signal {
@@ -32,7 +32,10 @@ fn host_hello_with_proto(attach_id: u64, proto: u32) -> Signal {
             kind: CandidateKind::ServerReflexive,
             priority: 1_000,
         }],
-        nat_type: NatType::EndpointIndependent,
+        nat: FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::EndpointIndependent,
+        },
         bound_port: 443,
         detachable: true,
         features: vec![],
@@ -47,7 +50,7 @@ fn client_hello() -> Signal {
         // without it is a client the host has nothing to authenticate.
         cert_spki_sha256: ClientSpki::new([0x11; 32]),
         candidates: vec![],
-        nat_type: NatType::Unknown,
+        nat: FamilyNat::UNKNOWN,
         caps: TerminalCaps {
             truecolor: true,
             colors: 16_777_216,

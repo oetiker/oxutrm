@@ -27,6 +27,11 @@ pub(crate) const RING: usize = 200;
 /// together never hold more than twice this.
 pub(crate) const LOG_CAP: u64 = 1024 * 1024;
 
+/// The most characters of one entry's text the file keeps. The popup cuts a
+/// reason to its first line; the file is where the rest of it is read, such as
+/// the per-rung verdicts of a failed ladder, so it keeps far more.
+pub(crate) const FILE_TEXT_CAP: usize = 4096;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
     Link,
@@ -73,6 +78,9 @@ pub(crate) struct Entry {
     /// What the popup shows for it: `text` unless it was recorded with a
     /// shorter wording. Legible already, like `text`.
     pub(crate) shown: String,
+    /// What the file gets: every line of the recorded text, escaped and
+    /// joined into one, up to [`FILE_TEXT_CAP`].
+    pub(crate) full: String,
     /// A step of something summed up by a later entry, such as the probes
     /// and attempts of an outage: in the file, not in the popup.
     pub(crate) detail: bool,
@@ -144,8 +152,9 @@ impl Activity {
         self.record_entry(kind, text, None, false, at);
     }
 
-    /// The one way in. Both texts are escaped and cut to one line here, so
-    /// neither the popup nor the file can be handed a control sequence.
+    /// The one way in. Both texts are escaped and made one line here, so
+    /// neither the popup nor the file can be handed a control sequence. The
+    /// popup's text is cut to its first line; the file's keeps every line.
     pub(crate) fn record_entry(
         &mut self,
         kind: Kind,
@@ -154,11 +163,12 @@ impl Activity {
         detail: bool,
         at: SystemTime,
     ) {
+        let full = file_text(text);
         let text = oxutrm_client::summarised(text);
         let shown = shown.map_or_else(|| text.clone(), oxutrm_client::summarised);
         if let Some(last) = self.ring.back_mut()
             && last.kind == kind
-            && last.text == text
+            && last.full == full
             && last.shown == shown
             && last.detail == detail
         {
@@ -167,13 +177,14 @@ impl Activity {
             return;
         }
         self.end_run();
-        let line = self.line(at, kind, &text, None);
+        let line = self.line(at, kind, &full, None);
         self.push(Entry {
             at,
             since: at,
             kind,
             text,
             shown,
+            full,
             detail,
             repeats: 0,
         });
@@ -212,7 +223,7 @@ impl Activity {
         let line = self.line(
             last.at,
             last.kind,
-            &last.text,
+            &last.full,
             Some((last.repeats, last.since)),
         );
         self.write(&line);
@@ -251,6 +262,7 @@ impl Activity {
             since: at,
             kind: Kind::Log,
             shown: text.clone(),
+            full: text.clone(),
             text,
             detail: false,
             repeats: 0,
@@ -333,6 +345,23 @@ impl LogFile {
         self.file = append(&self.path)?;
         Ok(())
     }
+}
+
+/// `text` as one line of the file: each line trimmed and escaped, the blank
+/// ones dropped, the rest joined with ` | `, and cut at [`FILE_TEXT_CAP`].
+fn file_text(text: &str) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(oxutrm_client::legible)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.chars().count() <= FILE_TEXT_CAP {
+        return joined;
+    }
+    let kept: String = joined.chars().take(FILE_TEXT_CAP).collect();
+    format!("{kept}...")
 }
 
 fn append(path: &Path) -> std::io::Result<File> {
@@ -560,6 +589,39 @@ mod tests {
             "{text:?}"
         );
         assert!(!text.contains("second line"), "{text:?}");
+    }
+
+    /// The popup keeps a reason's first line; the file keeps all of it, on
+    /// one line, escaped. A failed ladder's per-rung verdicts follow its
+    /// first line, and the file is the only place they can be read later.
+    #[test]
+    fn the_file_keeps_every_line_of_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, path) = opened(dir.path(), LOG_CAP);
+        a.record_at(
+            Kind::Standby,
+            "not found: no usable path. Every rung, in order:\n  \
+             rung 2  STUN punch  failed  \u{1b}[2Jno answer\n\n",
+            at(T),
+        );
+        let e = a.entries().next().unwrap();
+        assert_eq!(e.text, "not found: no usable path. Every rung, in order:");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "2026-09-21T14:13:20Z bastion f00dcafe standby not found: no usable \
+             path. Every rung, in order: | rung 2  STUN punch  failed  ^[[2Jno answer\n"
+        );
+
+        // Two reasons alike in their first line are still two entries.
+        a.record_at(
+            Kind::Standby,
+            "not found: no usable path. Every rung, in order:\nother",
+            at(T + 1),
+        );
+        assert_eq!(a.entries().len(), 2);
+
+        let long = "x".repeat(FILE_TEXT_CAP + 10);
+        assert_eq!(file_text(&long).chars().count(), FILE_TEXT_CAP + 3);
     }
 
     /// The popup's wording is the popup's: escaped like the file's text,

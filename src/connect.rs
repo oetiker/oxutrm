@@ -9,7 +9,7 @@ use oxutrm_host::signalling::{read_signal_async, write_signal_async};
 use oxutrm_host::ssh::{SshChannel, SshLauncher};
 use oxutrm_net::{IceRole, NetConfig};
 use oxutrm_proto::{
-    Candidate, Choice, ClientSpki, HostSpki, Name, NatType, OfferEntry, PROTO_VERSION,
+    Candidate, Choice, ClientSpki, FamilyNat, HostSpki, Name, OfferEntry, PROTO_VERSION,
     PathDescription, Psk, Signal, TermSize,
 };
 use oxutrm_term::detect_caps;
@@ -485,7 +485,7 @@ where
             proto: PROTO_VERSION,
             cert_spki_sha256: ClientSpki::new(our_spki),
             candidates: candidates.clone(),
-            nat_type: nat,
+            nat,
             caps: detect_caps(),
             size,
             features: client_features(cfg),
@@ -512,6 +512,7 @@ where
                     psk: &host.psk,
                     role: IceRole::Controlling,
                     nat,
+                    peer_nat: host.nat,
                     cfg,
                     local: candidates,
                     remote: host.candidates,
@@ -647,7 +648,7 @@ struct HostFacts {
     /// type-checked.
     host_spki: HostSpki,
     candidates: Vec<Candidate>,
-    nat: NatType,
+    nat: FamilyNat,
     /// What the host said it can do. Not secret.
     features: Vec<String>,
 }
@@ -681,7 +682,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             psk,
             cert_spki_sha256,
             candidates,
-            nat_type,
+            nat,
             features,
             ..
         } => Ok(HostFacts {
@@ -690,7 +691,7 @@ fn host_facts(signal: Signal) -> Result<HostFacts> {
             psk,
             host_spki: cert_spki_sha256,
             candidates,
-            nat: nat_type,
+            nat,
             features,
         }),
         // The host's own words. It is the only explanation there is for why
@@ -721,7 +722,7 @@ fn established_path(signal: Signal) -> Result<PathDescription> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxutrm_proto::{CandidateKind, Rung};
+    use oxutrm_proto::{CandidateKind, Family, NatType, Rung};
 
     /// STUN-free, like every other test in this repo: a test that reaches STUN
     /// makes every timing in it non-deterministic, and an injected bug once
@@ -950,7 +951,7 @@ mod tests {
     fn the_splash_caption_says_which_session_and_how_it_is_reached() {
         let id = "3ff1218f".to_string() + &"0".repeat(24);
         let path = PathDescription {
-            rung: oxutrm_proto::Rung::StunPunch,
+            rung: oxutrm_proto::Rung::Punched(oxutrm_proto::Family::V4),
             local: "127.0.0.1:1".parse().unwrap(),
             remote: "203.0.113.7:443".parse().unwrap(),
             probes_sent: 0,
@@ -1077,7 +1078,10 @@ mod tests {
                 kind: CandidateKind::ServerReflexive,
                 priority: 7,
             }],
-            nat_type: NatType::AddressDependent,
+            nat: FamilyNat {
+                v4: NatType::AddressDependent,
+                v6: NatType::AddressDependent,
+            },
             bound_port: 5000,
             detachable: true,
             features: vec![],
@@ -1088,7 +1092,13 @@ mod tests {
     fn the_offer_yields_the_key_material_and_the_peers_candidates() {
         let facts = host_facts(a_host_hello()).expect("a hello is an offer");
         assert_eq!(facts.host_spki, HostSpki::new([1u8; 32]));
-        assert_eq!(facts.nat, NatType::AddressDependent);
+        assert_eq!(
+            facts.nat,
+            FamilyNat {
+                v4: NatType::AddressDependent,
+                v6: NatType::AddressDependent,
+            }
+        );
         assert_eq!(facts.candidates.len(), 1);
     }
 
@@ -1137,7 +1147,7 @@ mod tests {
     #[test]
     fn the_path_comes_from_the_hosts_established() {
         let path = PathDescription {
-            rung: Rung::StunPunch,
+            rung: Rung::Punched(Family::V4),
             local: "192.0.2.1:1".parse().expect("a test address"),
             remote: "198.51.100.1:2".parse().expect("a test address"),
             probes_sent: 4,

@@ -31,7 +31,7 @@ pub struct ScrollbackReq {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NatType, PathDescription, Rung, TerminalCaps};
+    use crate::{Family, NatType, PathDescription, Rung, TerminalCaps};
 
     fn caps() -> TerminalCaps {
         TerminalCaps {
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn a_status_reply_carries_the_path() {
         match round_trip(&ControlMsg::StatusReply(PathDescription {
-            rung: Rung::PortMapped,
+            rung: Rung::PortMapped(Family::V4),
             local: "0.0.0.0:443".parse().unwrap(),
             remote: "198.51.100.1:60000".parse().unwrap(),
             probes_sent: 0,
@@ -99,7 +99,7 @@ mod tests {
             mtu: 1392,
         })) {
             ControlMsg::StatusReply(p) => {
-                assert_eq!(p.rung, Rung::PortMapped);
+                assert_eq!(p.rung, Rung::PortMapped(Family::V4));
                 assert_eq!(p.rtt_ms, 38);
                 assert_eq!(p.mtu, 1392);
             }

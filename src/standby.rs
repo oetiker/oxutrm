@@ -377,7 +377,7 @@ impl Standby {
 mod tests {
     use super::*;
     use crate::linkstate::{FAILOVER_GRACE, PROBE_RETRY, STANDBY_DELAY, standby_backoff};
-    use oxutrm_proto::{NatType, Rung};
+    use oxutrm_proto::{Family, NatType, Rung};
     use std::time::Duration;
 
     /// A real standby link, as a search would hand it over, and the host end
@@ -387,7 +387,7 @@ mod tests {
         let e = Established {
             link: client,
             path: PathDescription {
-                rung: Rung::StunPunch,
+                rung: Rung::Punched(Family::V4),
                 local: "127.0.0.1:1".parse().unwrap(),
                 remote: "203.0.113.7:443".parse().unwrap(),
                 probes_sent: 0,

@@ -121,10 +121,10 @@ for example `oxutrm  IPv6 direct  ·  11 ms  ·  mtu 1452`.
 The host listens on UDP port 443 where it may, else on another port.
 The client and the host then try these paths in order, and the first that validates carries the session:
 
-1. IPv6 direct, when both ends have a global IPv6 address.
-2. A port mapping on the router, through NAT-PMP, PCP or UPnP-IGD.
-3. STUN and a UDP hole punch.
-4. A birthday-paradox punch, for symmetric NAT.
+1. Direct, over IPv6, then over IPv4: both ends' own addresses, which includes a LAN or a VPN.
+2. A port mapping on the router, through NAT-PMP, PCP or UPnP-IGD, over IPv6, then over IPv4.
+3. STUN and a UDP hole punch, over IPv6, then over IPv4.
+4. A birthday-paradox punch, for symmetric NAT, over IPv6, then over IPv4.
 5. A tunnel inside the ssh connection, when no UDP path works.
 
 A session on the ssh tunnel is reported as a warning.

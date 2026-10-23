@@ -5,11 +5,41 @@
 ### New
 
 ### Changed
+- **The status line names the address family of every path.** A path over a
+  LAN or VPN address now reads "IPv4 direct" instead of "IPv4 punched", and a
+  router port mapping reads "IPv4 port mapped".
+
 - **Building oxutrm from source needs the current stable Rust.** oxutrm no
   longer names an oldest supported Rust version, so an older compiler fails
   with compile errors instead of a message about the version.
 
+- **`client.log` keeps the whole reason a path search failed.** The file
+  used to keep only the first line, so the verdict of each rung of the
+  connection ladder was lost; it now keeps every line, joined into one, and
+  names the addresses both ends offered. The popup still shows one line.
+
+- **A symmetric IPv4 NAT no longer stops IPv6 punching.** The NAT type is
+  learned for each address family, and a failure report lists every path
+  class once per family, saying which end lacks a family.
+
+- **A client and a host must both be updated.** This release changes the
+  protocol version to 7: the client refuses a host session started by an
+  older oxutrm, and the selector lists it as `old version`. End such
+  sessions, and update the client and the host together, before connecting.
+
 ### Fixed
+- **The birthday punch aims at an address family both ends can use.** It
+  guessed around the peer's best public address, which could be IPv6 when this
+  end had none, and then could never succeed. It now runs per family, only
+  for a family where one end's NAT is symmetric, address-dependent or
+  unknown, and only when both ends found their public address in that
+  family, so the two ends always blast at the same time.
+
+- **A machine with a global IPv6 address connects over public IPv4 again.**
+  Its STUN queries all went over IPv6, so it never learned its public IPv4
+  address, and a host with IPv4 only had nothing to punch towards: the
+  session took a VPN or other private path, or none at all. Both address
+  families are now queried.
 
 ## 0.4.0 - 2026-10-16
 ### New

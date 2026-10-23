@@ -9,7 +9,8 @@ use std::path::Path;
 use oxutrm_host::attach::{AttachError, connect_to_session, format_session_list, relay_signals};
 use oxutrm_host::{Registry, RegistryGuard, SessionMeta, begin_attach, now_unix};
 use oxutrm_proto::{
-    ClientSpki, HostSpki, NatType, PROTO_VERSION, Psk, Rung, Signal, TermSize, TerminalCaps,
+    ClientSpki, Family, FamilyNat, HostSpki, PROTO_VERSION, Psk, Rung, Signal, TermSize,
+    TerminalCaps,
 };
 use tokio::io::BufReader;
 
@@ -62,7 +63,7 @@ fn client_hello() -> Signal {
         // without it is a client the host has nothing to authenticate.
         cert_spki_sha256: ClientSpki::new([0x11; 32]),
         candidates: vec![],
-        nat_type: NatType::Unknown,
+        nat: FamilyNat::UNKNOWN,
         caps: TerminalCaps {
             truecolor: true,
             colors: 16_777_216,
@@ -280,7 +281,7 @@ fn the_minted_key_material_survives_the_wire_unchanged() {
         cert_spki_sha256: attach.keys.cert_spki_sha256(),
         psk: attach.keys.psk().clone(),
         candidates: vec![],
-        nat_type: NatType::Unknown,
+        nat: FamilyNat::UNKNOWN,
         bound_port: 443,
         detachable: true,
         features: vec![],
@@ -365,7 +366,7 @@ async fn the_relay_refuses_to_carry_garbage_into_a_session() {
 #[test]
 fn the_listing_shows_detachability_rather_than_implying_it() {
     let mut ok = meta("1111111111111111aaaaaaaaaaaaaaaa", 4242);
-    ok.set_detachable(Rung::Ipv6Direct);
+    ok.set_detachable(Rung::Direct(Family::V6));
     let mut tunnelled = meta("2222222222222222bbbbbbbbbbbbbbbb", 4243);
     tunnelled.set_detachable(Rung::SshTunnel);
 

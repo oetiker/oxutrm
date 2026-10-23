@@ -169,17 +169,154 @@ pub enum NatType {
     Unknown,
 }
 
-/// Which rung of the ladder produced the path in use.
+/// The NAT type of each address family, side by side.
 ///
-/// `SshTunnel` is not merely slower: a session on it runs its transport inside
-/// the SSH connection, so it can never daemonize and can never be reattached.
+/// The two families are classified separately because they fail separately:
+/// IPv6 is usually unNATed (`None`) while the same host's IPv4 sits behind a
+/// symmetric NAT, and a single verdict would hide one behind the other. Each
+/// rung of the ladder belongs to one family, so the planner asks for the NAT
+/// of the family it is planning, never for a merged answer. A family nobody
+/// probed (no socket in that family, no server answered) is `Unknown`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FamilyNat {
+    pub v4: NatType,
+    pub v6: NatType,
+}
+
+impl FamilyNat {
+    /// Nothing is known about either family.
+    pub const UNKNOWN: FamilyNat = FamilyNat {
+        v4: NatType::Unknown,
+        v6: NatType::Unknown,
+    };
+
+    /// The NAT type of one family.
+    pub fn get(self, f: Family) -> NatType {
+        match f {
+            Family::V4 => self.v4,
+            Family::V6 => self.v6,
+        }
+    }
+}
+
+/// An address family. Every rung of the ladder except the ssh tunnel exists
+/// once per family, because the two families fail independently: a host can
+/// have a working IPv6 path while its IPv4 NAT is symmetric, or the reverse.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    /// Both families in ladder order: IPv6 first, because it needs no NAT
+    /// traversal and so is the cheaper path whenever it works.
+    pub const BOTH: [Family; 2] = [Family::V6, Family::V4];
+
+    /// The family of an address. A v4-mapped IPv6 address (`::ffff:a.b.c.d`)
+    /// is an IPv4 path that a dual-stack socket reports in IPv6 clothing, so
+    /// it counts as `V4`.
+    pub fn of(addr: &std::net::SocketAddr) -> Family {
+        if addr.ip().to_canonical().is_ipv4() {
+            Family::V4
+        } else {
+            Family::V6
+        }
+    }
+
+    /// The name shown to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            Family::V4 => "IPv4",
+            Family::V6 => "IPv6",
+        }
+    }
+}
+
+/// Which rung of the ladder produced the path in use: a method, and for every
+/// method but the ssh tunnel the address family it ran in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Rung {
-    Ipv6Direct,
-    PortMapped,
-    StunPunch,
-    Birthday,
+    /// Both ends' own addresses, with no NAT in the way that needs help. This
+    /// includes an IPv4 path over a LAN or VPN.
+    Direct(Family),
+    /// An address the router was asked to open (UPnP, NAT-PMP, PCP).
+    PortMapped(Family),
+    /// A STUN-learned address, reached by simultaneous probing.
+    Punched(Family),
+    /// The birthday blast against a symmetric NAT.
+    Birthday(Family),
+    /// `SshTunnel` is not merely slower: a session on it runs its transport
+    /// inside the SSH connection, so it can never daemonize and can never be
+    /// reattached.
     SshTunnel,
+}
+
+impl Rung {
+    /// Every rung in ladder order: per method, IPv6 before IPv4.
+    pub const ALL: [Rung; 9] = [
+        Rung::Direct(Family::V6),
+        Rung::Direct(Family::V4),
+        Rung::PortMapped(Family::V6),
+        Rung::PortMapped(Family::V4),
+        Rung::Punched(Family::V6),
+        Rung::Punched(Family::V4),
+        Rung::Birthday(Family::V6),
+        Rung::Birthday(Family::V4),
+        Rung::SshTunnel,
+    ];
+
+    /// The address family of the rung, or `None` for the ssh tunnel.
+    pub fn family(self) -> Option<Family> {
+        match self {
+            Rung::Direct(f) | Rung::PortMapped(f) | Rung::Punched(f) | Rung::Birthday(f) => Some(f),
+            Rung::SshTunnel => None,
+        }
+    }
+
+    /// The number of the method, shared by both families: direct 0, port
+    /// mapped 1, punched 2, birthday 3, ssh tunnel 4.
+    pub fn method_number(self) -> u8 {
+        match self {
+            Rung::Direct(_) => 0,
+            Rung::PortMapped(_) => 1,
+            Rung::Punched(_) => 2,
+            Rung::Birthday(_) => 3,
+            Rung::SshTunnel => 4,
+        }
+    }
+
+    /// The rung a nominated remote candidate belongs to. This is the single
+    /// classifier: ICE labels the path it nominates with it, and the ladder
+    /// uses it to tell which rung a candidate pair belongs to.
+    ///
+    /// A `Host` candidate is a direct path in either family: an IPv4 host
+    /// address is a LAN or VPN address, and reaching it needs no punching.
+    pub fn of_candidate(kind: CandidateKind, remote: std::net::SocketAddr) -> Rung {
+        let f = Family::of(&remote);
+        match kind {
+            CandidateKind::PortMapped => Rung::PortMapped(f),
+            CandidateKind::Host => Rung::Direct(f),
+            CandidateKind::ServerReflexive | CandidateKind::PeerReflexive => Rung::Punched(f),
+        }
+    }
+}
+
+impl std::fmt::Display for Rung {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let method = match self {
+            Rung::Direct(_) => "direct",
+            Rung::PortMapped(_) => "port mapped",
+            Rung::Punched(_) => "punched",
+            Rung::Birthday(_) => "birthday",
+            Rung::SshTunnel => return f.pad("SSH tunnel"),
+        };
+        // `pad`, not `write!`, so a caller's width and fill (`{:<20}`) apply.
+        match self.family() {
+            Some(fam) => f.pad(&format!("{} {method}", fam.label())),
+            None => f.pad(method),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -219,6 +356,9 @@ pub struct PathDescription {
     pub local: std::net::SocketAddr,
     pub remote: std::net::SocketAddr,
     pub probes_sent: u32,
+    /// The NAT of the nominated rung's family, or `Unknown` for the ssh
+    /// tunnel, which crosses none. Not a merged verdict: the other family's
+    /// NAT was not on this path.
     pub nat_type: NatType,
     pub rtt_ms: u32,
     pub mtu: u16,
@@ -227,6 +367,16 @@ pub struct PathDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report lines rung names up in a column, so width and fill must apply.
+    #[test]
+    fn a_rung_honours_the_callers_width() {
+        assert_eq!(
+            format!("{:<14}|", Rung::Birthday(Family::V4)),
+            "IPv4 birthday |"
+        );
+        assert_eq!(format!("{:>12}|", Rung::SshTunnel), "  SSH tunnel|");
+    }
 
     #[test]
     fn term_size_round_trips_through_json() {
@@ -237,6 +387,21 @@ mod tests {
         let text = serde_json::to_string(&s).expect("encode");
         assert_eq!(text, r#"{"cols":132,"rows":43}"#);
         assert_eq!(serde_json::from_str::<TermSize>(&text).expect("decode"), s);
+    }
+
+    #[test]
+    fn the_nat_type_travels_per_family() {
+        let n = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::None,
+        };
+        assert_eq!(
+            serde_json::to_string(&n).unwrap(),
+            r#"{"v4":"Symmetric","v6":"None"}"#
+        );
+        assert_eq!(n.get(Family::V4), NatType::Symmetric);
+        assert_eq!(n.get(Family::V6), NatType::None);
+        assert_eq!(FamilyNat::UNKNOWN.get(Family::V6), NatType::Unknown);
     }
 
     #[test]
@@ -257,12 +422,71 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&NatType::None).unwrap(), r#""None""#);
         assert_eq!(
-            serde_json::to_string(&Rung::Ipv6Direct).unwrap(),
-            r#""Ipv6Direct""#
+            serde_json::to_string(&Rung::Direct(Family::V6)).unwrap(),
+            r#"{"Direct":"V6"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Rung::Punched(Family::V4)).unwrap(),
+            r#"{"Punched":"V4"}"#
         );
         assert_eq!(
             serde_json::to_string(&Rung::SshTunnel).unwrap(),
             r#""SshTunnel""#
+        );
+    }
+
+    #[test]
+    fn a_host_candidate_is_direct_in_either_family() {
+        let v4: std::net::SocketAddr = "192.168.0.11:443".parse().unwrap();
+        let v6: std::net::SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::Host, v4),
+            Rung::Direct(Family::V4)
+        );
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::Host, v6),
+            Rung::Direct(Family::V6)
+        );
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::PortMapped, v6),
+            Rung::PortMapped(Family::V6)
+        );
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::ServerReflexive, v4),
+            Rung::Punched(Family::V4)
+        );
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::PeerReflexive, v6),
+            Rung::Punched(Family::V6)
+        );
+    }
+
+    #[test]
+    fn a_v4_mapped_address_is_ipv4() {
+        let mapped: std::net::SocketAddr = "[::ffff:192.0.2.7]:443".parse().unwrap();
+        assert_eq!(Family::of(&mapped), Family::V4);
+        assert_eq!(
+            Rung::of_candidate(CandidateKind::PeerReflexive, mapped),
+            Rung::Punched(Family::V4)
+        );
+    }
+
+    #[test]
+    fn every_rung_is_labelled_with_family_and_method_in_ladder_order() {
+        let labels: Vec<String> = Rung::ALL.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            labels,
+            [
+                "IPv6 direct",
+                "IPv4 direct",
+                "IPv6 port mapped",
+                "IPv4 port mapped",
+                "IPv6 punched",
+                "IPv4 punched",
+                "IPv6 birthday",
+                "IPv4 birthday",
+                "SSH tunnel",
+            ]
         );
     }
 
@@ -319,7 +543,7 @@ mod tests {
     #[test]
     fn a_path_description_round_trips() {
         let p = PathDescription {
-            rung: Rung::Birthday,
+            rung: Rung::Birthday(Family::V4),
             local: "[2001:db8::1]:443".parse().expect("local"),
             remote: "198.51.100.9:60001".parse().expect("remote"),
             probes_sent: 312,

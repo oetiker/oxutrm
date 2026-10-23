@@ -51,7 +51,7 @@ pub mod ssh;
 
 pub use daemon::{Detached, FD_DIRS, daemonize, daemonize_session, detach_process, sever_from_ssh};
 pub use keys::{Attach, AttachKeys, DetachPermit, PSK_LEN, begin_attach, settle_detachability};
-pub use ladder::LadderPlan;
+pub use ladder::{EndFacts, LadderPlan};
 pub use registry::{
     DirVerdict, META_FILE, NAMES_LOCK, NamesLock, PID_REUSE_SLACK_SECS, PrepareError,
     REGISTRY_SUBDIR, Registry, RegistryGuard, RegistryRoot, RegistryRootKind, RootEnv, SOCK_FILE,

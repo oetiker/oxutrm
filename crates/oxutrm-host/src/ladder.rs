@@ -18,12 +18,27 @@
 //!
 //! # Why the NAT type short-circuits
 //!
-//! Three STUN probes classify the NAT before any punching is attempted. When
-//! they report `Symmetric`, ordinary punching cannot work: the external port is
-//! different for every destination, so the address rung 2 learned describes a
-//! mapping the peer will never reach. Attempting it anyway burns several
-//! seconds to fail in a way already known in advance, so the plan skips it and
-//! goes to rung 3.
+//! Three STUN probes classify the NAT before any punching is attempted, once
+//! **per address family**: a dual-stack host often sits behind a symmetric
+//! IPv4 NAT while its IPv6 path is open, and one verdict for both would either
+//! throw the good path away or waste seconds on the bad one. When a family's
+//! probes report `Symmetric`, ordinary punching cannot work in that family: the
+//! external port is different for every destination, so the address rung 2
+//! learned describes a mapping the peer will never reach. Attempting it anyway
+//! burns several seconds to fail in a way already known in advance, so the plan
+//! skips that family's punch rung and leaves the family to the blast.
+//!
+//! The plan reads **both ends'** facts, and that is deliberate. A family one
+//! end has no address in is hopeless for every method, and the reason says
+//! whose address is missing. The birthday blast is worth its noise only when
+//! at least one end's NAT in that family changes its port per destination —
+//! symmetric, address-dependent, or unclassified — and it is possible only
+//! when **both** ends offered a server-reflexive candidate in that family,
+//! because each end guesses around the other's. Both rules depend on the
+//! unordered pair of facts, so client and host, each planning from its own
+//! point of view, reach the same decision about which family to blast. Were
+//! one end to blast while the other sat waiting, the blast would be aimed at
+//! nobody, and every later family's blast would fall out of step.
 //!
 //! # This module is policy only, and the mechanism is not a seam
 //!
@@ -62,12 +77,73 @@
 //! framing rules and for the same reason. Read them before writing it. Nothing
 //! here is a seam waiting for an implementor — this module ends at the plan.
 
-use oxutrm_proto::{NatType, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, NatType, Rung};
+
+/// What one end of the connection knows about itself, as far as planning is
+/// concerned.
+///
+/// Both ends build one: ours from our own classification and candidates, the
+/// peer's from the NAT types in its hello and the candidates it offered. The
+/// plan is a pure function of the pair, which is what lets the two ends agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndFacts {
+    /// What STUN typing concluded about this end's NAT, per family.
+    pub nat: FamilyNat,
+    /// Whether this end has any IPv4 address to offer.
+    pub v4: bool,
+    /// Whether this end has any IPv6 address to offer.
+    pub v6: bool,
+    /// Whether this end offered an IPv4 server-reflexive candidate: the
+    /// observed external port the peer's blast guesses around.
+    pub srflx_v4: bool,
+    /// Whether this end offered an IPv6 server-reflexive candidate.
+    pub srflx_v6: bool,
+}
+
+impl EndFacts {
+    /// Facts for an end offering `candidates`: a family is present when any
+    /// candidate is in it, and has a server-reflexive candidate when one of
+    /// those is.
+    #[must_use]
+    pub fn from_candidates(nat: FamilyNat, candidates: &[Candidate]) -> EndFacts {
+        let has = |f: Family| candidates.iter().any(|c| Family::of(&c.addr) == f);
+        let srflx = |f: Family| {
+            candidates.iter().any(|c| {
+                matches!(c.kind, CandidateKind::ServerReflexive) && Family::of(&c.addr) == f
+            })
+        };
+        EndFacts {
+            nat,
+            v4: has(Family::V4),
+            v6: has(Family::V6),
+            srflx_v4: srflx(Family::V4),
+            srflx_v6: srflx(Family::V6),
+        }
+    }
+
+    /// Whether this end has an address in `f`.
+    #[must_use]
+    pub fn has(&self, f: Family) -> bool {
+        match f {
+            Family::V4 => self.v4,
+            Family::V6 => self.v6,
+        }
+    }
+
+    /// Whether this end offered a server-reflexive candidate in `f`.
+    #[must_use]
+    pub fn has_srflx(&self, f: Family) -> bool {
+        match f {
+            Family::V4 => self.srflx_v4,
+            Family::V6 => self.srflx_v6,
+        }
+    }
+}
 
 /// Which rungs to try, grouped by whether they can be raced.
 ///
-/// A plan is decided from the NAT type before anything is attempted, so the
-/// decision is inspectable and testable on its own.
+/// A plan is decided from both ends' facts before anything is attempted, so
+/// the decision is inspectable and testable on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LadderPlan {
     /// Raced together. Cheap, and the first to validate wins.
@@ -79,40 +155,123 @@ pub struct LadderPlan {
 }
 
 impl LadderPlan {
-    /// The plan for a given NAT classification.
+    /// The plan for two ends' facts, decided per address family.
     ///
     /// `NatType::Unknown` is treated as "might be anything", so nothing is
-    /// skipped: guessing wrong towards skipping costs a connection, while
-    /// guessing wrong towards attempting costs a few seconds.
+    /// skipped on its account: guessing wrong towards skipping costs a
+    /// connection, while guessing wrong towards attempting costs a few seconds.
     #[must_use]
-    pub fn for_nat(nat: NatType) -> LadderPlan {
-        let mut skipped = Vec::new();
+    pub fn for_ends(ours: &EndFacts, theirs: &EndFacts) -> LadderPlan {
+        let mut skipped: Vec<(Rung, String)> = Vec::new();
 
-        // Rung 2 cannot work behind a symmetric NAT: the external port differs
-        // per destination, so the address it learned names a mapping the peer
-        // will never reach. Failing to notice costs several seconds to discover
-        // something the three-probe classification already established.
-        let punch_is_hopeless = matches!(nat, NatType::Symmetric);
-        if punch_is_hopeless {
-            skipped.push((
-                Rung::StunPunch,
-                "the NAT is symmetric, so its external port differs per \
-                 destination and ordinary punching cannot reach it"
-                    .to_string(),
-            ));
+        for family in Family::BOTH {
+            let label = family.label();
+            let family_rungs = || {
+                Rung::ALL
+                    .into_iter()
+                    .filter(move |r| r.family() == Some(family))
+            };
+
+            // A family one end lacks cannot carry any method at all.
+            let missing = if !ours.has(family) {
+                Some(format!("this end has no {label} address"))
+            } else if !theirs.has(family) {
+                Some(format!("the peer has no {label} address"))
+            } else {
+                None
+            };
+            if let Some(why) = missing {
+                for rung in family_rungs() {
+                    skipped.push((rung, why.clone()));
+                }
+                continue;
+            }
+
+            // Rung 2 cannot work behind a NAT whose mapping changes per
+            // destination: the address it learned names a mapping the peer
+            // will never reach. Symmetric does that per destination address
+            // and port, address-dependent per destination address alone, and
+            // a peer is always a different address from the STUN server, so
+            // the two are equally hopeless here (see `oxutrm_net::discover`).
+            // Only *our* NAT is consulted: the peer's own plan skips its punch
+            // rung for its own NAT.
+            let nat = ours.nat.get(family);
+            if matches!(nat, NatType::Symmetric | NatType::AddressDependent) {
+                let kind = if nat == NatType::Symmetric {
+                    "symmetric"
+                } else {
+                    "address-dependent"
+                };
+                skipped.push((
+                    Rung::Punched(family),
+                    format!(
+                        "the {label} NAT is {kind}, so its external port differs per \
+                         destination and ordinary punching is not expected to reach it"
+                    ),
+                ));
+            }
+
+            // The blast is noisy, so it is planned only when ordinary punching
+            // might not do: some end's NAT in this family changes its port per
+            // destination, or is unclassified and so possibly does. And it is
+            // possible only when both ends offered a server-reflexive
+            // candidate in this family, because each end guesses around the
+            // other's observed port: with one missing, only one end could
+            // blast, and it would spend its whole budget at nobody. Both rules
+            // read the unordered pair, so both ends decide alike.
+            let might_need_blast = |n: NatType| {
+                matches!(
+                    n,
+                    NatType::Symmetric | NatType::AddressDependent | NatType::Unknown
+                )
+            };
+            let no_blast = if !might_need_blast(ours.nat.get(family))
+                && !might_need_blast(theirs.nat.get(family))
+            {
+                Some(format!(
+                    "neither end's {label} NAT changes its port per destination, so \
+                     ordinary punching covers it"
+                ))
+            } else if !ours.has_srflx(family) {
+                Some(format!(
+                    "this end offered no {label} server-reflexive candidate, so the peer \
+                     has no observed external port to guess around, and a blast from one \
+                     end alone is aimed at nobody"
+                ))
+            } else if !theirs.has_srflx(family) {
+                Some(format!(
+                    "the peer offered no {label} server-reflexive candidate, so there is \
+                     no observed external port to guess around"
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = no_blast {
+                skipped.push((Rung::Birthday(family), why));
+            }
         }
+
+        let is_skipped = |r: &Rung| skipped.iter().any(|(s, _)| s == r);
 
         // `raced` names the candidate classes the one ICE agent should gather
-        // and check together, not three things to spawn. See the module note.
-        let mut raced = vec![Rung::Ipv6Direct, Rung::PortMapped];
-        if !punch_is_hopeless {
-            raced.push(Rung::StunPunch);
-        }
+        // and check together, not things to spawn. See the module note. Every
+        // method appears once per family, IPv6 first.
+        let raced: Vec<Rung> = Rung::ALL
+            .into_iter()
+            .filter(|r| matches!(r, Rung::Direct(_) | Rung::PortMapped(_) | Rung::Punched(_)))
+            .filter(|r| !is_skipped(r))
+            .collect();
 
         // The blast is deliberately noisy, so it never joins the race. It is
         // reached only when the cheap rungs have produced nothing -- or gone to
-        // first when punching is already known to be hopeless.
-        let sequential = vec![Rung::Birthday, Rung::SshTunnel];
+        // first when punching is already known to be hopeless. The tunnel is
+        // always last.
+        let mut sequential: Vec<Rung> = Rung::ALL
+            .into_iter()
+            .filter(|r| matches!(r, Rung::Birthday(_)))
+            .filter(|r| !is_skipped(r))
+            .collect();
+        sequential.push(Rung::SshTunnel);
 
         LadderPlan {
             raced,

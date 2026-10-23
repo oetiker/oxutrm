@@ -55,9 +55,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use oxutrm_host::LadderPlan;
+use oxutrm_host::{EndFacts, LadderPlan};
 use oxutrm_net::{BlastOutcome, IceAgent, IceEvent, IceRole, NetConfig, birthday_blast};
-use oxutrm_proto::{Candidate, CandidateKind, NatType, Psk, Rung};
+use oxutrm_proto::{Candidate, CandidateKind, Family, FamilyNat, Psk, Rung};
 
 /// The path the ladder settled on, and the socket it belongs to.
 ///
@@ -129,48 +129,22 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LadderReport {
     entries: Vec<(Rung, Verdict)>,
-}
-
-/// Every rung, in ladder order. The report walks this rather than the plan, so
-/// a rung the plan never mentioned still appears — with `NotReached` — instead
-/// of vanishing from the account.
-const EVERY_RUNG: [Rung; 5] = [
-    Rung::Ipv6Direct,
-    Rung::PortMapped,
-    Rung::StunPunch,
-    Rung::Birthday,
-    Rung::SshTunnel,
-];
-
-/// Which number the user sees. The spec numbers the ladder from zero and the
-/// status line, the docs and the bug reports all use those numbers.
-fn rung_number(rung: Rung) -> u8 {
-    match rung {
-        Rung::Ipv6Direct => 0,
-        Rung::PortMapped => 1,
-        Rung::StunPunch => 2,
-        Rung::Birthday => 3,
-        Rung::SshTunnel => 4,
-    }
-}
-
-fn rung_name(rung: Rung) -> &'static str {
-    match rung {
-        Rung::Ipv6Direct => "IPv6 direct",
-        Rung::PortMapped => "router port mapping",
-        Rung::StunPunch => "STUN punch",
-        Rung::Birthday => "birthday blast",
-        Rung::SshTunnel => "SSH tunnel",
-    }
+    /// Both sides' candidates, as the race saw them. "No validated path after
+    /// 31 probes" says nothing about *which* addresses were probed, and that is
+    /// the first thing anyone reading a failure needs.
+    ours: String,
+    theirs: String,
 }
 
 impl LadderReport {
     fn new() -> LadderReport {
         LadderReport {
-            entries: EVERY_RUNG
+            entries: Rung::ALL
                 .iter()
                 .map(|r| (*r, Verdict::NotReached))
                 .collect(),
+            ours: candidate_list(&[]),
+            theirs: candidate_list(&[]),
         }
     }
 
@@ -212,12 +186,14 @@ impl fmt::Display for LadderReport {
             writeln!(
                 f,
                 "  rung {}  {:<20}  {:<11}  {}",
-                rung_number(*rung),
-                rung_name(*rung),
+                rung.method_number(),
+                rung.to_string(),
                 verdict.word(),
                 verdict.detail()
             )?;
         }
+        writeln!(f, "  ours:   {}", self.ours)?;
+        writeln!(f, "  theirs: {}", self.theirs)?;
         write!(
             f,
             "A rung marked `skipped` was never put on the wire; one marked \
@@ -227,6 +203,26 @@ impl fmt::Display for LadderReport {
 }
 
 impl std::error::Error for LadderReport {}
+
+/// `kind addr` per candidate, comma-separated, or `none`.
+fn candidate_list(cands: &[Candidate]) -> String {
+    if cands.is_empty() {
+        return "none".to_string();
+    }
+    cands
+        .iter()
+        .map(|c| {
+            let kind = match c.kind {
+                CandidateKind::Host => "host",
+                CandidateKind::PortMapped => "mapped",
+                CandidateKind::ServerReflexive => "srflx",
+                CandidateKind::PeerReflexive => "prflx",
+            };
+            format!("{kind} {}", c.addr)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Everything the ladder needs that is not the socket.
 ///
@@ -240,8 +236,13 @@ pub struct Ladder<'a> {
     /// The client is always `Controlling`; the host is always `Controlled`.
     /// Only the controlling side nominates — see `oxutrm_net::ice`.
     pub role: IceRole,
-    /// What STUN typing concluded about *our* NAT. It selects the plan.
-    pub nat: NatType,
+    /// What STUN typing concluded about *our* NAT, per address family. It
+    /// selects the plan.
+    pub nat: FamilyNat,
+    /// What the peer's hello says about *its* NAT, per address family. The
+    /// plan reads both ends so that each side reaches the same decision about
+    /// the blast.
+    pub peer_nat: FamilyNat,
     pub cfg: &'a NetConfig,
     /// Our own candidates, as offered to the peer.
     pub local: Vec<Candidate>,
@@ -252,33 +253,22 @@ pub struct Ladder<'a> {
     pub admit_remote: Option<oxutrm_net::RemoteFilter>,
 }
 
-/// Which rung a remote candidate belongs to.
+/// The peer address the blast guesses around, in `family`.
 ///
-/// **This mirrors `IceAgent::nominated_event`** (`crates/oxutrm-net/src/ice.rs`,
-/// the `match kind` deciding the `Rung`), which is private. The mirror is what
-/// lets the report say "rung 0 was skipped because the peer offered no IPv6
-/// host candidate" instead of blaming a rung that never had anything to try.
-/// If the two ever disagree, the report lies about a rung — so
-/// `the_rung_classification_matches_the_one_ice_nominates_by` pins the rule.
-fn rung_of(remote: &Candidate) -> Rung {
-    match remote.kind {
-        CandidateKind::PortMapped => Rung::PortMapped,
-        CandidateKind::Host if remote.addr.is_ipv6() => Rung::Ipv6Direct,
-        _ => Rung::StunPunch,
-    }
-}
-
-/// The peer address the blast guesses around.
+/// The family matters because a blast sends from this end's sockets of that
+/// family: an IPv6 base is unreachable from an IPv4-only end and the other way
+/// round, so the best address overall is not the best address to blast.
 ///
 /// A server-reflexive candidate is the only useful base: it is a real external
 /// mapping a STUN server observed, and rung 3's whole premise is that a
 /// symmetric NAT's next allocation lands *near* the last one. A host candidate
 /// is an interface address behind the NAT and names no mapping at all, so
 /// guessing ports around it aims 65k packets at the wrong machine.
-fn blast_base(remote: &[Candidate]) -> Option<SocketAddr> {
+fn blast_base(remote: &[Candidate], family: Family) -> Option<SocketAddr> {
     remote
         .iter()
         .filter(|c| matches!(c.kind, CandidateKind::ServerReflexive))
+        .filter(|c| Family::of(&c.addr) == family)
         .max_by_key(|c| c.priority)
         .map(|c| c.addr)
 }
@@ -293,15 +283,24 @@ fn blast_base(remote: &[Candidate]) -> Option<SocketAddr> {
 /// silently stops working.
 ///
 /// On success the caller gets a socket. On failure it gets [`LadderReport`],
-/// which names all five rungs.
+/// which names every rung (nine: four methods in two families, and the ssh tunnel).
+///
+/// The skip reasons for raced rungs are built only from the hello's
+/// candidates; candidates that trickle in later via `CandidateUpdate` feed the
+/// race but are not considered when the plan explains what it skipped.
 pub async fn nominate(
     socket: Arc<tokio::net::UdpSocket>,
     ladder: Ladder<'_>,
     inbound: &mut tokio::sync::mpsc::Receiver<Candidate>,
     learned: &tokio::sync::mpsc::Sender<Candidate>,
 ) -> Result<Nomination, LadderReport> {
-    let plan = LadderPlan::for_nat(ladder.nat);
+    let plan = LadderPlan::for_ends(
+        &EndFacts::from_candidates(ladder.nat, &ladder.local),
+        &EndFacts::from_candidates(ladder.peer_nat, &ladder.remote),
+    );
     let mut report = LadderReport::new();
+    report.ours = candidate_list(&ladder.local);
+    report.theirs = candidate_list(&ladder.remote);
 
     // The plan's own skips first: these are decisions taken from the NAT type
     // before a packet exists, and they carry the reason with them.
@@ -316,13 +315,17 @@ pub async fn nominate(
         if matches!(report.verdict(*rung), Verdict::Skipped(_)) {
             continue;
         }
-        if !ladder.remote.iter().any(|c| rung_of(c) == *rung) {
+        if !ladder
+            .remote
+            .iter()
+            .any(|c| Rung::of_candidate(c.kind, c.addr) == *rung)
+        {
             report.set(
                 *rung,
                 Verdict::Skipped(format!(
                     "the peer offered no candidate of this class ({} of theirs, none on rung {})",
                     ladder.remote.len(),
-                    rung_number(*rung)
+                    rung
                 )),
             );
         }
@@ -370,10 +373,18 @@ pub async fn nominate(
         }
     }
 
-    // Rung 3. Reached either because the race produced nothing, or because the
-    // NAT is symmetric and the plan sent us straight here.
-    if plan.sequential.contains(&Rung::Birthday) {
-        match blast(&ladder, probes).await {
+    // Rung 3, once per planned family. Reached either because the race
+    // produced nothing, or because a NAT is symmetric and the plan sent us
+    // straight here. Each `Birthday(f)` the plan admitted is blasted at a base
+    // of its own family, in plan order, and the first win returns at once.
+    //
+    // Only a birthday rung the plan admitted is run or recorded; the plan's
+    // own skips (and their reasons) stand in the report untouched.
+    for rung in &plan.sequential {
+        let Rung::Birthday(family) = *rung else {
+            continue;
+        };
+        match blast(&ladder, family, probes).await {
             // The blast nominates without going through `IceAgent::best_validated`,
             // so it carries its own veto (ruling S5). This falls through to the
             // next rung exactly as a failed blast does, rather than returning
@@ -386,18 +397,25 @@ pub async fn nominate(
                     .is_some_and(|f| !f(nomination.remote)) =>
             {
                 report.set(
-                    Rung::Birthday,
+                    *rung,
                     Verdict::Failed(format!(
                         "{} is reached the same way as the link this is standing by for",
                         nomination.remote
                     )),
                 );
+                // The veto is still a blast that fired its packets. The
+                // nomination's total already includes `probes`, so only the
+                // blast's own share is added.
+                probes = nomination.probes;
             }
             Ok(nomination) => {
-                report.set(Rung::Birthday, Verdict::Won);
+                report.set(*rung, Verdict::Won);
                 return Ok(nomination);
             }
-            Err(verdict) => report.set(Rung::Birthday, verdict),
+            Err((verdict, sent)) => {
+                report.set(*rung, verdict);
+                probes = probes.saturating_add(sent);
+            }
         }
     }
 
@@ -512,19 +530,34 @@ async fn race(
     }
 }
 
-/// Rung 3. `Err` carries the verdict to record, because every way this rung
-/// ends short of a path is a reason somebody has to read.
-async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Verdict> {
+/// Rung 3 in one address family. `Err` carries the verdict to record, because
+/// every way this rung ends short of a path is a reason somebody has to read,
+/// and the number of probes this blast itself sent, so that a later family's
+/// win still reports the cost of the misses before it.
+async fn blast(
+    ladder: &Ladder<'_>,
+    family: Family,
+    already_sent: u32,
+) -> Result<Nomination, (Verdict, u32)> {
     if !ladder.cfg.enable_birthday {
-        return Err(Verdict::Skipped(
-            "the birthday blast is switched off in this configuration".to_string(),
+        return Err((
+            Verdict::Skipped(
+                "the birthday blast is switched off in this configuration".to_string(),
+            ),
+            0,
         ));
     }
-    let Some(base) = blast_base(&ladder.remote) else {
-        return Err(Verdict::Skipped(
-            "the peer offered no server-reflexive candidate, so there is no \
-             observed external port to guess around"
-                .to_string(),
+    // Defensive only: the plan admits `Birthday(f)` only when both ends
+    // offered a server-reflexive candidate in `f`, so this should be
+    // unreachable. Were it reached, this end would skip while the peer blasts.
+    let Some(base) = blast_base(&ladder.remote, family) else {
+        return Err((
+            Verdict::Skipped(format!(
+                "the peer offered no {} server-reflexive candidate, so there is no \
+                 observed external port to guess around",
+                family.label()
+            )),
+            0,
         ));
     };
 
@@ -534,8 +567,15 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
         // The miss carries its own numbers now: this text is the
         // rung's verdict, printed at connect time before any session owns a
         // screen, so showing them here is still safe.
-        Ok(BlastOutcome::Miss(miss)) => return Err(Verdict::Failed(miss.to_string())),
-        Err(e) => return Err(Verdict::Failed(format!("the blast could not start: {e}"))),
+        Ok(BlastOutcome::Miss(miss)) => {
+            return Err((Verdict::Failed(miss.to_string()), miss.probes));
+        }
+        Err(e) => {
+            return Err((
+                Verdict::Failed(format!("the blast could not start: {e}")),
+                0,
+            ));
+        }
     };
 
     // Property 2 in the concrete: the mapping belongs to THIS socket, so this
@@ -543,20 +583,25 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
     // mapping names a hole the peer never reached.
     let probes = already_sent.saturating_add(found.probes);
     let remote = found.remote;
+    let found_probes = found.probes;
     let socket = match adopt(found.socket) {
         Ok(s) => s,
         Err(e) => {
-            return Err(Verdict::Failed(format!(
-                "the blast punched a hole but its socket could not be adopted: {e}"
-            )));
+            return Err((
+                Verdict::Failed(format!(
+                    "the blast punched a hole but its socket could not be adopted: {e}"
+                )),
+                found_probes,
+            ));
         }
     };
     let local = match socket.local_addr() {
         Ok(a) => a,
         Err(e) => {
-            return Err(Verdict::Failed(format!(
-                "the blast's socket has no local address: {e}"
-            )));
+            return Err((
+                Verdict::Failed(format!("the blast's socket has no local address: {e}")),
+                found_probes,
+            ));
         }
     };
 
@@ -564,7 +609,7 @@ async fn blast(ladder: &Ladder<'_>, already_sent: u32) -> Result<Nomination, Ver
         socket,
         local,
         remote,
-        rung: Rung::Birthday,
+        rung: Rung::Birthday(family),
         probes,
     })
 }
@@ -584,6 +629,7 @@ pub(crate) fn adopt(socket: std::net::UdpSocket) -> std::io::Result<Arc<tokio::n
 mod tests {
     use super::*;
     use oxutrm_net::ice_priority;
+    use oxutrm_proto::NatType;
     use std::time::Duration;
 
     const PSK: Psk = Psk::new([0x5a; 32]);
@@ -629,6 +675,101 @@ mod tests {
         (rx_in, tx_out)
     }
 
+    /// The plan's skip stands: with neither NAT symmetric the blast is not
+    /// admitted, so it is neither run nor given a verdict of its own, even
+    /// with the blast switched on and a base to guess around.
+    #[tokio::test]
+    async fn a_birthday_rung_the_plan_skipped_keeps_the_plans_reason() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let both = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::EndpointIndependent,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat: both,
+                peer_nat: both,
+                cfg: &NetConfig {
+                    enable_birthday: true,
+                    ..cfg(120)
+                },
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+        let birthday = report.verdict(Rung::Birthday(Family::V4)).clone();
+        assert!(
+            matches!(&birthday, Verdict::Skipped(why) if why.contains("ordinary punching covers it")),
+            "{birthday:?}"
+        );
+    }
+
+    /// Property 4 across families: the IPv6 NAT is unknown, so the blast is
+    /// wanted there, but the peer's only server-reflexive candidate is IPv4.
+    /// The plan skips the IPv6 blast naming whose base is missing -- on both
+    /// ends alike, so neither blasts alone -- and nothing may read "an earlier
+    /// rung won".
+    #[tokio::test]
+    async fn a_blast_with_no_peer_base_in_its_family_is_skipped_by_name() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let nat = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::Unknown,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat,
+                peer_nat: nat,
+                cfg: &NetConfig {
+                    enable_birthday: true,
+                    ..cfg(120)
+                },
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("[::1]:1", CandidateKind::Host),
+                    candidate("[::1]:2", CandidateKind::ServerReflexive),
+                ],
+                remote: vec![
+                    candidate("127.0.0.1:9", CandidateKind::ServerReflexive),
+                    candidate("[::1]:9", CandidateKind::Host),
+                ],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+        for rung in Rung::ALL {
+            assert!(
+                !matches!(report.verdict(rung), Verdict::NotReached),
+                "{rung} was left unaccounted for:\n{report}"
+            );
+        }
+        assert!(
+            matches!(report.verdict(Rung::Birthday(Family::V6)),
+                Verdict::Skipped(why)
+                    if why.contains("peer offered no IPv6 server-reflexive candidate")),
+            "{:?}",
+            report.verdict(Rung::Birthday(Family::V6))
+        );
+    }
+
     // ------------------------------------------------------ property 4
 
     /// The property the deleted `RungRunner` was the only thing testing.
@@ -642,7 +783,14 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -654,11 +802,11 @@ mod tests {
         .await
         .expect_err("nothing is listening, so nothing can be nominated");
 
-        for rung in EVERY_RUNG {
+        for rung in Rung::ALL {
             assert!(
                 !matches!(report.verdict(rung), Verdict::NotReached),
                 "rung {} has no reason recorded: {report}",
-                rung_number(rung)
+                rung.method_number()
             );
         }
     }
@@ -680,9 +828,19 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &cfg(120),
-                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("[::1]:1", CandidateKind::Host),
+                ],
                 // An IPv6 host candidate gives rung 0 something of its class to
                 // try, so it is genuinely ATTEMPTED and genuinely fails --
                 // while rung 2 is skipped by policy before anything is sent.
@@ -696,13 +854,13 @@ mod tests {
         .expect_err("nothing is listening");
 
         // Symmetric NAT: the plan skips rung 2 before a packet exists.
-        let punch = report.verdict(Rung::StunPunch).clone();
+        let punch = report.verdict(Rung::Punched(Family::V6)).clone();
         assert!(
             matches!(&punch, Verdict::Skipped(why) if why.contains("symmetric")),
             "expected a policy skip naming the NAT, got {punch:?}"
         );
         // Rung 0 had a candidate, was put on the wire, and did not answer.
-        let direct = report.verdict(Rung::Ipv6Direct).clone();
+        let direct = report.verdict(Rung::Direct(Family::V6)).clone();
         assert!(
             matches!(&direct, Verdict::Failed(_)),
             "rung 0 had an IPv6 candidate and must read as attempted, got {direct:?}"
@@ -734,7 +892,14 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 // IPv4 server-reflexive only: no IPv6 host candidate, and no
@@ -749,15 +914,24 @@ mod tests {
         .expect_err("nothing is listening");
 
         assert!(
-            matches!(report.verdict(Rung::Ipv6Direct), Verdict::Skipped(_)),
+            matches!(
+                report.verdict(Rung::Direct(Family::V6)),
+                Verdict::Skipped(_)
+            ),
             "rung 0 had no IPv6 candidate to try: {report}"
         );
         assert!(
-            matches!(report.verdict(Rung::PortMapped), Verdict::Skipped(_)),
+            matches!(
+                report.verdict(Rung::PortMapped(Family::V4)),
+                Verdict::Skipped(_)
+            ),
             "rung 1 had no port-mapped candidate to try: {report}"
         );
         assert!(
-            matches!(report.verdict(Rung::StunPunch), Verdict::Failed(_)),
+            matches!(
+                report.verdict(Rung::Punched(Family::V4)),
+                Verdict::Failed(_)
+            ),
             "rung 2 had a candidate and was actually tried: {report}"
         );
     }
@@ -772,7 +946,14 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(120),
                 local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -794,13 +975,30 @@ mod tests {
     #[test]
     fn the_report_names_every_rung_by_number_and_by_name() {
         let rendered = LadderReport::new().to_string();
-        for rung in EVERY_RUNG {
+        for rung in Rung::ALL {
             assert!(
-                rendered.contains(&format!("rung {}", rung_number(rung))),
+                rendered.contains(&format!("rung {}", rung.method_number())),
                 "{rendered}"
             );
-            assert!(rendered.contains(rung_name(rung)), "{rendered}");
+            assert!(rendered.contains(&rung.to_string()), "{rendered}");
         }
+    }
+
+    /// A failure names the addresses that were probed, on both sides.
+    #[test]
+    fn the_report_lists_both_sides_candidates() {
+        let mut report = LadderReport::new();
+        report.theirs = candidate_list(&[Candidate {
+            addr: "203.0.113.7:443".parse().unwrap(),
+            kind: CandidateKind::ServerReflexive,
+            priority: 1,
+        }]);
+        let rendered = report.to_string();
+        assert!(rendered.contains("  ours:   none\n"), "{rendered}");
+        assert!(
+            rendered.contains("  theirs: srflx 203.0.113.7:443\n"),
+            "{rendered}"
+        );
     }
 
     // ------------------------------------------------------ property 1
@@ -824,9 +1022,16 @@ mod tests {
                     Ladder {
                         psk: &PSK,
                         role: IceRole::Controlled,
-                        nat: NatType::EndpointIndependent,
+                        nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
+                        peer_nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
-                        local: vec![],
+                        local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                         remote: vec![candidate(
                             &client_addr.to_string(),
                             CandidateKind::ServerReflexive,
@@ -846,9 +1051,16 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate(
                     &host_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -866,7 +1078,7 @@ mod tests {
             "the nomination must hand back the socket the ladder ran on, not a new one"
         );
         assert_eq!(got.remote, host_addr);
-        assert_eq!(got.rung, Rung::StunPunch);
+        assert_eq!(got.rung, Rung::Punched(Family::V4));
         let _ = host.await;
     }
 
@@ -932,7 +1144,14 @@ mod tests {
                 // Symmetric sends the plan straight past rung 2, and the only
                 // candidate is server-reflexive, so rungs 0 and 1 have nothing
                 // of their class. The race is therefore never entered at all.
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -940,7 +1159,12 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![],
+                // Our own server-reflexive candidate is what the peer would
+                // blast around; without one the plan does not admit the blast.
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                ],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -953,7 +1177,7 @@ mod tests {
         .await
         .expect("the lurking peer sits exactly on the guessed base");
 
-        assert_eq!(got.rung, Rung::Birthday);
+        assert_eq!(got.rung, Rung::Birthday(Family::V4));
         assert_eq!(got.remote, peer_addr);
         assert!(
             !Arc::ptr_eq(&got.socket, &raced_on),
@@ -994,7 +1218,14 @@ mod tests {
         let ladder = Ladder {
             psk: &PSK,
             role: IceRole::Controlling,
-            nat: NatType::Symmetric,
+            nat: FamilyNat {
+                v4: NatType::Symmetric,
+                v6: NatType::Symmetric,
+            },
+            peer_nat: FamilyNat {
+                v4: NatType::Symmetric,
+                v6: NatType::Symmetric,
+            },
             cfg: &NetConfig {
                 enable_birthday: true,
                 birthday_sockets: 2,
@@ -1002,14 +1233,15 @@ mod tests {
                 birthday_budget: Duration::from_millis(300),
                 ..cfg(120)
             },
-            local: vec![],
+            local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
             remote: vec![candidate(&base.to_string(), CandidateKind::ServerReflexive)],
             admit_remote: None,
         };
 
-        let verdict = blast(&ladder, 0)
+        let (verdict, sent) = blast(&ladder, Family::V4, 0)
             .await
             .expect_err("nothing answers at this base");
+        assert!(sent > 0, "a miss must hand back the probes it sent");
         let Verdict::Failed(why) = verdict else {
             panic!("a miss must read as failed, got {verdict:?}");
         };
@@ -1039,7 +1271,14 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     birthday_sockets: 4,
@@ -1047,7 +1286,12 @@ mod tests {
                     birthday_budget: Duration::from_millis(3000),
                     ..cfg(120)
                 },
-                local: vec![],
+                // Our own server-reflexive candidate is what the peer would
+                // blast around; without one the plan does not admit the blast.
+                local: vec![
+                    candidate("127.0.0.1:1", CandidateKind::Host),
+                    candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                ],
                 remote: vec![candidate(
                     &peer_addr.to_string(),
                     CandidateKind::ServerReflexive,
@@ -1060,7 +1304,7 @@ mod tests {
         .await
         .expect_err("a ladder that admits no remote must not nominate the lurking peer");
 
-        let verdict = report.verdict(Rung::Birthday).clone();
+        let verdict = report.verdict(Rung::Birthday(Family::V4)).clone();
         assert!(
             matches!(&verdict, Verdict::Failed(why) if why.contains("reached the same way")),
             "expected the veto's own reason on rung 3, got {verdict:?}"
@@ -1092,59 +1336,152 @@ mod tests {
         assert!(body.contains("pub rung: Rung"), "{body}");
     }
 
-    // ------------------------------------------------------ classification
-
-    /// The report's per-rung skips are only true if this classification agrees
-    /// with the one `IceAgent` nominates by. That function is private, so the
-    /// rule is pinned here instead of inferred.
-    #[test]
-    fn the_rung_classification_matches_the_one_ice_nominates_by() {
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::PortMapped)),
-            Rung::PortMapped
-        );
-        assert_eq!(
-            rung_of(&candidate("[2001:db8::2]:443", CandidateKind::PortMapped)),
-            Rung::PortMapped,
-            "a port mapping is rung 1 in either address family"
-        );
-        assert_eq!(
-            rung_of(&candidate("[2001:db8::2]:443", CandidateKind::Host)),
-            Rung::Ipv6Direct,
-            "an IPv6 host candidate is rung 0"
-        );
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::Host)),
-            Rung::StunPunch,
-            "an IPv4 host candidate is NOT rung 0; ice.rs sends it to rung 2"
-        );
-        assert_eq!(
-            rung_of(&candidate(
-                "203.0.113.7:443",
-                CandidateKind::ServerReflexive
-            )),
-            Rung::StunPunch
-        );
-        assert_eq!(
-            rung_of(&candidate("203.0.113.7:443", CandidateKind::PeerReflexive)),
-            Rung::StunPunch
-        );
-    }
-
     #[test]
     fn the_blast_guesses_around_a_server_reflexive_address_only() {
         // A host candidate is an interface address behind the NAT. Guessing
         // ports around it aims the blast at the wrong machine.
         assert_eq!(
-            blast_base(&[candidate("192.168.1.5:443", CandidateKind::Host)]),
+            blast_base(
+                &[candidate("192.168.1.5:443", CandidateKind::Host)],
+                Family::V4
+            ),
             None
         );
         assert_eq!(
-            blast_base(&[
-                candidate("192.168.1.5:443", CandidateKind::Host),
-                candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
-            ]),
+            blast_base(
+                &[
+                    candidate("192.168.1.5:443", CandidateKind::Host),
+                    candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
+                ],
+                Family::V4
+            ),
             Some("203.0.113.7:51234".parse().expect("a literal address"))
+        );
+    }
+
+    /// The guardrail is that the blast's cost is reported, not hidden: when
+    /// the IPv6 blast misses and the IPv4 blast wins, the win's total carries
+    /// the probes the miss sent too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_win_after_a_missed_blast_counts_the_misses_probes() {
+        let (_peer, peer_addr) = lurking_peer().await;
+        let sym = FamilyNat {
+            v4: NatType::Symmetric,
+            v6: NatType::Symmetric,
+        };
+        let cfg = NetConfig {
+            enable_birthday: true,
+            birthday_sockets: 4,
+            birthday_ports: 8,
+            birthday_budget: Duration::from_millis(1500),
+            ..cfg(120)
+        };
+        let ladder = Ladder {
+            psk: &PSK,
+            role: IceRole::Controlling,
+            nat: sym,
+            peer_nat: sym,
+            cfg: &cfg,
+            local: vec![
+                candidate("127.0.0.1:1", CandidateKind::Host),
+                candidate("[::1]:1", CandidateKind::Host),
+                candidate("127.0.0.1:2", CandidateKind::ServerReflexive),
+                candidate("[::1]:2", CandidateKind::ServerReflexive),
+            ],
+            remote: vec![
+                candidate("[::1]:9", CandidateKind::ServerReflexive),
+                candidate(&peer_addr.to_string(), CandidateKind::ServerReflexive),
+            ],
+            admit_remote: None,
+        };
+        // What the IPv6 blast alone sends before it gives up.
+        let (_, missed) = blast(&ladder, Family::V6, 0)
+            .await
+            .expect_err("nothing answers on IPv6");
+        assert!(missed > 0);
+        // What the IPv4 blast alone reports for its win.
+        let alone = blast(&ladder, Family::V4, 0)
+            .await
+            .expect("the lurking peer answers on IPv4")
+            .probes;
+
+        let (mut rx, tx) = channels();
+        let got = nominate(socket().await, ladder, &mut rx, &tx)
+            .await
+            .expect("the IPv4 blast wins after the IPv6 one missed");
+        assert_eq!(got.rung, Rung::Birthday(Family::V4));
+        // Without the carry the total is just `alone`, far below `missed`.
+        assert!(
+            got.probes > missed,
+            "total {} must include the miss's {missed} (win alone: {alone})",
+            got.probes
+        );
+    }
+
+    #[test]
+    fn the_blast_aims_at_the_family_being_blasted() {
+        let remote = [
+            candidate("[2001:db8::9]:40000", CandidateKind::ServerReflexive),
+            candidate("203.0.113.7:51234", CandidateKind::ServerReflexive),
+        ];
+        assert_eq!(
+            blast_base(&remote, Family::V4),
+            Some("203.0.113.7:51234".parse().expect("a literal address"))
+        );
+        assert_eq!(
+            blast_base(&remote, Family::V6),
+            Some("[2001:db8::9]:40000".parse().expect("a literal address"))
+        );
+        assert_eq!(blast_base(&remote[..1], Family::V4), None);
+    }
+
+    /// Ours: IPv4 only. Theirs: both. Nothing listens, so the IPv4 race fails,
+    /// and the IPv6 rungs say which end lacks the family.
+    #[tokio::test]
+    async fn a_missing_family_is_skipped_by_name_in_the_report() {
+        let sock = socket().await;
+        let (mut rx, tx) = channels();
+        let nat = FamilyNat {
+            v4: NatType::EndpointIndependent,
+            v6: NatType::Unknown,
+        };
+        let report = nominate(
+            sock,
+            Ladder {
+                psk: &PSK,
+                role: IceRole::Controlling,
+                nat,
+                peer_nat: nat,
+                cfg: &cfg(120),
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
+                remote: vec![
+                    candidate("127.0.0.1:9", CandidateKind::ServerReflexive),
+                    candidate("[2001:db8::9]:9", CandidateKind::ServerReflexive),
+                ],
+                admit_remote: None,
+            },
+            &mut rx,
+            &tx,
+        )
+        .await
+        .expect_err("nothing listens");
+        for rung in Rung::ALL {
+            assert!(
+                !matches!(report.verdict(rung), Verdict::NotReached),
+                "{rung}: {report}"
+            );
+        }
+        assert!(
+            matches!(report.verdict(Rung::Punched(Family::V6)),
+                Verdict::Skipped(w) if w.contains("this end has no IPv6 address")),
+            "{report}"
+        );
+        assert!(
+            matches!(
+                report.verdict(Rung::Punched(Family::V4)),
+                Verdict::Failed(_)
+            ),
+            "{report}"
         );
     }
 
@@ -1157,12 +1494,19 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::Symmetric,
+                nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::Symmetric,
+                    v6: NatType::Symmetric,
+                },
                 cfg: &NetConfig {
                     enable_birthday: true,
                     ..cfg(120)
                 },
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 // Host candidates only: no observed external port anywhere.
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::Host)],
                 admit_remote: None,
@@ -1173,9 +1517,10 @@ mod tests {
         .await
         .expect_err("nothing is listening");
 
-        let v = report.verdict(Rung::Birthday).clone();
+        let v = report.verdict(Rung::Birthday(Family::V4)).clone();
         assert!(
-            matches!(&v, Verdict::Skipped(why) if why.contains("server-reflexive")),
+            matches!(&v, Verdict::Skipped(why)
+                if why.contains("no IPv4 server-reflexive candidate")),
             "got {v:?}"
         );
     }
@@ -1212,9 +1557,16 @@ mod tests {
                     Ladder {
                         psk: &PSK,
                         role: IceRole::Controlled,
-                        nat: NatType::EndpointIndependent,
+                        nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
+                        peer_nat: FamilyNat {
+                            v4: NatType::EndpointIndependent,
+                            v6: NatType::EndpointIndependent,
+                        },
                         cfg: &cfg,
-                        local: vec![],
+                        local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                         // Port 9 (discard) on loopback: the host's checks go
                         // nowhere, so the client learns nothing from them.
                         remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
@@ -1244,9 +1596,16 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(4000),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
                 admit_remote: None,
             },
@@ -1288,9 +1647,16 @@ mod tests {
             Ladder {
                 psk: &PSK,
                 role: IceRole::Controlling,
-                nat: NatType::EndpointIndependent,
+                nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
+                peer_nat: FamilyNat {
+                    v4: NatType::EndpointIndependent,
+                    v6: NatType::EndpointIndependent,
+                },
                 cfg: &cfg(300),
-                local: vec![],
+                local: vec![candidate("127.0.0.1:1", CandidateKind::Host)],
                 remote: vec![candidate("127.0.0.1:9", CandidateKind::ServerReflexive)],
                 admit_remote: None,
             },
